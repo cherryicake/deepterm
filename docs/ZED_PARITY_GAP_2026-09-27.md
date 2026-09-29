@@ -120,7 +120,7 @@ deepterm 的代码编辑器是一个**语法层编辑器**，Zed 是一个**语�
 | 2.20 | **无行/选区变换命令** | `actions.rs:449-477, 505, 738-850` | `SortLines\|UniqueLines\|ReverseLines\|ShuffleLines\|ToggleCase\|ConvertTo*Case\|ConvertIndentationTo*\|DuplicateSelection\|NewlineAbove\|NewlineBelow\|Transpose\|AutoIndent\|Rewrap` → **各 0**。有移动/复制/删除行、行注释、join lines |
 | 2.21 | **无光标定位命令** | `ScrollCursorTop/Center/Bottom/CenterTopBottom`、`HalfPageUp/Down`、`LineUp/Down`、`NextScreen`、`SelectLine`、`SaveLocation` | → **各 0**。内部已有 `scroll_to_center`（`state.rs:3611`）但无 action/键位 |
 | 2.22 | **无 Git hunk 导航** | `GoToHunk`/`GoToNextChange`/`GoToPreviousChange` | → **0**（有 hunk 展开，但不能在 hunk 间跳转） |
-| 2.23 | **无显示开关类 action** | `ToggleSoftWrap`/`ToggleLineNumbers`/`ToggleRelativeLineNumbers`/`ToggleIndentGuides`/`ToggleDiagnostics`/`ToggleBreadcrumb`/`ToggleGitBlameInline` | → **0**。`set_soft_wrap`/`set_line_number`/`set_show_whitespaces`/`set_cursor_shape` 等 setter 在编辑器侧**无调用点** |
+| 2.23 | **显示开关类 action 只有软换行一个** | `ToggleSoftWrap`(Zed `cmd-k z`)/`ToggleLineNumbers`/`ToggleRelativeLineNumbers`/`ToggleIndentGuides`/`ToggleDiagnostics`/`ToggleBreadcrumb`/`ToggleGitBlameInline` | `ToggleSoftWrap` **已有**（`alt-z`，VSCode 同款；Zed 的 `cmd-k z` 没法用——本仓 `cmd-k` 已被 ShowSshPicker 占用且无命令面板），其余 → **0**。`set_line_number`/`set_show_whitespaces`/`set_cursor_shape` 等 setter 仍**无调用点** |
 
 ---
 
@@ -133,7 +133,10 @@ deepterm 的代码编辑器是一个**语法层编辑器**，Zed 是一个**语�
 | `tab_size` / `indent_guides` / `show_whitespaces` / `rainbow_brackets` | 0 |
 | `occurrences` / `scroll_beyond_last_line` / `cursor_surrounding_lines` / `sticky_scroll` | 0 |
 | `git_gutter` / `scrollbar` / `soft_wrap` / `folding` | 0 |
-| `set_soft_wrap` / `set_line_number` / `set_show_whitespaces` / `set_cursor_shape` / `set_cursor_blink` | 0 |
+| `set_line_number` / `set_show_whitespaces` / `set_cursor_shape` / `set_cursor_blink` | 0 |
+
+（`set_soft_wrap` 已有调用点：代码编辑器默认 `soft_wrap = false`，`ToggleSoftWrap`(`alt-z`) 在
+软换行/水平滚动间切换，与 Zed 默认 `"soft_wrap": "none"` + `scrollbar.axes.horizontal` 对齐。）
 
 代码编辑器构造只写 `InputState::new(window, cx).code_editor(lang).multi_line(true)`
 （`editor/editor.rs:2626-2628`），**上述全部走默认值、用户无法调整**。状态栏的 `"缩进: Tab"`

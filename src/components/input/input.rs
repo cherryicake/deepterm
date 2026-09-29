@@ -162,6 +162,7 @@ impl RenderOnce for EditorInput {
                             .on_action(window.listener_for(&self.state, InputState::indent))
                             .on_action(window.listener_for(&self.state, InputState::outdent))
                             .on_action(window.listener_for(&self.state, InputState::toggle_comment))
+                            .on_action(window.listener_for(&self.state, InputState::toggle_soft_wrap))
                             .on_action(window.listener_for(&self.state, InputState::move_line_up))
                             .on_action(window.listener_for(&self.state, InputState::move_line_down))
                             .on_action(window.listener_for(&self.state, InputState::duplicate_line))

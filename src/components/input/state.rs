@@ -107,6 +107,7 @@ actions!(
         Search,
         SearchPrevious,
         ToggleComment,
+        ToggleSoftWrap,
         MoveLineUp,
         MoveLineDown,
         DuplicateLine,
@@ -217,16 +218,19 @@ pub(crate) struct RainbowCache {
 pub(crate) type ValidateFn = Box<dyn Fn(&str, &mut Context<InputState>) -> bool + 'static>;
 
 /// 滚动条几何信息（每次 paint 后写入，供拖拽命中与换算）。
+///
+/// 三个长度量都**沿轴**取值：纵向条是高/高/高，横向条是宽/宽/宽。
+/// 几何算法与 markdown 编辑器共用 `thumb_metrics` / `scroll_for_drag`。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScrollbarGeometry {
     /// thumb 在窗口坐标下的区域。
     pub(crate) thumb: Bounds<Pixels>,
-    /// 轨道总高度（= viewport 高度）。
-    pub(crate) track_height: Pixels,
-    /// thumb 高度。
-    pub(crate) thumb_height: Pixels,
-    /// 内容总高度。
-    pub(crate) content_height: Pixels,
+    /// 沿轴的视口长度（纵向 = 视口高，横向 = 视口宽）。
+    pub(crate) viewport_len: Pixels,
+    /// 沿轴的 thumb 长度。
+    pub(crate) thumb_len: Pixels,
+    /// 沿轴的内容总长度。
+    pub(crate) content_len: Pixels,
 }
 
 /// 括号着色的最大文件长度（字节），超出则跳过（避免每帧全文件扫描）。
@@ -392,6 +396,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-/", ToggleComment, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
+        // 软换行开关。Zed 是 `cmd-k z`，但本仓没有命令面板、`cmd-k` 已被
+        // ShowSshPicker 全局占用，这里用 VSCode 同款的 `alt-z`。
+        KeyBinding::new("alt-z", ToggleSoftWrap, Some(CONTEXT)),
         KeyBinding::new("alt-up", MoveLineUp, Some(CONTEXT)),
         KeyBinding::new("alt-down", MoveLineDown, Some(CONTEXT)),
         KeyBinding::new("alt-shift-up", DuplicateLine, Some(CONTEXT)),
@@ -482,8 +489,6 @@ pub(crate) struct LastLayout {
     pub(crate) lines: Rc<Vec<LineLayout>>,
     /// The line_height of text layout, this will change will InputElement painted.
     pub(crate) line_height: Pixels,
-    /// The wrap width of text layout, this will change will InputElement painted.
-    pub(crate) wrap_width: Option<Pixels>,
     /// The line number area width of text layout, if not line number, this will be 0px.
     pub(crate) line_number_width: Pixels,
     /// 行号数字位数（展开区旧行号按同宽格式化）。
@@ -600,11 +605,14 @@ pub struct InputState {
     pub(crate) tab_size: TabSize,
     /// 悬浮滚动条。
     pub(crate) scrollbar: bool,
-    /// 滚动条几何（每次 paint 后写入）。
+    /// 纵向滚动条几何（每次 paint 后写入）。
     pub(crate) scrollbar_geometry: Option<ScrollbarGeometry>,
-    /// 滚动条拖拽状态：(按下时鼠标 y, 按下时滚动位置)。
+    /// 纵向滚动条拖拽状态：(按下时鼠标 y, 按下时滚动位置)。
     pub(crate) scrollbar_drag: Option<(Pixels, Pixels)>,
-    /// 滚动条拖拽状态：(按下时鼠标 y, 按下时滚动位置)。
+    /// 横向滚动条几何（内容横向溢出时才有，每次 paint 后写入）。
+    pub(crate) scrollbar_geometry_h: Option<ScrollbarGeometry>,
+    /// 横向滚动条拖拽状态：(按下时鼠标 x, 按下时横向滚动位置)。
+    pub(crate) scrollbar_drag_h: Option<(Pixels, Pixels)>,
     /// Sticky scroll：顶部固定外围定义行。
     pub(crate) sticky_scroll: bool,
     /// Sticky 行点击目标（窗口坐标，由 paint 阶段写入，鼠标点击跳转用）。
@@ -755,6 +763,8 @@ impl InputState {
             scrollbar: true,
             scrollbar_geometry: None,
             scrollbar_drag: None,
+            scrollbar_geometry_h: None,
+            scrollbar_drag_h: None,
             sticky_scroll: true,
             sticky_click_targets: Vec::new(),
             fold_click_targets: Vec::new(),
@@ -871,6 +881,8 @@ impl InputState {
     /// - height: 100%
     /// - multi_line: true
     /// - indent_guides: true
+    /// - **soft_wrap: false**（与 Zed 默认 `"soft_wrap": "none"` 一致：
+    ///   长行不折行，改为水平滚动；其它多行输入框仍是默认的软换行）
     ///
     /// If `highlighter` is None, will use the default highlighter.
     ///
@@ -887,6 +899,9 @@ impl InputState {
         self.mode = InputMode::code_editor(language);
         self.searchable = true;
         self.replaceable = true;
+        // 代码编辑器默认不软换行（Zed: `"soft_wrap": "none"`，VSCode:
+        // `editor.wordWrap: off`）：长行保持原始行结构，靠水平滚动查看。
+        self.soft_wrap = false;
         self
     }
 
@@ -1705,11 +1720,17 @@ impl InputState {
         debug_assert!(self.mode.is_multi_line());
         self.soft_wrap = wrap;
         if wrap {
-            let wrap_width = self
+            // 换行宽度与 prepaint / `set_input_bounds` 同一套算法：元素宽 −
+            // 行号栏 − 右边距。这里原本直接用 `last_layout.wrap_width`，但
+            // 关着软换行时它恒为 None，退回「整元素宽」会让首行比可视区宽出
+            // 一个行号栏 —— 刚打开软换行的文件会立刻溢出右侧再横滚一次。
+            let line_number_width = self
                 .last_layout
                 .as_ref()
-                .and_then(|b| b.wrap_width)
-                .unwrap_or(self.input_bounds.size.width);
+                .map(|l| l.line_number_width)
+                .unwrap_or(px(0.));
+            let wrap_width =
+                (self.input_bounds.size.width - line_number_width - RIGHT_MARGIN).max(px(1.));
 
             self.display_map.on_layout_changed(Some(wrap_width), cx);
 
@@ -1721,6 +1742,23 @@ impl InputState {
             self.display_map.on_layout_changed(None, cx);
         }
         cx.notify();
+    }
+
+    /// [`ToggleSoftWrap`]（VSCode `alt-z` / Zed `cmd-k z`）：切换软换行。
+    ///
+    /// 代码编辑器默认关（长行水平滚动，与 Zed/VSCode 一致），此 action 让
+    /// 单个输入框随时切回软换行 —— 设置系统落地前的临时出口。
+    pub(crate) fn toggle_soft_wrap(
+        &mut self,
+        _: &ToggleSoftWrap,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.mode.is_multi_line() {
+            return;
+        }
+        let wrap = !self.soft_wrap;
+        self.set_soft_wrap(wrap, window, cx);
     }
 
     /// Update whether to show whitespace characters.
@@ -3397,6 +3435,16 @@ impl InputState {
             }
         }
 
+        // Zed：点行号区当三击处理（`crates/editor/src/element/mouse.rs`
+        // `click_count = 3 // Simulate triple-click when clicking the gutter
+        // to select lines`）= 选中整行。gutter 是**不随横向滚动平移**的固定
+        // 绘制区，用 x 反推列在横滚后必然算错（点行号会跳到第几十列），
+        // 所以这条路完全不问列、按行处理。
+        let in_gutter = event.button == MouseButton::Left
+            && self.input_bounds.contains(&event.position)
+            && event.position.x < self.content_left_x();
+        let click_count = if in_gutter { 3 } else { event.click_count };
+
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
 
@@ -3404,7 +3452,7 @@ impl InputState {
             return;
         }
 
-        match event.click_count {
+        match click_count {
             1 => {
                 if event.modifiers.shift {
                     self.select_to(offset, cx);
@@ -3469,7 +3517,15 @@ impl InputState {
             .as_ref()
             .map(|layout| layout.line_height)
             .unwrap_or(window.line_height());
-        let delta = event.delta.pixel_delta(line_height);
+        let mut delta = event.delta.pixel_delta(line_height);
+
+        // Shift + 滚轮 → 横向滚动（VSCode/Zed 同款）。gpui 把
+        // `scrollingDeltaX/Y` 原样透传（`gpui_macos/events.rs`），不做换轴：
+        // 触控板横扫自带 x 分量，只有 x 为 0 的滚轮/鼠标才需要换，避免双重
+        // 交换把横扫打成竖滚。
+        if event.modifiers.shift && delta.x == px(0.) {
+            delta = point(delta.y, px(0.));
+        }
 
         let old_offset = self.scroll_handle.offset();
         self.update_scroll_offset(Some(old_offset + delta), cx);
@@ -3858,6 +3914,20 @@ impl InputState {
             .clip_offset(offset.min(self.text.len()), Bias::Left)
     }
 
+    /// 正文左缘的窗口 x（= 输入框左缘 + 行号栏宽）。
+    ///
+    /// 行号栏 / 行底色 / git 色条等 gutter 元素都按 `input_bounds` 固定绘制，
+    /// **不随横向滚动平移**；只有正文跟着 `scroll_handle.offset().x` 平移。
+    /// 命中测试里凡是要区分「点在 gutter 上」还是「点在正文上」的地方都用它。
+    pub(crate) fn content_left_x(&self) -> Pixels {
+        let gutter = self
+            .last_layout
+            .as_ref()
+            .map(|l| l.line_number_width)
+            .unwrap_or(px(0.));
+        self.input_bounds.origin.x + gutter
+    }
+
     pub(crate) fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         // If the text is empty, always return 0
         if self.text.len() == 0 {
@@ -3884,6 +3954,21 @@ impl InputState {
         // - included the input padding.
         // - included the scroll offset.
         let inner_position = position - bounds.origin - point(line_number_width, px(0.));
+        // gutter 的 x 不是内容坐标：它固定绘制、不随横向滚动平移，而
+        // `bounds.origin` 含横滚偏移，两者相减会把「点在行号上的 x」算成
+        // 一段很深的内容列（横滚 600px 后点行号 → 跳到第几十列）。
+        // 落在 gutter 里的指针一律钳到内容左缘（当前可见首列）。
+        let inner_position = {
+            let content_left = self.content_left_x();
+            if position.x < content_left {
+                point(
+                    content_left - bounds.origin.x - line_number_width,
+                    inner_position.y,
+                )
+            } else {
+                inner_position
+            }
+        };
 
         let mut y_offset = last_layout.visible_top;
 
@@ -4688,7 +4773,19 @@ impl EntityInputHandler for InputState {
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         let last_layout = self.last_layout.as_ref()?;
-        let line_point = self.last_bounds?.localize(&point)?;
+        let bounds = self.last_bounds?;
+        let mut line_point = bounds.localize(&point)?;
+        // 坐标系：`localize` 得到的是元素内坐标，而正文从**行号栏之后**开始
+        // 绘制（见 paint 段 `origin.x + line_number_width`），这里不减行号栏
+        // 就会把 IME 定位整体右移一个 gutter。gutter 又不随横向滚动平移，
+        // 所以落在 gutter 里的点另钳到内容左缘（与 `index_for_mouse_position`
+        // 同一套规则）。
+        let content_left = self.content_left_x();
+        line_point.x = if point.x < content_left {
+            content_left - bounds.origin.x - last_layout.line_number_width
+        } else {
+            line_point.x - last_layout.line_number_width
+        };
 
         for (vi, line) in last_layout.lines.iter().enumerate() {
             let offset = last_layout.visible_line_byte_offsets[vi];

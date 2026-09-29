@@ -211,15 +211,16 @@ impl TextElement {
             }
         });
 
-        // 滚动条拖拽：按下命中 thumb → 拖动改 scroll offset → 松开结束
+        // 滚动条拖拽：按下命中 thumb → 拖动改 scroll offset → 松开结束。
+        // 纵向（右缘）与横向（底缘）两条各自一套状态，几何/换算共用。
         window.on_mouse_event({
             let state = self.state.clone();
             move |event: &MouseDownEvent, _, window, cx| {
                 if event.button != MouseButton::Left {
                     return;
                 }
-                let geometry = state.read(cx).scrollbar_geometry;
-                if let Some(geometry) = geometry {
+                // 纵向条。
+                if let Some(geometry) = state.read(cx).scrollbar_geometry {
                     // 命中宽容与 markdown 编辑器一致（`GRAB_SLOP`）。
                     let hit = Bounds::new(
                         geometry.thumb.origin - point(GRAB_SLOP, GRAB_SLOP),
@@ -233,6 +234,23 @@ impl TextElement {
                         });
                         window.prevent_default();
                         cx.stop_propagation();
+                        return;
+                    }
+                }
+                // 横向条。
+                if let Some(geometry) = state.read(cx).scrollbar_geometry_h {
+                    let hit = Bounds::new(
+                        geometry.thumb.origin - point(GRAB_SLOP, GRAB_SLOP),
+                        geometry.thumb.size + size(GRAB_SLOP * 2., GRAB_SLOP * 2.),
+                    );
+                    if hit.contains(&event.position) {
+                        state.update(cx, |state, cx| {
+                            state.scrollbar_drag_h =
+                                Some((event.position.x, -state.scroll_handle.offset().x));
+                            cx.notify();
+                        });
+                        window.prevent_default();
+                        cx.stop_propagation();
                     }
                 }
             }
@@ -240,32 +258,60 @@ impl TextElement {
         window.on_mouse_event({
             let state = self.state.clone();
             move |event: &MouseMoveEvent, _, _window, cx| {
-                let Some((start_y, start_scroll)) = state.read(cx).scrollbar_drag else {
-                    return;
-                };
-                let Some(geometry) = state.read(cx).scrollbar_geometry else {
-                    return;
-                };
-                // 内容不溢出时几何是退化的，`scroll_for_drag` 会算出 0 ——
-                // 直接不认，免得把滚动位置拍回顶端。
-                if (geometry.content_height - geometry.track_height).max(px(0.)) <= px(0.) {
+                // 纵向拖拽。
+                if let Some((start_y, start_scroll)) = state.read(cx).scrollbar_drag {
+                    let Some(geometry) = state.read(cx).scrollbar_geometry else {
+                        return;
+                    };
+                    // 内容不溢出时几何是退化的，`scroll_for_drag` 会算出 0 ——
+                    // 直接不认，免得把滚动位置拍回顶端。
+                    if (geometry.content_len - geometry.viewport_len).max(px(0.)) <= px(0.) {
+                        return;
+                    }
+                    let delta = event.position.y - start_y;
+                    // 与 markdown 编辑器共用同一份拖拽换算（同样扣掉轨道两端留白）。
+                    let new_scroll = scroll_for_drag(
+                        start_scroll,
+                        delta,
+                        geometry.viewport_len,
+                        geometry.content_len,
+                        geometry.thumb_len,
+                    );
+                    if new_scroll == start_scroll {
+                        return;
+                    }
+                    state.update(cx, |state, cx| {
+                        let mut offset = state.scroll_handle.offset();
+                        offset.y = -new_scroll;
+                        state.scroll_handle.set_offset(offset);
+                        cx.notify();
+                    });
                     return;
                 }
-                let delta = event.position.y - start_y;
-                // 与 markdown 编辑器共用同一份拖拽换算（同样扣掉轨道两端留白）。
+                // 横向拖拽：换算同一套，坐标轴换成 x。
+                let Some((start_x, start_scroll)) = state.read(cx).scrollbar_drag_h else {
+                    return;
+                };
+                let Some(geometry) = state.read(cx).scrollbar_geometry_h else {
+                    return;
+                };
+                if (geometry.content_len - geometry.viewport_len).max(px(0.)) <= px(0.) {
+                    return;
+                }
+                let delta = event.position.x - start_x;
                 let new_scroll = scroll_for_drag(
                     start_scroll,
                     delta,
-                    geometry.track_height,
-                    geometry.content_height,
-                    geometry.thumb_height,
+                    geometry.viewport_len,
+                    geometry.content_len,
+                    geometry.thumb_len,
                 );
                 if new_scroll == start_scroll {
                     return;
                 }
                 state.update(cx, |state, cx| {
                     let mut offset = state.scroll_handle.offset();
-                    offset.y = -new_scroll;
+                    offset.x = -new_scroll;
                     state.scroll_handle.set_offset(offset);
                     cx.notify();
                 });
@@ -274,9 +320,15 @@ impl TextElement {
         window.on_mouse_event({
             let state = self.state.clone();
             move |event: &MouseUpEvent, _, _window, cx| {
-                if event.button == MouseButton::Left && state.read(cx).scrollbar_drag.is_some() {
+                if event.button != MouseButton::Left {
+                    return;
+                }
+                if state.read(cx).scrollbar_drag.is_some()
+                    || state.read(cx).scrollbar_drag_h.is_some()
+                {
                     state.update(cx, |state, cx| {
                         state.scrollbar_drag = None;
+                        state.scrollbar_drag_h = None;
                         cx.notify();
                     });
                 }
@@ -2471,7 +2523,6 @@ impl TextElement {
             visible_top,
             visible_range_offset,
             line_height,
-            wrap_width,
             line_number_width,
             line_number_len,
             git_insert_shift,
@@ -2954,7 +3005,11 @@ impl TextElement {
         // 滚动条相关值提前取出（避免 state 借用跨 line.paint 的 &mut cx）
         let scrollbar_enabled = state.scrollbar && state.mode.is_multi_line();
         let scrollbar_dragging = state.scrollbar_drag.is_some();
+        let scrollbar_dragging_h = state.scrollbar_drag_h.is_some();
         let scrollbar_scroll_y = (-state.scroll_handle.offset().y).max(px(0.));
+        // 横向滚动偏移（右滚为负）：后面 `state` 的读锁要跨一次 `&mut cx`
+        // 的绘制段，这里与纵向一样提前取出来。
+        let scrollbar_scroll_x = state.scroll_handle.offset().x;
         let focus_handle = state.focus_handle.clone();
         // 光标绘制条件与不透明度提前取出（同上：后面要用 `&mut cx` 绘制）。
         // `should_paint_cursor` 覆盖「淡入窗口内 visible() 仍为 false」的情况。
@@ -3941,15 +3996,54 @@ impl TextElement {
                 window.paint_quad(fill(thumb_bounds, thumb_color).corner_radii(THUMB_RADIUS));
                 scrollbar_geometry = Some(ScrollbarGeometry {
                     thumb: thumb_bounds,
-                    track_height: viewport_h,
-                    thumb_height: thumb_h,
-                    content_height: content_h,
+                    viewport_len: viewport_h,
+                    thumb_len: thumb_h,
+                    content_len: content_h,
+                });
+            }
+        }
+
+        // 底部横向滚动条（Zed `scrollbar.axes.horizontal` 默认开）：长行不软
+        // 换行后靠它 + 水平滚轮/触控板查看行尾。几何/拖拽换算与纵向条共用
+        // `thumb_metrics` / `scroll_for_drag`（`offset.x` 向右滚为负，正好是
+        // `thumb_metrics` 要的符号）。
+        let mut scrollbar_geometry_h: Option<ScrollbarGeometry> = None;
+        if scrollbar_enabled {
+            // 条带贴底、右端给纵向条让位。视口/内容**同减** `BAR_THICKNESS`，
+            // 于是 `content' - viewport' = content - viewport`：thumb 到端点时
+            // 的滚动量与 `update_scroll_offset` 的钳制完全一致，不会脱节。
+            let viewport_w = input_bounds.size.width - BAR_THICKNESS;
+            let content_w = prepaint.scroll_size.width - BAR_THICKNESS;
+            if let Some((thumb_start, thumb_w)) =
+                thumb_metrics(viewport_w, content_w, scrollbar_scroll_x)
+            {
+                let thumb_bounds = Bounds::new(
+                    point(
+                        input_bounds.origin.x + thumb_start,
+                        input_bounds.origin.y + input_bounds.size.height - BAR_THICKNESS,
+                    ),
+                    size(thumb_w, BAR_THICKNESS),
+                );
+                let dragging = scrollbar_dragging_h;
+                let theme = cx.theme();
+                let thumb_color = if dragging {
+                    theme.border_strong
+                } else {
+                    theme.border.opacity(0.7)
+                };
+                window.paint_quad(fill(thumb_bounds, thumb_color).corner_radii(THUMB_RADIUS));
+                scrollbar_geometry_h = Some(ScrollbarGeometry {
+                    thumb: thumb_bounds,
+                    viewport_len: viewport_w,
+                    thumb_len: thumb_w,
+                    content_len: content_w,
                 });
             }
         }
 
         self.state.update(cx, |state, cx| {
             state.scrollbar_geometry = scrollbar_geometry;
+            state.scrollbar_geometry_h = scrollbar_geometry_h;
             state.sticky_click_targets = sticky_click_targets;
             state.fold_click_targets = fold_click_targets;
             state.git_bar_click_targets = git_bar_click_targets;
@@ -4281,6 +4375,198 @@ mod tests {
             }
             other => panic!("两侧都应有四边形: {other:?}"),
         }
+    }
+
+    // ── 水平滚动（长行不软换行，zed / vscode 语义） ────────────────────────
+
+    /// 点行号区 = Zed 的「模拟三击」= 选中整行；横向滚动下也必须如此 ——
+    /// gutter 是固定绘制的，若按内容坐标反推列，光标会落到藏在 gutter 底下的
+    /// 那一列上。
+    #[gpui::test]
+    fn gutter_click_selects_line_while_horizontally_scrolled(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::{
+            AppContext as _, Modifiers, MouseButton, MouseDownEvent, VisualTestContext,
+        };
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        // 首行足够长 → 内容横向溢出，才能真的滚起来（soft_wrap 默认已关）。
+        let long = "x".repeat(400);
+        let text = format!("{long}\nsecond line\nthird line\n");
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                s.set_text(&text, cx);
+                s
+            });
+            Host { state }
+        });
+        let state = host.read_with(cx, |h, _| h.state.clone());
+        let viewport = size(px(600.0), px(200.0));
+        let draw = |cx: &mut VisualTestContext, step: Duration| {
+            cx.executor().advance_clock(step);
+            cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+                // 固定尺寸容器：见上文 `cursor_animation_through_text_element`。
+                TextElement::new(state.clone())
+            })
+        };
+
+        draw(cx, Duration::from_millis(16));
+        // 向右滚 300px：gutter 不动，只有正文平移。
+        state.update_in(cx, |state, _window, cx| {
+            state.update_scroll_offset(Some(point(px(-300.0), px(0.0))), cx);
+        });
+        draw(cx, Duration::from_millis(16));
+        let offset_x = state.read_with(cx, |s, _| s.scroll_handle.offset().x);
+        assert!(
+            offset_x <= px(-1.),
+            "长行内容应能横向滚动，实际 offset.x = {offset_x}"
+        );
+
+        // 点第 2 行的行号（gutter 内、正文左缘左侧）。
+        let click_at = state.read_with(cx, |s, _| {
+            let input = s.input_bounds;
+            let line_height = s
+                .last_layout
+                .as_ref()
+                .map(|l| l.line_height)
+                .unwrap_or(px(20.));
+            assert!(
+                point(input.origin.x + px(4.), input.origin.y)
+                    .x < s.content_left_x(),
+                "点击点必须落在 gutter 内"
+            );
+            point(input.origin.x + px(4.), input.origin.y + line_height + px(4.))
+        });
+        state.update_in(cx, |state, window, cx| {
+            state.on_mouse_down(
+                &MouseDownEvent {
+                    position: click_at,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: Modifiers::default(),
+                    first_mouse: false,
+                },
+                window,
+                cx,
+            );
+            let second_line_start = state.text.line_start_offset(1);
+            let expected = state
+                .text
+                .line_range(second_line_start)
+                .expect("第 2 行存在");
+            assert_eq!(
+                state.selected_range, expected.into(),
+                "点行号应选中整行（Zed: click_count = 3），\
+                 而不是把光标放到 gutter 底下的某一列"
+            );
+        });
+    }
+
+    /// 内容横向溢出时底部出现横向滚动条（Zed `scrollbar.axes.horizontal`），
+    /// 不溢出时一条都不画。
+    #[gpui::test]
+    fn horizontal_scrollbar_follows_content_overflow(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        // 搭一个真实渲染过的编辑器（input_bounds / scroll_size 由 prepaint+paint
+        // 产出），滚动条几何只在 paint 里写回 state。
+        let build = |cx: &mut gpui::TestAppContext, text: String| {
+            let (host, cx) = cx.add_window_view(|window, cx| {
+                let state = cx.new(|cx| {
+                    let mut s = InputState::new(window, cx)
+                        .multi_line(true)
+                        .code_editor("text".to_string());
+                    s.set_text(&text, cx);
+                    s
+                });
+                Host { state }
+            });
+            let state = host.read_with(cx, |h, _| h.state.clone());
+            let viewport = size(px(600.0), px(200.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+                TextElement::new(state.clone())
+            });
+            state
+        };
+
+        // 不溢出：几何应为 None。
+        let short_state = build(
+            cx,
+            "fn main() {}\nfn other() {}\nsecond line is not long\n".to_string(),
+        );
+        let short_geom = short_state.read_with(cx, |s, _| s.scrollbar_geometry_h);
+        assert!(
+            short_geom.is_none(),
+            "内容不横向溢出时不应有横向滚动条，实际 {short_geom:?}"
+        );
+
+        // 长行溢出：几何存在，thumb 落在视口内、右端给纵向条让位。
+        let long = "x".repeat(400);
+        let state = build(cx, format!("{long}\nshort\n"));
+        let geom = state
+            .read_with(cx, |s, _| s.scrollbar_geometry_h)
+            .expect("内容横向溢出时应有横向滚动条");
+        let input = state.read_with(cx, |s, _| s.input_bounds);
+        assert!(
+            geom.thumb.left() >= input.left() && geom.thumb.right() <= input.right(),
+            "横向 thumb 应在视口内：{:?} vs {:?}",
+            geom.thumb,
+            input
+        );
+        assert!(
+            geom.thumb.right() <= input.right() - BAR_THICKNESS,
+            "横向条右端应给纵向条让位：thumb={:?} input_right={}",
+            geom.thumb,
+            input.right()
+        );
+        assert!(
+            geom.thumb.bottom() <= input.bottom(),
+            "横向 thumb 不应越过视口底边"
+        );
+        assert!(
+            geom.thumb.size.width < geom.viewport_len,
+            "长行应让 thumb 短于轨道（可见部分远小于内容）"
+        );
     }
 }
 

@@ -840,3 +840,31 @@ fn indent_level_bounds(line_text: &str) -> Vec<usize> {
             })
             .unwrap();
     }
+
+    // ==================== 软换行默认值（zed parity） ====================
+
+    /// 代码编辑器默认关软换行（Zed `"soft_wrap": "none"`、VSCode
+    /// `editor.wordWrap: off`）：长行保持原始行结构，靠水平滚动 + 底部横向
+    /// 滚动条查看；其它多行输入（提交框、说明框…）仍是默认的软换行。
+    #[gpui::test]
+    fn soft_wrap_defaults_match_zed(cx: &mut gpui::TestAppContext) {
+        struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let cell = std::cell::RefCell::new(None);
+        let (_host, cx) = cx.add_window_view(|window, cx| {
+            let code = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+            let plain = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+            *cell.borrow_mut() = Some((code.clone(), plain.clone()));
+            Host(code)
+        });
+        let (code, plain) = cell.into_inner().unwrap();
+
+        let code_wraps = code.read_with(cx, |s, _| s.soft_wrap);
+        let plain_wraps = plain.read_with(cx, |s, _| s.soft_wrap);
+        assert!(!code_wraps, "代码编辑器默认应关闭软换行");
+        assert!(plain_wraps, "普通多行输入（提交框等）默认仍应软换行");
+    }
