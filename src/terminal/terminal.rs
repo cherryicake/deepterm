@@ -1598,8 +1598,9 @@ impl Terminal {
     ) -> Entity<Self> {
         let (events_tx, events_rx) = unbounded();
         // 系统 ssh 路径原本没有驱动事件（`-R` 由 ssh 进程自己维护），这条通道
-        // 现在只用来回报端口转发的建立结果。
-        let (driver_tx, driver_rx) = async_channel::bounded(1);
+        // 现在回报两类「连接期一次性结果」：代理落点与端口转发。容量取 2——
+        // 两类各一条，都发生在建连前，满了会 `try_send` 失败丢掉其中一条。
+        let (driver_tx, driver_rx) = async_channel::bounded(2);
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
 
@@ -1609,7 +1610,7 @@ impl Terminal {
             listener.clone(),
         )));
 
-        let pty_terminal = match SshPtyTerminal::new(
+        let (pty_terminal, proxy_outcome) = match SshPtyTerminal::new(
             ssh_config,
             default_bounds,
             // 构造期没有窗口、拿不到 DPI，先用 1.0；首帧 `resize` 会带上真实
@@ -1619,7 +1620,7 @@ impl Terminal {
             listener,
             remote_cwd,
         ) {
-            Ok(pty_terminal) => pty_terminal,
+            Ok(created) => created,
             Err(err) => {
                 log::error!("SSH PTY 初始化失败: {}", err);
                 return cx.new(|_cx| Self::create_error_terminal());
@@ -1635,6 +1636,21 @@ impl Terminal {
         // 共享隧道已覆盖的规则不再计入：那些端口已经被本进程的专职隧道监听着，
         // 再加 `-R` 只会让 ssh 报「端口被占用」（占住的是我们自己），报到 UI
         // 就成了一条自己制造的假警报。
+        //
+        // 代理落点复用同一条通道：用户点了「使用系统代理连接」而这条路径表达
+        // 不了时，必须弹出来而不是静默直连。
+        let proxy_notice = match &proxy_outcome {
+            crate::ssh::ssh_pty::ProxyCommandOutcome::Unavailable { reason } => {
+                Some((format!("无法经系统代理连接：{reason}。本次为直连。"), false))
+            }
+            crate::ssh::ssh_pty::ProxyCommandOutcome::Applied { proxy } => {
+                Some((format!("已随连接请求经系统代理 {proxy} 建立"), true))
+            }
+            crate::ssh::ssh_pty::ProxyCommandOutcome::NotRequested => None,
+        };
+        if let Some((message, ok)) = proxy_notice {
+            driver_tx.try_send(DriverEvent::PortForward { message, ok }).ok();
+        }
         let pending =
             crate::ssh::tunnel::rules_for_openssh(ssh_config, &ssh_config.port_forwards);
         if !pending.is_empty() {

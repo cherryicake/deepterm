@@ -16,8 +16,8 @@ use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::folder_dialog::{FolderDialogMode, FolderNameDialog};
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::hosts_view::{
-    ConnectHost, CopyHostAddress, DeleteHost, EditHost, Host, folder_subtitle, load_grouped_hosts,
-    sort_hosts,
+    ConnectHost, ConnectHostViaProxy, CopyHostAddress, DeleteHost, EditHost, Host, folder_subtitle,
+    load_grouped_hosts, sort_hosts,
 };
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{
@@ -27,6 +27,58 @@ use crate::theme::ActiveTheme;
 
 /// SSH 主机回调（连接 / 编辑主机时触发），参数为该主机的连接配置。
 type HostConfigCallback = Rc<dyn Fn(&SshConnectionConfig, &mut Window, &mut App)>;
+
+/// 当前选中的主机配置，按列表顺序返回。
+///
+/// `via_proxy` 决定是否给这批配置打上「经系统代理」标记（见
+/// [`SshConnectionConfig::use_system_proxy`]）。
+///
+/// 返回的是**克隆**：`configs` 是本帧列表的数据源，就地置位会让同一帧里其它
+/// 读取方（列表渲染、编辑弹窗）看到被污染的配置，也会让「用代理连过一次」黏在
+/// 内存里的那份配置上。
+fn selected_configs(
+    configs: &[SshConnectionConfig],
+    selected_ids: &HashSet<SharedString>,
+    via_proxy: bool,
+) -> Vec<SshConnectionConfig> {
+    configs
+        .iter()
+        .filter(|config| selected_ids.iter().any(|id| id.as_ref() == config.id()))
+        .map(|config| {
+            let mut picked = config.clone();
+            picked.use_system_proxy = via_proxy;
+            picked
+        })
+        .collect()
+}
+
+/// 主机右键菜单顶部的两个连接项（直连 / 经系统代理）。
+///
+/// 两项必须各挂各的动作：接反了界面上完全看不出来，只有连上海外主机才会发现
+/// 代理没生效（或本机连接被误送进代理）。
+fn connect_menu_items(
+    menu: PopupMenu,
+    count: usize,
+    icon: fn(&'static str) -> crate::components::button::Icon,
+) -> PopupMenu {
+    let conn_label = if count == 1 {
+        "连接".to_string()
+    } else {
+        format!("连接 {} 台主机", count)
+    };
+    let proxy_label = if count == 1 {
+        "使用系统代理连接".to_string()
+    } else {
+        format!("使用系统代理连接 {} 台主机", count)
+    };
+    menu.menu_with_icon(&conn_label, icon("icons/link.svg"), Box::new(ConnectHost))
+        .menu_with_icon(
+            proxy_label,
+            icon("icons/network.svg"),
+            Box::new(ConnectHostViaProxy),
+        )
+        .separator()
+}
 
 /// Host 侧边栏视图组件，管理 Host 列表和 New Host Modal。文件夹=列表行，两级导航，无折叠。
 pub struct HostView {
@@ -899,20 +951,9 @@ impl HostView {
                 let host_group_id = host.group_id.clone();
                 move |menu: PopupMenu, _window, _cx| {
                     let count = entity.read(_cx).selected_ids.len();
-                    let mut m = menu;
-                    let conn_label = if count == 1 {
-                        "连接".to_string()
-                    } else {
-                        format!("连接 {} 台主机", count)
-                    };
+                    let mut m =
+                        connect_menu_items(menu, count, crate::components::button::Icon::new);
                     use crate::components::button::Icon as MenuIcon;
-                    m = m
-                        .menu_with_icon(
-                            &conn_label,
-                            MenuIcon::new("icons/link.svg"),
-                            Box::new(ConnectHost),
-                        )
-                        .separator();
                     if count == 1 {
                         m = m
                             .menu_with_icon(
@@ -1253,6 +1294,7 @@ impl Render for HostView {
 
         let configs_rc = Rc::new(configs.clone());
         let on_connect_action = self.on_connect.clone();
+        let on_connect_via_proxy = self.on_connect.clone();
         let hosts_for_delete = {
             let (h, _, _) = load_grouped_hosts();
             h
@@ -1266,15 +1308,21 @@ impl Render for HostView {
             .on_action(cx.listener({
                 let configs_rc = configs_rc.clone();
                 move |this, _: &ConnectHost, window, cx| {
-                    for config in configs_rc.iter() {
-                        if this
-                            .selected_ids
-                            .iter()
-                            .any(|id| id.as_ref() == config.id())
-                        {
-                            if let Some(ref f) = on_connect_action {
-                                f(config, window, cx);
-                            }
+                    let picked = selected_configs(&configs_rc, &this.selected_ids, false);
+                    if let Some(ref f) = on_connect_action {
+                        for config in &picked {
+                            f(config, window, cx);
+                        }
+                    }
+                }
+            }))
+            .on_action(cx.listener({
+                let configs_rc = configs_rc.clone();
+                move |this, _: &ConnectHostViaProxy, window, cx| {
+                    let picked = selected_configs(&configs_rc, &this.selected_ids, true);
+                    if let Some(ref f) = on_connect_via_proxy {
+                        for config in &picked {
+                            f(config, window, cx);
                         }
                     }
                 }
@@ -1379,5 +1427,117 @@ impl Render for HostView {
                     .flex_col()
                     .child(list),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ssh::config::AuthMethod;
+
+    /// 从菜单里取出「标签 → 动作名」的映射，供接线断言使用。
+    fn menu_entries(menu: &PopupMenu) -> Vec<(String, Option<String>)> {
+        menu.menu_items
+            .iter()
+            .filter_map(|item| match item {
+                PopupMenuItem::Item { label, action, .. } => Some((
+                    label.to_string(),
+                    action.as_ref().map(|action| action.name().to_string()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 两个连接项必须各挂各的动作。
+    ///
+    /// 断言的是 `PopupMenu` 里的真实条目而不是文案常量：动作接反了界面上完全
+    /// 看不出来，只有连上海外主机才会发现代理没生效（或本机连接被误送进代理）。
+    #[gpui::test]
+    fn connect_menu_items_wire_direct_and_proxy_actions(cx: &mut gpui::TestAppContext) {
+        let (single, multi) = cx.update(|cx| {
+            let single =
+                connect_menu_items(PopupMenu::new(cx), 1, crate::components::button::Icon::new);
+            let multi =
+                connect_menu_items(PopupMenu::new(cx), 3, crate::components::button::Icon::new);
+            (menu_entries(&single), menu_entries(&multi))
+        });
+
+        assert_eq!(
+            single,
+            vec![
+                (
+                    "连接".to_string(),
+                    Some("host_actions::ConnectHost".to_string())
+                ),
+                (
+                    "使用系统代理连接".to_string(),
+                    Some("host_actions::ConnectHostViaProxy".to_string())
+                ),
+            ],
+            "单选菜单：第一项直连、第二项经系统代理"
+        );
+        assert_eq!(
+            multi,
+            vec![
+                (
+                    "连接 3 台主机".to_string(),
+                    Some("host_actions::ConnectHost".to_string())
+                ),
+                (
+                    "使用系统代理连接 3 台主机".to_string(),
+                    Some("host_actions::ConnectHostViaProxy".to_string())
+                ),
+            ],
+            "多选菜单：文案带数量，动作保持不变"
+        );
+    }
+
+    /// 「使用系统代理连接」的菜单项：图标必须真实存在于嵌入资源里。
+    ///
+    /// gpui 画不出图标时不报错、不 panic，菜单上只是空一块——所以直接查
+    /// `Assets::get`，而不是只断言路径字符串长得对（与 tab_bar 的 agent 图标
+    /// 用例同款）。
+    #[test]
+    fn proxy_menu_icon_is_an_embedded_asset() {
+        assert!(
+            crate::assets::Assets::get("icons/network.svg").is_some(),
+            "「使用系统代理连接」的图标不在嵌入资源里"
+        );
+    }
+
+    /// `selected_configs`：选中哪些就连哪些，标记随调用路径而变。
+    ///
+    /// 覆盖单选、多选（Cmd 多选批量连接）、以及未选中任何主机三种情形——
+    /// 「连错主机」与「代理没生效」都从这里开始。
+    #[test]
+    fn selected_configs_carry_the_proxy_flag_only_on_the_proxy_path() {
+        let a = SshConnectionConfig::new("a.example.com", "root", AuthMethod::Agent);
+        let b = SshConnectionConfig::new("b.example.com", "root", AuthMethod::Agent);
+        let c = SshConnectionConfig::new("c.example.com", "root", AuthMethod::Agent);
+        let configs = vec![a.clone(), b.clone(), c.clone()];
+        let ids = |list: &[&SshConnectionConfig]| -> HashSet<SharedString> {
+            list.iter().map(|c| SharedString::from(c.id())).collect()
+        };
+
+        // 单选 + 直连
+        let picked = selected_configs(&configs, &ids(&[&a]), false);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].host, "a.example.com");
+        assert!(!picked[0].use_system_proxy, "直连路径不该带代理标记");
+
+        // 单选 + 经代理
+        let picked = selected_configs(&configs, &ids(&[&b]), true);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].host, "b.example.com");
+        assert!(picked[0].use_system_proxy, "代理路径必须带代理标记");
+
+        // 多选 + 经代理：每一台都要带标记（漏一台就会有一台悄悄直连）
+        let picked = selected_configs(&configs, &ids(&[&a, &c]), true);
+        assert_eq!(picked.len(), 2, "选中的两台都要连");
+        assert!(picked.iter().all(|c| c.use_system_proxy));
+
+        // 未选中：什么都不连
+        assert!(selected_configs(&configs, &HashSet::new(), true).is_empty());
     }
 }

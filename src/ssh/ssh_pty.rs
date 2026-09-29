@@ -15,6 +15,63 @@ use crate::ssh::remote_shell_tracking_command;
 use crate::terminal::TerminalBounds;
 use crate::terminal::terminal::ZedListener;
 
+/// 系统 ssh 路径的代理落点。
+///
+/// 这条路径只有 `ProxyCommand` 一种表达方式，而它在部分情况下不可用（非 macOS
+/// 的 nc、IPv6 代理地址）。不可用时**只能**直连（russh 处理不了的密钥类型才会
+/// 走到这里，没有可回退的通道），但必须让用户知道——所以把结论返回给调用方去
+/// 报到 UI，而不是只写日志。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProxyCommandOutcome {
+    /// 本次没有选择代理，或目标命中例外/本机地址，直连是预期行为。
+    NotRequested,
+    /// 已把 `ProxyCommand` 装进 ssh 参数。
+    Applied { proxy: String },
+    /// 用户选了代理，但这条路径无法表达，已退回直连。
+    Unavailable { reason: String },
+}
+
+/// 按系统代理设置给 `ssh_args` 追加 `ProxyCommand`，返回落点供调用方报到 UI。
+fn apply_proxy_command(
+    config: &SshConnectionConfig,
+    ssh_args: &mut Vec<String>,
+) -> ProxyCommandOutcome {
+    if !config.use_system_proxy {
+        return ProxyCommandOutcome::NotRequested;
+    }
+    let proxy = match crate::ssh::system_proxy::route(config) {
+        crate::ssh::system_proxy::ProxyRoute::Via(proxy) => proxy,
+        crate::ssh::system_proxy::ProxyRoute::Direct => {
+            log::info!("SSH: 本次目标直连（本机地址或命中代理例外）");
+            return ProxyCommandOutcome::NotRequested;
+        }
+        crate::ssh::system_proxy::ProxyRoute::Unavailable => {
+            return ProxyCommandOutcome::Unavailable {
+                reason: "未检测到系统代理（请在系统设置或 ALL_PROXY 中配置）".to_string(),
+            };
+        }
+    };
+    match proxy.openssh_proxy_command() {
+        Some(command) => {
+            log::info!(
+                "SSH: 经系统代理 {} 连接（ProxyCommand: {command}）",
+                proxy.display()
+            );
+            ssh_args.push("-o".to_string());
+            ssh_args.push(format!("ProxyCommand={command}"));
+            ProxyCommandOutcome::Applied {
+                proxy: proxy.display(),
+            }
+        }
+        None => ProxyCommandOutcome::Unavailable {
+            reason: format!(
+                "系统代理 {} 无法用 OpenSSH 的 ProxyCommand 表达（需要支持 -X 的 nc，且不支持 IPv6 代理地址）",
+                proxy.display()
+            ),
+        },
+    }
+}
+
 /// SSH 终端 - 使用 Zellij 方式（PTY）
 #[derive(Clone)]
 pub struct SshPtyTerminal {
@@ -27,6 +84,8 @@ impl SshPtyTerminal {
     ///
     /// `scale` 为窗口所在显示的缩放：`bounds` 是逻辑点，而 PTY 的
     /// `ws_xpixel` 需要物理像素（ghostty 也是按 DPI 换算后下发）。
+    ///
+    /// 返回终端句柄与代理落点：后者由调用方报到 UI（见 [`ProxyCommandOutcome`]）。
     pub fn new(
         config: &SshConnectionConfig,
         bounds: TerminalBounds,
@@ -34,7 +93,7 @@ impl SshPtyTerminal {
         term: Arc<FairMutex<Term<ZedListener>>>,
         listener: ZedListener,
         initial_cwd: Option<String>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, ProxyCommandOutcome)> {
         log::info!("=== 创建 SSH PTY 终端 ===");
         log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
 
@@ -62,6 +121,14 @@ impl SshPtyTerminal {
             "-t".to_string(),
             "-t".to_string(), // 强制分配 TTY
         ];
+
+        // 系统代理：OpenSSH 不读系统代理设置，只能经 `ProxyCommand` 表达。
+        // 路由判定与 russh 路径共用（`system_proxy::route`），两条传输对
+        // 「这个目标走不走代理」的结论一致。
+        //
+        // 结果由调用方报到 UI（见 [`ProxyCommandOutcome`]）：用户点了「使用系统
+        // 代理连接」却没走成代理时，必须说出来——只写日志等于静默直连。
+        let proxy_outcome = apply_proxy_command(config, &mut ssh_args);
 
         // 添加认证方式
         // 密码认证使用 sshpass -e：密码通过 SSHPASS 环境变量传递，
@@ -172,7 +239,7 @@ impl SshPtyTerminal {
 
         log::info!("SSH PTY 终端创建成功");
 
-        Ok(Self { sender })
+        Ok((Self { sender }, proxy_outcome))
     }
 
     /// 写入数据到 SSH（键盘输入）
@@ -230,6 +297,7 @@ fn redact_sensitive_args(args: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ssh::config::AuthMethod;
 
     #[test]
     fn redact_masks_value_after_sensitive_flag() {
@@ -254,5 +322,57 @@ mod tests {
         let out = redact_sensitive_args(&args);
         assert_eq!(out[0], "--password=********");
         assert_eq!(out[1], "ssh");
+    }
+
+    /// 未选代理时不动 ssh 参数，也不报告任何落点。
+    #[test]
+    fn proxy_command_is_absent_when_not_requested() {
+        let config = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+        let mut args: Vec<String> = Vec::new();
+        assert_eq!(
+            apply_proxy_command(&config, &mut args),
+            ProxyCommandOutcome::NotRequested
+        );
+        assert!(args.is_empty(), "没选代理不该往 ssh 参数里塞东西");
+    }
+
+    /// 本机地址直连：选了代理也不生成 ProxyCommand，且不算「不可用」——
+    /// 那是预期行为，不该弹提示。
+    #[test]
+    fn loopback_target_reports_not_requested_rather_than_unavailable() {
+        let mut config = SshConnectionConfig::new("127.0.0.1", "root", AuthMethod::Agent);
+        config.use_system_proxy = true;
+        let mut args: Vec<String> = Vec::new();
+        assert_eq!(
+            apply_proxy_command(&config, &mut args),
+            ProxyCommandOutcome::NotRequested,
+            "本机地址直连是预期行为，不该报「代理不可用」"
+        );
+        assert!(args.is_empty());
+    }
+
+    /// 选了代理但本机检测不到代理时，必须报告「不可用」（而不是静默直连）——
+    /// 调用方据此弹提示，这是这条路径唯一能告知用户的方式。
+    #[test]
+    fn missing_proxy_is_reported_as_unavailable() {
+        let mut config = SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
+        config.use_system_proxy = true;
+        let mut args: Vec<String> = Vec::new();
+        // 本机可能真配了代理：两种结果都可接受，但 Direct 式的静默不在此列。
+        match apply_proxy_command(&config, &mut args) {
+            ProxyCommandOutcome::Unavailable { reason } => {
+                assert!(!reason.is_empty(), "不可用必须带上可读的原因");
+                assert!(args.is_empty(), "退回直连时不该留下半个 ProxyCommand");
+            }
+            ProxyCommandOutcome::Applied { .. } => {
+                assert!(
+                    args.iter().any(|a| a.starts_with("ProxyCommand=")),
+                    "报告 Applied 就必须真的写进 ssh 参数"
+                );
+            }
+            ProxyCommandOutcome::NotRequested => {
+                panic!("选了代理却报 NotRequested 等于静默直连");
+            }
+        }
     }
 }

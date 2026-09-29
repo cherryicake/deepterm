@@ -21,6 +21,7 @@ pub mod russh_terminal;
 pub mod sftp_fs;
 pub mod shared_runtime;
 pub mod ssh_pty;
+pub mod system_proxy;
 pub mod tunnel;
 
 pub use config::{AuthMethod, SshConnectionConfig};

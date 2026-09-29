@@ -535,7 +535,19 @@ pub(crate) async fn connect_and_authenticate<H: client::Handler + Send + 'static
     // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
     let mut handle = tokio::time::timeout(
         Duration::from_secs(config.timeout.max(1)),
-        client::connect(russh_config, (config.host.as_str(), config.port), handler),
+        async {
+            // 经系统代理时先完成代理握手，再把已连通的流交给 russh；直连
+            // 交给 `client::connect`（它顺带处理 nodelay 等套接字选项）。
+            match crate::ssh::system_proxy::dial(config).await? {
+                Some(stream) => client::connect_stream(russh_config, stream, handler)
+                    .await
+                    // H::Error 只保证 Debug（russh 的约束），用 {:?} 而不是 {}。
+                    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
+                None => client::connect(russh_config, (config.host.as_str(), config.port), handler)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
+            }
+        },
     )
     .await
     .map_err(|_| {
@@ -545,9 +557,7 @@ pub(crate) async fn connect_and_authenticate<H: client::Handler + Send + 'static
             config.host,
             config.port
         )
-    })?
-    // H::Error 只保证 Debug（russh 的约束），用 {:?} 而不是 {}。
-    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}"))?;
+    })??;
 
     log::info!("russh: 开始认证 (用户: {})", config.username);
     let auth_result = authenticate(&mut handle, config).await?;

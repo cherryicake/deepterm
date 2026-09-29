@@ -142,6 +142,14 @@ pub struct SshConnectionConfig {
     /// 创建时间
     #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+    /// 本次连接是否经系统代理（见 [`crate::ssh::system_proxy`]）。
+    ///
+    /// **只存在于内存**：Host 菜单的「使用系统代理连接」是对这一次连接的指定，
+    /// 不是主机的持久属性，因此 `serde(skip)` 不落盘。代价是会话恢复
+    /// （`session_state.json`）与重新连接会退回直连——那两条路径都不是用户
+    /// 刚刚点过代理的上下文。
+    #[serde(skip)]
+    pub use_system_proxy: bool,
 }
 
 impl PartialEq for SshConnectionConfig {
@@ -158,6 +166,10 @@ impl PartialEq for SshConnectionConfig {
             && self.os == other.os
             && self.group_id == other.group_id
             && self.sort_order == other.sort_order
+        // `use_system_proxy` 有意不参与：它是本次连接的传输选择，不改变主机身份。
+        // 文件树后端匹配（`FileEndpoint::matches_fs`）与远端缓存键都拿这个相等性
+        // 判断「是不是同一台机器」，把代理标记算进去会让「经代理连上」的终端
+        // 与它自己的文件树判为不同来源。
         // created_at is metadata and intentionally excluded from equality
     }
 }
@@ -217,6 +229,7 @@ impl SshConnectionConfig {
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
+            use_system_proxy: false,
         }
     }
 
@@ -236,6 +249,7 @@ impl SshConnectionConfig {
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
+            use_system_proxy: false,
         }
     }
 
@@ -262,6 +276,7 @@ impl SshConnectionConfig {
             group_id: None,
             sort_order: None,
             created_at: Utc::now(),
+            use_system_proxy: false,
         }
     }
 
@@ -838,6 +853,43 @@ impl Default for SshGlobalConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 代理标记是**本次连接**的传输选择，不是主机的持久属性：序列化必须丢掉它，
+    /// 否则「用代理连过一次」会变成这台主机的永久设置，之后每次都走代理。
+    #[test]
+    fn proxy_choice_is_never_persisted() {
+        let mut config = SshConnectionConfig::new("example.com", "admin", AuthMethod::Agent);
+        config.use_system_proxy = true;
+
+        let json = serde_json::to_string(&config).expect("配置应可序列化");
+        assert!(
+            !json.contains("use_system_proxy"),
+            "代理标记不得出现在落盘 JSON 里: {json}"
+        );
+
+        let restored: SshConnectionConfig = serde_json::from_str(&json).expect("配置应可反序列化");
+        assert!(
+            !restored.use_system_proxy,
+            "从磁盘读回的主机必须是直连，代理标记不跨进程存活"
+        );
+        // 其余字段不受影响
+        assert_eq!(restored.host, "example.com");
+        assert_eq!(restored.username, "admin");
+    }
+
+    /// 代理标记不参与相等性：它不改变主机身份。
+    ///
+    /// 这一点被文件树后端匹配（`FileEndpoint::matches_fs`）依赖——「经代理连上」
+    /// 的终端与它自己的文件树必须判为同一来源，否则文件树会拒绝刷新。
+    #[test]
+    fn proxy_choice_does_not_change_host_identity() {
+        let direct = SshConnectionConfig::new("example.com", "admin", AuthMethod::Agent);
+        let mut proxied = direct.clone();
+        proxied.use_system_proxy = true;
+
+        assert_eq!(direct, proxied, "代理标记不该让主机变得不相等");
+        assert_eq!(direct.id(), proxied.id(), "主机 id 与代理选择无关");
+    }
 
     #[test]
     fn test_ssh_connection_config() {

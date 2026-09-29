@@ -5,6 +5,7 @@ actions!(
     host_actions,
     [
         ConnectHost,
+        ConnectHostViaProxy,
         EditHost,
         CopyHostAddress,
         DeleteHost,

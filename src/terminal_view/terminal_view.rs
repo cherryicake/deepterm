@@ -632,7 +632,7 @@ fn resolve_current_ssh_config(
     snapshot: &crate::ssh::SshConnectionConfig,
     saved: &[crate::ssh::SshConnectionConfig],
 ) -> crate::ssh::SshConnectionConfig {
-    match saved.iter().find(|current| current.id() == snapshot.id()) {
+    let mut resolved = match saved.iter().find(|current| current.id() == snapshot.id()) {
         Some(current) => {
             if current.port_forwards != snapshot.port_forwards {
                 log::info!(
@@ -644,7 +644,12 @@ fn resolve_current_ssh_config(
             current.clone()
         }
         None => snapshot.clone(),
-    }
+    };
+    // 传输选择只存在于内存（`use_system_proxy` 不落盘，见该字段的文档），
+    // 因此必须从调用方手里那份带过来：否则「使用系统代理连接」点下去，
+    // 紧接着的这次磁盘刷新就把标记抹掉，用户看到的还是直连。
+    resolved.use_system_proxy = snapshot.use_system_proxy;
+    resolved
 }
 
 /// 读「该 agent 的上报机制是否已装」。**不碰 `TerminalView`**，因此可以整个
@@ -5824,5 +5829,43 @@ mod tests {
 
         assert_eq!(resolved.host, "example.com");
         assert_eq!(resolved.port, 2222, "查不到时保留快照，避免连错主机");
+    }
+
+    /// 代理标记只存在于内存，磁盘刷新不能把它抹掉。
+    ///
+    /// 回归用例：`use_system_proxy` 是 `serde(skip)` 的，磁盘上那份配置里恒为
+    /// false。若这里不显式从快照带过来，「使用系统代理连接」点下去会在紧接着的
+    /// 这次配置刷新中失效，用户看到的仍是直连。
+    #[test]
+    fn proxy_choice_survives_the_disk_refresh() {
+        use crate::ssh::SshConnectionConfig;
+        use crate::ssh::config::AuthMethod;
+
+        let mut snapshot =
+            SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
+        snapshot.use_system_proxy = true;
+
+        // 磁盘上的同一台主机（从未记录过代理选择，因此是 false）
+        let mut on_disk = snapshot.clone();
+        on_disk.use_system_proxy = false;
+        assert!(
+            !on_disk.use_system_proxy,
+            "前提：磁盘配置不带代理标记（该字段 serde(skip)）"
+        );
+
+        let resolved = resolve_current_ssh_config(&snapshot, &[on_disk.clone()]);
+        assert!(
+            resolved.use_system_proxy,
+            "采用磁盘配置时仍须保留本次的代理选择"
+        );
+
+        // 反向：未选代理的快照不会被磁盘配置带上代理（磁盘上恒为 false，这里显式
+        // 造出 true 以证明标记来自快照而不是磁盘）。
+        let mut proxied_disk = on_disk.clone();
+        proxied_disk.use_system_proxy = true;
+        let plain_snapshot =
+            SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
+        let resolved = resolve_current_ssh_config(&plain_snapshot, &[proxied_disk]);
+        assert!(!resolved.use_system_proxy, "未选代理时不得凭空开启代理");
     }
 }

@@ -1086,6 +1086,11 @@ fn cache_key(config: &SshConnectionConfig) -> String {
             key.push_str(":auto");
         }
     }
+    // 传输路径也是会话身份的一部分：经代理建立的会话与直连会话不能互相复用
+    // （代理不可达时直连仍可用，复用会让「刚才直连建的」被当成代理会话）。
+    if config.use_system_proxy {
+        key.push_str(":proxy");
+    }
     key
 }
 
@@ -1323,17 +1328,26 @@ async fn connect_sftp(
     });
 
     // config.timeout 生效：TCP+SSH 握手整体限时（此前从未被使用）。
+    let handler = SftpClientHandler {
+        host: config.host.clone(),
+        port: config.port,
+        host_key_policy: crate::ssh::host_key::policy_from_global_config(),
+    };
     let mut handle = tokio::time::timeout(
         std::time::Duration::from_secs(config.timeout.max(1)),
-        client::connect(
-            russh_config,
-            (config.host.as_str(), config.port),
-            SftpClientHandler {
-                host: config.host.clone(),
-                port: config.port,
-                host_key_policy: crate::ssh::host_key::policy_from_global_config(),
-            },
-        ),
+        async {
+            // 与终端通道一致：选了系统代理就先经代理建立 TCP，再把流交给 russh。
+            // SFTP 承载全部远端文件读写，代理选择必须在这里同样生效，否则
+            // 「终端连上了、文件树却连不上」。
+            match crate::ssh::system_proxy::dial(config).await? {
+                Some(stream) => client::connect_stream(russh_config, stream, handler)
+                    .await
+                    .map_err(|e| anyhow!("TCP/SSH 握手失败: {}", e)),
+                None => client::connect(russh_config, (config.host.as_str(), config.port), handler)
+                    .await
+                    .map_err(|e| anyhow!("TCP/SSH 握手失败: {}", e)),
+            }
+        },
     )
     .await
     .map_err(|_| {
@@ -1343,8 +1357,7 @@ async fn connect_sftp(
             config.host,
             config.port
         )
-    })?
-    .map_err(|e| anyhow!("TCP/SSH 握手失败: {}", e))?;
+    })??;
 
     let auth_result = authenticate(&mut handle, config).await?;
     if !auth_result.success() {
