@@ -10,7 +10,6 @@ mod manager;
 mod remote_ops;
 mod request;
 mod scp_key_lease;
-pub mod project_search;
 pub mod types;
 mod upload_download;
 mod utils;
@@ -35,10 +34,3 @@ pub use view::{
     endpoint_label, quick_total_size, render_transfer_panel, transfer_item_name, transfer_label,
 };
 pub use watcher::{FsChangeEvent, FsChangeKind, FsWatcher, RemoteFsWatcher, WatcherContext};
-pub use project_search::{
-    FileMatch, MatchLine, MAX_SEARCH_FILE_BYTES, ProjectMatcher, ProjectSearchOptions,
-    ProjectSearchOutcome, SearchMode, search_project,
-};
-pub use walk::{
-    FileEntry, MAX_WALK_ENTRIES, WalkCancellation, WalkOptions, WalkOutcome, walk, walk_streaming,
-};
