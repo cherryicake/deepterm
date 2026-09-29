@@ -38,12 +38,15 @@ use gpui::{
 const MIN_THUMB: Pixels = px(28.0);
 /// 轨道两端留白（thumb 不会顶到卡片边缘）。
 const TRACK_INSET: Pixels = px(2.0);
-/// 纵向滚动条条带宽度（thumb 同宽）。代码编辑器的自绘滚动条也用它，
-/// 保证两边看起来是同一款。
-pub(crate) const BAR_THICKNESS: Pixels = px(10.0);
+/// 滚动条条带厚度（横条高 / 纵条宽，thumb 同宽），全应用统一 8px：
+/// markdown 编辑器纵向条、代码编辑器纵向/横向条共用本常量，终端滚动条在
+/// `terminal_view.rs` 里独立写 `.w(px(8.0))`，改这里时记得同步那边。
+/// （markdown 图片/表格下面的横条带更贴内容，单独用 6px，见 `h_bar_strip`
+/// 的 `thickness` 实参。）
+pub(crate) const BAR_THICKNESS: Pixels = px(8.0);
 /// thumb 圆角。
 pub(crate) const THUMB_RADIUS: Pixels = px(4.0);
-/// 命中宽容（thumb 只有 4~10px 厚，不加宽容很难按中）。
+/// 命中宽容（thumb 只有 4~8px 厚，不加宽容很难按中）。
 pub(crate) const GRAB_SLOP: Pixels = px(3.0);
 
 /// 由「视口长 / 内容长 / 当前偏移」算 thumb 的 `(轨道内起点, 长度)`（轴无关）。

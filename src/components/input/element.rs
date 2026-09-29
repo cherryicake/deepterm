@@ -91,6 +91,9 @@ fn combine_highlights_stable(
 }
 
 const BOTTOM_MARGIN_ROWS: usize = 3;
+/// 正文右侧留白：行尾最多能滚到「视口右缘 − RIGHT_MARGIN」处。必须 **≥
+/// 滚动条厚度**（`markdown_live::scrollbar::BAR_THICKNESS`，8px），否则滚到
+/// 行尾时最后几像素会钻到右侧纵向滚动条底下看不见。
 pub(super) const RIGHT_MARGIN: Pixels = px(10.);
 pub(super) const LINE_NUMBER_RIGHT_MARGIN: Pixels = px(10.);
 const FOLD_ICON_HITBOX_WIDTH: Pixels = px(18.);
