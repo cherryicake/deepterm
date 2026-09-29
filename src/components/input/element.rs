@@ -18,6 +18,9 @@ use crate::{
         cursor::{CursorLayout, CursorShape},
         display_map::LineLayout,
     },
+    editor::markdown_live::scrollbar::{
+        BAR_THICKNESS, GRAB_SLOP, THUMB_RADIUS, scroll_for_drag, thumb_metrics,
+    },
     sidebar_view::font_settings::FontState,
     theme::ActiveTheme as _,
 };
@@ -217,9 +220,10 @@ impl TextElement {
                 }
                 let geometry = state.read(cx).scrollbar_geometry;
                 if let Some(geometry) = geometry {
+                    // 命中宽容与 markdown 编辑器一致（`GRAB_SLOP`）。
                     let hit = Bounds::new(
-                        geometry.thumb.origin - point(px(3.), px(4.)),
-                        geometry.thumb.size + size(px(6.), px(8.)),
+                        geometry.thumb.origin - point(GRAB_SLOP, GRAB_SLOP),
+                        geometry.thumb.size + size(GRAB_SLOP * 2., GRAB_SLOP * 2.),
                     );
                     if hit.contains(&event.position) {
                         state.update(cx, |state, cx| {
@@ -242,14 +246,23 @@ impl TextElement {
                 let Some(geometry) = state.read(cx).scrollbar_geometry else {
                     return;
                 };
-                let max_scroll = geometry.content_height - geometry.track_height;
-                let scrollable_thumb = geometry.track_height - geometry.thumb_height;
-                if scrollable_thumb <= px(0.) || max_scroll <= px(0.) {
+                // 内容不溢出时几何是退化的，`scroll_for_drag` 会算出 0 ——
+                // 直接不认，免得把滚动位置拍回顶端。
+                if (geometry.content_height - geometry.track_height).max(px(0.)) <= px(0.) {
                     return;
                 }
                 let delta = event.position.y - start_y;
-                let new_scroll = (start_scroll + delta * (max_scroll / scrollable_thumb))
-                    .clamp(px(0.), max_scroll);
+                // 与 markdown 编辑器共用同一份拖拽换算（同样扣掉轨道两端留白）。
+                let new_scroll = scroll_for_drag(
+                    start_scroll,
+                    delta,
+                    geometry.track_height,
+                    geometry.content_height,
+                    geometry.thumb_height,
+                );
+                if new_scroll == start_scroll {
+                    return;
+                }
                 state.update(cx, |state, cx| {
                     let mut offset = state.scroll_handle.offset();
                     offset.y = -new_scroll;
@@ -3900,32 +3913,35 @@ impl TextElement {
             }
         }
 
-        // Paint scrollbar：右侧悬浮滚动条（内容超出视口时显示，支持拖拽）
+        // Paint scrollbar：右侧悬浮滚动条（内容超出视口时显示，支持拖拽）。
+        // 几何/尺寸/颜色与 markdown 编辑器的纵向滚动条同款（见
+        // `editor::markdown_live::scrollbar` 的模块注释），改那边时同步这里。
         let mut scrollbar_geometry: Option<ScrollbarGeometry> = None;
         if scrollbar_enabled {
             let viewport_h = input_bounds.size.height;
             let content_h = prepaint.scroll_size.height;
-            if content_h > viewport_h + px(1.) {
-                let track_h = viewport_h;
-                let thumb_h = ((viewport_h / content_h) * track_h).max(px(24.));
-                let scroll_y = scrollbar_scroll_y;
-                let max_scroll = content_h - viewport_h;
-                let frac = (f32::from(scroll_y) / f32::from(max_scroll)).clamp(0., 1.);
-                let thumb_y = input_bounds.origin.y + (track_h - thumb_h) * frac;
+            // `thumb_metrics` 吃的是 gpui 的原始 offset（向下滚为负）。
+            if let Some((thumb_start, thumb_h)) =
+                thumb_metrics(viewport_h, content_h, -scrollbar_scroll_y)
+            {
                 let thumb_bounds = Bounds::new(
-                    point(input_bounds.right() - px(6.), thumb_y),
-                    size(px(4.), thumb_h),
+                    point(
+                        input_bounds.right() - BAR_THICKNESS,
+                        input_bounds.origin.y + thumb_start,
+                    ),
+                    size(BAR_THICKNESS, thumb_h),
                 );
                 let dragging = scrollbar_dragging;
+                let theme = cx.theme();
                 let thumb_color = if dragging {
-                    cx.theme().border.opacity(0.9)
+                    theme.border_strong
                 } else {
-                    cx.theme().border.opacity(0.55)
+                    theme.border.opacity(0.7)
                 };
-                window.paint_quad(fill(thumb_bounds, thumb_color).corner_radii(px(2.)));
+                window.paint_quad(fill(thumb_bounds, thumb_color).corner_radii(THUMB_RADIUS));
                 scrollbar_geometry = Some(ScrollbarGeometry {
                     thumb: thumb_bounds,
-                    track_height: track_h,
+                    track_height: viewport_h,
                     thumb_height: thumb_h,
                     content_height: content_h,
                 });

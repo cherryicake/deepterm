@@ -38,7 +38,7 @@ use crate::editor::markdown_live::mermaid::{
     MermaidState,
 };
 use crate::editor::markdown_live::scrollbar::{
-    ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
+    BAR_THICKNESS, ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
 };
 use crate::editor::markdown_live::images::{
     MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
@@ -8366,7 +8366,7 @@ impl Render for LiveMarkdownView {
                                             .top_0()
                                             .bottom_0()
                                             .right_0()
-                                            .w(px(10.0))
+                                            .w(BAR_THICKNESS)
                                             .child(scroll_bar(
                                                 gpui::Axis::Vertical,
                                                 v_state,

@@ -6,6 +6,12 @@
 //! （`components/input/element.rs` 的 paint 段）都是自绘，这里沿用同一套做法，
 //! 并抽成轴无关的通用组件（`Axis::Horizontal` / `Axis::Vertical`）。
 //!
+//! 代码编辑器不整块复用 `scroll_bar`（它的 paint 与输入框绘制耦合在同一
+//! Element 里），但**几何与样式取自本模块**：`thumb_metrics` /
+//! `scroll_for_drag` 算位置，`BAR_THICKNESS` / `THUMB_RADIUS` /
+//! `GRAB_SLOP` 定尺寸，颜色同为 `border.opacity(0.7)` + 拖拽时
+//! `border_strong`。改这里请同步那边，否则两个滚动条会长得不一样。
+//!
 //! 为什么不用 gpui 默认滚轮：`paint_scroll_listener` 在「只开了 x 轴」时会把
 //! **纵向**滚轮增量喂给 x 轴（`Overflow::Scroll if !restrict_scroll_to_axis &&
 //! overflow.y != Overflow::Scroll => delta.y`），普通上下滚动会被卡片截胡。
@@ -32,10 +38,13 @@ use gpui::{
 const MIN_THUMB: Pixels = px(28.0);
 /// 轨道两端留白（thumb 不会顶到卡片边缘）。
 const TRACK_INSET: Pixels = px(2.0);
+/// 纵向滚动条条带宽度（thumb 同宽）。代码编辑器的自绘滚动条也用它，
+/// 保证两边看起来是同一款。
+pub(crate) const BAR_THICKNESS: Pixels = px(10.0);
 /// thumb 圆角。
-const THUMB_RADIUS: Pixels = px(4.0);
-/// 命中宽容（thumb 只有 4~6px 厚，不加宽容很难按中）。
-const GRAB_SLOP: Pixels = px(3.0);
+pub(crate) const THUMB_RADIUS: Pixels = px(4.0);
+/// 命中宽容（thumb 只有 4~10px 厚，不加宽容很难按中）。
+pub(crate) const GRAB_SLOP: Pixels = px(3.0);
 
 /// 由「视口长 / 内容长 / 当前偏移」算 thumb 的 `(轨道内起点, 长度)`（轴无关）。
 ///
