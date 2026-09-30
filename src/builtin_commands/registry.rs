@@ -111,15 +111,6 @@ impl CommandRegistry {
     pub fn all_commands(&self) -> Vec<Arc<BuiltinCommand>> {
         self.commands.clone()
     }
-
-    /// 从命令列表初始化
-    pub fn from_commands(commands: Vec<BuiltinCommand>) -> Self {
-        let mut registry = Self::new();
-        for cmd in commands {
-            registry.register(cmd);
-        }
-        registry
-    }
 }
 
 impl Default for CommandRegistry {

@@ -502,25 +502,6 @@ impl BlockingSftpSession {
         })
     }
 
-    /// 读取完整远程文件内容，若检测到二进制内容则返回 None。
-    pub fn read_file_to_string(&mut self, path: &str) -> anyhow::Result<Option<String>> {
-        sftp_block_on!({
-            let mut file = self.sftp.open(path).await?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).await?;
-
-            if bytes.is_empty() {
-                return Ok(Some(String::new()));
-            }
-
-            if is_binary_bytes(&bytes) {
-                return Ok(None);
-            }
-
-            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
-        })
-    }
-
     /// 读取完整远程文件原始字节（小文件快路径）。
     pub fn read_file_bytes(&mut self, path: &str) -> anyhow::Result<Option<Vec<u8>>> {
         sftp_block_on!({

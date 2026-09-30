@@ -9,7 +9,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::ops::Deref;
-use std::sync::Arc;
 
 use crate::theme::ThemeAppearance;
 
@@ -353,11 +352,6 @@ impl SyntaxColors {
             None
         }
     }
-
-    #[inline]
-    pub fn style_for_index(&self, index: usize) -> Option<HighlightStyle> {
-        HIGHLIGHT_NAMES.get(index).and_then(|name| self.style(name))
-    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, JsonSchema, Serialize, Deserialize)]
@@ -512,24 +506,6 @@ impl Deref for HighlightTheme {
 
     fn deref(&self) -> &Self::Target {
         &self.style.syntax
-    }
-}
-
-impl HighlightTheme {
-    pub fn default_dark() -> Arc<Self> {
-        Arc::new(Self {
-            name: "Default Dark".to_string(),
-            appearance: ThemeAppearance::Dark,
-            style: HighlightThemeStyle::default(),
-        })
-    }
-
-    pub fn default_light() -> Arc<Self> {
-        Arc::new(Self {
-            name: "Default Light".to_string(),
-            appearance: ThemeAppearance::Light,
-            style: HighlightThemeStyle::default(),
-        })
     }
 }
 

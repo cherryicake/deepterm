@@ -84,9 +84,9 @@ pub struct SshConnectView {
     pub status: ConnectStatus,
     /// 动画帧计数（用于 "..." 点动画）
     frame: u32,
-    /// 动画任务（持有此字段使任务保持运行，drop 时自动停止）
-    #[allow(dead_code)]
-    animation_task: Option<Task<()>>,
+    /// 动画任务（持有此字段使任务保持运行，drop 时自动停止；
+    /// 字段本身不被读取，故以下划线前缀标记）
+    _animation_task: Option<Task<()>>,
 }
 
 impl SshConnectView {
@@ -120,14 +120,8 @@ impl SshConnectView {
                 stage: ConnectStage::Handshake,
             },
             frame: 0,
-            animation_task: Some(animation_task),
+            _animation_task: Some(animation_task),
         }
-    }
-
-    /// 更新连接阶段（用于 SSH 库报告进度）
-    pub fn set_stage(&mut self, stage: ConnectStage, cx: &mut Context<Self>) {
-        self.status = ConnectStatus::Connecting { stage };
-        cx.notify();
     }
 
     /// 将状态更新为连接成功
@@ -143,20 +137,6 @@ impl SshConnectView {
             ConnectStatus::Connecting { stage } => stage.clone(),
             _ => ConnectStage::Handshake,
         };
-        self.status = ConnectStatus::Failed {
-            stage,
-            message: message.into(),
-        };
-        cx.notify();
-    }
-
-    /// 将状态更新为连接失败（指定失败阶段）
-    pub fn set_failed_at(
-        &mut self,
-        stage: ConnectStage,
-        message: impl Into<String>,
-        cx: &mut Context<Self>,
-    ) {
         self.status = ConnectStatus::Failed {
             stage,
             message: message.into(),

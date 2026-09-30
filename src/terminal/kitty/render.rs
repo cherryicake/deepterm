@@ -1197,12 +1197,6 @@ mod tests {
     // ---- AnimationClock ----
 
     #[test]
-    fn fresh_clock_has_nothing_pending() {
-        let clock = AnimationClock::new();
-        assert!(!clock.is_pending(), "刚构造时不应有在途计划");
-    }
-
-    #[test]
     fn schedule_none_clears_the_plan() {
         let mut clock = AnimationClock::new();
         clock.schedule(Some(100));

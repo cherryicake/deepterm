@@ -233,11 +233,6 @@ impl KittyGraphicsScanner {
         self
     }
 
-    /// 只读访问存储（渲染层/测试用）。
-    pub fn with_store<R>(&self, f: impl FnOnce(&ImageStore) -> R) -> R {
-        f(&self.store)
-    }
-
     /// 当前光标位置。
     pub fn cursor(&self) -> (i32, u32) {
         self.cursor

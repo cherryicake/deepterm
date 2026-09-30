@@ -117,17 +117,6 @@ impl FileStatus {
         }
     }
 
-    pub fn is_deleted(&self) -> bool {
-        match self {
-            FileStatus::Tracked(tracked) => {
-                (tracked.index_status == StatusCode::Deleted
-                    && tracked.worktree_status != StatusCode::Added)
-                    || tracked.worktree_status == StatusCode::Deleted
-            }
-            _ => false,
-        }
-    }
-
     pub fn is_modified(&self) -> bool {
         match self {
             FileStatus::Tracked(tracked) => matches!(
@@ -166,10 +155,6 @@ pub enum StageStatus {
 impl StageStatus {
     pub fn has_staged(&self) -> bool {
         matches!(self, StageStatus::Staged | StageStatus::PartiallyStaged)
-    }
-
-    pub fn has_unstaged(&self) -> bool {
-        matches!(self, StageStatus::Unstaged | StageStatus::PartiallyStaged)
     }
 }
 

@@ -222,17 +222,6 @@ fn route_with(config: &SshConnectionConfig, detected: Option<SystemProxy>) -> Pr
 /// 因此那里如实说明并直连。
 pub const OPENSSH_PROXY_SUPPORTED: bool = cfg!(target_os = "macos");
 
-/// 供系统 ssh 路径使用的 `ProxyCommand`；`None` = 直连或该环境无法表达代理。
-pub fn openssh_proxy_command_for(config: &SshConnectionConfig) -> Option<String> {
-    if !OPENSSH_PROXY_SUPPORTED {
-        return None;
-    }
-    match route(config) {
-        ProxyRoute::Via(proxy) => proxy.openssh_proxy_command(),
-        ProxyRoute::Direct | ProxyRoute::Unavailable => None,
-    }
-}
-
 /// 本次连接是否需要、且能够经系统代理建立。
 ///
 /// - `Ok(None)`：直连（未选择代理，或目标是代理的例外）；

@@ -281,8 +281,9 @@ pub enum LocalNotice {
 /// 因此接收端不留在本结构内（避免读线程之外还持有一个消费方）。
 pub struct LocalReader {
     sender: LocalSender,
-    #[allow(dead_code)]
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// 读线程句柄：仅用于保持线程存活（`LocalReader` drop 即 join）,
+    /// 字段本身不被读取，故以下划线前缀标记。
+    _thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// `LocalReader::spawn` 的返回值。
@@ -349,7 +350,7 @@ impl LocalReader {
                     tx,
                     poller: sender_poller,
                 },
-                thread: Some(thread),
+                _thread: Some(thread),
             },
             notices: notice_rx,
         })
@@ -630,37 +631,6 @@ mod tests {
     use gpui::{Point, px};
     use std::sync::Mutex as StdMutex;
     use std::time::{Duration, Instant};
-
-    /// 标准字母表 base64 编码（kitty 用它承载负载）。
-    ///
-    /// 测试里需要**编码**方向的实现，而 `kitty::command` 只提供解码
-    /// （那是生产路径唯一需要的方向），故在此就地实现。
-    fn base64_encode(data: &[u8]) -> String {
-        const TABLE: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-        for chunk in data.chunks(3) {
-            let b = [
-                chunk[0],
-                chunk.get(1).copied().unwrap_or(0),
-                chunk.get(2).copied().unwrap_or(0),
-            ];
-            let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-            out.push(TABLE[(n >> 18) as usize & 63] as char);
-            out.push(TABLE[(n >> 12) as usize & 63] as char);
-            out.push(if chunk.len() > 1 {
-                TABLE[(n >> 6) as usize & 63] as char
-            } else {
-                '='
-            });
-            out.push(if chunk.len() > 2 {
-                TABLE[n as usize & 63] as char
-            } else {
-                '='
-            });
-        }
-        out
-    }
 
     /// 记录扫描器收到的全部字节，用于断言 APC 确实到达应用层。
     struct RecordingScanner {
@@ -976,7 +946,7 @@ mod tests {
         let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
         std::io::Write::write_all(&mut enc, &raw).expect("压缩失败");
         let compressed = enc.finish().expect("压缩收尾失败");
-        let b64 = base64_encode(&compressed);
+        let b64 = crate::terminal::kitty::command::encode_base64(&compressed);
 
         // 逐字对齐 `_Ga=T,f=32,o=z,s=...,q=2`：q=2 静默，故断言只能落在
         // 存储与渲染计划上。
@@ -1237,7 +1207,7 @@ mod tests {
         let mut png = Vec::new();
         img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("PNG 编码失败");
-        let b64 = base64_encode(&png);
+        let b64 = crate::terminal::kitty::command::encode_base64(&png);
         assert!(b64.len() > 4096, "需要多分片，实际 {} 字符", b64.len());
 
         // 光标定位到 0-based (row=6, col=9)：CSI 7;10H（grok 的
@@ -1617,7 +1587,7 @@ mod tests {
             0x80, 0x24, 0x61, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60,
             0x82,
         ];
-        let b64 = base64_encode(PNG_8X8_GRAY);
+        let b64 = crate::terminal::kitty::command::encode_base64(PNG_8X8_GRAY);
 
         const COLS: u32 = 12;
         const ROWS: u32 = 6;

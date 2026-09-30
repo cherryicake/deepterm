@@ -38,19 +38,6 @@ impl BufferPoint {
     }
 }
 
-/// Position after soft-wrapping but before folding (internal).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct WrapPoint {
-    pub row: usize,
-    pub col: usize,
-}
-
-impl WrapPoint {
-    pub fn new(row: usize, col: usize) -> Self {
-        Self { row, col }
-    }
-}
-
 /// Final display position (after soft-wrapping and folding).
 ///
 /// - `row`: 0-based display row (final visible row)

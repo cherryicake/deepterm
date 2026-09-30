@@ -13,14 +13,6 @@ pub const OSC_START: &[u8] = b"\x1b]";
 /// APC 起始符（Kitty 图形协议为 `ESC _ G`）。
 pub const APC_START: &[u8] = b"\x1b_";
 
-/// 序列种类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SequenceKind {
-    Osc,
-    /// APC（`ESC _`），负载为 `G` 开头时即 Kitty 图形协议。
-    Apc,
-}
-
 /// 抽取结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Extract<'a> {
@@ -377,13 +369,6 @@ pub struct PrivateModeHit {
     pub enabled: bool,
     /// 可整条摘除时给出 `(起始偏移, 长度)`；多参数时为 `None`（保留原文）。
     pub removable: Option<(usize, usize)>,
-}
-
-impl PrivateModeHit {
-    /// 该序列是否可从字节流中整条摘除。
-    pub fn is_removable(&self) -> bool {
-        self.removable.is_some()
-    }
 }
 
 /// in-band size reports 的模式号（DECSET/DECRST `?2048`）。

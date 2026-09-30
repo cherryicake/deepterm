@@ -815,18 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn test_line_layout() {
-        let mut line_layout = LineLayout::new();
-
-        let line1 = ShapedLine::default().with_len(100);
-        let line2 = ShapedLine::default().with_len(50);
-        let wrapped_lines = smallvec::smallvec![line1, line2];
-        line_layout.set_wrapped_lines(wrapped_lines);
-        assert_eq!(line_layout.len(), 150);
-        assert_eq!(line_layout.wrapped_lines.len(), 2);
-    }
-
-    #[test]
     fn test_offset_to_display_point() {
         let font = gpui::Font {
             family: "Arial".into(),

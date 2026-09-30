@@ -343,21 +343,7 @@ mod tests {
         assert_eq!(mode.line_number(), false);
         assert_eq!(mode.rows(), 2);
 
-        mode.set_rows(4);
-        assert_eq!(mode.rows(), 4);
-
-        mode.set_rows(1);
-        assert_eq!(mode.rows(), 2);
-
-        mode.set_rows(10);
-        assert_eq!(mode.rows(), 5);
-    }
-
-    #[test]
-    fn test_max_rows() {
-        let mut mode = InputMode::auto_grow(2, 5);
-        assert_eq!(mode.rows(), 2);
-
+        // 低于下界回夹到 `min`，高于上界回夹到 `max`。
         mode.set_rows(4);
         assert_eq!(mode.rows(), 4);
 

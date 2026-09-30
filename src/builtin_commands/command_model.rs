@@ -15,14 +15,6 @@ pub enum CommandEntryState {
 }
 
 impl CommandEntryState {
-    /// 获取检测到的命令（如果有）
-    pub fn detected_command(&self) -> Option<&DetectedCommand> {
-        match self {
-            CommandEntryState::Detected(cmd) => Some(cmd),
-            _ => None,
-        }
-    }
-
     /// 检查是否检测到有效命令
     pub fn is_detected(&self) -> bool {
         matches!(self, CommandEntryState::Detected(_))

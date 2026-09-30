@@ -683,11 +683,6 @@ impl Workspace {
         });
     }
 
-    /// 创建新 Tab（本地终端）
-    pub fn create_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_local_terminal(window, cx);
-    }
-
     /// 将焦点设置到当前活动 tab 的第一个 panel
     pub fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {

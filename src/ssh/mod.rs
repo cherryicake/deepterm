@@ -209,16 +209,6 @@ impl KeyType {
             None
         }
     }
-
-    /// 获取默认的密钥文件名
-    pub fn default_filename(&self) -> &'static str {
-        match self {
-            KeyType::Rsa => "id_rsa",
-            KeyType::Ecdsa => "id_ecdsa",
-            KeyType::Ed25519 => "id_ed25519",
-            KeyType::Dss => "id_dsa",
-        }
-    }
 }
 
 /// 查找默认的 SSH 密钥

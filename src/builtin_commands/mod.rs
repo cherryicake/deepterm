@@ -66,11 +66,6 @@ impl OverlayState {
     pub fn is_hidden(self) -> bool {
         !matches!(self, Self::Visible)
     }
-
-    /// 回车时是否应把缓冲交回 shell（放弃内建语义）
-    pub fn should_fallthrough_to_shell(self) -> bool {
-        matches!(self, Self::DismissedUntilReset)
-    }
 }
 
 /// 内建命令管理器，封装命令状态和建议逻辑
@@ -129,18 +124,6 @@ pub struct BuiltinCommandManager {
     /// 历史候选的选中下标；`None` ⇒ 未选中历史项。
     /// 与 `selected_index` / `path_selected_index` 互斥：选中历史时后两者为 `None`。
     history_selected_index: Option<usize>,
-}
-
-/// 统一选中项：落在「历史段」还是「原候选段」。
-///
-/// 两个阶段的选中索引都按「历史在前、原候选在后」的组合空间编码：
-/// `[0..H)` 为历史候选，`[H..)` 为原候选（命令名 / 路径）。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SelectedKind {
-    /// 历史候选下标（指向 `history_matches`）
-    History(usize),
-    /// 原候选下标（指向 `suggestions` 或 `path_completions`，已减去历史段偏移）
-    Base(usize),
 }
 
 /// 远端目录在补全缓存中的状态
@@ -1270,7 +1253,6 @@ impl BuiltinCommandManager {
             }
         }
     }
-
 }
 
 impl Default for BuiltinCommandManager {
@@ -1349,7 +1331,6 @@ fn remote_dir_failed_item(err: String) -> PathCompletionItem {
         replacement: None,
     }
 }
-
 
 
 /// `HostOrLocal` 阶段：合并"匹配的主机"与"本地路径补全"为一份列表。
@@ -1892,13 +1873,6 @@ pub fn find_builtin_command(input: &str) -> Option<Arc<BuiltinCommand>> {
 
 /// 根据当前查询生成建议列表，并按匹配分数从高到低排序。
 ///
-/// 优先级依次是：精确匹配、前缀匹配、名称子串匹配、描述子串匹配。
-pub fn command_suggestions(query: &str) -> Vec<Arc<BuiltinCommand>> {
-    let all_commands = global_registry().all_commands();
-    let scored = SuggestionEngine::suggest(&all_commands, query);
-    scored.into_iter().map(|s| s.command).collect()
-}
-
 /// 根据当前输入和选中项，生成最终要提交的命令行。
 ///
 /// `force_selected = true` 用于显式选择场景（如鼠标点击），允许直接用选中项覆盖当前前缀。
@@ -1921,7 +1895,6 @@ pub fn resolve_command_line(
     let suffix = query.strip_prefix(command_name).unwrap_or_default();
     format!("{}{}", selected.name, suffix)
 }
-
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

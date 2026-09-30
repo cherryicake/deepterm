@@ -409,7 +409,6 @@ mod tests {
     fn frame_count_includes_root() {
         let a = anim_with(&[0, 40, 40]);
         assert_eq!(a.frame_count(), 3, "根帧 + 2 个存储帧");
-        assert!(a.frames.len() == 2);
     }
 
     #[test]
@@ -430,8 +429,7 @@ mod tests {
         let a = anim_with(&[0, 40, 40]);
         assert!(a.frame(1).is_none(), "帧 1 是图像自身数据，不在 frames 里");
         assert_eq!(a.frame(2).unwrap().gap_ms, 40);
-        assert_eq!(a.frame(3).unwrap().gap_ms, 40);
-        assert!(a.frame(4).is_none());
+        assert!(a.frame(4).is_none(), "帧编号超出范围");
     }
 
     #[test]

@@ -109,11 +109,6 @@ impl ButtonVariant {
     }
 
     #[inline]
-    pub fn is_ghost(&self) -> bool {
-        matches!(self, Self::Ghost)
-    }
-
-    #[inline]
     fn no_padding(&self) -> bool {
         self.is_link() || self.is_text()
     }

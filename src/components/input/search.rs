@@ -272,18 +272,6 @@ impl SearchMatcher {
         self.current_match_ix
     }
 
-    /// Move the current-match index (clamped, no-op when empty).
-    pub fn set_current_ix(&mut self, ix: usize) {
-        if !self.matched_ranges.is_empty() {
-            self.current_match_ix = ix.min(self.matched_ranges.len() - 1);
-        }
-    }
-
-    /// True when a non-empty query produced no matcher (invalid regex).
-    pub fn query_failed(&self, query: &str) -> bool {
-        !query.is_empty() && self.query.is_none()
-    }
-
     fn peek(&self) -> Option<Range<usize>> {
         let next_match_ix = self.next_ix()?;
         self.matched_ranges.get(next_match_ix).cloned()

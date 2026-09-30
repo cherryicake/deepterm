@@ -559,7 +559,6 @@ pub struct InputState {
     pub(crate) display_map: DisplayMap,
     pub(crate) history: History<Change>,
     pub(crate) blink_cursor: Entity<BlinkCursor>,
-    pub(crate) loading: bool,
     /// Range in UTF-8 length for the selected text.
     ///
     /// - "Hello 世界💝" = 16
@@ -775,7 +774,6 @@ impl InputState {
             git_bar_click_targets: Vec::new(),
             git_expandable: false,
             show_whitespaces: false,
-            loading: false,
             pattern: None,
             validate: None,
             mode: InputMode::default(),
@@ -947,20 +945,6 @@ impl InputState {
         self
     }
 
-    /// Set code folding at runtime, only for [`InputMode::CodeEditor`] mode.
-    ///
-    /// When disabling, all existing folds are cleared.
-    pub fn set_folding(&mut self, folding: bool, _: &mut Window, cx: &mut Context<Self>) {
-        debug_assert!(self.mode.is_code_editor());
-        if let InputMode::CodeEditor { folding: f, .. } = &mut self.mode {
-            *f = folding;
-        }
-        if !folding {
-            self.display_map.clear_folds();
-        }
-        cx.notify();
-    }
-
     /// Set enable/disable line number, only for [`InputMode::CodeEditor`] mode.
     pub fn line_number(mut self, line_number: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
@@ -968,15 +952,6 @@ impl InputState {
             *l = line_number;
         }
         self
-    }
-
-    /// Set line number, only for [`InputMode::CodeEditor`] mode.
-    pub fn set_line_number(&mut self, line_number: bool, _: &mut Window, cx: &mut Context<Self>) {
-        debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
-        if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {
-            *l = line_number;
-        }
-        cx.notify();
     }
 
     /// Set the number of rows for the multi-line Textarea.
@@ -1143,37 +1118,6 @@ impl InputState {
     ) {
         self.placeholder = placeholder.into();
         cx.notify();
-    }
-
-    /// Find which line and sub-line the given offset belongs to, along with the position within that sub-line.
-    ///
-    /// Returns:
-    ///
-    /// - The index of the line (zero-based) containing the offset.
-    /// - The index of the sub-line (zero-based) within the line containing the offset.
-    /// - The position of the offset.
-    pub(crate) fn line_and_position_for_offset(
-        &self,
-        offset: usize,
-    ) -> (usize, usize, Option<Point<Pixels>>) {
-        let Some(last_layout) = &self.last_layout else {
-            return (0, 0, None);
-        };
-        let line_height = last_layout.line_height;
-
-        let mut y_offset = last_layout.visible_top;
-        for (vi, line) in last_layout.lines.iter().enumerate() {
-            let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
-            let local_offset = offset.saturating_sub(prev_lines_offset);
-            if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
-                let sub_line_index = (pos.y / line_height) as usize;
-                let adjusted_pos = point(pos.x + last_layout.line_number_width, pos.y + y_offset);
-                return (vi, sub_line_index, Some(adjusted_pos));
-            }
-
-            y_offset += line.size(line_height).height;
-        }
-        (0, 0, None)
     }
 
     /// Set the text of the input field.
@@ -1458,12 +1402,6 @@ impl InputState {
     pub fn git_gutter(mut self, enable: bool) -> Self {
         self.git_gutter = enable;
         self
-    }
-
-    /// 写入 Git 行变更标记（由 Editor 侧异步计算后调用）。
-    pub fn set_git_line_marks(&mut self, marks: Vec<(u32, GitLineMark)>, cx: &mut Context<Self>) {
-        self.git_line_marks = marks.into_iter().collect();
-        cx.notify();
     }
 
     /// 写入 Git 行标记与 hunk 列表（HEAD→工作区 diff 重算完成后调用）。
@@ -1761,12 +1699,6 @@ impl InputState {
         self.set_soft_wrap(wrap, window, cx);
     }
 
-    /// Update whether to show whitespace characters.
-    pub fn set_show_whitespaces(&mut self, show: bool, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_whitespaces = show;
-        cx.notify();
-    }
-
     /// Set the regular expression pattern of the input field.
     ///
     /// Only for [`InputMode::SingleLine`] mode.
@@ -1774,19 +1706,6 @@ impl InputState {
         debug_assert!(self.mode.is_single_line());
         self.pattern = Some(pattern);
         self
-    }
-
-    /// Set the regular expression pattern of the input field with reference.
-    ///
-    /// Only for [`InputMode::SingleLine`] mode.
-    pub fn set_pattern(
-        &mut self,
-        pattern: regex::Regex,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) {
-        debug_assert!(self.mode.is_single_line());
-        self.pattern = Some(pattern);
     }
 
     /// Set the validation function of the input field.
@@ -1798,43 +1717,9 @@ impl InputState {
         self
     }
 
-    /// Set true to show spinner at the input right.
-    ///
-    /// Only for [`InputMode::SingleLine`] mode.
-    pub fn set_loading(&mut self, loading: bool, _: &mut Window, cx: &mut Context<Self>) {
-        debug_assert!(self.mode.is_single_line());
-        self.loading = loading;
-        cx.notify();
-    }
-
-    /// Set the default value of the input field.
-    pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
-        let text: SharedString = value.into();
-        self.text = Rope::from(text.as_str());
-        if let Some(diagnostics) = self.mode.diagnostics_mut() {
-            diagnostics.reset(&self.text)
-        }
-        // Note: We can't call display_map.set_text here because it needs cx.
-        // The text will be set during prepare_if_need in element.rs
-        self._pending_update = true;
-        self
-    }
-
     /// Return the value of the input field.
     pub fn value(&self) -> SharedString {
         SharedString::new(self.text.to_string())
-    }
-
-    /// The unmasked value: identical to [`Self::value`] when not masked
-    /// (deepterm stores the raw text; masking is a display-time concern).
-    pub fn unmask_value(&self) -> SharedString {
-        SharedString::new(self.text.to_string())
-    }
-
-    /// Return the portion of the value within the input field that
-    /// is selected by the user
-    pub fn selected_value(&self) -> SharedString {
-        SharedString::new(self.selected_text().to_string())
     }
 
     /// Return the text [`Rope`] of the input field.
@@ -1846,23 +1731,6 @@ impl InputState {
     pub fn cursor_position(&self) -> Position {
         let offset = self.cursor();
         self.text.offset_to_position(offset)
-    }
-
-    /// Set (0-based) [`Position`] of the cursor.
-    ///
-    /// This will move the cursor to the specified line and column, and update the selection range.
-    pub fn set_cursor_position(
-        &mut self,
-        position: impl Into<Position>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let position: Position = position.into();
-        let offset = self.text.position_to_offset(&position);
-
-        self.move_to(offset, None, cx);
-        self.update_preferred_column();
-        self.focus(window, cx);
     }
 
     /// Focus the input field.
@@ -4059,13 +3927,6 @@ impl InputState {
         cx.notify()
     }
 
-    /// Unselects the currently selected text.
-    pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.cursor();
-        self.selected_range = (offset..offset).into();
-        cx.notify()
-    }
-
     #[inline]
     pub(crate) fn offset_from_utf16(&self, offset: usize) -> usize {
         self.text.offset_utf16_to_offset(offset)
@@ -4310,25 +4171,6 @@ impl InputState {
         let range_utf16 = self.range_to_utf16(&self.selected_range.into());
         let range = self.range_from_utf16(&range_utf16);
         self.text.slice(range)
-    }
-
-    /// Return the rendered bounds for a UTF-8 byte range in the current input contents.
-    ///
-    /// Returns `None` when the requested range is not currently laid out or visible.
-    pub fn range_to_bounds(&self, range: &Range<usize>) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
-        let last_bounds = self.last_bounds?;
-
-        let (_, _, start_pos) = self.line_and_position_for_offset(range.start);
-        let (_, _, end_pos) = self.line_and_position_for_offset(range.end);
-
-        let start_pos = start_pos?;
-        let end_pos = end_pos?;
-
-        Some(Bounds::from_corners(
-            last_bounds.origin + start_pos,
-            last_bounds.origin + end_pos + point(px(0.), last_layout.line_height),
-        ))
     }
 
     /// Replace text in range in silent.

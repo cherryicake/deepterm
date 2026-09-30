@@ -123,13 +123,6 @@ impl Default for CommandExecutor {
     }
 }
 
-/// 便捷函数：显示错误提示
-pub fn show_error_toast(message: impl Into<String>) {
-    // TODO: 实现 toast 提示
-    // 目前先使用 log 记录
-    log::warn!("Command error: {}", message.into());
-}
-
 /// `/open` 处理器：解析路径，打开文件或目录
 pub struct OpenPathHandler;
 

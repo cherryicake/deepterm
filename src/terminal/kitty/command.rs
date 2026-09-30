@@ -475,7 +475,6 @@ fn parse_value(buf: &[u8], key: u8) -> Result<u32, ParseError> {
 ///
 /// 是 [`decode_base64`] 的逆运算：协议要求负载与路径都以 base64 承载，测试与
 /// 需要回写负载的调用方都得用它。
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);

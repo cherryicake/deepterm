@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::ssh::keychain::{KeychainStore, migrate_auth_method};
-use crate::ssh::parse_ssh_target;
 
 fn generate_id(username: &str, host: &str, port: u16, nickname: Option<&str>) -> String {
     if let Some(nick) = nickname {
@@ -257,33 +256,6 @@ impl SshConnectionConfig {
         }
     }
 
-    /// 从连接字符串创建配置
-    ///
-    /// 支持格式：
-    /// - `user@host`
-    /// - `user@host:port`
-    /// - `host`（使用当前用户名）
-    pub fn from_string(target: &str, auth_method: AuthMethod) -> Self {
-        let (username, host, port) = parse_ssh_target(target);
-
-        Self {
-            host,
-            port,
-            username,
-            auth_method,
-            nickname: None,
-            extra_args: None,
-            timeout: default_timeout(),
-            save_config: default_save(),
-            os: None,
-            port_forwards: Vec::new(),
-            group_id: None,
-            sort_order: None,
-            created_at: Utc::now(),
-            use_system_proxy: false,
-        }
-    }
-
     /// 设置端口号
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
@@ -524,29 +496,6 @@ impl SshGlobalConfig {
                 next_sort += 1;
             }
         }
-    }
-
-    pub fn reorder_groups(&mut self, ordered_ids: Vec<String>) {
-        let mut map: std::collections::HashMap<String, HostGroup> = self
-            .host_groups
-            .drain(..)
-            .map(|g| (g.id.clone(), g))
-            .collect();
-        let mut new_groups = Vec::new();
-        for (i, id) in ordered_ids.iter().enumerate() {
-            if let Some(mut g) = map.remove(id) {
-                g.sort_order = i as u32;
-                new_groups.push(g);
-            }
-        }
-        // 剩余未在 ordered_ids 中的按原 sort_order 追加
-        let mut remaining: Vec<HostGroup> = map.into_values().collect();
-        remaining.sort_by_key(|g| g.sort_order);
-        for mut g in remaining {
-            g.sort_order = new_groups.len() as u32;
-            new_groups.push(g);
-        }
-        self.host_groups = new_groups;
     }
 
     pub fn find_group(&self, id: &str) -> Option<&HostGroup> {

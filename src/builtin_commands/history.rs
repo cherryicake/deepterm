@@ -158,12 +158,6 @@ pub fn record_command(command_line: &str) {
     history.save();
 }
 
-/// 取当前输入对应的历史候选（线程安全）。
-pub fn match_history(query: &str) -> Vec<HistoryEntry> {
-    let history = global_history().lock();
-    history.matches(query)
-}
-
 /// 克隆全局历史的内存快照（线程安全）。供补全管理器注入使用，避免每次按键读盘。
 pub fn snapshot() -> CommandHistory {
     global_history().lock().clone()

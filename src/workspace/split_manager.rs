@@ -58,20 +58,6 @@ impl SplitContainer {
         SplitContainer::Panel(panel)
     }
 
-    pub fn new_split(direction: SplitDirection, children: Vec<SplitContainer>) -> Self {
-        let count = children.len();
-        let sizes = if count > 0 {
-            vec![1.0 / count as f32; count]
-        } else {
-            vec![]
-        };
-        SplitContainer::Split {
-            direction,
-            children,
-            sizes,
-        }
-    }
-
     pub fn session_state(&self, cx: &App) -> Option<SplitSessionState> {
         match self {
             SplitContainer::Panel(panel) => panel
@@ -141,14 +127,6 @@ impl SplitContainer {
                     sizes,
                 }
             }
-        }
-    }
-
-    /// 获取Panel实体
-    pub fn get_panel_entity(&self, _cx: &App) -> Option<Entity<Panel>> {
-        match self {
-            SplitContainer::Panel(panel) => Some(panel.clone()),
-            _ => None,
         }
     }
 

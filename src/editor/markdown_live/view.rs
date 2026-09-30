@@ -416,14 +416,6 @@ impl LiveMarkdownView {
         }
     }
 
-    /// 更新文档落盘路径（预留：重命名/另存后同步 assets 定位）。
-    pub fn set_doc_path(&mut self, path: impl AsRef<Path>) {
-        let path = path.as_ref();
-        if !path.as_os_str().is_empty() {
-            self.doc_path = Some(path.to_path_buf());
-        }
-    }
-
     pub fn text(&self) -> String {
         self.buffer.text()
     }
@@ -5021,15 +5013,6 @@ impl PlanGeometry {
     }
 
     /// Whether group `gi` is a fence (code block).
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn group_fence_lang(&self, gi: usize) -> Option<&str> {
-        match self.groups.get(gi) {
-            Some(Group::Fence { lang, .. }) => lang.as_deref(),
-            _ => None,
-        }
-    }
-
     /// The cached joined source of the mermaid block whose opening fence is at
     /// source line `block_id`, if that fence is a non-empty mermaid block.
     ///
@@ -5115,13 +5098,6 @@ impl PlanGeometry {
             }
             None => false,
         }
-    }
-
-    /// Ordered-list display number of row `pi`.
-    #[inline]
-    #[allow(dead_code)]
-    fn display_number(&self, pi: usize) -> Option<u64> {
-        self.display_numbers.get(pi).copied().flatten()
     }
 }
 
@@ -5734,7 +5710,6 @@ impl Render for LiveMarkdownView {
         let geometry: Rc<PlanGeometry> = self.planned_geometry.clone();
         let ginfo = &geometry.ginfo;
 
-
         // Row virtualization window, computed BEFORE per-row paint so
         // `code_runs` / `find_marks` / `paints` / `display_numbers` only pay
         // for the viewport (+ overscan). Small docs render everything.
@@ -5760,7 +5735,6 @@ impl Render for LiveMarkdownView {
             None
         };
         let row_visible = |pi: usize| -> bool { is_visible(pi) || caret_row == Some(pi) };
-
 
         // ---- per-row paint (runs + selection + caret) --------------------
         // (`row.plan` already carries callout tag-stripping from
@@ -8648,7 +8622,6 @@ mod live_render_tests {
         }
     }
 }
-
 
 #[cfg(test)]
 mod live_frame_tests {
@@ -11738,7 +11711,6 @@ mod scroll_to_caret_tests {
             "caret at doc end must scroll down (offset {offset})"
         );
     }
-
 }
 
 #[cfg(test)]

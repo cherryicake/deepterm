@@ -13,9 +13,7 @@ use super::fold_map::{Fold, FoldMap};
 use super::folding::Crease;
 use super::text_wrapper::{LineItem, WrapDisplayPoint};
 use super::wrap_map::WrapMap;
-use super::{BufferPoint, DisplayPoint};
 use crate::components::input::Point as TreeSitterPoint;
-use crate::components::input::display_map::WrapPoint;
 use crate::components::input::rope_ext::RopeExt as _;
 
 /// git hunk 展开区：插在 `before_buffer_row` 之前的只读虚拟行
@@ -61,31 +59,6 @@ impl DisplayMap {
     }
 
     // ==================== Core Coordinate Mapping ====================
-
-    /// Convert buffer position to display position
-    pub fn buffer_pos_to_display_pos(&self, pos: BufferPoint) -> DisplayPoint {
-        // Buffer → Wrap
-        let wrap_pos = self.wrap_map.buffer_pos_to_wrap_pos(pos);
-
-        // Wrap → Display
-        if let Some(display_row) = self.fold_map.wrap_row_to_display_row(wrap_pos.row) {
-            DisplayPoint::new(display_row, wrap_pos.col)
-        } else {
-            // Cursor is in a folded region, find nearest visible row
-            let display_row = self.fold_map.nearest_visible_display_row(wrap_pos.row);
-            DisplayPoint::new(display_row, 0) // Column 0 at fold boundary
-        }
-    }
-
-    /// Convert display position to buffer position
-    pub fn display_pos_to_buffer_pos(&self, pos: DisplayPoint) -> BufferPoint {
-        // Display → Wrap
-        let wrap_row = self.fold_map.display_row_to_wrap_row(pos.row).unwrap_or(0);
-
-        // Wrap → Buffer
-        let wrap_pos = WrapPoint::new(wrap_row, pos.col);
-        self.wrap_map.wrap_pos_to_buffer_pos(wrap_pos)
-    }
 
     /// Get total number of visible display rows
     ///
@@ -144,44 +117,6 @@ impl DisplayMap {
             .filter(|ins| !self.fold_map.is_row_hidden(ins.before_buffer_row))
             .map(|ins| ins.lines.len())
             .sum()
-    }
-
-    /// Get the buffer line for a given display row
-    pub fn display_row_to_buffer_line(&self, display_row: usize) -> usize {
-        // Display → Wrap
-        let wrap_row = self
-            .fold_map
-            .display_row_to_wrap_row(display_row)
-            .unwrap_or(0);
-
-        // Wrap → Buffer line
-        self.wrap_map.wrap_row_to_buffer_line(wrap_row)
-    }
-
-    /// Get the display row range for a buffer line: [start, end)
-    /// Returns None if the buffer line is completely hidden
-    pub fn buffer_line_to_display_row_range(&self, line: usize) -> Option<Range<usize>> {
-        // Buffer line → Wrap row range
-        let wrap_row_range = self.wrap_map.buffer_line_to_wrap_row_range(line);
-
-        // Find first and last visible display rows in this range
-        let mut first_display_row = None;
-        let mut last_display_row = None;
-
-        for wrap_row in wrap_row_range {
-            if let Some(display_row) = self.fold_map.wrap_row_to_display_row(wrap_row) {
-                if first_display_row.is_none() {
-                    first_display_row = Some(display_row);
-                }
-                last_display_row = Some(display_row);
-            }
-        }
-
-        if let (Some(start), Some(end)) = (first_display_row, last_display_row) {
-            Some(start..end + 1)
-        } else {
-            None // Completely folded
-        }
     }
 
     /// Check if a buffer line is completely hidden

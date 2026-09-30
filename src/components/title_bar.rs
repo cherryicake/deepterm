@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyView, App, Context, Decorations, ElementId, Entity, InteractiveElement, IntoElement,
+    AnyView, Context, Decorations, ElementId, Entity, InteractiveElement, IntoElement,
     MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, TitlebarOptions, Window,
     WindowControlArea, div, px,
 };
@@ -69,11 +69,6 @@ impl TitleBar {
     /// 重置 TitleBar 左侧内边距为平台默认值。
     pub fn reset_left_padding(&mut self) {
         self.left_padding = TITLE_BAR_LEFT_PADDING;
-    }
-
-    /// Create a new TitleBar as an Entity.
-    pub fn new_entity(cx: &mut App) -> Entity<Self> {
-        cx.new(|_cx| Self::new("title-bar"))
     }
 
     /// Create a new TitleBar with a TabBar.

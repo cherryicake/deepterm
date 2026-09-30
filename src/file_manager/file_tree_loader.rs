@@ -189,12 +189,6 @@ impl FileTreeLoader {
         self.pending_refresh.retain(|p| !p.starts_with(path));
     }
 
-    /// 清空 expanded 对应的缓存（用于强制刷新）
-    pub fn invalidate_path(&mut self, path: &Path) {
-        self.directory_cache.remove(path);
-        self.loading_paths.remove(path);
-    }
-
     // ── 文件系统事件处理 ──
 
     /// 处理文件系统事件，返回需要刷新的父目录路径（如有）。

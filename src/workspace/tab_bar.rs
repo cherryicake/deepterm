@@ -768,15 +768,6 @@ impl TabBar {
         }
     }
 
-    pub fn set_tabs(&mut self, tabs: Vec<TabItem>, cx: &mut Context<Self>) {
-        self.tabs = tabs;
-        if self.active_tab_id.is_none() && !self.tabs.is_empty() {
-            self.active_tab_id = Some(self.tabs[0].id.clone());
-        }
-        self.context_menu_tab_id = None;
-        cx.notify();
-    }
-
     /// 原地修改单个标签，避免重建整个 tabs Vec
     pub fn modify_tab(
         &mut self,
@@ -2588,5 +2579,4 @@ mod tests {
             );
         }
     }
-
 }

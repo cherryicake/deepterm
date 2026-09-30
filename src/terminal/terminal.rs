@@ -894,9 +894,9 @@ pub struct Terminal {
     #[cfg(unix)]
     local_sender: Option<crate::terminal::local_pty::LocalSender>,
     /// 本地读线程句柄（仅 unix）。持有它以保证读线程存活至终端析构。
+    /// 字段本身不被读取，故以下划线前缀标记。
     #[cfg(unix)]
-    #[allow(dead_code)]
-    local_reader: Option<crate::terminal::local_pty::LocalReader>,
+    _local_reader: Option<crate::terminal::local_pty::LocalReader>,
     /// Kitty 图形协议已存储的图像（本地路径：读线程写入，UI 线程只读渲染）。
     ///
     /// 远程路径下扫描发生在 UI 线程，直接由这里的扫描器更新。
@@ -933,12 +933,10 @@ pub struct Terminal {
     /// 每次 update_last_content 后，记录 viewport 行的脏区列范围 `(left, right)`。
     /// 若该行无变更则为 `None`；全量刷新时所有行为 `Some((0, cols-1))`。
     dirty_row_bounds: Vec<Option<(usize, usize)>>,
-    /// 事件循环任务（保持任务存活，防止被drop）
-    #[allow(dead_code)]
-    event_loop_task: Option<Task<()>>,
-    /// 远程驱动任务（保持任务存活，防止被drop）
-    #[allow(dead_code)]
-    driver_task: Option<Task<()>>,
+    /// 事件循环任务（保持任务存活，防止被 drop；字段不被读取故加下划线前缀）
+    _event_loop_task: Option<Task<()>>,
+    /// 远程驱动任务（保持任务存活，防止被 drop；字段不被读取故加下划线前缀）
+    _driver_task: Option<Task<()>>,
     /// 最新待应用的窗口尺寸（合并器只保留最新值；网格与 PTY/SSH 一起原子应用）。
     pending_resize: Option<TerminalBounds>,
     /// resize 合并任务句柄（ghostty 式 25ms 非重置节流）；drop 即取消。
@@ -1098,7 +1096,7 @@ impl Terminal {
             #[cfg(unix)]
             local_sender: None,
             #[cfg(unix)]
-            local_reader: None,
+            _local_reader: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1117,8 +1115,8 @@ impl Terminal {
             snapshot_cells_built: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
-            event_loop_task: None,
-            driver_task: None,
+            _event_loop_task: None,
+            _driver_task: None,
             pending_resize: None,
             resize_task: None,
             snapshot_retry_task: None,
@@ -1301,7 +1299,7 @@ impl Terminal {
                 window_title: None,
                 sender: None,
                 local_sender: local_reader.as_ref().map(|r| r.sender()),
-                local_reader,
+                _local_reader: local_reader,
                 images,
                 kitty_replies,
                 kitty_images_dirty,
@@ -1320,8 +1318,8 @@ impl Terminal {
                 snapshot_cells_built: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
-                event_loop_task: Some(event_loop_task),
-                driver_task: reader_notice_task,
+                _event_loop_task: Some(event_loop_task),
+                _driver_task: reader_notice_task,
                 pending_resize: None,
                 resize_task: None,
                 snapshot_retry_task: None,
@@ -1463,7 +1461,7 @@ impl Terminal {
             #[cfg(unix)]
             local_sender: None,
             #[cfg(unix)]
-            local_reader: None,
+            _local_reader: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1482,8 +1480,8 @@ impl Terminal {
             snapshot_cells_built: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
-            event_loop_task: None,
-            driver_task: None,
+            _event_loop_task: None,
+            _driver_task: None,
             pending_resize: None,
             resize_task: None,
             snapshot_retry_task: None,
@@ -1768,7 +1766,7 @@ impl Terminal {
                 #[cfg(unix)]
                 local_sender: None,
                 #[cfg(unix)]
-                local_reader: None,
+                _local_reader: None,
                 // 复用上面交给扫描器的那三份共享句柄：扫描器（写）与渲染/
                 // 应答路径（读）必须是**同一个** `Arc`，否则 SSH 下图像永远
                 // 渲染不出来、应答也发不出去。它们在外层创建，此处克隆
@@ -1801,8 +1799,8 @@ impl Terminal {
                 snapshot_cells_built: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
-                event_loop_task: Some(event_loop_task),
-                driver_task: Some(driver_task),
+                _event_loop_task: Some(event_loop_task),
+                _driver_task: Some(driver_task),
                 pending_resize: None,
                 resize_task: None,
                 snapshot_retry_task: None,
@@ -4518,12 +4516,6 @@ impl Terminal {
         self.scroll_px = px(0.);
     }
 
-    // Selection
-    pub fn selection_text(&self) -> Option<String> {
-        let term = self.term.lock();
-        term.selection_to_string()
-    }
-
     pub fn clear_selection(&mut self) {
         let mut term = self.term.lock();
         term.selection = None;
@@ -4605,16 +4597,6 @@ impl Terminal {
 
     /// 在全部滚动区（scrollback + 屏幕）内搜索 needle（**同步，阻塞调用线程**）。
     ///
-    /// 大滚动区（数千行）下的全量扫描较重，UI 路径请改用
-    /// [`Self::search_snapshot`] + [`search_matches_in_snapshot`] 把比对放到后台线程。
-    /// 本方法保留给测试与一次性同步查询。
-    ///
-    /// 点坐标为 grid 绝对坐标（负 Line 表示 scrollback），空 / 纯空白 needle 返回空集。
-    pub fn search_matches(&self, needle: &str) -> Vec<SearchMatch> {
-        let snapshot = self.search_snapshot();
-        search_matches_in_snapshot(&snapshot, needle)
-    }
-
     /// 抓取当前 grid 的搜索快照（持 term 锁，成本为 O(可见字符数) 的一次拷贝）。
     ///
     /// 快照与 grid 解耦后可安全 move 到后台线程做比对，避免逐键全量扫描卡住 UI。
@@ -5400,7 +5382,6 @@ mod tests {
     // - agent 事件走 OSC 777 与桌面通知**共用**的信道，但绝不能被当成通知；
     // - 状态只由 hook 事件驱动，进程检测只管"是哪个 agent"；
     // - 只有真正变化才发 `AgentChanged`。
-
 
     /// 判定一条 OSC 应落到哪条路由。
     ///

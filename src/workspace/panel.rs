@@ -554,12 +554,6 @@ impl Panel {
         }
     }
 
-    /// 设置Tab标签名
-    pub fn set_tab_label(&mut self, label: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.active_tab_label = Some(label.into());
-        cx.notify();
-    }
-
     /// 获取Tab标签名
     pub fn tab_label(&self) -> Option<&SharedString> {
         self.active_tab_label.as_ref()

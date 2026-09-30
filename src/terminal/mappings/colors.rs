@@ -86,18 +86,6 @@ pub fn hsla_to_rgb888(color: Hsla) -> Rgb {
     }
 }
 
-/// Convert alacritty color to GPUI Hsla
-///
-/// 兼容旧调用方的纯主题解析（不叠加调色板覆盖）。
-/// 新渲染路径请使用 [`TerminalPalette::resolve`]。
-pub fn convert_alacritty_color(color: &AlacColor, theme: &TerminalTheme) -> Hsla {
-    match color {
-        AlacColor::Named(named) => theme.named_color(*named),
-        AlacColor::Spec(rgb) => rgb888_to_hsla(*rgb),
-        AlacColor::Indexed(idx) => theme.indexed_color(*idx),
-    }
-}
-
 /// 把主题色板灌入 alacritty `Term.colors` 的槽位清单。
 ///
 /// 返回 `(索引, rgb)` 列表，索引含义见 `alacritty_terminal::term::color::Colors`：

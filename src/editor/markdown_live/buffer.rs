@@ -93,12 +93,6 @@ impl LiveBuffer {
         buf
     }
 
-    /// Diagnostics/bench: rebuild the index unconditionally.
-    #[cfg(test)]
-    pub fn force_rebuild_line_starts(&mut self) {
-        self.rebuild_line_starts();
-    }
-
     /// Recompute the line-start prefix table from the current line table.
     fn rebuild_line_starts(&mut self) {
         let lines = self.model.lines();
@@ -121,11 +115,6 @@ impl LiveBuffer {
         self.rebuild_line_starts();
         self.bump();
         self.clean_version = self.version;
-    }
-
-    /// External reload that becomes the new clean baseline.
-    pub fn set_baseline(&mut self, text: &str) {
-        self.set_text(text);
     }
 
     /// Mark the current text as saved (clears dirty without touching history).
