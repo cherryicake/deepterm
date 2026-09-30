@@ -8,9 +8,9 @@ use std::{ops::Range, rc::Rc};
 use aho_corasick::AhoCorasick;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable, Hsla, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, Styled, Subscription, Window, actions, div,
-    px, relative,
+    AnyElement, App, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
+    InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Styled, Subscription,
+    Window, actions, div, px, relative,
 };
 use ropey::Rope;
 
@@ -1118,6 +1118,13 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
             .id("search-panel")
             .key_context(CONTEXT)
             .track_focus(&self.focus_handle(cx))
+            // 卡片是**浮层**，不是文本区。它悬浮在编辑器内部（`EditorInput`
+            // 的绝对定位子元素），而编辑器的根 hitbox 覆盖整块区域、仍然
+            // 参与命中——若不在这里声明光标，指针落在卡片上会一路命中到
+            // 根 hitbox 的 IBeam，卡片内边距与行间隙上就出现文本光标。
+            // 显式设为箭头：卡片自身的 hitbox 在根之后注册，覆盖根的请求；
+            // 卡片里的输入框再各自注册 IBeam，同样覆盖卡片。
+            .cursor(CursorStyle::Arrow)
             // 阻断鼠标事件冒泡：面板悬浮在编辑器内部，若不拦截，点击面板
             // （含 ‹/› 按钮）会同时触发编辑器的 on_mouse_down，把编辑器光标
             // 移到面板对应的坐标处并引发竞争滚动，导致跳转错乱/延迟。

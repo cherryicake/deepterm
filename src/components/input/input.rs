@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px, relative,
+    App, CursorStyle, Entity, Focusable, IntoElement, MouseButton, RenderOnce, Window, div, px,
+    relative,
 };
 
 use crate::components::button::{Button, ButtonCustomVariant, ButtonVariants, Icon, Sizable, Size};
@@ -131,6 +132,11 @@ impl RenderOnce for EditorInput {
             .key_context(super::CONTEXT)
             .track_focus(&state.focus_handle)
             .line_height(LINE_HEIGHT)
+            // 整个输入面默认是文本光标（VSCode `.view-lines{cursor:text}`，
+            // 迁移前本仓也在根 div 上设 IBeam）：内边距、末行以下的空白都算
+            // 编辑器的一部分。行号栏与滚动条条带由 `TextElement` 用更靠后的
+            // hitbox 覆盖成箭头，子元素的光标请求优先于本容器。
+            .cursor(CursorStyle::IBeam)
             .when(!state.disabled, |this| {
                 this.on_action(window.listener_for(&self.state, InputState::backspace))
                     .on_action(window.listener_for(&self.state, InputState::delete))

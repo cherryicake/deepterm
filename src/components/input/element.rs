@@ -2298,6 +2298,15 @@ pub(crate) struct PrepaintState {
     git_insert_rows: Vec<GitInsertRowPaint>,
     /// 行首色条点击目标（prepaint 创建 hitbox，paint 落到 state）。
     git_bar_hitboxes: Vec<(u32, Bounds<Pixels>, Hitbox)>,
+    /// 文本命中区（未滚动的元素 bounds，窗口坐标）：paint 阶段据此把
+    /// IBeam 光标限定在文本上，而不是整个编辑器（含行号栏、滚动条）。
+    text_hitbox: Hitbox,
+    /// 行号栏命中区：paint 阶段显式设为箭头，压掉文本区的 IBeam。
+    gutter_hitbox: Hitbox,
+    /// 纵向滚动条条带命中区（内容不溢出时为 None）。
+    v_scrollbar_hitbox: Option<Hitbox>,
+    /// 横向滚动条条带命中区（内容不横向溢出时为 None）。
+    h_scrollbar_hitbox: Option<Hitbox>,
 }
 
 impl PrepaintState {
@@ -2975,6 +2984,75 @@ impl TextElement {
             cx,
         );
 
+        // 鼠标光标命中区（Zed `EditorElement` 同款拆分）：
+        // - `gutter_hitbox` 覆盖行号栏（含折叠图标列），paint 里显式设 Arrow；
+        // - `text_hitbox` 覆盖文本区，paint 里设 IBeam。
+        // 两者都是**未滚动**的窗口坐标：命中判定用的是屏幕上的静态矩形，
+        // 内容滚动不改变「哪块区域是文本」。文本区从行号栏右缘起，横向滚动
+        // 只平移文字本身，命中区不动（与 Zed 的 `text_hitbox` 一致）。
+        let text_hitbox = window.insert_hitbox(
+            Bounds {
+                origin: point(input_bounds.origin.x + line_number_width, input_bounds.origin.y),
+                size: size(
+                    (input_bounds.size.width - line_number_width).max(px(0.)),
+                    input_bounds.size.height,
+                ),
+            },
+            HitboxBehavior::Normal,
+        );
+        let gutter_hitbox = window.insert_hitbox(
+            Bounds {
+                origin: input_bounds.origin,
+                size: size(line_number_width, input_bounds.size.height),
+            },
+            HitboxBehavior::Normal,
+        );
+
+        // 滚动条条带命中区：thumb 是拖拽目标，指针停在条带上要显示箭头
+        // （Zed `paint_scrollbars` 对 scrollbar hitbox 设 Arrow，VSCode 的
+        // `.monaco-scrollable-element > .scrollbar` 同样是 `cursor:default`）。
+        // 只在内容真的溢出、条带会画出来时才建：否则会把文本右缘/底缘的
+        // IBeam 变成箭头，反而误导。
+        //
+        // 溢出判定与 paint 阶段同一套 `thumb_metrics` 入参（视口/内容同减
+        // `BAR_THICKNESS`），保证「建了 hitbox」与「画出条带」一一对应。
+        // 传 0 作 offset：`thumb_metrics` 是否返回 `Some` 只由两个长度决定，
+        // offset 仅影响 thumb 位置（那是 paint 的事）。
+        let scrollbar_enabled = {
+            let state = self.state.read(cx);
+            state.scrollbar && state.mode.is_multi_line()
+        };
+        let v_scrollbar_hitbox = (scrollbar_enabled
+            && thumb_metrics(input_bounds.size.height, scroll_size.height, px(0.)).is_some())
+        .then(|| {
+            window.insert_hitbox(
+                Bounds {
+                    origin: point(input_bounds.right() - BAR_THICKNESS, input_bounds.origin.y),
+                    size: size(BAR_THICKNESS, input_bounds.size.height),
+                },
+                HitboxBehavior::Normal,
+            )
+        });
+        let h_scrollbar_hitbox = (scrollbar_enabled
+            && thumb_metrics(
+                input_bounds.size.width - BAR_THICKNESS,
+                scroll_size.width - BAR_THICKNESS,
+                px(0.),
+            )
+            .is_some())
+        .then(|| {
+            window.insert_hitbox(
+                Bounds {
+                    origin: point(
+                        input_bounds.origin.x,
+                        input_bounds.bottom() - BAR_THICKNESS,
+                    ),
+                    size: size(input_bounds.size.width - BAR_THICKNESS, BAR_THICKNESS),
+                },
+                HitboxBehavior::Normal,
+            )
+        });
+
         PrepaintState {
             bounds,
             last_layout,
@@ -2993,6 +3071,10 @@ impl TextElement {
             line_geometry,
             git_insert_rows,
             git_bar_hitboxes,
+            text_hitbox,
+            gutter_hitbox,
+            v_scrollbar_hitbox,
+            h_scrollbar_hitbox,
         }
     }
 
@@ -3022,6 +3104,40 @@ impl TextElement {
         let bounds = prepaint.bounds;
         let selected_range = state.selected_range;
         let text_align = prepaint.last_layout.text_align;
+
+        // 鼠标光标（Zed `EditorElement::paint_text` + `paint_line_numbers`，
+        // VSCode `viewLines.css` 的 `cursor:text` + `lineNumbers.css` 的
+        // `cursor:default`）：文本区 IBeam、行号栏与滚动条箭头。
+        //
+        // 只读/disabled 的编辑器同样给 IBeam：两条参考实现里只读编辑器都能
+        // 划选复制（diff 视图左栏、只读预览），箭头会误导用户以为不能选。
+        //
+        // 命中区用 prepaint 里按**未滚动** bounds 建的 hitbox：光标样式判定的是
+        // 屏幕上哪块矩形属于文本，内容滚动不改变这一点（Zed 的 `text_hitbox`
+        // 同样在滚动之外）。
+        //
+        // 滚动条是**悬浮**在文本右缘/底缘之上的，与文本命中区有意重叠；这里
+        // 把箭头请求放在文本之后（gpui 取最后一条命中项，`NextFrame::
+        // cursor_style`），条带上就压掉 IBeam。
+        window.set_cursor_style(CursorStyle::IBeam, &prepaint.text_hitbox);
+        window.set_cursor_style(CursorStyle::Arrow, &prepaint.gutter_hitbox);
+        if let Some(hitbox) = prepaint.v_scrollbar_hitbox.as_ref() {
+            window.set_cursor_style(CursorStyle::Arrow, hitbox);
+        }
+        if let Some(hitbox) = prepaint.h_scrollbar_hitbox.as_ref() {
+            window.set_cursor_style(CursorStyle::Arrow, hitbox);
+        }
+        #[cfg(test)]
+        {
+            record_cursor_request(CursorStyle::IBeam, prepaint.text_hitbox.bounds);
+            record_cursor_request(CursorStyle::Arrow, prepaint.gutter_hitbox.bounds);
+            if let Some(hitbox) = prepaint.v_scrollbar_hitbox.as_ref() {
+                record_cursor_request(CursorStyle::Arrow, hitbox.bounds);
+            }
+            if let Some(hitbox) = prepaint.h_scrollbar_hitbox.as_ref() {
+                record_cursor_request(CursorStyle::Arrow, hitbox.bounds);
+            }
+        }
 
         window.handle_input(
             &focus_handle,
@@ -4162,6 +4278,41 @@ pub(super) fn measure_guide_xs(
     out
 }
 
+/// 最近一帧注册的光标请求，按 paint 顺序排列，供测试断言「指针落在哪个区域
+/// 会显示什么光标」。
+///
+/// 顺序本身就是语义：gpui 的 `NextFrame::cursor_style` 反向扫描请求列表，
+/// 返回**最后一条**命中的样式；子元素在父元素之后绘制，所以子元素的请求
+/// 覆盖父容器。测试据此验证「行号栏/滚动条压掉容器与文本区的 IBeam」。
+///
+/// 存在 thread-local 里而不是进程级静态量：`#[gpui::test]` 用例并行跑在各自
+/// 线程上，进程级槽位会被别的用例的帧覆盖（`LIVE_LINE_PAINT_LOG` 就带着这个
+/// 坑，其断言因此只能写成单向存在性检查）。绘制与断言在同一线程，thread-local
+/// 天然按用例隔离。
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct CursorRequest {
+    pub(crate) style: CursorStyle,
+    pub(crate) bounds: Bounds<Pixels>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CURSOR_REQUESTS: std::cell::RefCell<Vec<CursorRequest>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn record_cursor_request(style: CursorStyle, bounds: Bounds<Pixels>) {
+    CURSOR_REQUESTS.with(|slot| slot.borrow_mut().push(CursorRequest { style, bounds }));
+}
+
+/// 读取本线程最近一帧记录的光标请求（paint 顺序），并清空槽位。
+#[cfg(test)]
+pub(crate) fn take_cursor_requests() -> Vec<CursorRequest> {
+    CURSOR_REQUESTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4570,6 +4721,446 @@ mod tests {
             geom.thumb.size.width < geom.viewport_len,
             "长行应让 thumb 短于轨道（可见部分远小于内容）"
         );
+    }
+
+    /// 编辑器文本区必须报 IBeam（Zed `paint_text` / VSCode
+    /// `viewLines.css` 的 `cursor:text`），行号栏报箭头。回归用例：修复前
+    /// `TextElement` 从不注册任何光标样式，指针在编辑器上始终是箭头。
+    #[gpui::test]
+    fn text_area_requests_ibeam_cursor(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                s.set_text("fn main() {\n    println!(\"hi\");\n}\n", cx);
+                s
+            });
+            Host { state }
+        });
+        let state = host.read_with(cx, |h, _| h.state.clone());
+
+        let viewport = size(px(600.0), px(200.0));
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            TextElement::new(state.clone())
+        });
+
+        let requests = take_cursor_requests();
+        assert!(
+            !requests.is_empty(),
+            "一帧绘制后应注册光标样式请求（回归：修复前 TextElement 一条都不发）"
+        );
+
+        let find = |style: CursorStyle| {
+            requests
+                .iter()
+                .find(|r| r.style == style)
+                .unwrap_or_else(|| panic!("缺少 {style:?} 请求，实际 {requests:?}"))
+        };
+        let text = find(CursorStyle::IBeam);
+        let gutter = find(CursorStyle::Arrow);
+
+        // 文本区在行号栏右侧，行号栏在左：两块区域不重叠。
+        assert!(
+            gutter.bounds.right() <= text.bounds.left(),
+            "行号栏与文本区不应重叠：gutter={:?} text={:?}",
+            gutter.bounds,
+            text.bounds
+        );
+        assert!(
+            gutter.bounds.size.width > px(0.),
+            "代码编辑器应留出行号栏，实际 {:?}",
+            gutter.bounds
+        );
+        assert!(
+            text.bounds.size.width > px(0.),
+            "文本命中区应有宽度，实际 {:?}",
+            text.bounds
+        );
+        // 文本区必须真的落在元素内（回归：若按滚动过的 bounds 建 hitbox，
+        // 滚动后命中区会整体平移出可视范围）。
+        let input = state.read_with(cx, |s, _| s.input_bounds);
+        assert!(
+            text.bounds.left() >= input.left() && text.bounds.right() <= input.right(),
+            "文本命中区应在编辑器内：text={:?} input={:?}",
+            text.bounds,
+            input
+        );
+        assert!(
+            text.bounds.top() >= input.top() && text.bounds.bottom() <= input.bottom(),
+            "文本命中区纵向应在编辑器内：text={:?} input={:?}",
+            text.bounds,
+            input
+        );
+
+        // 指针落在文本区中心 → 只命中文本命中区。
+        let probe = text.bounds.center();
+        assert!(
+            text.bounds.contains(&probe) && !gutter.bounds.contains(&probe),
+            "文本区中心的指针应只命中文本命中区"
+        );
+
+        // 指针落在行号栏 → 只命中行号栏命中区。
+        let gutter_probe = gutter.bounds.center();
+        assert!(
+            gutter.bounds.contains(&gutter_probe) && !text.bounds.contains(&gutter_probe),
+            "行号栏中心的指针应只命中行号栏命中区"
+        );
+    }
+
+    /// 滚动条条带命中区必须与「真的画出来的条带」一一对应：不溢出就没有
+    /// 条带（文本右缘/底缘仍是 IBeam），溢出时两者同时出现。
+    #[gpui::test]
+    fn scrollbar_strips_match_painted_bars(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let build = |cx: &mut gpui::TestAppContext, text: String| {
+            let (host, cx) = cx.add_window_view(|window, cx| {
+                let state = cx.new(|cx| {
+                    let mut s = InputState::new(window, cx)
+                        .multi_line(true)
+                        .code_editor("text".to_string());
+                    s.set_text(&text, cx);
+                    s
+                });
+                Host { state }
+            });
+            let state = host.read_with(cx, |h, _| h.state.clone());
+            let viewport = size(px(600.0), px(200.0));
+            cx.executor().advance_clock(Duration::from_millis(16));
+            cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+                TextElement::new(state.clone())
+            });
+            state
+        };
+
+        let check = |state: &gpui::Entity<InputState>,
+                     cx: &gpui::TestAppContext,
+                     label: &str| {
+            let requests = take_cursor_requests();
+            let (painted_v, painted_h) = state.read_with(cx, |s, _| {
+                (s.scrollbar_geometry.is_some(), s.scrollbar_geometry_h.is_some())
+            });
+            // 条带请求排在文本请求之后，所以指针停在条带上时箭头胜出。
+            // 按精确厚度区分：纵向条宽 = BAR_THICKNESS、高 = 视口高；
+            // 横向条反过来。行号栏也是 Arrow，但宽度远大于 BAR_THICKNESS。
+            let bar_requests: Vec<_> = requests
+                .iter()
+                .filter(|r| r.style == CursorStyle::Arrow)
+                .collect();
+            let has_v = bar_requests.iter().any(|r| {
+                r.bounds.size.width <= BAR_THICKNESS + px(0.5)
+                    && r.bounds.size.height > BAR_THICKNESS
+            });
+            let has_h = bar_requests.iter().any(|r| {
+                r.bounds.size.height <= BAR_THICKNESS + px(0.5)
+                    && r.bounds.size.width > BAR_THICKNESS
+            });
+            assert_eq!(
+                has_v, painted_v,
+                "{label}: 纵向条带光标请求应与画出的条带一致（requests={requests:?}）"
+            );
+            assert_eq!(
+                has_h, painted_h,
+                "{label}: 横向条带光标请求应与画出的条带一致（requests={requests:?}）"
+            );
+            if painted_h {
+                let last = requests.last().expect("应有光标请求");
+                assert_eq!(
+                    last.style,
+                    CursorStyle::Arrow,
+                    "{label}: 条带请求必须排在文本 IBeam 之后（gpui 取最后一条命中项）"
+                );
+                assert!(
+                    last.bounds.size.height <= BAR_THICKNESS + px(0.5),
+                    "{label}: 最后一条应为横向条带请求，实际 {:?}",
+                    last.bounds
+                );
+            }
+        };
+
+        // 内容不横向溢出：横向条带（及其命中区）都不该出现。
+        let state = build(cx, "short\nlines\n".to_string());
+        let h_painted = state.read_with(cx, |s, _| s.scrollbar_geometry_h.is_some());
+        assert!(!h_painted, "内容不横向溢出时不应画出横向滚动条");
+        check(&state, cx, "short");
+
+        // 长行 + 行数超出视口：两条都出现。
+        let long = "x".repeat(400);
+        let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let state = build(cx, format!("{long}\n{lines}"));
+        let h_painted = state.read_with(cx, |s, _| s.scrollbar_geometry_h.is_some());
+        assert!(h_painted, "长行溢出时应画出横向滚动条");
+        check(&state, cx, "overflowing");
+    }
+
+    /// 走完整 `EditorInput` 层级解析「指针落在某处会显示什么光标」。
+    ///
+    /// `EditorInput` 根 div 统一设 IBeam（覆盖内边距与末行以下的空白），
+    /// `TextElement` 再用更靠后的 hitbox 把行号栏与滚动条条带改成箭头——
+    /// gpui 取的是**最后一条**命中项（`NextFrame::cursor_style` 反向扫描），
+    /// 子元素在父元素之后绘制，所以子元素的请求生效。
+    ///
+    /// 这里按 gpui 的规则在本地重放「命中 → 取最后一条」，锁住两个语义：
+    /// 1. 文本区中心解析为 IBeam（回归：修复前整块编辑器都是箭头）；
+    /// 2. 行号栏中心解析为 Arrow，即箭头请求确实排在文本请求之后。
+    #[gpui::test]
+    fn cursor_style_resolves_per_region(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let long = "x".repeat(400);
+        let lines: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                s.set_text(format!("{long}\n{lines}"), cx);
+                s
+            });
+            Host { state }
+        });
+
+        let viewport = size(px(600.0), px(200.0));
+        cx.executor().advance_clock(Duration::from_millis(16));
+        // 渲染完整 `EditorInput`（含根 div 的 IBeam 与文本区的 hitbox）：
+        // 走 Host 视图，`RenderOnce` 需要视图上下文。
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            host.clone().into_any_element()
+        });
+
+        let requests = take_cursor_requests();
+        assert!(
+            requests.len() >= 3,
+            "完整 EditorInput 应至少注册 文本/行号栏/纵向条 三条请求，实际 {requests:?}"
+        );
+        assert!(
+            requests.iter().any(|r| r.style == CursorStyle::IBeam),
+            "编辑器应注册 IBeam 请求，实际 {requests:?}"
+        );
+
+        // 复刻 gpui `NextFrame::cursor_style`：反向扫描，第一条命中的即为结果。
+        let resolve = |position: Point<Pixels>| {
+            requests
+                .iter()
+                .rev()
+                .find(|r| r.bounds.contains(&position))
+                .map(|r| r.style)
+        };
+
+        let text = requests
+            .iter()
+            .find(|r| r.style == CursorStyle::IBeam)
+            .expect("应有 IBeam 请求");
+        assert_eq!(
+            resolve(text.bounds.center()),
+            Some(CursorStyle::IBeam),
+            "指针在文本区中心时应显示 IBeam，实际请求 {requests:?}"
+        );
+
+        let gutter = requests
+            .iter()
+            .find(|r| {
+                r.style == CursorStyle::Arrow && r.bounds.right() <= text.bounds.left()
+            })
+            .expect("应有行号栏的 Arrow 请求（位于文本区左侧）");
+        assert_eq!(
+            resolve(gutter.bounds.center()),
+            Some(CursorStyle::Arrow),
+            "指针在行号栏中心时应显示箭头，实际请求 {requests:?}"
+        );
+
+        // 滚动条条带：悬浮在文本右缘/底缘之上，箭头请求排在文本之后才能压住。
+        let bars: Vec<_> = requests
+            .iter()
+            .filter(|r| r.style == CursorStyle::Arrow)
+            .filter(|r| r.bounds.size.height > BAR_THICKNESS && r.bounds.size.width <= BAR_THICKNESS + px(0.5))
+            .collect();
+        let v_bar = bars.first().expect("内容溢出时应有纵向条带的箭头请求");
+        assert!(
+            text.bounds.contains(&v_bar.bounds.center()),
+            "纵向条带悬浮在文本命中区之上（有意重叠）：bar={:?} text={:?}",
+            v_bar.bounds,
+            text.bounds
+        );
+        assert_eq!(
+            resolve(v_bar.bounds.center()),
+            Some(CursorStyle::Arrow),
+            "指针在纵向条带上时应显示箭头（条带请求必须排在文本 IBeam 之后）"
+        );
+    }
+
+    /// 只读（`disabled`）编辑器仍给文本区 IBeam：diff 视图左栏、只读预览
+    /// 都能划选复制，箭头会误导用户以为不能选。
+    ///
+    /// `disabled` 只关掉闪烁光标与文本写入（`should_paint_cursor` /
+    /// `replace_text_in_range`），`on_mouse_down` 并不拦——选中逻辑照常。
+    #[gpui::test]
+    fn disabled_editor_still_requests_ibeam(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state).disabled(true)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("text".to_string());
+                s.set_text("fn main() {}\n", cx);
+                s
+            });
+            Host { state }
+        });
+
+        let viewport = size(px(600.0), px(200.0));
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            host.clone().into_any_element()
+        });
+
+        let requests = take_cursor_requests();
+        assert!(
+            requests.iter().any(|r| r.style == CursorStyle::IBeam),
+            "只读编辑器也应给文本区 IBeam（可划选复制），实际 {requests:?}"
+        );
+    }
+
+    /// 单行输入框（搜索框、表单字段）没有行号栏：整块都是文本区，
+    /// 行号栏命中区退化为零宽，不会误吞 IBeam。
+    #[gpui::test]
+    fn single_line_input_has_no_gutter_region(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::InputState;
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: gpui::Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx);
+                s.set_text("search query", cx);
+                s
+            });
+            Host { state }
+        });
+
+        let viewport = size(px(300.0), px(28.0));
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            host.clone().into_any_element()
+        });
+
+        let requests = take_cursor_requests();
+        let text = requests
+            .iter()
+            .find(|r| r.style == CursorStyle::IBeam)
+            .unwrap_or_else(|| panic!("单行输入框应给 IBeam，实际 {requests:?}"));
+        assert!(
+            text.bounds.size.width > px(0.),
+            "单行输入框的文本命中区应有宽度：{:?}",
+            text.bounds
+        );
+        // 行号栏是零宽的（`layout_line_numbers` 对单行输入返回 0），
+        // 所以它永远不命中——不会把文本区的 IBeam 顶掉。
+        for arrow in requests.iter().filter(|r| r.style == CursorStyle::Arrow) {
+            assert!(
+                !arrow.bounds.contains(&text.bounds.center()),
+                "零宽行号栏不应命中文本区中心：arrow={:?}",
+                arrow.bounds
+            );
+        }
     }
 }
 
