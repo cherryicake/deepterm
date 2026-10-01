@@ -733,16 +733,31 @@ impl TextElement {
         ) {
             return (CURSOR_WIDTH, None);
         }
-        let fallback = (line_height * 0.6).max(CURSOR_WIDTH);
-        let Some(ch) = cursor_char else {
-            return (fallback, None);
-        };
-        if ch == '\n' || ch == '\r' {
-            return (fallback, None);
-        }
+
         let style = window.text_style();
         let font_size =
             font_size_opt.unwrap_or_else(|| style.font_size.to_pixels(window.rem_size()));
+        // 一个等宽字符格的宽度。
+        //
+        // 用字体的 `ch` 前进宽度而不是 `line_height * 0.6`：后者是随行高估算的
+        // 经验值，在常见的 1.6 倍行高下约为单元格的 1.6 倍，块状光标会溢出到
+        // 下一个字符上。取不到字体度量时才退回估算值。
+        let font_id = window.text_system().resolve_font(&style.font());
+        let cell_width = window
+            .text_system()
+            .ch_advance(font_id, font_size)
+            .ok()
+            .filter(|width| *width > px(0.))
+            .unwrap_or_else(|| (line_height * 0.6).max(CURSOR_WIDTH));
+
+        // 行尾 / 空行没有可覆盖的字符，按一格宽画。
+        let Some(ch) = cursor_char else {
+            return (cell_width, None);
+        };
+        if ch == '\n' || ch == '\r' {
+            return (cell_width, None);
+        }
+
         let editor_bg = cx.theme().editor_background();
         let text_color = if editor_bg.a < 0.75 {
             if cx.theme().appearance.is_dark() {
@@ -767,11 +782,19 @@ impl TextElement {
             }],
             None,
         );
-        let is_whitespace = ch.is_ascii_whitespace();
-        let width = if is_whitespace {
-            fallback
+        // 块状光标必须正好盖住**字符自身的格宽**。
+        //
+        // 格宽由 `unicode-width` 的字符宽度决定，而不是靠字体度量：
+        // 主字体没有该字形时（如 Menlo 遇到中文）`advance` 会失败，
+        // `shaped.width` 在无回退字体的环境里也只有一格，两者都不可靠。
+        // 终端侧（`terminal_element.rs`）用的是同一个判定，这里保持一致。
+        let cells = unicode_width::UnicodeWidthChar::width(ch)
+            .unwrap_or(1)
+            .max(1) as f32;
+        let width = if ch.is_ascii_whitespace() {
+            cell_width
         } else {
-            fallback.max(shaped.width)
+            cell_width * cells
         };
         (width, Some(shaped))
     }
@@ -4358,6 +4381,196 @@ mod tests {
     }
 
     // ── 编辑器光标动画（端到端） ──────────────────────────────────────────
+
+    /// 块状光标的宽度必须等于**一个字符格**。
+    ///
+    /// 回归背景：宽度曾用 `line_height * 0.6` 估算，在常见的 1.6 倍行高下
+    /// 约为单元格的 1.6 倍，Normal 模式下光标会盖住下一个字符。
+    /// 这里直接量 `cursor_block_layout_static` 的产出，与实际渲染同一函数。
+    #[gpui::test]
+    fn block_cursor_is_one_cell_wide(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::CursorShape;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (_host, cx) = cx.add_window_view(|_window, _cx| {
+            struct Host;
+            impl gpui::Render for Host {
+                fn render(
+                    &mut self,
+                    _: &mut gpui::Window,
+                    _: &mut gpui::Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div()
+                }
+            }
+            Host
+        });
+
+        let (line_height, font, font_size, cell, block_width) = cx.update(|window, cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line_height = window.line_height();
+            let font = style.font();
+            let font_id = window.text_system().resolve_font(&font);
+            let cell = window
+                .text_system()
+                .ch_advance(font_id, font_size)
+                .expect("等宽字体应能取到字符前进宽度");
+
+            // 直接量渲染用的宽度计算。
+            let (block_width, _) = TextElement::cursor_block_layout_static(
+                CursorShape::Block,
+                Some('a'),
+                Some(font_size),
+                line_height,
+                window,
+                cx,
+            );
+            (line_height, font, font_size, cell, block_width)
+        });
+
+        let _ = (font, font_size);
+        assert!(cell > px(0.), "字符前进宽度应为正数：{cell:?}");
+
+        // 关键断言：块状光标宽度就是一格。
+        assert_eq!(
+            block_width, cell,
+            "块状光标宽度应等于一个字符格（旧实现是 line_height*0.6 = {:?}）",
+            line_height * 0.6
+        );
+
+        // 并明确它不等于旧的估算值（防止回退）。
+        let old_estimate = (line_height * 0.6).max(CURSOR_WIDTH);
+        assert!(
+            old_estimate > cell,
+            "本测试的前提是旧估算值确实大于一格（估算 {old_estimate:?} vs 实际 {cell:?}）"
+        );
+    }
+
+    /// 宽字符（CJK）的块状光标应覆盖两格。
+    #[gpui::test]
+    fn block_cursor_covers_wide_characters(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::CursorShape;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (_host, cx) = cx.add_window_view(|_window, _cx| {
+            struct Host;
+            impl gpui::Render for Host {
+                fn render(
+                    &mut self,
+                    _: &mut gpui::Window,
+                    _: &mut gpui::Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div()
+                }
+            }
+            Host
+        });
+
+        let (ascii_width, cjk_width, cell) = cx.update(|window, cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line_height = window.line_height();
+            let font = style.font();
+            let font_id = window.text_system().resolve_font(&font);
+            let cell = window
+                .text_system()
+                .ch_advance(font_id, font_size)
+                .expect("等宽字体应能取到字符前进宽度");
+
+            let (ascii, _) = TextElement::cursor_block_layout_static(
+                CursorShape::Block,
+                Some('a'),
+                Some(font_size),
+                line_height,
+                window,
+                cx,
+            );
+            let (cjk, _) = TextElement::cursor_block_layout_static(
+                CursorShape::Block,
+                Some('中'),
+                Some(font_size),
+                line_height,
+                window,
+                cx,
+            );
+            (ascii, cjk, cell)
+        });
+
+        assert_eq!(ascii_width, cell, "ASCII 字符占一格");
+        assert!(
+            cjk_width > cell,
+            "CJK 字符的块状光标应宽于一格（{cjk_width:?} vs {cell:?}）"
+        );
+    }
+
+    /// 行尾 / 空行（没有可覆盖字符）时，块状光标也应按一格宽画。
+    ///
+    /// 这条路径此前用的是行高估算值，比一格宽约 1.6 倍，视觉上会盖住
+    /// 本不存在的「下一个字符」位置。
+    #[gpui::test]
+    fn block_cursor_on_empty_line_is_one_cell_wide(cx: &mut gpui::TestAppContext) {
+        use crate::components::input::CursorShape;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (_host, cx) = cx.add_window_view(|_window, _cx| {
+            struct Host;
+            impl gpui::Render for Host {
+                fn render(
+                    &mut self,
+                    _: &mut gpui::Window,
+                    _: &mut gpui::Context<Self>,
+                ) -> impl gpui::IntoElement {
+                    gpui::div()
+                }
+            }
+            Host
+        });
+
+        let (empty_width, newline_width, cell) = cx.update(|window, cx| {
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let line_height = window.line_height();
+            let font_id = window.text_system().resolve_font(&style.font());
+            let cell = window
+                .text_system()
+                .ch_advance(font_id, font_size)
+                .expect("等宽字体应能取到字符前进宽度");
+
+            let (empty, _) = TextElement::cursor_block_layout_static(
+                CursorShape::Block,
+                None,
+                Some(font_size),
+                line_height,
+                window,
+                cx,
+            );
+            let (newline, _) = TextElement::cursor_block_layout_static(
+                CursorShape::Block,
+                Some('\n'),
+                Some(font_size),
+                line_height,
+                window,
+                cx,
+            );
+            (empty, newline, cell)
+        });
+
+        assert_eq!(empty_width, cell, "空行的块状光标应为一格宽");
+        assert_eq!(newline_width, cell, "换行符处的块状光标应为一格宽");
+    }
 
     /// 通过真实的 `TextElement` prepaint/paint 驱动，验证：
     /// 1. 首帧光标直接就位（不从中途飞入）；

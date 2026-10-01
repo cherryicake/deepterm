@@ -415,7 +415,7 @@ impl InputState {
         });
     }
 
-    pub(super) fn on_action_search(
+    pub(crate) fn on_action_search(
         &mut self,
         _: &Search,
         window: &mut Window,
@@ -690,11 +690,11 @@ impl<T: SearchTarget> SearchPanel<T> {
         cx.notify();
     }
 
-    fn on_action_enter(&mut self, _action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_action_enter(&mut self, _action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
         self.jump(1, window, cx);
     }
 
-    pub(super) fn on_action_search_previous(
+    pub(crate) fn on_action_search_previous(
         &mut self,
         _: &super::SearchPrevious,
         window: &mut Window,

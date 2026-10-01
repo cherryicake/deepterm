@@ -219,7 +219,7 @@ pub struct Markdown {
 
 impl Markdown {
     pub fn init(cx: &mut gpui::App) {
-        cx.bind_keys([
+        crate::keymap::bind(cx, [
             KeyBinding::new("cmd-c", Copy, Some("Markdown")),
             KeyBinding::new("ctrl-c", Copy, Some("Markdown")),
             KeyBinding::new("cmd-a", SelectAll, Some("Markdown")),

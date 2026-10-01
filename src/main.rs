@@ -46,8 +46,12 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
+            // 设置系统必须最先就绪：theme / font / editor / keymap 都从它取值。
+            deepterm::settings::init(cx);
             theme::init(cx);
             deepterm::sidebar_view::font_settings::FontState::init(cx);
+            // keymap 依赖 settings（vim 开关决定是否加载 vim 键位表）。
+            deepterm::keymap::init(cx);
             deepterm::file_manager::watcher::init(cx);
             components::init(cx);
             terminal_view::init(cx);
@@ -55,7 +59,7 @@ fn main() {
             editor::init(cx);
             WindowManager::init(cx);
             init_global_executor();
-            cx.bind_keys([
+            deepterm::keymap::bind(cx, [
                 KeyBinding::new("cmd-q", Quit, None),
                 #[cfg(target_os = "windows")]
                 KeyBinding::new("ctrl-k", ShowSshPicker, None),

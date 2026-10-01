@@ -18,7 +18,7 @@ const CHECK_ICON_PATH: &str = "icons/check.svg";
 actions!(popup_menu, [Confirm, Cancel, SelectUp, SelectDown]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
+    crate::keymap::bind(cx, [
         KeyBinding::new("enter", Confirm, Some(CONTEXT)),
         KeyBinding::new("escape", Cancel, Some(CONTEXT)),
         KeyBinding::new("up", SelectUp, Some(CONTEXT)),

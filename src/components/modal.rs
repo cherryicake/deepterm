@@ -23,7 +23,7 @@ const MODAL_SLIDE_PX: f32 = 22.0;
 actions!(modal, [Cancel]);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", Cancel, Some(CONTEXT))]);
+    crate::keymap::bind(cx, [KeyBinding::new("escape", Cancel, Some(CONTEXT))]);
 }
 
 /// 弹窗动画状态。封装「打开 / 关闭中 / 动画代次」与延迟卸载任务，

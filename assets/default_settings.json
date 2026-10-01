@@ -1,0 +1,33 @@
+{
+  "theme": {
+    "id": ""
+  },
+  "font": {
+    "terminal_font_family": "Menlo",
+    "terminal_font_size": 18.0,
+    "terminal_line_height": 1.3,
+    "terminal_font_weight": 400.0,
+    "editor_font_family": "Menlo",
+    "editor_font_size": 16.0
+  },
+  "editor": {
+    "cursor_shape": "bar",
+    "cursor_blink": true,
+    "soft_wrap": false,
+    "tab_size": 4,
+    "hard_tabs": false,
+    "line_number": true,
+    "folding": true,
+    "indent_guides": true
+  },
+  "terminal": {
+    "scrollback_lines": 10000,
+    "cursor_shape": "bar"
+  },
+  "vim": {
+    "enabled": false,
+    "default_mode": "normal",
+    "normal_cursor_shape": "block",
+    "relative_line_numbers": false
+  }
+}

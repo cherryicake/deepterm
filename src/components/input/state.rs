@@ -15,10 +15,12 @@ use edit_primitives::{
 pub(crate) use edit_primitives::{
     is_code_bracket, is_word_char, scan_bracket_spans_text, scan_bracket_spans_tree,
 };
+/// vim 的 `iw`/`aw` 复用同一套词判定。
+pub(crate) use edit_primitives::word_range_at;
 
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, HighlightStyle, KeyBinding, KeyDownEvent, MouseButton,
+    EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, WeakEntity,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent,
     ShapedLine, SharedString, Subscription, UTF16Selection, Window, actions, point, px,
 };
@@ -48,15 +50,20 @@ use crate::editor::syntax::{DiagnosticSet, syntax_diagnostics_opt};
 #[cfg(not(target_family = "wasm"))]
 use crate::editor::syntax::LanguageRegistry;
 
-#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = editor, no_json)]
+/// 按下 Enter。
+///
+/// 可经 JSON 构造：`keymap.json` 里写
+/// `["editor::Enter", { "secondary": true }]` 即可绑定「次要确认」。
+#[derive(Action, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[action(namespace = editor)]
 pub struct Enter {
     /// Is confirm with secondary.
     pub secondary: bool,
 }
 
-#[derive(Action, Clone, PartialEq, Eq, Deserialize)]
-#[action(namespace = editor, no_json)]
+/// 折叠到指定层级；`0` 表示全部折叠。
+#[derive(Action, Clone, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[action(namespace = editor)]
 pub struct FoldLevel(pub usize);
 
 actions!(
@@ -273,193 +280,101 @@ fn is_sticky_definition_kind(kind: &str) -> bool {
     )
 }
 
+/// 安装编辑器的 App 级钩子。
+///
+/// 目前只有一件事：vim 的「等待一个字符」命令（`f`/`t`/`F`/`T`/`r`）需要在
+/// 绑定解析**之前**截住参数。这必须走 `App::intercept_keystrokes`——它比
+/// 绑定解析更早运行（`window.rs:5297` vs `:5305`），而 `on_key_down` /
+/// `capture_key_down` 都在 action 派发之后（`:5402`），且 action 派发默认
+/// 中止传播，参数会被吞掉。
 pub fn init(cx: &mut App) {
-    cx.bind_keys([
-        KeyBinding::new("backspace", Backspace, Some(CONTEXT)),
-        KeyBinding::new("shift-backspace", Backspace, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-backspace", Backspace, Some(CONTEXT)),
-        KeyBinding::new("delete", Delete, Some(CONTEXT)),
-        KeyBinding::new("shift-delete", Delete, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-backspace", DeleteToBeginningOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-delete", DeleteToEndOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-backspace", DeleteToPreviousWordStart, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-backspace", DeleteToPreviousWordStart, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-delete", DeleteToNextWordEnd, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-delete", DeleteToNextWordEnd, Some(CONTEXT)),
-        KeyBinding::new("enter", Enter { secondary: false }, Some(CONTEXT)),
-        KeyBinding::new("shift-enter", Enter { secondary: false }, Some(CONTEXT)),
-        KeyBinding::new("secondary-enter", Enter { secondary: true }, Some(CONTEXT)),
-        KeyBinding::new("escape", Escape, Some(CONTEXT)),
-        KeyBinding::new("up", MoveUp, Some(CONTEXT)),
-        KeyBinding::new("down", MoveDown, Some(CONTEXT)),
-        KeyBinding::new("left", MoveLeft, Some(CONTEXT)),
-        KeyBinding::new("right", MoveRight, Some(CONTEXT)),
-        KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
-        KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
-        KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
-        KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-]", Indent, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-[", Outdent, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-[", Outdent, Some(CONTEXT)),
-        KeyBinding::new("shift-left", SelectLeft, Some(CONTEXT)),
-        KeyBinding::new("shift-right", SelectRight, Some(CONTEXT)),
-        KeyBinding::new("shift-up", SelectUp, Some(CONTEXT)),
-        KeyBinding::new("shift-down", SelectDown, Some(CONTEXT)),
-        KeyBinding::new("home", MoveHome, Some(CONTEXT)),
-        KeyBinding::new("end", MoveEnd, Some(CONTEXT)),
-        KeyBinding::new("shift-home", SelectToStartOfLine, Some(CONTEXT)),
-        KeyBinding::new("shift-end", SelectToEndOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-shift-a", SelectToStartOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-shift-e", SelectToEndOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("shift-cmd-left", SelectToStartOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("shift-cmd-right", SelectToEndOfLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-shift-left", SelectToPreviousWordStart, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-left", SelectToPreviousWordStart, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-shift-right", SelectToNextWordEnd, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-right", SelectToNextWordEnd, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-c", Copy, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-x", Cut, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-x", Cut, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-a", MoveHome, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-left", MoveHome, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("ctrl-e", MoveEnd, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-right", MoveEnd, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-z", Undo, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-z", Redo, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-up", MoveToStart, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-down", MoveToEnd, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-left", MoveToPreviousWord, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-right", MoveToNextWord, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-left", MoveToPreviousWord, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-right", MoveToNextWord, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-up", SelectToStart, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-down", SelectToEnd, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-z", Undo, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-y", Redo, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-f", Search, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
-        KeyBinding::new("shift-enter", SearchPrevious, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-/", ToggleComment, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-/", ToggleComment, Some(CONTEXT)),
-        // 软换行开关。Zed 是 `cmd-k z`，但本仓没有命令面板、`cmd-k` 已被
-        // ShowSshPicker 全局占用，这里用 VSCode 同款的 `alt-z`。
-        KeyBinding::new("alt-z", ToggleSoftWrap, Some(CONTEXT)),
-        KeyBinding::new("alt-up", MoveLineUp, Some(CONTEXT)),
-        KeyBinding::new("alt-down", MoveLineDown, Some(CONTEXT)),
-        KeyBinding::new("alt-shift-up", DuplicateLine, Some(CONTEXT)),
-        KeyBinding::new("alt-shift-down", DuplicateLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-k", DeleteLine, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-k", DeleteLine, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-j", JoinLines, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-j", JoinLines, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-[", Fold, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-[", Fold, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-]", Unfold, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-]", Unfold, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-l", ToggleFold, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-l", ToggleFold, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-0", FoldAll, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-0", FoldAll, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-j", UnfoldAll, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-j", UnfoldAll, Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-1", FoldLevel(1), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-1", FoldLevel(1), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-2", FoldLevel(2), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-2", FoldLevel(2), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-3", FoldLevel(3), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-3", FoldLevel(3), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-4", FoldLevel(4), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-4", FoldLevel(4), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-5", FoldLevel(5), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-5", FoldLevel(5), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-6", FoldLevel(6), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-6", FoldLevel(6), Some(CONTEXT)),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("alt-cmd-7", FoldLevel(7), Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-7", FoldLevel(7), Some(CONTEXT)),
-    ]);
+    crate::keymap::init(cx);
+
+    // 订阅必须活到进程结束：`Subscription` 一旦 drop，拦截器就被注销，
+    // `f`/`t`/`r` 的参数会重新被当作命令派发。挂在全局上保活。
+    let subscription = cx.intercept_keystrokes(|event, window, cx| {
+        let Some(focused) = focused_for_intercept(window, cx) else {
+            return;
+        };
+        let consumed = focused.update(cx, |state, cx| {
+            state.on_intercept_keystroke(event, window, cx)
+        });
+        if consumed {
+            cx.stop_propagation();
+        }
+    });
+    cx.set_global(KeystrokeInterceptor(subscription));
+}
+
+/// 保活 `intercept_keystrokes` 返回的订阅。
+struct KeystrokeInterceptor(#[allow(dead_code)] gpui::Subscription);
+
+impl gpui::Global for KeystrokeInterceptor {}
+
+/// 测试入口：直接跑一次拦截逻辑，不依赖 App 级订阅。
+#[cfg(test)]
+pub(crate) fn intercept_for_test(
+    state: &Entity<InputState>,
+    keystroke: &gpui::Keystroke,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let event = gpui::KeystrokeEvent {
+        keystroke: keystroke.clone(),
+        action: None,
+        context_stack: Vec::new(),
+    };
+    let consumed = state.update(cx, |state, cx| {
+        state.on_intercept_keystroke(&event, window, cx)
+    });
+    if consumed {
+        cx.stop_propagation();
+    }
+    consumed
+}
+
+/// 当前存活的所有 `InputState`。
+///
+/// 供 vim 开关切换时批量同步模式状态。注册表只存弱引用，已析构的条目
+/// 在这里顺带清理。
+pub(crate) fn all_input_states() -> Vec<Entity<InputState>> {
+    FOCUSED_INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        inputs.retain(|(_, weak)| weak.upgrade().is_some());
+        inputs
+            .iter()
+            .filter_map(|(_, weak)| weak.upgrade())
+            .collect()
+    })
+}
+
+/// 找到当前持有键盘焦点的 `InputState`。
+///
+/// 遍历注册表并按焦点句柄匹配——比给「谁有焦点」再造一套全局状态更直接，
+/// 且天然支持多窗口（各自窗口的 `is_focused` 只会命中自己的那个）。
+/// 顺带清理已析构的条目。
+fn focused_for_intercept(
+    window: &mut Window,
+    _cx: &mut App,
+) -> Option<Entity<InputState>> {
+    FOCUSED_INPUTS.with(|inputs| {
+        let mut inputs = inputs.borrow_mut();
+        inputs.retain(|(_, weak)| weak.upgrade().is_some());
+        inputs
+            .iter()
+            .find(|(handle, _)| handle.is_focused(window))
+            .and_then(|(_, weak)| weak.upgrade())
+    })
+}
+
+thread_local! {
+    /// 已注册的 `InputState`：焦点句柄 + 弱引用。
+    ///
+    /// 必须持弱引用：强引用会让每个创建过的 `InputState` 都无法析构，
+    /// gpui 的实体泄漏检查会直接判测试失败（实测 `host_form` 等用例
+    /// 因此报 "Leaked handle for entity InputState"）。
+    static FOCUSED_INPUTS: std::cell::RefCell<Vec<(FocusHandle, WeakEntity<InputState>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Whitespace indicators for rendering spaces and tabs.
@@ -635,6 +550,15 @@ pub struct InputState {
     /// This flag tells the renderer to prefer the end of the current visual line.
     pub(crate) cursor_line_end_affinity: bool,
     pub(crate) cursor_shape: CursorShape,
+    /// 本次 Insert 会话输入的文本，供 `.` 重放。
+    pub(crate) vim_insert_buffer: String,
+    /// 本次 Insert 会话的起点偏移。
+    pub(crate) vim_insert_start: Option<usize>,
+    /// Vim 模式状态。`None` 表示 vim 未启用（或非代码编辑器）。
+    ///
+    /// 状态挂在 `InputState` 上而不是 `Editor` 上：每个文件 tab 持有独立的
+    /// `InputState`，模式因此天然随 tab 走，切换标签不会串味。
+    pub(crate) vim: Option<crate::vim::VimState>,
     pub(crate) cursor_blink: bool,
     /// 光标四角弹簧动画状态（跨帧存活；元素每帧只 `step` 一次）。
     pub(crate) cursor_animator: crate::components::cursor_animation::CursorAnimator,
@@ -734,7 +658,7 @@ impl InputState {
 
         let text_style = window.text_style();
 
-        Self {
+        let state = Self {
             focus_handle: focus_handle.clone(),
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
@@ -794,6 +718,9 @@ impl InputState {
             _pending_update: false,
             cursor_line_end_affinity: false,
             cursor_shape: CursorShape::default(),
+            vim_insert_buffer: String::new(),
+            vim_insert_start: None,
+            vim: None,
             cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             cursor_blink: true,
             diff_line_colors: std::collections::HashMap::new(),
@@ -804,7 +731,18 @@ impl InputState {
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
             submit_on_enter: false,
-        }
+        };
+
+        // 注册焦点句柄，供 App 级击键拦截器找到「当前聚焦的编辑器」
+        // （vim 的 `f`/`t`/`r` 参数需要在绑定解析前截住）。
+        // 只存弱引用：强引用会阻止 `InputState` 析构，触发 gpui 的实体泄漏检查。
+        let entity = cx.entity();
+        let weak = entity.downgrade();
+        FOCUSED_INPUTS.with(|inputs| {
+            inputs.borrow_mut().push((focus_handle.clone(), weak));
+        });
+
+        state
     }
 
     /// Override the line-number labels (indexed by buffer row; `None` entry
@@ -4031,6 +3969,10 @@ impl InputState {
         if self.masked || self.ime_marked_range.is_some() {
             return CursorShape::Bar;
         }
+        // vim 启用时由模式决定：Normal/Visual 用块状，Insert 沿用编辑器设置。
+        if let Some(vim) = self.vim.as_ref() {
+            return vim.cursor_shape(self.cursor_shape);
+        }
         self.cursor_shape
     }
 
@@ -4080,11 +4022,101 @@ impl InputState {
 
     pub(crate) fn on_key_down(
         &mut self,
-        _event: &KeyDownEvent,
+        event: &KeyDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pause_blink_cursor(cx);
+
+        if !self.should_intercept_key(event) {
+            return;
+        }
+
+        // 消费掉这次击键，阻止平台输入处理器把它当字符插入。
+        //
+        // 这不会阻断 action 派发：绑定解析发生在 `dispatch_key_event` 的
+        // 匹配阶段，`on_key_down` 监听器在其后的 `finish_dispatch_key_event`
+        // 里才被调用（gpui `window.rs:5305` vs `:5417`）。所以已绑定的键
+        // 照常触发 action，未绑定的键被安静吞掉——与 vim 一致。
+        cx.stop_propagation();
+    }
+
+    /// 「等待一个字符」的命令（`f`/`t`/`F`/`T`/`r`）消费本次击键。
+    ///
+    /// 必须走 **App 级击键拦截器**（`App::intercept_keystrokes`），而不是
+    /// `on_key_down` 或 `capture_key_down`：后两者都在 gpui 的
+    /// `finish_dispatch_key_event` 里执行，而那一步在**绑定解析与 action 派发
+    /// 之后**（`window.rs:5392` 派发 action，`:5402` 才调 key 监听器），
+    /// 且 action 派发默认会中止事件传播。结果是 `f` 之后的 `o`（本身绑定到
+    /// `vim::OpenLineBelow`）会被派发成命令，参数永远收不到。
+    ///
+    /// 拦截器在绑定解析**之前**运行（`window.rs:5297` vs `:5305`），
+    /// 因此能稳定地把这类字符截为参数。
+    pub(crate) fn on_intercept_keystroke(
+        &mut self,
+        event: &gpui::KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.vim_pending_char_is_set() {
+            return false;
+        }
+        let keystroke = &event.keystroke;
+        if keystroke.modifiers.platform || keystroke.modifiers.control {
+            return false;
+        }
+        let Some(ch) = keystroke
+            .key_char
+            .as_deref()
+            .and_then(|s| s.chars().next())
+            .filter(|ch| !ch.is_control())
+        else {
+            return false;
+        };
+
+        self.vim_do_apply_pending_char(ch, window, cx);
+        // 返回 true = 已消费，后续不再解析绑定。
+        true
+    }
+
+    /// 是否有待决的字符输入（`f`/`t`/`r` 正在等字符）。
+    fn vim_pending_char_is_set(&self) -> bool {
+        self.vim
+            .as_ref()
+            .is_some_and(|vim| vim.pending_char.is_some())
+    }
+
+    /// 这次击键是否应由 vim 拦截（即：不该作为文本插入）。
+    ///
+    /// 只拦「一定是命令」的输入：Normal/Visual 模式下、无 Cmd/Ctrl 修饰、
+    /// 且不在 IME 组合中。Insert 模式、快捷键组合、IME 组字一律放行，
+    /// 否则会破坏中文输入法与系统快捷键。
+    fn should_intercept_key(&self, event: &KeyDownEvent) -> bool {
+        let Some(vim) = self.vim.as_ref() else {
+            return false;
+        };
+        if !vim.blocks_text_input() {
+            return false;
+        }
+        if self.ime_marked_range.is_some() {
+            return false;
+        }
+        if self.disabled {
+            return false;
+        }
+
+        let modifiers = &event.keystroke.modifiers;
+        !modifiers.platform && !modifiers.control
+    }
+
+    /// 测试入口：直接判定某个击键是否被拦截，不经过窗口事件。
+    #[cfg(test)]
+    pub(crate) fn should_intercept_key_for_test(&self, keystroke: &gpui::Keystroke) -> bool {
+        self.should_intercept_key(&KeyDownEvent {
+            keystroke: keystroke.clone(),
+            is_held: false,
+            prefer_character_input: false,
+        })
     }
 
     pub(crate) fn on_drag_move(
@@ -4199,6 +4231,17 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 记录 Insert 会话中键入的文本，供 `.` 重放整次修改。
+        // 只记真实键入（`allow_auto_pair`）且处于 Insert 模式时：
+        // 程序化插入（撤销回放、缩进、行操作）不属于「用户输入」。
+        if allow_auto_pair
+            && self
+                .vim
+                .as_ref()
+                .is_some_and(|vim| vim.mode == crate::vim::VimMode::Insert)
+        {
+            self.vim_insert_buffer.push_str(new_text);
+        }
         if self.disabled {
             return;
         }
@@ -4637,6 +4680,19 @@ impl EntityInputHandler for InputState {
         }
 
         None
+    }
+
+    /// Normal/Visual 模式下不接受文本输入。
+    ///
+    /// 这是按键拦截的第二道防线：`on_key_down` 的 `stop_propagation` 挡住
+    /// 平台输入处理器，而这里告诉 gpui「当前视图不参与文本输入」，
+    /// 使 IME 与输入法切换的判定也正确。仓库里已有两处先例：
+    /// `markdown_live/view.rs` 与 `terminal_view.rs`。
+    fn accepts_text_input(&self, _window: &mut Window, _cx: &mut Context<Self>) -> bool {
+        match self.vim.as_ref() {
+            Some(vim) => !vim.blocks_text_input(),
+            None => true,
+        }
     }
 }
 

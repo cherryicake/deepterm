@@ -145,7 +145,7 @@ const SEARCH_DRIFT_THROTTLE_MS: u64 = 400;
 
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
-    cx.bind_keys([
+    crate::keymap::bind(cx, [
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
         // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell

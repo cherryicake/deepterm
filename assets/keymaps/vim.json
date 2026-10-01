@@ -1,0 +1,255 @@
+// Vim 键位表。
+//
+// 仅在 `settings.vim.enabled` 为 true 时加载（见 src/keymap/mod.rs），
+// 因此这些绑定不会影响非 vim 用户。
+//
+// 上下文由 `EditorInput` 渲染时注入（src/components/input/input.rs）：
+//   VimControl        —— Normal / Visual 下存在
+//   vim_mode          —— normal | insert | replace | visual
+//   vim_operator      —— none | d | y | c | i | a
+//
+// 未绑定的按键在 Normal 模式下会被 `on_key_down` 吞掉（不插入字符），
+// 与 vim 的「无操作」一致。
+[
+  {
+    "context": "Input && VimControl && vim_mode == normal && vim_operator == none",
+    "bindings": {
+      // 模式切换
+      "escape": "vim::NormalMode",
+      "ctrl-[": "vim::NormalMode",
+      "i": "vim::InsertBefore",
+      "a": "vim::InsertAfter",
+      "shift-i": "vim::InsertFirstNonWhitespace",
+      "shift-a": "vim::InsertEndOfLine",
+
+      // 移动
+      "h": "vim::Left",
+      "left": "vim::Left",
+      "l": "vim::Right",
+      "right": "vim::Right",
+      "j": "vim::Down",
+      "down": "vim::Down",
+      "k": "vim::Up",
+      "up": "vim::Up",
+      "w": "vim::NextWordStart",
+      "b": "vim::PreviousWordStart",
+      "e": "vim::NextWordEnd",
+      "0": "vim::StartOfLine",
+      "home": "vim::StartOfLine",
+      "$": "vim::EndOfLine",
+      "end": "vim::EndOfLine",
+      "g g": "vim::StartOfDocument",
+      "shift-g": "vim::EndOfDocument",
+
+      // 操作符（进入 vim_operator 上下文，后续键在下方各段绑定）
+      "d": "vim::PushDelete",
+      "y": "vim::PushYank",
+      "c": "vim::PushChange",
+
+      // 单键编辑命令
+      "x": "vim::DeleteChar",
+      "p": "vim::PasteAfter",
+      "shift-p": "vim::PasteBefore",
+      "shift-j": "vim::JoinLines",
+      "> >": "vim::IndentLine",
+      "< <": "vim::OutdentLine",
+      "s": "vim::SubstituteChar",
+      "shift-s": "vim::SubstituteLine",
+      "shift-d": "vim::DeleteToEndOfLine",
+      "shift-c": "vim::ChangeToEndOfLine",
+      "shift-y": "vim::YankLine",
+      "o": "vim::OpenLineBelow",
+      "shift-o": "vim::OpenLineAbove",
+      "~": "vim::ToggleCase",
+      "^": "vim::FirstNonWhitespace",
+      "_": "vim::FirstNonWhitespaceDown",
+
+      // 撤销 / 重做 / 重复
+      "u": "vim::Undo",
+      "ctrl-r": "vim::Redo",
+      ".": "vim::RepeatChange",
+
+      // 寄存器前缀：`"ayy`、`"+p`
+      "\"": "vim::PushRegister",
+
+      // 标记：`ma` 设置，`` `a `` 精确跳转，`'a` 跳到行首
+      "m": "vim::PushSetMark",
+      "`": "vim::PushJumpMark",
+      "'": "vim::PushJumpMarkLine",
+
+      // 可视模式入口与重选
+      "v": "vim::VisualChar",
+      "shift-v": "vim::VisualLine",
+      "g v": "vim::ReselectVisual",
+
+      // 括号匹配与查找
+      "%": "vim::MatchingBracket",
+      "*": "vim::SearchWordForward",
+      "#": "vim::SearchWordBackward",
+      "n": "vim::SearchNext",
+      "shift-n": "vim::SearchPrev",
+
+      // 字符查找与替换（`f`/`t`/`F`/`T`/`r` 会等待一个字符）
+      "f": "vim::PushFindForward",
+      "t": "vim::PushFindBefore",
+      "shift-f": "vim::PushFindBackward",
+      "shift-t": "vim::PushFindAfter",
+      "r": "vim::PushReplace",
+      ";": "vim::RepeatFind",
+      ",": "vim::RepeatFindReversed",
+
+      // 注释
+      "g c": "vim::ToggleComment",
+
+      // 翻页与窗口定位
+      "ctrl-d": "vim::HalfPageDown",
+      "ctrl-u": "vim::HalfPageUp",
+      "ctrl-f": "vim::PageDown",
+      "ctrl-b": "vim::PageUp",
+      "shift-h": "vim::WindowTop",
+      "shift-m": "vim::WindowMiddle",
+      "shift-l": "vim::WindowBottom",
+
+      // 计数前缀。`0` 不在其中——它只有在计数已经开始时才是数字，
+      // 否则是行首移动（见下面 `0` 的绑定）。
+      "1": "vim::Count1",
+      "2": "vim::Count2",
+      "3": "vim::Count3",
+      "4": "vim::Count4",
+      "5": "vim::Count5",
+      "6": "vim::Count6",
+      "7": "vim::Count7",
+      "8": "vim::Count8",
+      "9": "vim::Count9"
+    }
+  },
+  {
+    // 操作符待决：`d`/`y`/`c` 之后接受移动与对象前缀。
+    // 与上面的 normal 段分开，是为了让 `vim_operator` 参与匹配——
+    // 这样 `d` 之后的 `w` 走同一条 `vim::NextWordStart`，
+    // 而 `i`/`a` 变成对象前缀而非插入命令。
+    "context": "Input && VimControl && vim_mode == normal && vim_operator != none",
+    "bindings": {
+      "escape": "vim::NormalMode",
+      "ctrl-[": "vim::NormalMode",
+      "i": "vim::PushObjectInner",
+      "a": "vim::PushObjectAround",
+      "h": "vim::Left",
+      "l": "vim::Right",
+      "j": "vim::Down",
+      "k": "vim::Up",
+      "w": "vim::NextWordStart",
+      "b": "vim::PreviousWordStart",
+      "e": "vim::NextWordEnd",
+      "0": "vim::StartOfLine",
+      "$": "vim::EndOfLine",
+      "g g": "vim::StartOfDocument",
+      "shift-g": "vim::EndOfDocument",
+      // 字符查找在操作符待决时也要可用（`dfa`、`dta`、`dFa`）。
+      "f": "vim::PushFindForward",
+      "t": "vim::PushFindBefore",
+      "shift-f": "vim::PushFindBackward",
+      "shift-t": "vim::PushFindAfter",
+      // 重复操作符 = 整行：`dd` / `yy` / `cc`。
+      // 绑在操作符待决段，因为只有此时「再按一次 d」才意味着整行；
+      // 单独按 `d` 走上面 normal 段的 PushDelete。
+      "d": "vim::PushDelete",
+      "y": "vim::PushYank",
+      "c": "vim::PushChange",
+      // 操作符之后的计数（`d2w`）。
+      "1": "vim::Count1",
+      "2": "vim::Count2",
+      "3": "vim::Count3",
+      "4": "vim::Count4",
+      "5": "vim::Count5",
+      "6": "vim::Count6",
+      "7": "vim::Count7",
+      "8": "vim::Count8",
+      "9": "vim::Count9"
+    }
+  },
+  {
+    // 对象前缀待决（`di` / `da` / `ci` / `ya` …）：`w` 在这里是对象名
+    // 而非移动，所以必须单独一段——否则 `diw` 会被当成 `di` + 移动。
+    "context": "Input && VimControl && vim_mode == normal && (vim_operator == i || vim_operator == a)",
+    "bindings": {
+      "escape": "vim::NormalMode",
+      "ctrl-[": "vim::NormalMode",
+      // 对象名。每个键都用带参 action 声明，语义统一：
+      // 「把当前操作符作用到这个对象上」。
+      "w": ["vim::ObjectKey", { "key": "w" }],
+      "\"": ["vim::ObjectKey", { "key": "\"" }],
+      "'": ["vim::ObjectKey", { "key": "'" }],
+      "`": ["vim::ObjectKey", { "key": "`" }],
+      "(": ["vim::ObjectKey", { "key": "(" }],
+      ")": ["vim::ObjectKey", { "key": ")" }],
+      "b": ["vim::ObjectKey", { "key": "b" }],
+      "[": ["vim::ObjectKey", { "key": "[" }],
+      "]": ["vim::ObjectKey", { "key": "]" }],
+      "{": ["vim::ObjectKey", { "key": "{" }],
+      "}": ["vim::ObjectKey", { "key": "}" }],
+      "shift-b": ["vim::ObjectKey", { "key": "B" }],
+      "<": ["vim::ObjectKey", { "key": "<" }],
+      ">": ["vim::ObjectKey", { "key": ">" }],
+      "p": ["vim::ObjectKey", { "key": "p" }],
+      "t": ["vim::ObjectKey", { "key": "t" }]
+    }
+  },
+  {
+    // Visual 模式：`v` / `V` 进入，操作符直接作用于选区。
+    // 上下文里没有 `vim_operator == none` 限制——可视模式下操作符立即执行，
+    // 不像 Normal 那样需要后续的移动或对象。
+    "context": "Input && VimControl && vim_mode == visual",
+    "bindings": {
+      "escape": "vim::NormalMode",
+      "ctrl-[": "vim::NormalMode",
+      "v": "vim::VisualChar",
+      "shift-v": "vim::VisualLine",
+      "o": "vim::VisualSwapEnds",
+      "shift-o": "vim::VisualSwapEnds",
+
+      // 操作符：立即作用于选区。
+      // 这些 action 名与 Normal 段的不同——gpui 对同一 action 只派发给
+      // 第一个匹配的监听器，复用名字会让 Normal 的 handler 抢走事件。
+      "d": "vim::VisualDelete",
+      "x": "vim::VisualDelete",
+      "y": "vim::VisualYank",
+      "c": "vim::VisualChange",
+      "s": "vim::VisualChange",
+      ">": "vim::VisualIndent",
+      "<": "vim::VisualOutdent",
+
+      // 移动（扩展选区）
+      "h": "vim::Left",
+      "left": "vim::Left",
+      "l": "vim::Right",
+      "right": "vim::Right",
+      "j": "vim::Down",
+      "down": "vim::Down",
+      "k": "vim::Up",
+      "up": "vim::Up",
+      "w": "vim::NextWordStart",
+      "b": "vim::PreviousWordStart",
+      "e": "vim::NextWordEnd",
+      "0": "vim::StartOfLine",
+      "home": "vim::StartOfLine",
+      "$": "vim::EndOfLine",
+      "end": "vim::EndOfLine",
+      "^": "vim::FirstNonWhitespace",
+      "g g": "vim::StartOfDocument",
+      "shift-g": "vim::EndOfDocument",
+      "ctrl-d": "vim::HalfPageDown",
+      "ctrl-u": "vim::HalfPageUp",
+      "%": "vim::MatchingBracket",
+      "~": "vim::ToggleCase"
+    }
+  },
+  {
+    // Insert 模式：只保留 `Esc` 与 `ctrl-[`。其余按键交给文本输入。
+    "context": "Input && vim_mode == insert",
+    "bindings": {
+      "escape": "vim::NormalMode",
+      "ctrl-[": "vim::NormalMode"
+    }
+  }
+]

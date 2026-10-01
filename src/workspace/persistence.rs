@@ -39,7 +39,7 @@ impl PersistenceManager {
     }
 
     /// 获取配置目录路径：优先使用系统标准 config_dir，失败回退到 home/.config
-    fn get_config_dir() -> PathBuf {
+    pub fn get_config_dir() -> PathBuf {
         if let Some(dir) = dirs::config_dir() {
             return dir.join("deepterm");
         }

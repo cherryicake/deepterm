@@ -57,13 +57,13 @@ actions!(
 pub fn init(cx: &mut App) {
     crate::editor::markdown::Markdown::init(cx);
     // 实时 markdown 与只读预览共用复制/全选语义，仅上下文不同。
-    cx.bind_keys([
+    crate::keymap::bind(cx, [
         KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
         KeyBinding::new("ctrl-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
         KeyBinding::new("cmd-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
         KeyBinding::new("ctrl-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
     ]);
-    cx.bind_keys([
+    crate::keymap::bind(cx, [
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
         #[cfg(target_os = "macos")]
@@ -1484,6 +1484,20 @@ impl Editor {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
+                    // vim 模式徽章：只在 vim 启用时出现。放在最左，与 vim 的
+                    // 状态行位置一致，扫一眼就知道当前是 Normal 还是 Insert。
+                    .when_some(state.vim.as_ref(), |this, vim| {
+                        let mode = vim.mode;
+                        this.child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(4.0))
+                                .bg(theme.accent.opacity(0.15))
+                                .text_color(theme.accent)
+                                .child(mode.indicator()),
+                        )
+                    })
                     .child(format!(
                         "行 {}, 列 {}",
                         position.line + 1,
@@ -2638,6 +2652,8 @@ impl Editor {
             // 普通文件标签：行首 git 色条可点击展开 hunk
             // （diff 视图自己的编辑器已是展开态，保持默认 false）。
             state.set_git_expandable(true);
+            // vim 状态随 tab 创建：每个 tab 一个 InputState，模式因此天然隔离。
+            state.vim = crate::vim::initial_state(cx);
             state
         });
 

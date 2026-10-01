@@ -1,0 +1,40 @@
+// 编辑器键位（平台无关部分）。
+// 上下文 `Input` 由 `EditorInput` 渲染时设置。
+// 平台相关的键位见 default-macos.json / default-linux.json。
+[
+  {
+    "context": "Input",
+    "bindings": {
+      "backspace": "editor::Backspace",
+      "shift-backspace": "editor::Backspace",
+      "delete": "editor::Delete",
+      "shift-delete": "editor::Delete",
+      "enter": ["editor::Enter", {"secondary": false}],
+      "shift-enter": "editor::SearchPrevious",
+      "secondary-enter": ["editor::Enter", {"secondary": true}],
+      "escape": "editor::Escape",
+      "up": "editor::MoveUp",
+      "down": "editor::MoveDown",
+      "left": "editor::MoveLeft",
+      "right": "editor::MoveRight",
+      "pageup": "editor::MovePageUp",
+      "pagedown": "editor::MovePageDown",
+      "tab": "editor::IndentInline",
+      "shift-tab": "editor::OutdentInline",
+      "shift-left": "editor::SelectLeft",
+      "shift-right": "editor::SelectRight",
+      "shift-up": "editor::SelectUp",
+      "shift-down": "editor::SelectDown",
+      "home": "editor::MoveHome",
+      "end": "editor::MoveEnd",
+      "shift-home": "editor::SelectToStartOfLine",
+      "shift-end": "editor::SelectToEndOfLine",
+      // 软换行开关。Zed 是 `cmd-k z`，但本仓没有命令面板、`cmd-k` 已被 ShowSshPicker 全局占用，这里用 VSCode 同款的 `alt-z`。
+      "alt-z": "editor::ToggleSoftWrap",
+      "alt-up": "editor::MoveLineUp",
+      "alt-down": "editor::MoveLineDown",
+      "alt-shift-up": "editor::DuplicateLine",
+      "alt-shift-down": "editor::DuplicateLine"
+    }
+  }
+]

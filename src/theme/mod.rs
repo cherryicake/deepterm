@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use alacritty_terminal::vte::ansi::NamedColor;
@@ -521,16 +520,16 @@ impl ActiveTheme for App {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ThemePreference {
-    theme_id: String,
-}
-
 pub fn init(cx: &mut App) {
     let themes = load_builtin_themes().expect("failed to load embedded builtin themes");
     let default_theme_id = default_theme_id(cx.window_appearance());
-    let preferred_theme_id = ThemePreference::load()
-        .map(|preference| preference.theme_id)
+    // 主题 id 存在 settings.json 的 `theme.id`；空串表示跟随系统外观。
+    // store 缺席时退回系统外观：测试与独立渲染组件会只初始化本类型。
+    let preferred_theme_id = cx
+        .try_global::<crate::settings::SettingsStore>()
+        .and_then(|store| store.get::<crate::settings::ThemeContent>())
+        .map(|theme| theme.id.clone())
+        .filter(|theme_id| !theme_id.is_empty())
         .filter(|theme_id| themes.iter().any(|theme| theme.id == *theme_id));
     let active_theme_id = preferred_theme_id.unwrap_or_else(|| default_theme_id.to_string());
 
@@ -583,42 +582,41 @@ impl ThemeState {
         }
 
         if changed {
-            if let Err(err) = (ThemePreference {
-                theme_id: next_theme_id,
-            })
-            .save()
-            {
-                log::warn!("failed to persist theme preference: {err}");
+            // 主题 id 与其它设置同源，写回 settings.json。
+            if cx.try_global::<crate::settings::SettingsStore>().is_some() {
+                crate::settings::SettingsStore::update_user(cx, |content| {
+                    content.theme.id = next_theme_id.clone();
+                });
             }
             cx.refresh_windows();
         }
 
         changed
     }
-}
 
-impl ThemePreference {
-    fn load() -> Option<Self> {
-        let path = Self::config_path()?;
-        let content = std::fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
-    }
-
-    fn save(&self) -> anyhow::Result<()> {
-        let Some(path) = Self::config_path() else {
-            anyhow::bail!("unable to resolve theme config path");
+    /// 从设置 store 重新应用主题（热重载路径）。
+    pub fn sync_from_settings(cx: &mut App) {
+        let Some(preferred) = cx
+            .try_global::<crate::settings::SettingsStore>()
+            .and_then(|store| store.get::<crate::settings::ThemeContent>())
+            .map(|theme| theme.id.clone())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
         };
-
-        let json = serde_json::to_string_pretty(self)?;
-        // 原子写（tmp + rename）：与 session 状态等其它落盘点同一标准，
-        // 避免崩溃时留下截断的主题配置。
-        crate::utils::fs_atomic::atomic_write(&path, json.as_bytes())?;
-        Ok(())
-    }
-
-    fn config_path() -> Option<PathBuf> {
-        let config_dir = dirs::config_dir()?;
-        Some(config_dir.join("deepterm").join("theme.json"))
+        let Some(next) = Self::themes(cx)
+            .iter()
+            .find(|theme| theme.id == preferred)
+            .map(|theme| theme.id.clone())
+        else {
+            return;
+        };
+        // 先比较再取可变引用：`global_mut` 会无条件通知观察者。
+        if cx.global::<ThemeState>().active_theme_id.as_ref() == next {
+            return;
+        }
+        cx.global_mut::<ThemeState>().active_theme_id = next.into();
+        cx.refresh_windows();
     }
 }
 

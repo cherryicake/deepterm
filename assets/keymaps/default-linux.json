@@ -1,0 +1,38 @@
+// 编辑器键位（Linux / Windows 专属），由 src/keymap/mod.rs 在非 macOS 上追加加载。
+[
+  {
+    "context": "Input",
+    "bindings": {
+      "ctrl-backspace": "editor::DeleteToPreviousWordStart",
+      "ctrl-delete": "editor::DeleteToNextWordEnd",
+      "ctrl-]": "editor::Indent",
+      "ctrl-[": "editor::Outdent",
+      "ctrl-shift-left": "editor::SelectToPreviousWordStart",
+      "ctrl-shift-right": "editor::SelectToNextWordEnd",
+      "ctrl-a": "editor::SelectAll",
+      "ctrl-c": "editor::Copy",
+      "ctrl-x": "editor::Cut",
+      "ctrl-v": "editor::Paste",
+      "ctrl-left": "editor::MoveToPreviousWord",
+      "ctrl-right": "editor::MoveToNextWord",
+      "ctrl-z": "editor::Undo",
+      "ctrl-y": "editor::Redo",
+      "ctrl-f": "editor::Search",
+      "ctrl-/": "editor::ToggleComment",
+      "ctrl-shift-k": "editor::DeleteLine",
+      "ctrl-j": "editor::JoinLines",
+      "ctrl-shift-[": "editor::Fold",
+      "ctrl-shift-]": "editor::Unfold",
+      "ctrl-shift-l": "editor::ToggleFold",
+      "ctrl-shift-0": "editor::FoldAll",
+      "ctrl-shift-j": "editor::UnfoldAll",
+      "ctrl-shift-1": ["editor::FoldLevel", 1],
+      "ctrl-shift-2": ["editor::FoldLevel", 2],
+      "ctrl-shift-3": ["editor::FoldLevel", 3],
+      "ctrl-shift-4": ["editor::FoldLevel", 4],
+      "ctrl-shift-5": ["editor::FoldLevel", 5],
+      "ctrl-shift-6": ["editor::FoldLevel", 6],
+      "ctrl-shift-7": ["editor::FoldLevel", 7]
+    }
+  }
+]

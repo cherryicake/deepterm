@@ -1,9 +1,9 @@
-use std::path::PathBuf;
-
 use gpui::{App, Global, SharedString};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+use crate::settings::SettingsStore;
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FontSettings {
     #[serde(default = "default_terminal_font_family")]
     pub terminal_font_family: String,
@@ -42,6 +42,32 @@ impl Default for FontSettings {
     }
 }
 
+impl FontSettings {
+    /// 从合并后的设置文档取值。
+    pub fn from_settings(content: &crate::settings::SettingsContent) -> Self {
+        Self {
+            terminal_font_family: content.font.terminal_font_family.clone(),
+            terminal_font_size: content.font.terminal_font_size,
+            terminal_line_height: content.font.terminal_line_height,
+            terminal_font_weight: content.font.terminal_font_weight,
+            editor_font_family: content.font.editor_font_family.clone(),
+            editor_font_size: content.font.editor_font_size,
+        }
+    }
+
+    /// 转回设置文档的 `font` 段，用于写回。
+    pub fn into_content(self) -> crate::settings::FontContent {
+        crate::settings::FontContent {
+            terminal_font_family: self.terminal_font_family,
+            terminal_font_size: self.terminal_font_size,
+            terminal_line_height: self.terminal_line_height,
+            terminal_font_weight: self.terminal_font_weight,
+            editor_font_family: self.editor_font_family,
+            editor_font_size: self.editor_font_size,
+        }
+    }
+}
+
 pub const DEFAULT_FONT_SUFFIX: &str = " (default)";
 
 pub fn format_font_choice(family: &str, is_default: bool) -> String {
@@ -56,7 +82,7 @@ pub fn clean_font_choice(label: &str) -> &str {
     label.trim_end_matches(DEFAULT_FONT_SUFFIX)
 }
 
-fn default_terminal_font_family() -> String {
+pub fn default_terminal_font_family() -> String {
     #[cfg(target_os = "macos")]
     {
         "Menlo".into()
@@ -71,24 +97,24 @@ fn default_terminal_font_family() -> String {
     }
 }
 
-fn default_terminal_font_size() -> f32 {
+pub fn default_terminal_font_size() -> f32 {
     18.0
 }
 
-fn default_terminal_line_height() -> f32 {
+pub fn default_terminal_line_height() -> f32 {
     1.3
 }
 
-fn default_terminal_font_weight() -> f32 {
+pub fn default_terminal_font_weight() -> f32 {
     400.0
 }
 
 /// 编辑器默认字体 = 平台默认等宽字体（与终端默认一致）。
-fn default_editor_font_family() -> String {
+pub fn default_editor_font_family() -> String {
     default_terminal_font_family()
 }
 
-fn default_editor_font_size() -> f32 {
+pub fn default_editor_font_size() -> f32 {
     16.0
 }
 
@@ -109,34 +135,11 @@ fn get_system_monospace_font() -> &'static str {
     })
 }
 
-impl FontSettings {
-    pub fn load() -> Self {
-        let path = match Self::config_path() {
-            Some(p) => p,
-            None => return Self::default(),
-        };
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
-        serde_json::from_str(&content).unwrap_or_default()
-    }
-
-    pub fn save(&self) -> anyhow::Result<()> {
-        let path = Self::config_path().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)?;
-        Ok(())
-    }
-
-    fn config_path() -> Option<PathBuf> {
-        let config_dir = dirs::config_dir()?;
-        Some(config_dir.join("deepterm").join("font.json"))
-    }
-}
-
+/// 字体设置的只读快照。
+///
+/// 数据的唯一真源是 [`crate::settings::SettingsStore`]；本类型不再自己读写
+/// 磁盘，只作为「渲染路径便捷取用」的门面。这样字体的读写与其它设置走同一条
+/// 路径（热重载、差异写回、未知键保留都自动生效）。
 #[derive(Clone, Debug)]
 pub struct FontState {
     pub settings: FontSettings,
@@ -145,25 +148,53 @@ pub struct FontState {
 impl Global for FontState {}
 
 impl FontState {
+    /// 安装字体快照。
+    ///
+    /// 设置 store 缺席时退回内置默认值，而不是 panic：测试与独立渲染
+    /// 组件会只初始化本类型。这比旧行为更可复现——旧实现会去读开发者
+    /// 机器上的真实 `font.json`。
     pub fn init(cx: &mut App) {
-        let settings = FontSettings::load();
+        let settings = cx
+            .try_global::<SettingsStore>()
+            .map(|store| FontSettings::from_settings(store.content()))
+            .unwrap_or_default();
         cx.set_global(FontState { settings });
+    }
+
+    /// 从设置 store 刷新快照。`SettingsStore` 变化后由订阅方调用。
+    pub fn sync_from_settings(cx: &mut App) {
+        let settings = FontSettings::from_settings(cx.global::<SettingsStore>().content());
+        // 先比较再取可变引用：`global_mut` 会无条件通知观察者，
+        // 设置里改的是别的段落时不该惊动字体的订阅方。
+        if cx.global::<FontState>().settings == settings {
+            return;
+        }
+        cx.global_mut::<FontState>().settings = settings;
     }
 
     pub fn global(cx: &App) -> &Self {
         cx.global::<Self>()
     }
 
+    /// 修改字体设置：写回 `settings.json`，并同步本快照。
     pub fn update<F>(cx: &mut App, f: F)
     where
         F: FnOnce(&mut FontSettings),
     {
-        let state = cx.global_mut::<FontState>();
-        f(&mut state.settings);
-        if let Err(e) = state.settings.save() {
-            log::warn!("failed to save font settings: {e}");
+        if cx.try_global::<SettingsStore>().is_none() {
+            // 无 store 时只改快照，不落盘（测试路径）。
+            let state = cx.global_mut::<FontState>();
+            f(&mut state.settings);
+            cx.refresh_windows();
+            return;
         }
-        cx.refresh_windows();
+
+        SettingsStore::update_user(cx, |content| {
+            let mut font = FontSettings::from_settings(content);
+            f(&mut font);
+            content.font = font.into_content();
+        });
+        Self::sync_from_settings(cx);
     }
 }
 
