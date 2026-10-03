@@ -18,3 +18,6 @@ pub mod rename;
 pub mod symbols;
 pub mod syntax;
 pub use editor::*;
+
+#[cfg(test)]
+mod lsp_jump_tests;

@@ -1517,13 +1517,20 @@ impl Editor {
         Some((editor, client, uri))
     }
 
-    /// 跳转定义：跳到服务器给的第一个位置。
-    fn goto_definition(&mut self, _: &GotoDefinition, _window: &mut Window, cx: &mut Context<Self>) {
+    /// 跳转定义：跳到服务器给的第一个位置（**支持跨文件**）。
+    ///
+    /// 对照 Zed 的 `go_to_definition_of_kind`：它拿到 `Location` 后
+    /// `open_local_buffer_via_lsp` 打开目标文件再选中区间——从不因为
+    /// 「目标在别的文件」而放弃。
+    ///
+    /// 之前的实现只在目标 uri 与当前文件相同时才跳，跨文件时静默返回，
+    /// 于是「跳转不工作」——而这恰恰是最常见的场景（跳到其它模块的定义）。
+    fn goto_definition(&mut self, _: &GotoDefinition, window: &mut Window, cx: &mut Context<Self>) {
         let Some((editor, client, uri)) = self.lsp_context(cx) else {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
-        cx.spawn(async move |_this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let result = client.goto_definition(&uri, position).await;
             let Ok(Some(response)) = result else {
                 return;
@@ -1531,32 +1538,69 @@ impl Editor {
             let Some(location) = crate::lsp::features::first_location(&response) else {
                 return;
             };
-            cx.update_entity(&editor, |state, cx| {
-                crate::lsp::session::reveal_location(state, &location, cx);
-            });
+            this.update_in(cx, |this, window, cx| {
+                this.open_lsp_location(&location, window, cx);
+            })
+            .ok();
         })
         .detach();
     }
 
-    /// 查找引用：把结果列出来（首个结果直接跳转，其余写进日志）。
+    /// 打开一个 LSP `Location`：同文件直接选中，跨文件先开目标文件再跳。
     ///
-    /// 完整的引用面板需要一个新的列表 UI；首版先保证「能跳到第一个」，
-    /// 这与跳转定义共用同一条「位置 → 跳转」管线。
-    fn find_references(&mut self, _: &FindReferences, _window: &mut Window, cx: &mut Context<Self>) {
+    /// LSP 的位置是 (line, character)（UTF-16 列，0 基）；编辑器内部的
+    /// `jump_to_line_col` 收 1 基行号，所以这里 +1。
+    fn open_lsp_location(
+        &mut self,
+        location: &lsp_types::Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 目标就是当前文件：直接跳，避免多余的「打开」往返。
+        let same_file = self
+            .active_lsp_session()
+            .map(|s| s.uri() == &location.uri)
+            .unwrap_or(false);
+
+        match lsp_location_action(location, same_file) {
+            // 非 file:// uri（如 untitled:）：无法打开，保持不动作。
+            LspJumpAction::Ignore => {
+                log::debug!("lsp: cannot open non-file location {}", location.uri);
+            }
+            LspJumpAction::JumpInPlace { line, col } => {
+                if let Some(tab_id) = self.active_file_id.clone() {
+                    self.jump_to_line_col(&tab_id, line, Some(col), cx);
+                }
+            }
+            // 跨文件（或目标未打开）：打开并定位。
+            // `open_file_at_line_col_no_notify` 会处理「已打开就切过去并跳」
+            // 「正在加载则记 pending_jumps」两种情况。
+            LspJumpAction::OpenFile { path, line, col } => {
+                self.open_file_at_line_col_no_notify(path, Some(line), Some(col), window, cx);
+            }
+        }
+    }
+
+    /// 查找引用：跳到第一个结果（**支持跨文件**，与跳转定义同一管线）。
+    ///
+    /// 完整的引用列表面板需要新的 UI；这里先保证「能跳到第一个」，
+    /// 与 `goto_definition` 共用 [`Self::open_lsp_location`]。
+    fn find_references(&mut self, _: &FindReferences, window: &mut Window, cx: &mut Context<Self>) {
         let Some((editor, client, uri)) = self.lsp_context(cx) else {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
-        cx.spawn(async move |_this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             let Ok(locations) = client.references(&uri, position, true).await else {
                 return;
             };
             let Some(first) = locations.first().cloned() else {
                 return;
             };
-            cx.update_entity(&editor, |state, cx| {
-                crate::lsp::session::reveal_location(state, &first, cx);
-            });
+            this.update_in(cx, |this, window, cx| {
+                this.open_lsp_location(&first, window, cx);
+            })
+            .ok();
         })
         .detach();
     }
@@ -1914,6 +1958,43 @@ impl Editor {
                 panel.update(cx, |p, _| p.set_symbols(symbols));
             }
         }
+    }
+
+    /// 测试用：已打开文件的数量。
+    #[cfg(test)]
+    pub(crate) fn open_file_count(&self) -> usize {
+        self.open_files.len()
+    }
+
+    /// 测试用：某个路径是否已打开成标签。
+    #[cfg(test)]
+    pub(crate) fn has_open_path(&self, path: &std::path::Path) -> bool {
+        let want = path.to_string_lossy();
+        self.open_files.iter().any(|f| f.path == want)
+    }
+
+    /// 测试用：取某个已打开文件的光标位置（0 基行列）。
+    #[cfg(test)]
+    pub(crate) fn cursor_position_of_open_path(
+        &self,
+        path: &std::path::Path,
+        cx: &App,
+    ) -> Option<(usize, usize)> {
+        let want = path.to_string_lossy();
+        let file = self.open_files.iter().find(|f| f.path == want)?;
+        let pos = file.editor_state.read(cx).cursor_position();
+        Some((pos.line as usize, pos.character as usize))
+    }
+
+    /// 测试用：直接走 `open_lsp_location` 这条跳转路径。
+    #[cfg(test)]
+    pub(crate) fn open_lsp_location_for_test(
+        &mut self,
+        location: &lsp_types::Location,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_lsp_location(location, window, cx);
     }
 
     /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览/实时返回 None）。
@@ -3322,6 +3403,10 @@ impl Editor {
                         && this.active_file_id.as_deref() == Some(sync_tab_id.as_str())
                     {
                         let editor = this.open_files[idx].editor_state.clone();
+                        // 用与补全替换区间**同一个**字符分类器判定
+                        // （对照 Zed 的 `CharKind` / `completion_query`）：
+                        // 此前这里硬编码了 `'.'` 算词字符，而 Rust 里
+                        // `foo.` 的点是标点，导致「输入语法匹配不准确」。
                         let in_identifier = {
                             let state = editor.read(cx);
                             let cursor = state.cursor();
@@ -3329,7 +3414,12 @@ impl Editor {
                                 && state
                                     .text()
                                     .char_at(cursor.saturating_sub(1).min(state.text().len()))
-                                    .map(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                                    .map(|c| {
+                                        crate::lsp::features::char_kind(
+                                            c,
+                                            crate::lsp::features::DEFAULT_EXTRA_WORD_CHARS,
+                                        ) == crate::lsp::features::CharKind::Word
+                                    })
                                     .unwrap_or(false)
                         };
                         if in_identifier {
@@ -4979,6 +5069,47 @@ fn render_lsp_status_chip(
     }
 
     chip.child(label).into_any_element()
+}
+
+/// LSP 跳转该怎么做（纯决策，便于单测）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LspJumpAction {
+    /// 目标就是当前文件：原地跳。
+    JumpInPlace { line: u32, col: u32 },
+    /// 目标在别的文件（或尚未打开）：打开它并定位。
+    OpenFile {
+        path: PathBuf,
+        line: u32,
+        col: u32,
+    },
+    /// 无法处理（非 `file://` uri）。
+    Ignore,
+}
+
+/// 由 `Location` 与「是否当前文件」决定跳转动作。
+///
+/// 对照 Zed 的 `go_to_definition_of_kind`：它拿到 `Location` 后一律打开目标
+/// buffer 再选中区间，**不区分**同文件/跨文件。这里区分只是为了省一次
+/// 「打开」往返，语义等价。
+///
+/// 之所以抽成纯函数：跨文件跳转的失败模式（旧实现直接 return）在真实
+/// 绘制/文件系统环境里很难断言，而这个决策本身就是唯一的分支点。
+///
+/// 行号 +1：LSP 是 0 基，编辑器内部 `jump_to_line_col` 收 1 基。
+pub(crate) fn lsp_location_action(
+    location: &lsp_types::Location,
+    same_file: bool,
+) -> LspJumpAction {
+    let line = location.range.start.line + 1;
+    let col = location.range.start.character;
+
+    if same_file {
+        return LspJumpAction::JumpInPlace { line, col };
+    }
+    match crate::lsp::client::uri_to_path(&location.uri) {
+        Some(path) => LspJumpAction::OpenFile { path, line, col },
+        None => LspJumpAction::Ignore,
+    }
 }
 
 pub(crate) fn guess_language_from_extension(path: &Path) -> String {

@@ -409,29 +409,6 @@ pub fn cursor_lsp_position(state: &InputState) -> Position {
     offset_to_lsp_position(state, state.cursor())
 }
 
-/// 把编辑器视口移到某个 LSP 位置并选中它。
-///
-/// 跨文件的跳转（定义/引用）由调用方负责打开对应文件——这里只处理
-/// **同文件**内的定位；不同文件的 uri 会被忽略（不静默跳错位置）。
-pub fn reveal_location(state: &mut InputState, location: &lsp_types::Location, cx: &mut gpui::Context<InputState>) {
-    let current = crate::lsp::client::path_to_uri(&std::path::PathBuf::from(
-        state.lsp_file_path().unwrap_or_default(),
-    ));
-    if let Ok(current) = current
-        && current != location.uri
-    {
-        // 跨文件：首版不自动打开目标文件，交给调用方处理。
-        log::debug!("lsp: cross-file jump to {} not applied", location.uri);
-        return;
-    }
-    let offset = features::position_to_offset(state.text(), location.range.start);
-    let end = features::position_to_offset(state.text(), location.range.end);
-    // 选中定义所在的区间：跳转后能立刻看到「跳到哪了」。
-    state.selected_range = (offset..end.max(offset)).into();
-    state.reveal_offset(offset, cx);
-    cx.notify();
-}
-
 /// 应用一组 LSP `TextEdit`（格式化 / Code Action / 重命名）。
 ///
 /// 只处理**当前文件**的部分：重命名可能跨多个文件，其余文件由调用方决定。

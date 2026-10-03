@@ -357,15 +357,64 @@ pub fn completion_replace_range(
     word_range_before(rope, offset)
 }
 
-/// 光标前连续标识符字符的区间。
+/// 字符在「词」中的角色。对照 Zed 的 `language::CharKind`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharKind {
+    Whitespace,
+    Punctuation,
+    Word,
+}
+
+/// 判断字符是否属于标识符（Zed 的 `CharScopeContext`）。
 ///
-/// 覆盖 ASCII 标识符字符 + Unicode 字母数字；`-` 和 `.` 不算
-/// （否则 `foo.` 里的 `.` 会被吃掉，而多数语言的成员访问要保留点号）。
+/// 默认与 Zed 的 `kind_with` 完全一致：
+/// ```text
+/// c.is_alphanumeric() || c == '_'  -> Word
+/// c.is_whitespace()                -> Whitespace
+/// 其余                             -> Punctuation
+/// ```
+///
+/// `extra_word_chars` 对应 Zed 的 `scope.completion_query_characters()`：
+/// 某些语言把 `.`（import 路径 `foo.ts`）或 `-`（Tailwind `bg-yellow-100`）
+/// 也算词字符。**不能无条件把 `.` 当词字符**——在 Rust 里 `foo.` 的点是
+/// 标点，把它算进词会让补全替换区间多吞一个点。
+pub fn char_kind(c: char, extra_word_chars: &[char]) -> CharKind {
+    if c.is_alphanumeric() || c == '_' {
+        return CharKind::Word;
+    }
+    if extra_word_chars.contains(&c) {
+        return CharKind::Word;
+    }
+    if c.is_whitespace() {
+        return CharKind::Whitespace;
+    }
+    CharKind::Punctuation
+}
+
+/// 默认的补全查询字符集（无语言作用域信息时）。
+///
+/// 空集：只有字母数字与 `_` 算词字符。语言相关的额外字符由调用方通过
+/// [`char_kind`] 的 `extra_word_chars` 传入。
+pub const DEFAULT_EXTRA_WORD_CHARS: &[char] = &[];
+
+/// 光标前连续「词字符」的区间（Zed 的 `surrounding_word` 左半部分）。
+///
+/// 词字符的判定见 [`char_kind`]：字母数字与 `_`，外加调用方给的
+/// `extra_word_chars`（如 import 路径里的 `.`）。
 ///
 /// **必须走 `RopeExt` 的边界吸附原语**：`offset` 可能落在多字节字符内部
 /// （上游换算偏差、或 LSP 给的列号），而 `Rope::char` 在非字符边界上会
 /// panic。这里先把 offset 向左吸附，再**按字符下标**回退。
 pub fn word_range_before(rope: &Rope, offset: usize) -> Range<usize> {
+    word_range_before_with(rope, offset, DEFAULT_EXTRA_WORD_CHARS)
+}
+
+/// 带语言额外词字符的 [`word_range_before`]。
+pub fn word_range_before_with(
+    rope: &Rope,
+    offset: usize,
+    extra_word_chars: &[char],
+) -> Range<usize> {
     use crate::components::input::rope_ext::RopeExt as _;
 
     let end = offset.min(rope.len());
@@ -378,7 +427,7 @@ pub fn word_range_before(rope: &Rope, offset: usize) -> Range<usize> {
     while ci > 0 {
         let byte_off = rope.char_index_to_offset(ci - 1);
         let ch = rope.char(byte_off);
-        if ch.is_alphanumeric() || ch == '_' {
+        if char_kind(ch, extra_word_chars) == CharKind::Word {
             ci -= 1;
         } else {
             break;
@@ -1250,5 +1299,82 @@ mod tests {
         let byte_edits = to_byte_edits(&text, edits);
         let out = apply_byte_edits(&text.to_string(), &byte_edits);
         assert_eq!(out, "fn main() { new_name(); }\n");
+    }
+
+    // ------------------------------------------------ 字符分类（对照 Zed CharKind）
+
+    /// `.` 默认是**标点**，不是词字符。
+    ///
+    /// 回归：补全触发条件曾硬编码 `c == '.'` 算词字符，于是 Rust 里打完
+    /// `foo.` 也会触发补全、且替换区间多吞一个点——「输入语法匹配不准确」。
+    /// Zed 只在语言作用域声明了 `completion_query_characters` 时才把 `.`
+    /// 当词字符（如 import 路径 `foo.ts`）。
+    #[test]
+    fn dot_is_punctuation_by_default() {
+        assert_eq!(char_kind('.', DEFAULT_EXTRA_WORD_CHARS), CharKind::Punctuation);
+        // 显式声明后才是词字符（对应 import 路径场景）。
+        assert_eq!(char_kind('.', &['.']), CharKind::Word);
+    }
+
+    /// 字母、数字、下划线是词字符。
+    #[test]
+    fn alphanumeric_and_underscore_are_word_chars() {
+        for c in ['a', 'Z', '0', '9', '_', '中', 'é'] {
+            assert_eq!(
+                char_kind(c, DEFAULT_EXTRA_WORD_CHARS),
+                CharKind::Word,
+                "{c:?} should be a word char"
+            );
+        }
+    }
+
+    /// 空白与其它标点的分类。
+    #[test]
+    fn whitespace_and_punctuation_are_classified() {
+        for c in [' ', '\t', '\n'] {
+            assert_eq!(char_kind(c, DEFAULT_EXTRA_WORD_CHARS), CharKind::Whitespace);
+        }
+        for c in ['-', '(', ')', '{', '}', ':', ',', ';', '+', '"', '\''] {
+            assert_eq!(
+                char_kind(c, DEFAULT_EXTRA_WORD_CHARS),
+                CharKind::Punctuation,
+                "{c:?} should be punctuation"
+            );
+        }
+    }
+
+    /// `-` 在 Tailwind 场景（显式声明）下是词字符。
+    #[test]
+    fn hyphen_is_word_char_when_scope_declares_it() {
+        assert_eq!(char_kind('-', DEFAULT_EXTRA_WORD_CHARS), CharKind::Punctuation);
+        assert_eq!(char_kind('-', &['-']), CharKind::Word);
+    }
+
+    /// 替换区间：`foo.` 后不该把点吞进去（Rust 成员访问）。
+    #[test]
+    fn word_range_does_not_swallow_dot() {
+        let text = rope("foo.");
+        // 光标在末尾：`.` 是标点 → 替换区间为空（服务器会给 textEdit 指定范围）。
+        assert_eq!(word_range_before(&text, 4), 4..4);
+        // 光标在 `foo` 之后：取到 `foo`。
+        assert_eq!(word_range_before(&text, 3), 0..3);
+    }
+
+    /// 带额外词字符时，`.` 会被并入词（import 路径场景）。
+    #[test]
+    fn word_range_includes_dot_with_extra_chars() {
+        let text = rope("./foo.ts");
+        // 显式声明 `.` 为词字符：`foo.ts` 整体算一个词（前导 `/` 仍是标点，
+        // 因为路径分隔符不属于标识符）。
+        assert_eq!(word_range_before_with(&text, text.len(), &['.']), 2..8);
+        // 不声明 `.` 时只取 `ts`（点当标点）。
+        assert_eq!(word_range_before(&text, text.len()), 6..8);
+    }
+
+    /// 普通标识符照常取全。
+    #[test]
+    fn word_range_takes_whole_identifier() {
+        let text = rope("let value = 1;");
+        assert_eq!(word_range_before(&text, 9), 4..9);
     }
 }
