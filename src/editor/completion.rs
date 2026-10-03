@@ -238,20 +238,35 @@ impl CompletionState {
     }
 
     /// 应用选中的候选：替换区间并写入文本。
-    pub fn confirm(&mut self, editor: &Entity<InputState>, cx: &mut App) {
+    ///
+    /// 返回 `Some((item, range))` 表示**调用方需要先 resolve 再应用**：
+    /// LSP 允许服务器把 `additionalTextEdits`（自动导入的 `use` 语句）
+    /// 延到用户选中时才给（`resolveSupport`）。不 resolve 就拿不到那些编辑，
+    /// 表现为「自动导入不生效」。
+    ///
+    /// 之所以不在这里直接 spawn：本函数只有 `&mut App`，无法把 `cx` move 进
+    /// async 块；`Editor` 有 `Context<Editor>`，由它 spawn 更自然。
+    /// 本地已有 `additionalTextEdits` 时直接应用并返回 `None`（省一次往返）。
+    pub fn confirm(
+        &mut self,
+        editor: &Entity<InputState>,
+        client: Option<Arc<LspClient>>,
+        cx: &mut App,
+    ) -> Option<(lsp_types::CompletionItem, std::ops::Range<usize>)> {
         let Some(candidate) = self.selected().cloned() else {
             self.hide();
-            return;
+            return None;
         };
-        let insert = features::completion_insert_text(&candidate.item);
         let range = self.replace_range.clone();
-        editor.update(cx, |state, cx| {
-            if !state.apply_completion(range, &insert, cx) {
-                // 区间失效（文本被改短）：放弃本次补全，不写坏缓冲区。
-                log::debug!("lsp: stale completion range, discarding");
-            }
-        });
         self.hide();
+
+        let needs_resolve =
+            candidate.item.additional_text_edits.is_none() && client.is_some();
+        if !needs_resolve {
+            apply_completion_item(&candidate.item, editor, range, cx);
+            return None;
+        }
+        Some((candidate.item, range))
     }
 
     /// 当前 uri（用于校验结果来源）。
@@ -348,4 +363,23 @@ pub fn render_completion_rows(
     }
 
     Some(el.into_any_element())
+}
+
+/// 把一条补全候选写进缓冲区（含 `additionalTextEdits`）。
+///
+/// 抽成自由函数：`confirm` 的同步路径与 Editor 的 resolve 回调都要用它，
+/// 两处必须行为一致（尤其「先附加编辑、再插主文本」的顺序）。
+pub fn apply_completion_item(
+    item: &lsp_types::CompletionItem,
+    editor: &Entity<InputState>,
+    range: std::ops::Range<usize>,
+    cx: &mut App,
+) {
+    let insert = features::completion_insert_text(item);
+    let additional = item.additional_text_edits.clone().unwrap_or_default();
+    editor.update(cx, |state, cx| {
+        if !state.apply_completion_with_edits(range, &insert, &additional, cx) {
+            log::debug!("lsp: stale completion range, discarding");
+        }
+    });
 }

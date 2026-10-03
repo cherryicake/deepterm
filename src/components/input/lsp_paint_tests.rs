@@ -414,3 +414,125 @@ fn placement_direction_is_scroll_invariant(cx: &mut gpui::TestAppContext) {
          (anchor_y={a_bot}, popover_y={p_bot})"
     );
 }
+
+// ==================== 补全：additionalTextEdits（自动导入） ====================
+
+/// 接受候选时必须一并应用 `additionalTextEdits`（自动导入的 `use` 语句）。
+///
+/// 回归：此前只插主文本，`additionalTextEdits` 被完全忽略——接受 `HashMap`
+/// 得到的是「未导入」的错误，而不是可用的代码。
+#[gpui::test]
+fn completion_applies_additional_text_edits(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("fn main() {\n    let m = HashMap\n}\n", cx, |_s, _cx| {});
+
+    input.update(cx, |state, cx| {
+        // 光标在 `HashMap` 之后（行 1 偏移 18 = `    let m = HashMap` 末尾）。
+        let cursor = state.text().line_start_offset(1) + "    let m = HashMap".len();
+        state.selected_range = (cursor..cursor).into();
+
+        // 主插入：把 `HashMap` 换成 `HashMap::new()`；
+        // 附加编辑：在文件开头插入 `use std::collections::HashMap;\n`。
+        let additional = vec![lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 0),
+                lsp_types::Position::new(0, 0),
+            ),
+            new_text: "use std::collections::HashMap;\n".to_string(),
+        }];
+        let range = (cursor - "HashMap".len())..cursor;
+        let ok = state.apply_completion_with_edits(range, "HashMap::new()", &additional, cx);
+        assert!(ok, "completion should apply");
+
+        let text = state.text().to_string();
+        assert!(
+            text.starts_with("use std::collections::HashMap;\n"),
+            "the `use` line must be inserted at the top; got:\n{text}"
+        );
+        assert!(
+            text.contains("let m = HashMap::new()"),
+            "the main insert must land correctly after the shifted offset; got:\n{text}"
+        );
+    });
+}
+
+/// 附加编辑落在主插入**之后**时，主插入区间不应被平移。
+#[gpui::test]
+fn additional_edit_after_insert_does_not_shift_it(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("let x = foo\n\n\n\n", cx, |_s, _cx| {});
+
+    input.update(cx, |state, cx| {
+        let cursor = "let x = foo".len();
+        state.selected_range = (cursor..cursor).into();
+        let additional = vec![lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(3, 0),
+                lsp_types::Position::new(3, 0),
+            ),
+            new_text: "// trailing\n".to_string(),
+        }];
+        let range = 8..11; // `foo`
+        assert!(state.apply_completion_with_edits(range, "bar()", &additional, cx));
+
+        let text = state.text().to_string();
+        assert!(text.starts_with("let x = bar()"), "got:\n{text}");
+        assert!(text.contains("// trailing"), "got:\n{text}");
+    });
+}
+
+/// 越界的附加编辑**被钳制**而不是 panic，也不会写坏缓冲区。
+///
+/// `position_to_offset` 对越界行返回文本末尾（`clip_offset` 语义），
+/// 所以这类编辑退化成「在文件末尾插入」——安全但无意义。关键是：
+/// 不 panic、不越界、不破坏已有内容。
+#[gpui::test]
+fn out_of_range_additional_edit_is_clamped_not_fatal(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("ab\n", cx, |_s, _cx| {});
+
+    input.update(cx, |state, cx| {
+        state.selected_range = (2..2).into();
+        let additional = vec![lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(99, 0),
+                lsp_types::Position::new(99, 5),
+            ),
+            new_text: "junk".to_string(),
+        }];
+        let ok = state.apply_completion_with_edits(0..2, "XY", &additional, cx);
+        assert!(ok, "must not panic on an out-of-range additional edit");
+        // 原有内容仍然完整（`ab` 被 `XY` 替换，末尾追加了 junk）。
+        let text = state.text().to_string();
+        assert!(text.starts_with("XY"), "main insert applied; got {text:?}");
+        assert!(text.len() <= 16, "no runaway growth; got {text:?}");
+    });
+}
+
+/// 附加编辑区间落在字符中间（多字节字符内部）时安全跳过该编辑。
+#[gpui::test]
+fn additional_edit_on_non_char_boundary_is_safe(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("中文x\n", cx, |_s, _cx| {});
+    input.update(cx, |state, cx| {
+        state.selected_range = (0..0).into();
+        // 列 1 落在 `中` 的 UTF-16 中间 → 换算后被吸附，不应 panic。
+        let additional = vec![lsp_types::TextEdit {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 1),
+                lsp_types::Position::new(0, 2),
+            ),
+            new_text: "Y".to_string(),
+        }];
+        let _ = state.apply_completion_with_edits(0..0, "", &additional, cx);
+        // 只要不 panic 即通过；文本仍应是合法 UTF-8。
+        let _ = state.text().to_string();
+    });
+}
+
+/// 没有附加编辑时行为与普通插入一致（不能因为新路径引入回归）。
+#[gpui::test]
+fn completion_without_additional_edits_still_works(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("let v = fo\n", cx, |_s, _cx| {});
+    input.update(cx, |state, cx| {
+        state.selected_range = (10..10).into();
+        assert!(state.apply_completion_with_edits(8..10, "foo", &[], cx));
+        assert_eq!(state.text().to_string(), "let v = foo\n");
+    });
+}

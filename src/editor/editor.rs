@@ -58,6 +58,8 @@ actions!(
         GotoTypeDefinition,
         /// 跳转实现（cmd-F12）：trait → 实现类型。
         GotoImplementation,
+        /// 返回上一个跳转位置（ctrl--）。
+        NavigateBack,
         /// 查找引用（shift-F12）。
         FindReferences,
         /// 重命名符号（F2）。
@@ -119,6 +121,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
         KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
         KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
+        // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
+        KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
         KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
         KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
         KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
@@ -402,6 +406,12 @@ pub struct Editor {
     rename_panel: Option<Entity<rename::RenamePanel>>,
     /// LSP 文档符号面板（cmd-shift-o）。
     symbols_panel: Option<Entity<symbols::SymbolsPanel>>,
+    /// 跳转历史栈：每次跳转前压入「从哪来」，`NavigateBack` 弹栈回去。
+    ///
+    /// 对照 Zed：它在 workspace pane 上维护 `ItemNavHistory`。这里放在
+    /// Editor 上，粒度是「编辑器内的位置」——足够覆盖「跳到定义后返回」，
+    /// 不必引入 workspace 层的历史模型。
+    nav_history: Vec<NavLocation>,
     /// 上次请求文档高亮时的光标位置（避免重复请求）。
     last_highlight_cursor: Option<usize>,
     /// 上次请求 Inlay Hint 的可见区间（避免重复请求）。
@@ -518,6 +528,7 @@ impl Editor {
             completion: completion::CompletionState::new(),
             rename_panel: None,
             symbols_panel: None,
+            nav_history: Vec::new(),
             last_highlight_cursor: None,
             last_inlay_range: None,
             last_signature_cursor: None,
@@ -991,6 +1002,36 @@ impl Editor {
     fn handle_fs_event(&mut self, event: &FsChangeEvent, cx: &mut Context<Self>) {
         if !matches!(event.kind, FsChangeKind::Modify | FsChangeKind::Create) {
             return;
+        }
+
+        // 通知语言服务器「这个文件在磁盘上变了」。
+        //
+        // 编辑器之外的工具（`cargo add`、`git checkout`、另一个编辑器）改动
+        // 文件时服务器不会自动知道，它的分析会基于过期内容。对照 Zed：它订阅
+        // 文件系统事件后发 `workspace/didChangeWatchedFiles`。
+        //
+        // 只对**本地**文件发（远程文件的路径在服务器看来不存在）。
+        if event.is_from_backend(None)
+            && let Some(path) = crate::lsp::client::path_to_uri(&event.path).ok()
+            && let Some(session) = self.active_lsp_session()
+            && let Some(client) = session.client().cloned()
+        {
+            let change_type = match event.kind {
+                FsChangeKind::Create => lsp_types::FileChangeType::CREATED,
+                FsChangeKind::Modify => lsp_types::FileChangeType::CHANGED,
+                FsChangeKind::Remove => lsp_types::FileChangeType::DELETED,
+                _ => lsp_types::FileChangeType::CHANGED,
+            };
+            let changes = vec![lsp_types::FileEvent {
+                uri: path,
+                typ: change_type,
+            }];
+            smol::spawn(async move {
+                if let Err(e) = client.did_change_watched_files(changes).await {
+                    log::debug!("lsp: didChangeWatchedFiles failed: {e}");
+                }
+            })
+            .detach();
         }
 
         for file in &mut self.open_files {
@@ -1573,6 +1614,8 @@ impl Editor {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
+        // 跳转前记录「从哪来」，供 `ctrl--` 返回。
+        self.push_nav_history(cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = match kind {
                 LspGotoKind::Definition => client.goto_definition(&uri, position).await,
@@ -1598,6 +1641,76 @@ impl Editor {
     ///
     /// LSP 的位置是 (line, character)（UTF-16 列，0 基）；编辑器内部的
     /// `jump_to_line_col` 收 1 基行号，所以这里 +1。
+    /// 压入一条跳转历史（跳转**前**调用）。
+    ///
+    /// 记录当前文件与光标偏移，供 [`Self::navigate_back`] 返回。
+    fn push_nav_history(&mut self, cx: &App) {
+        let Some(tab_id) = self.active_file_id.as_ref() else {
+            return;
+        };
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        let offset = editor.read(cx).cursor();
+        let entry = NavLocation {
+            tab_id: tab_id.to_string(),
+            offset,
+        };
+        // 连续在同一点跳转不重复压栈（避免历史里一堆相同项）。
+        if self.nav_history.last() == Some(&entry) {
+            return;
+        }
+        self.nav_history.push(entry);
+        if self.nav_history.len() > NAV_HISTORY_LIMIT {
+            self.nav_history.remove(0);
+        }
+    }
+
+    /// 返回上一个跳转位置（`ctrl--`）。
+    ///
+    /// 对照 Zed 的 `navigate_backward`：弹出栈顶并跳回去。栈空时什么都不做
+    /// （不报错——用户连按几次到底了是正常操作）。
+    fn navigate_back(&mut self, _: &NavigateBack, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.nav_history.pop() else {
+            log::debug!("lsp: navigation history is empty");
+            return;
+        };
+        // 目标标签可能已被关闭：继续往回找，直到找到一个还存在的。
+        let mut target = target;
+        loop {
+            let exists = self
+                .open_files
+                .iter()
+                .any(|f| f.id.as_ref() == target.tab_id);
+            if exists {
+                break;
+            }
+            match self.nav_history.pop() {
+                Some(next) => target = next,
+                None => return,
+            }
+        }
+
+        // 切到那个标签并把光标放回原偏移。
+        let tab_id = target.tab_id.clone();
+        self.switch_to_file(&tab_id, cx);
+        let editor = self
+            .open_files
+            .iter()
+            .find(|f| f.id.as_ref() == tab_id)
+            .map(|f| f.editor_state.clone());
+        if let Some(editor) = editor {
+            editor.update(cx, |state, cx| {
+                let offset = target.offset.min(state.text().len());
+                state.selected_range = (offset..offset).into();
+                state.reveal_offset(offset, cx);
+                cx.notify();
+            });
+        }
+        let _ = window;
+        cx.notify();
+    }
+
     fn open_lsp_location(
         &mut self,
         location: &lsp_types::Location,
@@ -1638,6 +1751,7 @@ impl Editor {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
+        self.push_nav_history(cx);
         cx.spawn_in(window, async move |this, cx| {
             let Ok(locations) = client.references(&uri, position, true).await else {
                 return;
@@ -1752,7 +1866,29 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
-        self.completion.confirm(&editor, cx);
+        let client = self.active_lsp_client(cx);
+        // 需要 `completionItem/resolve` 时，在这里 spawn：只有
+        // `Context<Editor>` 能把 `cx` 带进 async 块。
+        let pending = self.completion.confirm(&editor, client.clone(), cx);
+        if let (Some((item, range)), Some(client)) = (pending, client) {
+            cx.spawn(async move |_this, cx| {
+                let resolved = client.resolve_completion(item.clone()).await;
+                let item = match resolved {
+                    Ok(item) => item,
+                    // resolve 失败不该阻止补全本身：用原候选照常插入。
+                    Err(e) => {
+                        log::debug!("lsp: completionItem/resolve failed, using raw item: {e}");
+                        item
+                    }
+                };
+                // `apply_completion_item` 需要 `&mut App`；`AsyncApp`
+                // 通过 `update` 提供。
+                cx.update(|cx| {
+                    crate::editor::completion::apply_completion_item(&item, &editor, range, cx);
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -4902,6 +5038,9 @@ impl Render for Editor {
                 .on_action(cx.listener(|this, _: &GotoImplementation, window, cx| {
                     this.goto_implementation(&GotoImplementation, window, cx);
                 }))
+                .on_action(cx.listener(|this, _: &NavigateBack, window, cx| {
+                    this.navigate_back(&NavigateBack, window, cx);
+                }))
                 .on_action(cx.listener(|this, _: &FindReferences, window, cx| {
                     this.find_references(&FindReferences, window, cx);
                 }))
@@ -5314,6 +5453,21 @@ pub(crate) fn is_rename_rejection(err: &anyhow::Error) -> bool {
         || msg.contains("InvalidParams")
         || msg.contains("-32602")
 }
+
+/// 跳转历史里的一项：从哪个文件的哪个偏移跳出去的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NavLocation {
+    /// 标签 id（`EditorFile::id`）。
+    pub tab_id: String,
+    /// 跳转发生时的光标字节偏移。
+    pub offset: usize,
+}
+
+/// 跳转历史的容量上限。
+///
+/// 不设上限的话长时间使用会无限增长（每次跳转都压栈）。100 条足够覆盖
+/// 任何真实的「往回翻」需求，与多数编辑器的默认值同量级。
+pub(crate) const NAV_HISTORY_LIMIT: usize = 100;
 
 /// 跳转种类（四个动作只有请求方法不同）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

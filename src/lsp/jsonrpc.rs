@@ -294,6 +294,12 @@ pub struct Connection {
     /// 读循环是否已经退出（进程关闭/崩溃）。置位后所有请求立即失败，
     /// 不必等到超时。
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// 服务器通过 `client/registerCapability` 动态注册的方法名集合。
+    ///
+    /// 某些能力（尤其 `workspace/didChangeWatchedFiles`）不在静态
+    /// `InitializeResult.capabilities` 里，而是启动后由服务器动态注册。
+    /// 不记录就无法判断「该不该发这个通知」。
+    registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl Connection {
@@ -329,6 +335,7 @@ impl Connection {
             notifications: notify_rx,
             child: Arc::new(Mutex::new(Some(child))),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registered_methods: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
 
         // 读循环：独立于任何请求，寿命与连接相同。
@@ -336,9 +343,16 @@ impl Connection {
         let closed2 = conn.closed.clone();
         let notify_tx2 = notify_tx.clone();
         let stdin2 = Arc::clone(&conn.stdin);
+        let registered2 = Arc::clone(&conn.registered_methods);
         smol::spawn(async move {
-            let result =
-                read_loop(stdout, stdin2, pending2, (notify_tx2, notify_rx_loop)).await;
+            let result = read_loop(
+                stdout,
+                stdin2,
+                pending2,
+                (notify_tx2, notify_rx_loop),
+                registered2,
+            )
+            .await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -367,6 +381,11 @@ impl Connection {
     /// 仍在等待应答的请求数（测试用来确认超时后没有泄漏）。
     pub fn pending_len(&self) -> usize {
         self.pending.lock().len()
+    }
+
+    /// 服务器是否动态注册过某个方法（`client/registerCapability`）。
+    pub fn is_registered(&self, method: &str) -> bool {
+        self.registered_methods.lock().contains(method)
     }
 
     /// 发送一个请求并等待应答。
@@ -573,6 +592,7 @@ impl Connection {
             notifications: self.notifications.clone(),
             child: Arc::clone(&self.child),
             closed: Arc::clone(&self.closed),
+            registered_methods: Arc::clone(&self.registered_methods),
         }
     }
 }
@@ -591,6 +611,7 @@ async fn read_loop(
     stdin: Arc<AsyncMutex<ChildStdin>>,
     pending: Pending,
     notify: (Sender<Message>, Receiver<Message>),
+    registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -600,6 +621,11 @@ async fn read_loop(
         // 一次 read 拿到多条消息时避免反复进 read 系统调用。
         while let Some((msg, consumed)) = parse_frame(&buf)? {
             buf.drain(..consumed);
+            // 记录/清除服务器动态注册的能力（在应答之前处理，保证
+            // 「注册成功」与「我们记住了」是同一时刻）。
+            if let Message::Request { method, params, .. } = &msg {
+                record_dynamic_registration(&registered_methods, method, params);
+            }
             if let Some((id, reply)) = dispatch(msg, &pending, &notify) {
                 // 就地应答服务器的主动请求：不应答它就会一直等。
                 let payload = match &reply {
@@ -687,6 +713,35 @@ fn server_request_reply(method: &str) -> ServerRequestReply {
         "workspace/applyEdit" => ServerRequestReply::Unimplemented,
         // 其余（自定义请求等）：回 null，让服务器继续。
         _ => ServerRequestReply::Value(Value::Null),
+    }
+}
+
+/// 记录 `client/registerCapability` / `unregisterCapability` 的注册项。
+///
+/// `params.registrations[].method` 是要注册的方法名（如
+/// `workspace/didChangeWatchedFiles`）。只有注册过的方法才应该发通知。
+fn record_dynamic_registration(
+    set: &Mutex<std::collections::HashSet<String>>,
+    request_method: &str,
+    params: &Value,
+) {
+    let Some(items) = params.get("registrations").and_then(|r| r.as_array()) else {
+        return;
+    };
+    let mut guard = set.lock();
+    for item in items {
+        let Some(method) = item.get("method").and_then(|m| m.as_str()) else {
+            continue;
+        };
+        match request_method {
+            "client/registerCapability" => {
+                guard.insert(method.to_string());
+            }
+            "client/unregisterCapability" => {
+                guard.remove(method);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1112,5 +1167,61 @@ mod tests {
         assert_eq!(v["method"], "shutdown");
         // `skip_serializing_if` 生效：多数服务器对显式 null 参数更挑剔。
         assert!(v.get("params").is_none());
+    }
+
+    // ------------------------------------------------ 动态能力注册
+
+    /// 记录 `client/registerCapability` 里声明的方法名。
+    ///
+    /// 回归：某些能力（如 `workspace/didChangeWatchedFiles`）不在静态
+    /// `InitializeResult.capabilities` 里，而是启动后动态注册。不记录就
+    /// 无法判断该不该发通知。
+    #[test]
+    fn records_dynamically_registered_methods() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let params = serde_json::json!({
+            "registrations": [
+                { "id": "r1", "method": "workspace/didChangeWatchedFiles" },
+                { "id": "r2", "method": "workspace/didChangeConfiguration" },
+            ]
+        });
+        record_dynamic_registration(&set, "client/registerCapability", &params);
+
+        assert!(set.lock().contains("workspace/didChangeWatchedFiles"));
+        assert!(set.lock().contains("workspace/didChangeConfiguration"));
+        assert!(!set.lock().contains("workspace/symbol"));
+    }
+
+    /// `client/unregisterCapability` 要移除对应的方法名。
+    #[test]
+    fn unregister_removes_the_method() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let reg = serde_json::json!({
+            "registrations": [{ "id": "r1", "method": "workspace/didChangeWatchedFiles" }]
+        });
+        record_dynamic_registration(&set, "client/registerCapability", &reg);
+        assert!(set.lock().contains("workspace/didChangeWatchedFiles"));
+
+        record_dynamic_registration(&set, "client/unregisterCapability", &reg);
+        assert!(
+            !set.lock().contains("workspace/didChangeWatchedFiles"),
+            "unregister must remove the method"
+        );
+    }
+
+    /// 形态不对的 params（缺 registrations / 元素缺 method）不能 panic。
+    #[test]
+    fn malformed_registrations_are_ignored() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "registrations": [] }),
+            serde_json::json!({ "registrations": [{}] }),
+            serde_json::json!({ "registrations": [{ "method": 42 }] }),
+            serde_json::json!("not an object"),
+        ] {
+            record_dynamic_registration(&set, "client/registerCapability", &params);
+        }
+        assert!(set.lock().is_empty(), "malformed input must not register anything");
     }
 }

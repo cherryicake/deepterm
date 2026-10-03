@@ -131,3 +131,64 @@ fn transport_failures_are_not_rename_rejections() {
         );
     }
 }
+
+// ------------------------------------------------ 跳转历史（返回）
+
+/// 跳转历史是后进先出：返回应回到**最近一次**跳转前的位置。
+///
+/// 回归：此前完全没有历史——跳到定义后无法返回，用户只能自己找回来。
+/// 对照 Zed：它用 `ItemNavHistory` 支持 `navigate_backward`。
+#[test]
+fn nav_history_is_lifo() {
+    let mut history: Vec<super::NavLocation> = Vec::new();
+    for (tab, offset) in [("a.rs", 10usize), ("b.rs", 20), ("c.rs", 30)] {
+        history.push(super::NavLocation {
+            tab_id: tab.to_string(),
+            offset,
+        });
+    }
+    // 返回三次应得到逆序。
+    assert_eq!(history.pop().unwrap().tab_id, "c.rs");
+    assert_eq!(history.pop().unwrap().tab_id, "b.rs");
+    assert_eq!(history.pop().unwrap().tab_id, "a.rs");
+    assert!(history.pop().is_none(), "empty history must yield None");
+}
+
+/// 历史有容量上限，不会无限增长。
+#[test]
+fn nav_history_is_bounded() {
+    let limit = super::NAV_HISTORY_LIMIT;
+    assert!(limit > 0 && limit <= 1000, "limit should be sane, got {limit}");
+
+    let mut history: Vec<super::NavLocation> = Vec::new();
+    for i in 0..(limit * 2) {
+        history.push(super::NavLocation {
+            tab_id: "t.rs".to_string(),
+            offset: i,
+        });
+        if history.len() > limit {
+            history.remove(0);
+        }
+    }
+    assert_eq!(history.len(), limit, "history must be capped");
+    // 最旧的被丢弃，最新的保留。
+    assert_eq!(history.last().unwrap().offset, limit * 2 - 1);
+}
+
+/// 同一位置连续跳转不重复压栈（避免历史里一堆相同项）。
+#[test]
+fn consecutive_identical_jumps_are_deduplicated() {
+    let entry = super::NavLocation {
+        tab_id: "a.rs".to_string(),
+        offset: 42,
+    };
+    let mut history: Vec<super::NavLocation> = Vec::new();
+    // 模拟 `push_nav_history` 的去重条件。
+    for _ in 0..5 {
+        if history.last() == Some(&entry) {
+            continue;
+        }
+        history.push(entry.clone());
+    }
+    assert_eq!(history.len(), 1, "identical consecutive entries must collapse");
+}

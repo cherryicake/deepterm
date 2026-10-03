@@ -1368,6 +1368,55 @@ impl InputState {
         range
     }
 
+    /// 应用一条补全：主插入 + `additionalTextEdits`（如自动导入）。
+    ///
+    /// LSP 的 `CompletionItem.additionalTextEdits` 是**接受该候选时必须一并
+    /// 应用**的编辑——rust-analyzer 用它插入 `use` 语句（自动导入）。
+    /// 不处理的话，接受 `HashMap` 会得到「未导入」的错误而不是可用的代码。
+    ///
+    /// 顺序很重要：**先应用附加编辑，再插入主文本**。附加编辑的 range 是
+    /// 基于「插入前」的文档坐标（通常落在文件顶部），若先插入主文本，顶部
+    /// 之后的偏移会整体平移，附加编辑就会打到错误位置。
+    ///
+    /// 返回 false 表示主插入的区间失效（文本被并发改短），调用方应放弃本次
+    /// 补全——此时附加编辑也不该生效。
+    pub fn apply_completion_with_edits(
+        &mut self,
+        range: std::ops::Range<usize>,
+        new_text: &str,
+        additional: &[lsp_types::TextEdit],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // 先把附加编辑换算成字节区间（基于当前文本），并从后往前排序。
+        let additional_bytes = crate::lsp::features::to_byte_edits(self.text(), additional.to_vec());
+
+        // 逐条应用（已按起点降序）。任一区间失效就整体放弃，避免留下
+        // 「导入加了但名字没插」的半成品。
+        for edit in &additional_bytes {
+            if !self.apply_completion(edit.range.clone(), &edit.new_text, cx) {
+                log::debug!("lsp: stale additionalTextEdit range, aborting completion");
+                return false;
+            }
+        }
+
+        // 主插入的区间是基于**原始**文档算的；附加编辑若落在它之前，
+        // 偏移会平移。按平移量修正后再插入。
+        let shift: i64 = additional_bytes
+            .iter()
+            .filter(|e| e.range.start <= range.start)
+            .map(|e| e.new_text.len() as i64 - (e.range.end - e.range.start) as i64)
+            .sum();
+        let shifted = if shift == 0 {
+            range
+        } else {
+            let start = (range.start as i64 + shift).max(0) as usize;
+            let end = (range.end as i64 + shift).max(0) as usize;
+            start..end
+        };
+
+        self.apply_completion(shifted, new_text, cx)
+    }
+
     /// 记下的补全替换区间。
     pub fn pending_completion_range(&self) -> std::ops::Range<usize> {
         self.pending_completion_range.clone()

@@ -205,6 +205,36 @@ impl LspClient {
         self.conn.notify("textDocument/didSave", Some(&value)).await
     }
 
+    /// `workspace/didChangeWatchedFiles`：告知服务器「这些文件在磁盘上变了」。
+    ///
+    /// 编辑器之外的工具（`cargo add`、`git checkout`、另一个编辑器）改动文件时，
+    /// 服务器不会自动知道——它的分析结果会基于过期内容。通知之后服务器会重新
+    /// 读取并更新诊断。
+    ///
+    /// 对照 Zed 的 `lsp_store.rs`：它订阅文件系统事件后调用
+    /// `language_server.notify::<DidChangeWatchedFiles>`。
+    pub async fn did_change_watched_files(
+        &self,
+        changes: Vec<lsp_types::FileEvent>,
+    ) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        // **不按注册状态过滤**：对照 Zed 的 `lsp_store.rs:10849`，它在
+        // `!changes.is_empty()` 时就发，不检查服务器是否动态注册过该能力。
+        //
+        // 实测 rust-analyzer 根本不发 `client/registerCapability`（探针确认
+        // 注册集合为空），却仍然依赖这个通知来感知外部改动。按注册状态过滤
+        // 会把功能整个关掉。
+        //
+        // 服务器没声明支持时忽略未知通知是它的自由；我们只保证「该发的发出去」。
+        let params = lsp_types::DidChangeWatchedFilesParams { changes };
+        let value = serde_json::to_value(&params)?;
+        self.conn
+            .notify("workspace/didChangeWatchedFiles", Some(&value))
+            .await
+    }
+
     /// `textDocument/didClose`。
     pub async fn did_close(&self, uri: &Url) -> Result<()> {
         let params = lsp_types::DidCloseTextDocumentParams {
@@ -606,6 +636,11 @@ impl LspClient {
             return Ok(action);
         }
         Ok(serde_json::from_value(result).unwrap_or(action))
+    }
+
+    /// 服务器是否动态注册过某个方法（`client/registerCapability`）。
+    pub fn is_registered(&self, method: &str) -> bool {
+        self.conn.is_registered(method)
     }
 
     /// 服务器是否声明 `codeActionProvider.resolveProvider`。
