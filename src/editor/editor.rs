@@ -13,11 +13,16 @@ use gpui::{
 use crate::assets::Icon;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::notification::NotificationKind;
+use crate::editor::completion;
 use crate::editor::encoding::{self, FileEncoding};
 use crate::editor::git_marks::compute_git_diff_summary;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::goto_line;
+use crate::editor::hover;
+use crate::editor::rename;
+use crate::editor::symbols;
 use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
+use crate::components::input::RopeExt as _;
 use crate::editor::syntax::languages::Language;
 use crate::assets::file_icon_or_default;
 use crate::file_manager::filesystem::RemoteFileSystem;
@@ -41,7 +46,30 @@ const EDITOR_OPEN_ANIMATION_MS: u64 = 120;
 
 actions!(
     editor_panel,
-    [CloseActiveEditorTab, SaveActiveEditorTab, GotoLine]
+    [
+        CloseActiveEditorTab,
+        SaveActiveEditorTab,
+        GotoLine,
+        /// 跳转定义（F12）。
+        GotoDefinition,
+        /// 查找引用（shift-F12）。
+        FindReferences,
+        /// 重命名符号（F2）。
+        RenameSymbol,
+        /// 格式化文档（alt-shift-f）。
+        FormatDocument,
+        /// 手动触发补全（ctrl-space）。
+        TriggerCompletion,
+        /// 补全菜单：上下移动 / 确认 / 取消。
+        CompletionNext,
+        CompletionPrev,
+        CompletionConfirm,
+        CompletionCancel,
+        /// 文档符号大纲（cmd-shift-o）。
+        DocumentSymbols,
+        /// 应用首选 Code Action（快速修复，cmd-.）。
+        CodeAction
+    ]
 );
 actions!(
     editor_tab_context_menu,
@@ -77,6 +105,23 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
         KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
         KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
+        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+        // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
+        KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
+        KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
+        KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
+        KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
+        KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
+        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
+        KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
+        // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
+        // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
+        KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
+        KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
+        KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
+        KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
         KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
         KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
         KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
@@ -128,6 +173,11 @@ struct EditorFile {
     /// diff tab 的仓库（含 root + local/remote 后端）：`path` 存的是仓库相对路径，
     /// 切标签页组后重建 `DiffView` 需要它（后台重新 `diff_file_contents`）。
     diff_repo: Option<crate::editor::git_repository::GitRepository>,
+    /// LSP 会话。**仅本地文件**有值：语言服务器跑在本地，远程文件的路径
+    /// 在服务器看来不存在，语义上不成立。
+    ///
+    /// `None` 也可能是「该语言没有服务器」——失败一律降级为普通编辑器。
+    lsp: Option<crate::lsp::session::LspSession>,
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -335,7 +385,65 @@ pub struct Editor {
     language_menu: Option<Entity<crate::components::menu::PopupMenu>>,
     _language_menu_subscription: Option<Subscription>,
     language_menu_position: gpui::Point<Pixels>,
+    /// LSP 悬浮提示浮层状态。
+    hover: hover::HoverState,
+    /// LSP 补全菜单状态。
+    completion: completion::CompletionState,
+    /// LSP 重命名输入面板（F2）。
+    rename_panel: Option<Entity<rename::RenamePanel>>,
+    /// LSP 文档符号面板（cmd-shift-o）。
+    symbols_panel: Option<Entity<symbols::SymbolsPanel>>,
+    /// 上次请求文档高亮时的光标位置（避免重复请求）。
+    last_highlight_cursor: Option<usize>,
+    /// 上次请求 Inlay Hint 的可见区间（避免重复请求）。
+    last_inlay_range: Option<lsp_types::Range>,
+    /// 上次请求签名帮助时的光标位置（避免重复请求）。
+    last_signature_cursor: Option<usize>,
     next_load_generation: u64,
+}
+
+/// 光标是否处于「参数列表内」——即前面有未闭合的 `(`。
+///
+/// 只做括号配平的粗判：不解析字符串/注释里的括号。签名帮助是提示性的，
+/// 偶尔多弹一次比引入一套词法分析划算。
+///
+/// **索引换算一律走 `RopeExt` 的既有原语**（`clip_offset` / `offset_to_char_index`
+/// / `char_index_to_offset`）：它们做过边界吸附且有测试覆盖。手写
+/// `offset - 1` 或直接把字节偏移喂给 `Rope::char` 会落在多字节字符内部而
+/// panic——本项目大量中文注释，一撞就必现崩溃。
+///
+/// 回溯限长：签名帮助只关心最近的参数列表，不必扫到文件开头（大文件上
+/// 每次渲染都全量回溯会拖慢输入）。
+fn signature_trigger_for(text: &ropey::Rope, cursor: usize) -> bool {
+    use crate::components::input::rope_ext::RopeExt as _;
+
+    const MAX_SCAN_CHARS: usize = 4096;
+    if text.len() == 0 {
+        return false;
+    }
+    // 先吸附到字符边界（向左），越界偏移会被钳制。
+    let upto = text.clip_offset(cursor.min(text.len()), sum_tree::Bias::Left);
+    if upto == 0 {
+        return false;
+    }
+    let mut ci = text.offset_to_char_index(upto);
+    let floor = ci.saturating_sub(MAX_SCAN_CHARS);
+    let mut depth = 0i32;
+    while ci > floor {
+        let byte_off = text.char_index_to_offset(ci - 1);
+        match text.char(byte_off) {
+            ')' => depth += 1,
+            '(' => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        ci -= 1;
+    }
+    false
 }
 
 impl Editor {
@@ -397,6 +505,13 @@ impl Editor {
             language_menu: None,
             _language_menu_subscription: None,
             language_menu_position: gpui::point(px(0.0), px(0.0)),
+            hover: hover::HoverState::new(),
+            completion: completion::CompletionState::new(),
+            rename_panel: None,
+            symbols_panel: None,
+            last_highlight_cursor: None,
+            last_inlay_range: None,
+            last_signature_cursor: None,
             next_load_generation: 0,
         };
 
@@ -816,6 +931,7 @@ impl Editor {
             image: None,
             diff: None,
             diff_repo: None,
+            lsp: None,
         };
 
         // 只读文件：恢复后同样置为禁用，避免可编辑后保存才报错。
@@ -1358,6 +1474,448 @@ impl Editor {
         cx.notify();
     }
 
+    /// 重命名：光标处符号改名，应用服务器返回的 `WorkspaceEdit`。
+    ///
+    /// `Editor` 里有会话（uri + client），而命名面板只有编辑器实体，
+    /// 所以由面板回调到这里发起请求。
+    pub(crate) fn apply_rename(
+        &mut self,
+        editor: &Entity<InputState>,
+        position: lsp_types::Position,
+        new_name: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((client, uri)) = self
+            .active_lsp_session()
+            .map(|s| s.uri().clone())
+            .and_then(|uri| self.active_lsp_client(cx).map(|c| (c, uri)))
+        else {
+            return;
+        };
+        let editor = editor.clone();
+        cx.spawn(async move |_this, cx| {
+            let Ok(Some(edit)) = client.rename(&uri, position, &new_name).await else {
+                return;
+            };
+            let Some(edits) = crate::lsp::features::edits_for_uri(&edit, &uri) else {
+                // 跨文件重命名：只处理了当前文件的部分（可能是 0 条）。
+                log::info!("lsp: rename touched other files, applying current file only");
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                crate::lsp::session::apply_text_edits(state, edits, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// LSP 请求的三件套：编辑器实体、客户端、文件 URI。缺任一即无 LSP。
+    fn lsp_context(&self, cx: &App) -> Option<(Entity<InputState>, std::sync::Arc<crate::lsp::client::LspClient>, lsp_types::Url)> {
+        let editor = self.active_text_editor(cx)?;
+        let uri = self.active_lsp_session()?.uri().clone();
+        let client = self.active_lsp_client(cx)?;
+        Some((editor, client, uri))
+    }
+
+    /// 跳转定义：跳到服务器给的第一个位置。
+    fn goto_definition(&mut self, _: &GotoDefinition, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((editor, client, uri)) = self.lsp_context(cx) else {
+            return;
+        };
+        let position = editor.read(cx).lsp_cursor_position();
+        cx.spawn(async move |_this, cx| {
+            let result = client.goto_definition(&uri, position).await;
+            let Ok(Some(response)) = result else {
+                return;
+            };
+            let Some(location) = crate::lsp::features::first_location(&response) else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                crate::lsp::session::reveal_location(state, &location, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 查找引用：把结果列出来（首个结果直接跳转，其余写进日志）。
+    ///
+    /// 完整的引用面板需要一个新的列表 UI；首版先保证「能跳到第一个」，
+    /// 这与跳转定义共用同一条「位置 → 跳转」管线。
+    fn find_references(&mut self, _: &FindReferences, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((editor, client, uri)) = self.lsp_context(cx) else {
+            return;
+        };
+        let position = editor.read(cx).lsp_cursor_position();
+        cx.spawn(async move |_this, cx| {
+            let Ok(locations) = client.references(&uri, position, true).await else {
+                return;
+            };
+            let Some(first) = locations.first().cloned() else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                crate::lsp::session::reveal_location(state, &first, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 格式化文档：应用服务器返回的 `TextEdit[]`。
+    fn format_document(&mut self, _: &FormatDocument, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((editor, client, uri)) = self.lsp_context(cx) else {
+            return;
+        };
+        let tab_size = editor.read(cx).tab_size;
+        cx.spawn(async move |_this, cx| {
+            let Ok(edits) = client
+                .formatting(
+                    &uri,
+                    tab_size.tab_size as u32,
+                    !tab_size.hard_tabs,
+                )
+                .await
+            else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                crate::lsp::session::apply_text_edits(state, edits, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 手动触发补全。
+    fn trigger_completion(&mut self, _: &TriggerCompletion, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
+            return;
+        };
+        let client = self.active_lsp_client(cx);
+        self.completion.trigger(&editor, client, uri, cx);
+        cx.notify();
+    }
+
+    /// 补全菜单：下一项。
+    fn completion_next(&mut self, _: &CompletionNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            return;
+        }
+        self.completion.move_selection(1);
+        let editor = self.active_text_editor(cx);
+        if let Some(editor) = editor {
+            self.completion.sync_selection(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    /// 补全菜单：上一项。
+    fn completion_prev(&mut self, _: &CompletionPrev, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            return;
+        }
+        self.completion.move_selection(-1);
+        let editor = self.active_text_editor(cx);
+        if let Some(editor) = editor {
+            self.completion.sync_selection(&editor, cx);
+        }
+        cx.notify();
+    }
+
+    /// 补全菜单：确认插入。
+    fn completion_confirm(
+        &mut self,
+        _: &CompletionConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.completion.is_visible() {
+            return;
+        }
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        self.completion.confirm(&editor, cx);
+        cx.notify();
+    }
+
+    /// 补全菜单：取消（Esc）。
+    fn completion_cancel(&mut self, _: &CompletionCancel, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            return;
+        }
+        if let Some(editor) = self.active_text_editor(cx) {
+            self.completion.hide_in(&editor, cx);
+        } else {
+            self.completion.hide();
+        }
+        cx.notify();
+    }
+
+    /// 重命名面板（F2）：开则关、关则开。
+    fn toggle_rename(&mut self, _: &RenameSymbol, window: &mut Window, cx: &mut Context<Self>) {
+        if self.rename_panel.take().is_some() {
+            if let Some(editor) = self.active_text_editor(cx) {
+                editor.read(cx).focus_handle.clone().focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        // 光标不在符号上时不开面板：改名没有意义。
+        if editor.read(cx).word_at_cursor().is_empty() {
+            return;
+        }
+        let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
+        let panel = rename::RenamePanel::new(cx.entity().downgrade(), editor, handle, window, cx);
+        panel.update(cx, |p, cx| p.focus(window, cx));
+        self.rename_panel = Some(panel);
+        cx.notify();
+    }
+
+    /// 文档符号面板（cmd-shift-o）：开则关、关则请求符号列表后打开。
+    fn toggle_symbols(&mut self, _: &DocumentSymbols, window: &mut Window, cx: &mut Context<Self>) {
+        if self.symbols_panel.take().is_some() {
+            if let Some(editor) = self.active_text_editor(cx) {
+                editor.read(cx).focus_handle.clone().focus(window, cx);
+            }
+            cx.notify();
+            return;
+        }
+        let Some((editor, client, uri)) = self.lsp_context(cx) else {
+            return;
+        };
+        let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
+        // 先建空面板（立刻给反馈），符号到了再填充。
+        let panel = symbols::SymbolsPanel::new(editor.clone(), Vec::new(), handle, cx);
+        self.symbols_panel = Some(panel.clone());
+
+        cx.spawn(async move |_this, cx| {
+            let Ok(response) = client.document_symbols(&uri).await else {
+                return;
+            };
+            cx.update_entity(&editor, |state, _cx| {
+                state.set_pending_symbols(response);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 请求 LSP 文档高亮（光标处符号的所有出现位置）。
+    ///
+    /// 结果覆盖编辑器的「同词高亮」：服务器按语义作用域算，不会把同名但
+    /// 不同作用域的符号混在一起。
+    fn request_document_highlight(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        let Some(client) = self
+            .active_lsp_session()
+            .and_then(|s| s.client().cloned())
+        else {
+            return;
+        };
+        // 每次光标移动都请求会打挂服务器：只在光标真的换了位置时才发。
+        let cursor = editor.read(cx).cursor();
+        if self.last_highlight_cursor == Some(cursor) {
+            return;
+        }
+        self.last_highlight_cursor = Some(cursor);
+        let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
+            return;
+        };
+        let position = editor.read(cx).lsp_cursor_position();
+
+        cx.spawn(async move |_this, cx| {
+            let Ok(highlights) = client.document_highlight(&uri, position).await else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                let ranges = crate::lsp::features::to_highlight_ranges(state.text(), highlights);
+                state.set_lsp_highlights(Some(ranges));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 请求签名帮助：光标停在 `(` / `,` 之后时显示当前函数签名。
+    ///
+    /// 与 hover 共用同一张浮层（同时只会显示一个），但独立请求——
+    /// 签名帮助的触发条件（在参数列表内）与 hover（在标识符上）不同。
+    fn request_signature_help(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        // hover 已显示时不抢：两个浮层叠在一起没有意义。
+        if editor.read(cx).hover_popover().is_some() {
+            return;
+        }
+        let Some(client) = self
+            .active_lsp_session()
+            .and_then(|s| s.client().cloned())
+        else {
+            return;
+        };
+        let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
+            return;
+        };
+
+        // 触发判定：光标前最近的未闭合 `(` 之后仍在参数列表内。
+        let (cursor, text_len) = {
+            let state = editor.read(cx);
+            (state.cursor(), state.text().len())
+        };
+        let in_params = signature_trigger_for(editor.read(cx).text(), cursor);
+        if !in_params {
+            self.last_signature_cursor = None;
+            return;
+        }
+        if self.last_signature_cursor == Some(cursor) {
+            return;
+        }
+        self.last_signature_cursor = Some(cursor);
+        let _ = text_len;
+
+        let position = editor.read(cx).lsp_cursor_position();
+        cx.spawn(async move |_this, cx| {
+            let Ok(Some(help)) = client.signature_help(&uri, position).await else {
+                return;
+            };
+            let contents = crate::lsp::features::signature_text(&help);
+            if contents.trim().is_empty() {
+                return;
+            }
+            cx.update_entity(&editor, |state, cx| {
+                state.set_pending_hover(crate::editor::hover::HoverInfo {
+                    contents,
+                    range: None,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 光标是否处于「参数列表内」——即前面有未闭合的 `(`。
+    ///
+    /// 只做括号配平的粗判：不解析字符串/注释里的括号。签名帮助是提示性的，
+    /// 偶尔多弹一次比引入一套词法分析划算。
+    /// 应用 Code Action（快速修复）：取服务器给的**首选**动作并应用。
+    ///
+    /// 首选 = `isPreferred` 为 true 的那条；没有则取第一条。完整的动作选择
+    /// 菜单要一个新的浮层；首版先保证「一键修复」这条最常用路径可用。
+    fn apply_code_action(&mut self, _: &CodeAction, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((editor, client, uri)) = self.lsp_context(cx) else {
+            return;
+        };
+        // 用整行范围请求：服务器在整行上给出的动作（如「移除未使用的导入」）
+        // 比单字符范围全得多。
+        let line_range = {
+            let state = editor.read(cx);
+            let text = state.text();
+            let row = text.byte_to_line_idx(state.cursor().min(text.len()), ropey::LineType::LF);
+            lsp_types::Range::new(
+                crate::lsp::features::offset_to_position(text, text.line_start_offset(row)),
+                crate::lsp::features::offset_to_position(text, text.line_content_end_offset(row)),
+            )
+        };
+
+        cx.spawn(async move |_this, cx| {
+            let Ok(response) = client.code_actions(&uri, line_range, Vec::new()).await else {
+                return;
+            };
+            // 首选优先，否则第一条。
+            let chosen = response
+                .iter()
+                .find(|a| {
+                    matches!(a, lsp_types::CodeActionOrCommand::CodeAction(a)
+                        if a.is_preferred == Some(true))
+                })
+                .or_else(|| response.first());
+            let Some(lsp_types::CodeActionOrCommand::CodeAction(action)) = chosen else {
+                // Command 形态需要执行服务器命令（一套额外的执行协议），
+                // 首版不支持：静默跳过比报错好。
+                return;
+            };
+            let Some(edits) = action
+                .edit
+                .as_ref()
+                .and_then(|e| crate::lsp::features::edits_for_uri(e, &uri))
+            else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                crate::lsp::session::apply_text_edits(state, edits, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 请求 LSP Inlay Hint（可见区间的）。
+    ///
+    /// 按「首个可见行 .. 末个可见行」请求，而不是全文件——服务器算全文件
+    /// 的 hint 在大文件上很慢，而用户一次只能看到几十行。
+    fn request_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        let Some(client) = self
+            .active_lsp_session()
+            .and_then(|s| s.client().cloned())
+        else {
+            return;
+        };
+        let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
+            return;
+        };
+        let Some(range) = editor.read(cx).visible_lsp_range() else {
+            return;
+        };
+        // 可见区间没变就不重发（滚动/打字会频繁触发渲染）。
+        if self.last_inlay_range.as_ref() == Some(&range) {
+            return;
+        }
+        self.last_inlay_range = Some(range.clone());
+
+        cx.spawn(async move |_this, cx| {
+            let Ok(hints) = client.inlay_hints(&uri, range).await else {
+                return;
+            };
+            cx.update_entity(&editor, |state, cx| {
+                let data = crate::lsp::features::to_inlay_hints(state.text(), hints);
+                state.set_inlay_hints(data);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 取走后台算好的 hover / 补全 / 符号结果。
+    ///
+    /// 在 `render` 里调用：后台任务完成时只能把结果放进 `InputState` 的槽，
+    /// 真正的浮层状态在 `Editor` 上，需要一个时机把它们搬过来。渲染前是最
+    /// 自然的时机——不额外起任务，且保证下一帧就能看到。
+    fn drain_lsp_results(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        self.hover.take_pending(&editor, cx);
+        self.completion.take_pending(&editor, cx);
+        if let Some(panel) = self.symbols_panel.clone() {
+            let response = editor.update(cx, |state, _| state.take_pending_symbols());
+            if let Some(response) = response {
+                let symbols = crate::lsp::features::flatten_symbols(editor.read(cx).text(), &response);
+                panel.update(cx, |p, _| p.set_symbols(symbols));
+            }
+        }
+    }
+
     /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览/实时返回 None）。
     fn active_text_editor(&self, _cx: &App) -> Option<Entity<InputState>> {
         let active_id = self.active_file_id.as_ref()?;
@@ -1431,7 +1989,20 @@ impl Editor {
         cx.notify();
     }
 
-    /// 底部状态栏（仅文本编辑器）：行/列、选区、编码、缩进、语言。
+    /// 当前活动 tab 的 LSP 客户端（无 LSP 时 None）。
+    fn active_lsp_client(&self, _cx: &App) -> Option<std::sync::Arc<crate::lsp::client::LspClient>> {
+        let id = self.active_file_id.clone()?;
+        let file = self.open_files.iter().find(|f| f.id == id)?;
+        file.lsp.as_ref()?.client().cloned()
+    }
+
+    /// 当前活动 tab 的 LSP 会话。
+    fn active_lsp_session(&self) -> Option<&crate::lsp::session::LspSession> {
+        let id = self.active_file_id.clone()?;
+        let file = self.open_files.iter().find(|f| f.id == id)?;
+        file.lsp.as_ref()
+    }
+
     fn render_status_bar(
         &self,
         file: &EditorFile,
@@ -1518,6 +2089,11 @@ impl Editor {
                     .flex_row()
                     .items_center()
                     .gap(px(4.0))
+                    // 语言服务器实时状态：转圈（工作时）+ 阶段名/进度/诊断计数。
+                    // 没有 LSP 的文件（远程、无服务器）不占位。
+                    .when_some(state.lsp_status(), |this, status| {
+                        this.child(render_lsp_status_chip(status, &theme))
+                    })
                     .child(
                         div()
                             .px(px(8.0))
@@ -1784,6 +2360,7 @@ impl Editor {
             image: None,
             diff: Some(diff_view),
             diff_repo: Some(diff_repo),
+            lsp: None,
         });
 
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1847,6 +2424,7 @@ impl Editor {
             image: None,
             diff: Some(diff_view),
             diff_repo,
+            lsp: None,
         });
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.add_tab(
@@ -2098,6 +2676,17 @@ impl Editor {
                             // arrived, apply line:col now (clamped to total).
                             if let Some((line, col)) = this.take_pending_jump(&tab_id) {
                                 this.jump_to_line_col(&tab_id, line, col, cx);
+                            }
+                            // 加载完成才有内容：此时才接语言服务器（didOpen
+                            // 需要把全文发给服务器）。
+                            let is_local = this
+                                .open_files
+                                .iter()
+                                .find(|f| f.id == tab_id)
+                                .map(|f| f.ssh_config.is_none())
+                                .unwrap_or(false);
+                            if is_local {
+                                this.start_lsp_for_tab(&tab_id, cx);
                             }
                             let file_path = this
                                 .open_files
@@ -2719,6 +3308,43 @@ impl Editor {
                         this.open_files[idx].dirty = dirty;
                         this.sync_tab_modified(&sync_tab_id, dirty, cx);
                     }
+                    // LSP 文档同步：只在文本真的变了时发 didChange。
+                    // 放在这个 O(1) 闸门内，避免每次光标移动都触发一轮
+                    // 防抖任务（防抖本身也会救，但省掉更干净）。
+                    let text = this.open_files[idx].editor_state.read(cx).text().clone();
+                    if let Some(session) = this.open_files[idx].lsp.as_mut() {
+                        session.on_text_changed(&text, cx);
+                    }
+                    // 自动补全：只在光标处于标识符内时触发。
+                    // 不对每次击键都请求——否则敲注释/字符串也会打服务器，
+                    // 而且候选会一直闪。
+                    if this.open_files[idx].lsp.is_some()
+                        && this.active_file_id.as_deref() == Some(sync_tab_id.as_str())
+                    {
+                        let editor = this.open_files[idx].editor_state.clone();
+                        let in_identifier = {
+                            let state = editor.read(cx);
+                            let cursor = state.cursor();
+                            cursor > 0
+                                && state
+                                    .text()
+                                    .char_at(cursor.saturating_sub(1).min(state.text().len()))
+                                    .map(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                                    .unwrap_or(false)
+                        };
+                        if in_identifier {
+                            let uri = this
+                                .active_lsp_session()
+                                .map(|s| s.uri().clone());
+                            if let Some(uri) = uri {
+                                let client = this.active_lsp_client(cx);
+                                this.completion.trigger_auto(&editor, client, uri, cx);
+                            }
+                        } else {
+                            // 光标离开标识符：收起候选（比如刚打完空格）。
+                            this.completion.hide_in(&editor, cx);
+                        }
+                    }
                 }
 
                 // 编辑 tab 内容变化时，同步刷新同路径的 markdown 预览 tab，
@@ -2792,6 +3418,7 @@ impl Editor {
             image,
             diff: None,
             diff_repo: None,
+            lsp: None,
         });
 
         let is_local = self
@@ -2829,8 +3456,111 @@ impl Editor {
             );
         });
 
+        // LSP：本地文件在标签建好后异步接语言服务器。
+        // 加载中的文件没有内容，等加载完成再接（见 `finish_file_load`）。
+        if is_local && !is_loading {
+            self.start_lsp_for_tab(&tab_id, cx);
+        }
+
         self.switch_to_file(&tab_id, cx);
         cx.notify();
+    }
+
+    /// 为一个本地标签接上语言服务器。
+    ///
+    /// 全流程异步且可失败：拿到服务器后 didOpen，再订阅诊断。任何一步失败
+    /// 都只记日志，编辑器退回纯 tree-sitter 状态（诊断仍由语法树产出）。
+    fn start_lsp_for_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
+            return;
+        };
+        // 远程文件、图片、diff 视图都不走 LSP。
+        if self.open_files[idx].ssh_config.is_some()
+            || self.open_files[idx].image.is_some()
+            || self.open_files[idx].diff.is_some()
+        {
+            return;
+        }
+        let language = self.open_files[idx]
+            .editor_state
+            .read(cx)
+            .language()
+            .map(|l| l.to_string())
+            .unwrap_or_default();
+        if language.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(&self.open_files[idx].path);
+        // 记下路径：跨文件跳转时用它判断「是不是同一个文件」。
+        self.open_files[idx]
+            .editor_state
+            .update(cx, |state, _| state.set_lsp_file_path(path.display().to_string()));
+        let editor = self.open_files[idx].editor_state.downgrade();
+
+        let Some(mut session) = crate::lsp::session::LspSession::new(&path, &language, editor)
+        else {
+            return;
+        };
+        let Some(rx) = session.connect(cx) else {
+            log::info!("lsp: no server available for {language} ({path:?})");
+            return;
+        };
+        log::debug!("lsp: connecting {language} for {path:?}");
+        // 状态栏：进程已 spawn，正在握手。
+        self.open_files[idx].editor_state.update(cx, |state, _| {
+            state.set_lsp_status(Some(crate::lsp::status::LspStatus::Starting));
+        });
+        self.open_files[idx].lsp = Some(session);
+
+        // 等服务器就绪（spawn + initialize 握手）。
+        let tab_id = tab_id.to_string();
+        let language_for_status = language.clone();
+        cx.spawn(async move |this, cx| {
+            let client = rx.recv().await.ok().flatten();
+            let Some(client) = client else {
+                // 启动失败：状态栏给出可读原因，而不是停在「启动中」。
+                let _ = this.update(cx, |this, cx| {
+                    let Some(idx) = this.open_files.iter().position(|f| f.id.as_ref() == tab_id)
+                    else {
+                        return;
+                    };
+                    this.open_files[idx].editor_state.update(cx, |state, _| {
+                        state.set_lsp_status(Some(crate::lsp::status::LspStatus::Failed {
+                            reason: format!("{language_for_status} 服务器启动失败"),
+                        }));
+                    });
+                    cx.notify();
+                });
+                return;
+            };
+            let _ = this.update(cx, |this, cx| {
+                let Some(idx) = this.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
+                    return;
+                };
+                let text = this.open_files[idx].editor_state.read(cx).text().clone();
+                // 先克隆实体句柄：下面要可变借 `lsp`，同时借 `open_files`
+                // 会撞借用检查。
+                let editor = this.open_files[idx].editor_state.clone();
+                let file_path = this.open_files[idx].path.clone();
+                let Some(session) = this.open_files[idx].lsp.as_mut() else {
+                    return;
+                };
+                log::debug!("lsp: didOpen {file_path} ({} bytes)", text.len());
+                session.on_connected(client, &text);
+                // 诊断监听要在会话拿到 client 之后建。
+                session.spawn_diagnostic_listener(&editor, cx);
+                // 握手完成 → 就绪。若服务器随后开始索引，它会用
+                // `$/progress` 把状态推成 Working。
+                editor.update(cx, |state, _| {
+                    state.set_lsp_status(Some(crate::lsp::status::LspStatus::Ready {
+                        errors: 0,
+                        warnings: 0,
+                    }));
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -3183,6 +3913,14 @@ impl Editor {
                             // 会走「无变化重载」路径，不会覆盖编辑器内容。
                             file.original_content = written.clone();
                             file.dirty = false;
+                            // LSP：didSave 让服务器重读磁盘（构建脚本/宏展开
+                            // 之类依赖文件内容的分析会跟着更新）。放在这里
+                            // 是因为下面就要调 `&mut self` 的方法，`file`
+                            // 的可变借用到此为止。
+                            if let Some(session) = file.lsp.as_ref() {
+                                let text = file.editor_state.read(cx).text().clone();
+                                session.on_saved(&text);
+                            }
                             if let Some(live) = &file.live {
                                 live.update(cx, |view, _cx| view.mark_saved());
                             }
@@ -3294,6 +4032,11 @@ impl Editor {
         self.editor_state_subscriptions.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
+            // LSP：发 didClose 并停掉该 tab 的同步/监听任务。
+            // `close()` 内部会 take 掉任务，Drop 时不会再重复发一次。
+            if let Some(session) = self.open_files[index].lsp.as_mut() {
+                session.close();
+            }
             let path = self.open_files[index].path.clone();
             let is_remote = self.open_files[index].ssh_config.is_some();
             // 同一路径可能同时打开预览/编辑两个 tab：
@@ -3542,6 +4285,13 @@ impl Editor {
 
 impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 搬移后台算好的 LSP 结果（hover / 补全）：后台任务只能把结果写进
+        // `InputState` 的槽，浮层状态在 `Editor` 上，渲染前搬到本帧可见。
+        self.drain_lsp_results(cx);
+        // 光标处的符号高亮：跟着光标走，渲染前发请求（有位置闸门，不会每帧发）。
+        self.request_document_highlight(cx);
+        self.request_inlay_hints(cx);
+        self.request_signature_help(cx);
         // 窗口跟随只吃“变化量”：拖拽中仅更新基线（松手不结算、无弹跳）。
         // 空编辑器不参与布局（宽度目标为 0），此时不累积窗口增量、只追踪基线，
         // 避免关闭期间改窗口大小导致之后打开文件时宽度突变。
@@ -3691,8 +4441,74 @@ impl Render for Editor {
                                     .flex_1()
                                     .min_h_0()
                                     .child(EditorInput::new(&file.editor_state))
+                                    // LSP 悬浮提示：鼠标停稳后请求，浮层跟随命中字符。
+                                    // 用 `on_mouse_move` 而不是 input 内部的事件：
+                                    // 后者既没有 uri/client，也不能碰 Editor 的浮层状态。
+                                    .on_mouse_move(cx.listener(
+                                        move |this, event: &gpui::MouseMoveEvent, _window, cx| {
+                                            let Some(editor) = this.active_text_editor(cx) else {
+                                                return;
+                                            };
+                                            // 只取命中偏移。浮层的**像素位置在绘制阶段**
+                                            // 用当前帧的行布局算（照抄 Zed 的
+                                            // `layout_hover_popovers`）——在这里预先算
+                                            // 像素会随滚动/软换行过期，正是之前位置错乱的根因。
+                                            let offset = editor
+                                                .read(cx)
+                                                .index_for_mouse_position(event.position);
+                                            let uri = this
+                                                .active_lsp_session()
+                                                .map(|s| s.uri().clone());
+                                            let Some(uri) = uri else {
+                                                return;
+                                            };
+                                            let client = this.active_lsp_client(cx);
+                                            this.hover.on_mouse_moved(
+                                                offset, &editor, client, uri, cx,
+                                            );
+                                            cx.notify();
+                                        },
+                                    ))
+                                    // 鼠标移出编辑区：收起浮层（否则它会一直挂着）。
+                                    .on_mouse_down_out(cx.listener(
+                                        move |this, _: &gpui::MouseDownEvent, _window, cx| {
+                                            let Some(editor) = this.active_text_editor(cx) else {
+                                                return;
+                                            };
+                                            this.hover.hide_in(&editor, cx);
+                                            cx.notify();
+                                        },
+                                    ))
                                     // 跳转到行：顶部居中悬浮卡片
                                     .when_some(self.goto_line_panel.clone(), |this, panel| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(8.0))
+                                                .left_0()
+                                                .right_0()
+                                                .flex()
+                                                .justify_center()
+                                                .child(panel),
+                                        )
+                                    })
+                                    // LSP 补全菜单：与 hover 同样在绘制阶段定位
+                                    // （`TextElement::paint_completion_menu`）。
+                                    // LSP 重命名输入：顶部居中
+                                    .when_some(self.rename_panel.clone(), |this, panel| {
+                                        this.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(8.0))
+                                                .left_0()
+                                                .right_0()
+                                                .flex()
+                                                .justify_center()
+                                                .child(panel),
+                                        )
+                                    })
+                                    // LSP 符号大纲：顶部居中列表
+                                    .when_some(self.symbols_panel.clone(), |this, panel| {
                                         this.child(
                                             div()
                                                 .absolute()
@@ -3767,6 +4583,39 @@ impl Render for Editor {
                 }))
                 .on_action(cx.listener(|this, _: &GotoLine, window, cx| {
                     this.toggle_goto_line(&GotoLine, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &GotoDefinition, window, cx| {
+                    this.goto_definition(&GotoDefinition, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FindReferences, window, cx| {
+                    this.find_references(&FindReferences, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &FormatDocument, window, cx| {
+                    this.format_document(&FormatDocument, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &TriggerCompletion, window, cx| {
+                    this.trigger_completion(&TriggerCompletion, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionNext, window, cx| {
+                    this.completion_next(&CompletionNext, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionPrev, window, cx| {
+                    this.completion_prev(&CompletionPrev, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionConfirm, window, cx| {
+                    this.completion_confirm(&CompletionConfirm, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionCancel, window, cx| {
+                    this.completion_cancel(&CompletionCancel, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &RenameSymbol, window, cx| {
+                    this.toggle_rename(&RenameSymbol, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &DocumentSymbols, window, cx| {
+                    this.toggle_symbols(&DocumentSymbols, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CodeAction, window, cx| {
+                    this.apply_code_action(&CodeAction, window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
                     if let Some(tab_id) = this.tab_bar.read(cx).context_menu_tab_id() {
@@ -4057,6 +4906,79 @@ fn atomic_write_local(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// 状态栏上的语言服务器状态 chip。
+///
+/// 三态视觉：
+/// - **工作中/启动中**：转圈图标 + 阶段名（+ 百分比），配色用主题强调色；
+/// - **就绪且无问题**：绿色小圆点 + "就绪"；
+/// - **就绪但有诊断**：按最严重的级别着色（有错红、只有警告黄）；
+/// - **失败**：红色文字 + 原因。
+fn render_lsp_status_chip(
+    status: &crate::lsp::status::LspStatus,
+    theme: &crate::theme::UiTheme,
+) -> gpui::AnyElement {
+    use crate::lsp::status::LspStatus;
+
+    let label = status.label();
+    let (color, show_spinner) = match status {
+        LspStatus::Starting | LspStatus::Working { .. } => (theme.accent, true),
+        LspStatus::Ready { errors, warnings } => {
+            if *errors > 0 {
+                (theme.error, false)
+            } else if *warnings > 0 {
+                (theme.warning, false)
+            } else {
+                // 无问题：用较淡的文本色，不抢注意力。
+                (theme.text_muted.opacity(0.8), false)
+            }
+        }
+        LspStatus::Failed { .. } => (theme.error, false),
+    };
+
+    let mut chip = div()
+        .id("lsp-status-chip")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(6.0))
+        .text_color(color);
+
+    if show_spinner {
+        // 转圈：与 tab 栏的 loading 图标同一套动画参数（800ms 匀速旋转）。
+        chip = chip.child(
+            gpui::svg()
+                .size(px(11.0))
+                .text_color(color)
+                .path(crate::assets::Icon::Loader.path())
+                .with_animation(
+                    "lsp-status-spinner",
+                    gpui::Animation::new(std::time::Duration::from_millis(800)).repeat(),
+                    |this, delta| {
+                        this.with_transformation(gpui::Transformation::rotate(gpui::percentage(
+                            delta,
+                        )))
+                    },
+                ),
+        );
+    } else if let LspStatus::Ready { errors, warnings } = status
+        && (*errors > 0 || *warnings > 0)
+    {
+        // 有诊断：画一个小圆点，颜色与数字一致。
+        chip = chip.child(
+            div()
+                .w(px(6.0))
+                .h(px(6.0))
+                .rounded_full()
+                .bg(color),
+        );
+    }
+
+    chip.child(label).into_any_element()
 }
 
 pub(crate) fn guess_language_from_extension(path: &Path) -> String {
@@ -5062,5 +5984,71 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("GBK"));
+    }
+}
+
+#[cfg(test)]
+mod lsp_signature_tests {
+    use super::signature_trigger_for;
+    use ropey::Rope;
+
+    #[test]
+    fn open_paren_puts_cursor_in_params() {
+        let t = Rope::from("foo(1, 2");
+        assert!(signature_trigger_for(&t, t.len()), "cursor inside `(` should trigger");
+    }
+
+    #[test]
+    fn closed_paren_does_not_trigger() {
+        let t = Rope::from("foo(1, 2)");
+        // 光标在 `)` 之后：不在参数列表内。
+        assert!(!signature_trigger_for(&t, t.len()));
+    }
+
+    #[test]
+    fn no_paren_never_triggers() {
+        let t = Rope::from("let x = 1;");
+        assert!(!signature_trigger_for(&t, t.len()));
+    }
+
+    #[test]
+    fn nested_paren_still_triggers() {
+        let t = Rope::from("outer(inner(1");
+        assert!(signature_trigger_for(&t, t.len()));
+    }
+
+    /// 回归：多字节字符（中文注释）不能让回溯 panic。
+    ///
+    /// 曾经按字节回退 `offset - 1` 并调 `Rope::char`，落在多字节字符
+    /// 内部会直接 panic——本项目的中文注释里必现，表现为打开 .rs 文件
+    /// 立刻崩溃。
+    #[test]
+    fn multibyte_text_does_not_panic() {
+        let src = "fn main() { // 中文注释\n    foo(1\n";
+        let t = Rope::from(src);
+        // 光标在末尾（参数列表内），前面全是 CJK 字节。
+        assert!(signature_trigger_for(&t, t.len()));
+    }
+
+    #[test]
+    fn multibyte_without_paren_does_not_panic() {
+        let t = Rope::from("// 中文注释 emoji 🎉 结尾");
+        assert!(!signature_trigger_for(&t, t.len()));
+    }
+
+    #[test]
+    fn cursor_at_zero_or_past_end_is_safe() {
+        let t = Rope::from("abc");
+        assert!(!signature_trigger_for(&t, 0));
+        // 越界光标：内部会钳制到文本长度。
+        assert!(!signature_trigger_for(&t, 999));
+    }
+
+    /// 光标恰好落在多字节字符**中间**也不能 panic（上游偏移算错时的情形）。
+    #[test]
+    fn cursor_inside_multibyte_char_is_safe() {
+        let t = Rope::from("中文abc");
+        assert!(!signature_trigger_for(&t, 1));
+        assert!(!signature_trigger_for(&t, 2));
     }
 }

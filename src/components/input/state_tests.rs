@@ -868,3 +868,91 @@ fn indent_level_bounds(line_text: &str) -> Vec<usize> {
         assert!(!code_wraps, "代码编辑器默认应关闭软换行");
         assert!(plain_wraps, "普通多行输入（提交框等）默认仍应软换行");
     }
+
+// ==================== LSP 补全应用 ====================
+
+#[gpui::test]
+fn apply_completion_replaces_range_and_moves_cursor(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input
+        .downgrade()
+        .update_in(cx, |state, window, cx| {
+            state.replace_text_in_range_silent(None, "let x = fo", window, cx);
+            // 把 `fo` 补全成 `foo_bar`：区间覆盖用户已输入的前缀。
+            let range = 8..10;
+            let ok = state.apply_completion(range, "foo_bar", cx);
+            assert!(ok, "apply_completion should succeed on a valid range");
+            assert_eq!(state.value().as_ref(), "let x = foo_bar");
+            // 光标落在插入文本末尾。
+            assert_eq!(state.cursor(), 15);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn apply_completion_rejects_bad_ranges(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input
+        .downgrade()
+        .update_in(cx, |state, window, cx| {
+            state.replace_text_in_range_silent(None, "abc", window, cx);
+            // 越界、反向区间都必须被拒绝，且**不能改动文本**。
+            assert!(!state.apply_completion(0..99, "x", cx));
+            assert!(!state.apply_completion(2..1, "x", cx));
+            assert_eq!(state.value().as_ref(), "abc");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn apply_completion_rejects_non_char_boundary(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input
+        .downgrade()
+        .update_in(cx, |state, window, cx| {
+            // "中" 占 3 字节：偏移 1 落在字符中间，必须拒绝（否则 Rope 会 panic）。
+            state.replace_text_in_range_silent(None, "中x", window, cx);
+            assert!(!state.apply_completion(1..2, "y", cx));
+            assert_eq!(state.value().as_ref(), "中x");
+        })
+        .unwrap();
+}

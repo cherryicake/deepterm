@@ -1,0 +1,1030 @@
+//! JSON-RPC 2.0 over a language server's stdio pipes.
+//!
+//! 这一层刻意与 LSP 语义解耦：它只知道「怎么把一条 JSON 消息写进 stdin、
+//! 怎么从 stdout 里切出一条消息、以及怎么把响应配对回挂起的请求」。
+//! LSP 的方法名与参数类型留给 [`crate::lsp::client`]。
+//!
+//! 设计要点：
+//! - **帧格式**是 LSP 的固定约定：`Content-Length: N\r\n\r\n` + N 字节 UTF-8
+//!   载荷。头字段大小写不敏感，但真实服务器（尤其 Windows 上的）偶发
+//!   `content-length`；解析时统一小写比较。
+//! - **粘包/半包是常态**：一次 `read` 可能只拿到半个头，也可能一次拿到
+//!   三条消息。所以读循环必须累积缓冲区、按已解析出的长度反复切分。
+//! - **请求配对**用自增 id + `HashMap<id, oneshot>`。服务器发来的
+//!   `id` 若不在表里（过期响应/服务器主动乱发），只记日志不 panic。
+//! - **服务器主动通知**（如 `publishDiagnostics`）走独立 channel，
+//!   与请求-响应流分离，避免消费者必须区分「响应」和「通知」。
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use anyhow::{Context as _, Result, anyhow};
+use async_channel::{Receiver, Sender, bounded};
+use async_process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use futures::io::BufReader;
+use futures::{AsyncReadExt as _, AsyncWriteExt as _};
+use async_lock::Mutex as AsyncMutex;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// 一条 JSON-RPC 消息。
+///
+/// 请求/响应/通知三态共用 `id` 字段：`id` 为 `Some` 且带 `method` 是
+/// 入站请求；`Some` 且带 `result`/`error` 是响应；`None` 是通知。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Message {
+    /// 服务器向客户端发起的请求（如 `workspace/configuration`、
+    /// `window/workDoneProgress/create`）。必须回一个响应，否则部分服务器
+    /// 会一直等下去。
+    Request { id: u32, method: String, params: Value },
+    /// 对客户端请求的应答。`result` 与 `error` 互斥，由 LSP 保证；
+    /// 解析时两者都缺视为协议错误。
+    Response {
+        id: u32,
+        result: Option<Value>,
+        error: Option<ResponseError>,
+    },
+    /// 单向通知，无需应答（`publishDiagnostics` 等）。
+    Notification { method: String, params: Value },
+}
+
+/// JSON-RPC 错误对象。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResponseError {
+    pub code: i32,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl std::fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "JSON-RPC error {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ResponseError {}
+
+/// 出站请求的原始报文：序列化后可直接写进 stdin。
+#[derive(Debug, Serialize)]
+struct OutgoingRequest<'a> {
+    jsonrpc: &'static str,
+    id: u32,
+    method: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<&'a Value>,
+}
+
+/// 出站响应的原始报文（用于应答服务器的 `Request`）。
+#[derive(Debug, Serialize)]
+struct OutgoingResponse<'a> {
+    jsonrpc: &'static str,
+    id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a ResponseError>,
+}
+
+#[derive(Debug, Serialize)]
+struct OutgoingNotification<'a> {
+    jsonrpc: &'static str,
+    method: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    params: Option<&'a Value>,
+}
+
+/// 入站报文的判别结构。
+///
+/// 先反序列化成这个「扁平」结构判断种类，再由调用方把 `params`/
+/// `result` 转成具体类型——避免为每种方法写一个枚举变体。
+///
+/// `result` / `error` 收成 `Value` 而不是 `Option<Value>`：LSP 里
+/// `{"result": null}` 是**合法响应**（方法成功但无返回值，如
+/// `textDocument/completion` 没有候选时 rust-analyzer 就这么回），
+/// 而 `Option<Value>` 会把「字段不存在」和「字段是 null」混为一谈，
+/// 导致把正常响应当成协议错误。是否存在由 `has_result` / `has_error`
+/// 两个显式标志记录。
+/// 入站报文的判别结构。
+///
+/// 先反序列化成这个「扁平」结构判断种类，再由调用方把 `params`/
+/// `result` 转成具体类型——避免为每种方法写一个枚举变体。
+///
+/// `result` / `error` 的**存在性**不能用 `Option<T>` 表达：serde 会把
+/// `{"result": null}` 和「没有 result 字段」都解析成 `None`，而前者是合法
+/// 响应（方法成功但无返回值——`textDocument/completion` 没有候选时
+/// rust-analyzer 就这么回）。所以直接看原始 JSON 对象的键。
+#[derive(Debug, Deserialize)]
+struct IncomingMessage {
+    #[serde(default)]
+    id: Option<u32>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: Option<Value>,
+    /// 服务器可能用字符串 id（少见但不违规）；统一拒绝并记日志，
+    /// 因为本实现只发数值 id。
+    #[serde(default)]
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+}
+
+/// 解析一帧：`Content-Length` 头 + 空行 + 载荷。
+///
+/// 返回 `(消息, 剩余未消费字节)`；缓冲区里不足一整帧时返回
+/// `Ok(None)`，调用方继续读。
+///
+/// 头部字段按 `:` 切分并 `trim`，值大小写不敏感。载荷长度以头声明为准，
+/// 缓冲区不足则判定为「半包」——不能按 UTF-8 提前截断。
+fn parse_frame(buf: &[u8]) -> Result<Option<(Message, usize)>> {
+    // 找头部结束的空行。LSP 规定用 \r\n，但容忍裸 \n。
+    let header_end = find_header_end(buf).ok_or_else(|| {
+        // 头部本身还不完整（连空行都没到）——不是错误，是数据不够。
+        anyhow!("incomplete header")
+    });
+
+    let header_end = match header_end {
+        Ok(pos) => pos,
+        // 头部未结束有两种可能：数据不够，或头长到不合理（服务器出 bug
+        // 狂喷无换行数据）。超过 64KB 还没见到空行就判定为协议错误，
+        // 避免缓冲区无限增长。
+        Err(_) if buf.len() > 64 * 1024 => {
+            return Err(anyhow!("header exceeds 64KB without a blank line"));
+        }
+        Err(_) => return Ok(None),
+    };
+
+    let header = std::str::from_utf8(&buf[..header_end])
+        .context("header is not valid UTF-8")?;
+    let mut content_length: Option<usize> = None;
+    for line in header.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("content-length") {
+            content_length = value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|n| *n > 0 || true);
+        }
+    }
+
+    let len = content_length.context("missing or invalid Content-Length header")?;
+    let body_start = header_end + header_terminator_len(buf, header_end);
+    if buf.len() - body_start < len {
+        // 半包：头完整但载荷没到齐。
+        return Ok(None);
+    }
+    let body = &buf[body_start..body_start + len];
+    let raw: Value = serde_json::from_slice(body)
+        .with_context(|| format!("invalid JSON body: {}", String::from_utf8_lossy(body)))?;
+    let msg: IncomingMessage = serde_json::from_value(raw.clone())
+        .with_context(|| format!("invalid JSON-RPC message: {}", String::from_utf8_lossy(body)))?;
+
+    // `result` / `error` 是否存在只能看键——见 `IncomingMessage` 的说明。
+    let has_result = raw.get("result").is_some();
+    let error = raw
+        .get("error")
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value::<ResponseError>(v.clone()).ok());
+
+    let message = match (msg.id, msg.method) {
+        (Some(id), Some(method)) => Message::Request {
+            id,
+            method,
+            params: msg.params.unwrap_or(Value::Null),
+        },
+        (Some(id), None) => {
+            if !has_result && error.is_none() {
+                return Err(anyhow!("response {id} has neither result nor error"));
+            }
+            Message::Response {
+                id,
+                // 显式 null → `Value::Null`，调用方按「无返回值」处理。
+                result: if has_result {
+                    Some(raw.get("result").cloned().unwrap_or(Value::Null))
+                } else {
+                    None
+                },
+                error,
+            }
+        }
+        (None, Some(method)) => Message::Notification {
+            method,
+            params: msg.params.unwrap_or(Value::Null),
+        },
+        (None, None) => return Err(anyhow!("message has neither id nor method")),
+    };
+
+    Ok(Some((message, body_start + len)))
+}
+
+/// 找头部结束位置（空行起点）。同时接受 `\r\n\r\n` 与 `\n\n`。
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    for i in 0..buf.len().saturating_sub(1) {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+        if buf[i] == b'\r'
+            && buf[i + 1] == b'\n'
+            && i + 3 < buf.len()
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// 空行终止符的实际长度（`\r\n\r\n` 是 4，`\n\n` 是 2）。
+fn header_terminator_len(buf: &[u8], header_end: usize) -> usize {
+    if buf[header_end] == b'\r' { 4 } else { 2 }
+}
+
+/// 把一条消息编码成带头的帧字节。
+fn encode_frame(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 32);
+    out.extend_from_slice(b"Content-Length: ");
+    out.extend_from_slice(payload.len().to_string().as_bytes());
+    out.extend_from_slice(b"\r\n\r\n");
+    out.extend_from_slice(payload);
+    out
+}
+
+/// 挂起请求的应答通道。
+type Pending = Arc<Mutex<HashMap<u32, Sender<Result<Value>>>>>;
+
+/// 单个请求的最长等待时间。
+///
+/// 服务器可能死锁、卡在 IO、或干脆不实现某个方法。没有上限的话调用方的
+/// future 永远不返回，pending 表也会一直留着那个条目。
+///
+/// 取 30s：足够覆盖大项目上的冷启动重活（rust-analyzer 首次
+/// `cargo metadata` 可能十几秒），又不至于让卡死的请求挂太久。
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 关闭握手的等待上限（Zed 的 `SERVER_SHUTDOWN_TIMEOUT` 同为 5s）。
+pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 一条到语言服务器的连接。
+///
+/// 内部结构全部 `Arc`，因为读写循环跑在后台任务里、而 `Connection`
+/// 本身要被多个 UI 任务共享（每个请求都可能来自不同的 tab）。
+pub struct Connection {
+    /// 写端在异步 `Mutex` 里：多条消息必须整体写入，交错会破坏帧。
+    ///
+    /// 必须是**异步**锁而不是 `parking_lot` 的：写帧要跨 `await`，
+    /// 而 `parking_lot::MutexGuard` 不是 `Send`，会让整个 future 失去
+    /// `Send`，从而无法交给 `smol::spawn`。
+    stdin: Arc<AsyncMutex<ChildStdin>>,
+    pending: Pending,
+    next_id: AtomicU32,
+    /// 服务器主动通知的接收端。
+    pub notifications: Receiver<Message>,
+    /// 子进程句柄：drop 时用来 `kill`，避免僵尸进程。
+    child: Arc<Mutex<Option<Child>>>,
+    /// 读循环是否已经退出（进程关闭/崩溃）。置位后所有请求立即失败，
+    /// 不必等到超时。
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Connection {
+    /// 启动一个语言服务器进程并完成握手。
+    ///
+    /// `spawn` 失败（命令不存在）会以 `Err` 返回，调用方降级为「无 LSP」，
+    /// 不阻塞编辑器。
+    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn language server `{program}`"))?;
+
+        let stdin = child.stdin.take().context("language server has no stdin")?;
+        let stdout = child.stdout.take().context("language server has no stdout")?;
+
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        // 通知队列有界：服务器狂发诊断时不能无限堆积内存。满时丢**最旧**的
+        // 一条（见 `dispatch`），所以读循环同时持有接收端用于出队。
+        let (notify_tx, notify_rx) = bounded(256);
+        let notify_rx_loop = notify_rx.clone();
+
+        let conn = Self {
+            stdin: Arc::new(AsyncMutex::new(stdin)),
+            pending: pending.clone(),
+            next_id: AtomicU32::new(1),
+            notifications: notify_rx,
+            child: Arc::new(Mutex::new(Some(child))),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+
+        // 读循环：独立于任何请求，寿命与连接相同。
+        let pending2 = pending.clone();
+        let closed2 = conn.closed.clone();
+        let notify_tx2 = notify_tx.clone();
+        let stdin2 = Arc::clone(&conn.stdin);
+        smol::spawn(async move {
+            let result =
+                read_loop(stdout, stdin2, pending2, (notify_tx2, notify_rx_loop)).await;
+            if let Err(e) = result {
+                log::error!("lsp read loop terminated: {e}");
+            }
+            closed2.store(true, Ordering::SeqCst);
+            // 唤醒所有挂起请求，否则它们会一直挂到进程被回收。
+            let mut pending = pending.lock();
+            for (_, tx) in pending.drain() {
+                let _ = tx.try_send(Err(anyhow!("language server closed")));
+            }
+        })
+        .detach();
+
+        Ok(conn)
+    }
+
+    /// 是否已断开（进程退出或读循环终止）。
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// 子进程 pid（测试用来独立确认进程已被回收）。
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child.lock().as_ref().map(|c| c.id())
+    }
+
+    /// 仍在等待应答的请求数（测试用来确认超时后没有泄漏）。
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().len()
+    }
+
+    /// 发送一个请求并等待应答。
+    ///
+    /// `params` 是已经序列化好的 `serde_json::Value`；返回原始 `Value`
+    /// 交给调用方转具体类型——这样新增一个方法不需要动这一层。
+    ///
+    /// **有界等待**：服务器不答（死锁、挂起、实现有 bug）时按
+    /// [`REQUEST_TIMEOUT`] 超时返回 `Err`，并把自己的条目从 pending 表摘掉
+    /// ——否则该条目会永远留在表里泄漏。
+    pub async fn request(&self, method: &str, params: Option<&Value>) -> Result<Value> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::request`] 的可指定超时版本（shutdown 用更短的上限）。
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
+        if self.is_closed() {
+            return Err(anyhow!("language server is closed"));
+        }
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        // 每个挂起请求一个 slot：响应到达后即关闭，因此 `recv` 拿到的一定
+        // 是本 id 的应答。
+        let (tx, rx) = bounded(1);
+        self.pending.lock().insert(id, tx);
+
+        let outgoing = OutgoingRequest {
+            jsonrpc: "2.0",
+            id,
+            method,
+            params,
+        };
+        let payload = serde_json::to_vec(&outgoing).context("failed to serialize request")?;
+
+        // 写入失败要从 pending 表摘掉，否则请求会挂死。
+        if let Err(e) = self.write_frame(&payload).await {
+            self.pending.lock().remove(&id);
+            return Err(e);
+        }
+
+        // 有界等待：`or` 返回先完成的那一支（应答，或超时标记）。
+        let result = match smol::future::or(
+            async { Some(rx.recv().await) },
+            async {
+                smol::Timer::after(timeout).await;
+                None
+            },
+        )
+        .await
+        {
+            Some(Ok(value)) => value,
+            // slot 被 drop（读循环退出时唤醒）→ 连接已断。
+            Some(Err(_)) => Err(anyhow!("language server closed before response")),
+            None => {
+                // 超时：必须摘掉自己的条目，否则 pending 表永久泄漏。
+                self.pending.lock().remove(&id);
+                return Err(anyhow!(
+                    "timed out after {timeout:?} waiting for `{method}` (id {id})"
+                ));
+            }
+        };
+
+        // `result` 为 `Value::Null` 是合法的（方法没有返回值），
+        // 与「出错」由 `Message::Response` 的 `error` 字段区分。
+        result
+    }
+
+    /// LSP 关闭握手：`shutdown` 请求 → `exit` 通知 → 回收子进程。
+    ///
+    /// 顺序与 Zed 的 `LanguageServer::shutdown` 一致：
+    /// 1. 发 `shutdown` 请求并**有界等待**应答（服务器可能在忙，不能无限等）；
+    /// 2. 无论应答与否都发 `exit` 通知（规范要求 exit 才算完成关闭）；
+    /// 3. 关 stdin，宽限后 `kill` 并 `status()` 回收，避免留下孤儿进程。
+    ///
+    /// 幂等：重复调用只做一次。
+    pub async fn shutdown_gracefully(&self) {
+        // 已经关过就直接返回（`child` 已被取走）。
+        if self.child.lock().is_none() {
+            self.closed.store(true, Ordering::SeqCst);
+            return;
+        }
+
+        // 1) shutdown 请求。失败（超时/连接断）不阻断后续步骤。
+        let started = std::time::Instant::now();
+        match self.request_with_timeout("shutdown", None, SHUTDOWN_TIMEOUT).await {
+            Ok(_) => log::debug!("lsp: shutdown request acknowledged"),
+            Err(e) => log::warn!("lsp: shutdown request did not complete cleanly: {e}"),
+        }
+
+        // 2) exit 通知。规范：服务器收到 exit 后应自行退出。
+        if let Err(e) = self.notify("exit", None).await {
+            log::debug!("lsp: exit notification not delivered: {e}");
+        }
+
+        // 3) 关 stdin + 回收子进程。
+        self.closed.store(true, Ordering::SeqCst);
+        // 先把子进程句柄**取出来**（释放锁），再 await：`parking_lot` 的
+        // guard 不是 `Send`，跨 await 持着它会让整个 future 无法 spawn。
+        let child = self.child.lock().take();
+        if let Some(mut child) = child {
+            drop(child.stdin.take());
+            // 等服务器自行退出的预算与请求超时**共享**同一个上限：
+            // 否则最坏情况是「请求等 5s + 回收再等 5s」= 2× 常量，
+            // 退出路径被拖成 10s。
+            let step = std::time::Duration::from_millis(50);
+            while started.elapsed() < SHUTDOWN_TIMEOUT {
+                match child.try_status() {
+                    // 已退出：`status()` 收尸，避免僵尸。
+                    Ok(Some(_)) => {
+                        let _ = child.status().await;
+                        log::debug!("lsp: language server exited after shutdown handshake");
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::debug!("lsp: error polling language server status: {e}");
+                        break;
+                    }
+                }
+                smol::Timer::after(step).await;
+            }
+            // 没自己退：强杀并收尸。
+            let _ = child.kill();
+            let _ = child.status().await;
+            log::debug!("lsp: language server killed after shutdown timeout");
+        }
+    }
+
+    /// 发送一个单向通知。
+    pub async fn notify(&self, method: &str, params: Option<&Value>) -> Result<()> {
+        if self.is_closed() {
+            return Err(anyhow!("language server is closed"));
+        }
+        let outgoing = OutgoingNotification {
+            jsonrpc: "2.0",
+            method,
+            params,
+        };
+        let payload = serde_json::to_vec(&outgoing).context("failed to serialize notification")?;
+        self.write_frame(&payload).await
+    }
+
+    /// 应答服务器发来的请求。
+    pub async fn respond(
+        &self,
+        id: u32,
+        result: Option<&Value>,
+        error: Option<&ResponseError>,
+    ) -> Result<()> {
+        let outgoing = OutgoingResponse {
+            jsonrpc: "2.0",
+            id,
+            result,
+            error,
+        };
+        let payload = serde_json::to_vec(&outgoing).context("failed to serialize response")?;
+        self.write_frame(&payload).await
+    }
+
+    /// 写一帧：持锁整体写出并 flush。
+    ///
+    /// 不加 flush 的话，消息可能留在 `BufWriter` 里直到下一条——
+    /// 表现为「服务器收不到最后的 didChange」。
+    async fn write_frame(&self, payload: &[u8]) -> Result<()> {
+        let frame = encode_frame(payload);
+        let mut stdin = self.stdin.lock().await;
+        stdin
+            .write_all(&frame)
+            .await
+            .context("failed to write to language server stdin")?;
+        stdin
+            .flush()
+            .await
+            .context("failed to flush language server stdin")?;
+        Ok(())
+    }
+
+    /// 关闭连接：执行 LSP 关闭握手（`shutdown` → `exit`）并回收子进程。
+    ///
+    /// 同步入口（可在 `Drop` 里调用）：握手本身是异步的，所以丢给后台任务
+    /// 执行，本函数立刻返回。真正的收尸在 [`Self::shutdown_gracefully`] 里。
+    pub fn shutdown(&self) {
+        let conn = self.clone_for_shutdown();
+        smol::spawn(async move {
+            conn.shutdown_gracefully().await;
+        })
+        .detach();
+    }
+
+    /// 取一份只含关闭所需字段的轻量句柄。
+    ///
+    /// `Connection` 本身不能 `Clone`（`Receiver` 不实现 `Clone` 的语义是
+    /// 「唯一的通知消费者」），但关闭路径只需要写端、pending 表与子进程
+    /// 句柄，所以单独复制这几项。
+    fn clone_for_shutdown(&self) -> Connection {
+        Connection {
+            stdin: Arc::clone(&self.stdin),
+            pending: Arc::clone(&self.pending),
+            next_id: AtomicU32::new(self.next_id.load(Ordering::SeqCst)),
+            notifications: self.notifications.clone(),
+            child: Arc::clone(&self.child),
+            closed: Arc::clone(&self.closed),
+        }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.child.lock().is_some() {
+            self.shutdown();
+        }
+    }
+}
+
+/// 读循环：切帧 → 配对响应 / 转发通知。
+async fn read_loop(
+    stdout: ChildStdout,
+    stdin: Arc<AsyncMutex<ChildStdin>>,
+    pending: Pending,
+    notify: (Sender<Message>, Receiver<Message>),
+) -> Result<()> {
+    let mut reader = BufReader::new(stdout);
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+
+    loop {
+        // 先把缓冲区里能切出的帧全部消费掉，再读新数据——
+        // 一次 read 拿到多条消息时避免反复进 read 系统调用。
+        while let Some((msg, consumed)) = parse_frame(&buf)? {
+            buf.drain(..consumed);
+            if let Some((id, reply)) = dispatch(msg, &pending, &notify) {
+                // 就地应答服务器的主动请求：不应答它就会一直等。
+                let payload = match &reply {
+                    ServerRequestReply::Value(v) => serde_json::to_vec(&OutgoingResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(v),
+                        error: None,
+                    }),
+                    ServerRequestReply::Unimplemented => {
+                        let err = ResponseError {
+                            code: -32601,
+                            message: "method not implemented".to_string(),
+                            data: None,
+                        };
+                        serde_json::to_vec(&OutgoingResponse {
+                            jsonrpc: "2.0",
+                            id,
+                            result: None,
+                            error: Some(&err),
+                        })
+                    }
+                };
+                match payload {
+                    Ok(payload) => {
+                        let frame = encode_frame(&payload);
+                        let mut guard = stdin.lock().await;
+                        // 写入失败只记日志：服务器请求应答丢了不会损坏本地
+                        // 状态，下一次请求照常。
+                        if let Err(e) = guard.write_all(&frame).await {
+                            log::warn!("lsp: failed to reply to server request {id}: {e}");
+                        } else if let Err(e) = guard.flush().await {
+                            log::warn!("lsp: failed to flush reply {id}: {e}");
+                        }
+                    }
+                    Err(e) => log::warn!("lsp: failed to serialize reply {id}: {e}"),
+                }
+            }
+        }
+
+        let mut chunk = [0u8; 8192];
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .context("failed to read from language server stdout")?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+/// 服务器主动请求的处理结果。
+enum ServerRequestReply {
+    /// 直接回这个值（多数请求回 `null` 即可）。
+    Value(Value),
+    /// 回一个「方法未实现」错误。用于我们确实不该假装支持的请求，
+    /// 让服务器立刻降级而不是等着。
+    Unimplemented,
+}
+
+/// 服务器向我们发起的请求该怎么应答。
+///
+/// **必须应答**：JSON-RPC 的服务器会一直等到响应才继续。早期版本只记日志
+/// 不应答，rust-analyzer 就反复重发 `window/workDoneProgress/create` 并卡住
+/// 进度上报（日志里表现为几十条同样的请求）。
+fn server_request_reply(method: &str) -> ServerRequestReply {
+    match method {
+        // 服务器想注册额外能力：接受（回 null 即表示成功）。
+        "client/registerCapability" | "client/unregisterCapability" => {
+            ServerRequestReply::Value(Value::Null)
+        }
+        // 进度令牌：接受，我们只是不显示进度 UI。
+        "window/workDoneProgress/create" => ServerRequestReply::Value(Value::Null),
+        // 拉取配置项：返回空数组 = 「都用默认值」。不回的话部分服务器
+        // （pyright、gopls）会一直等，表现为请求挂死。
+        "workspace/configuration" => ServerRequestReply::Value(Value::Array(Vec::new())),
+        // 服务器要求写入文件（格式化到文件等）：我们不支持，明确报错，
+        // 让服务器退回「通过响应体返回编辑」的路径。
+        "workspace/applyEdit" => ServerRequestReply::Unimplemented,
+        // 其余（自定义请求等）：回 null，让服务器继续。
+        _ => ServerRequestReply::Value(Value::Null),
+    }
+}
+
+/// 分发一条入站消息：有 id 且在 pending 表里 → 应答；否则按通知转发。
+///
+/// 服务器的**主动请求**不进通知队列，而是直接就地应答——`dispatch` 拿不到
+/// 写端（在 `Connection` 上），所以返回待应答项由读循环发送。
+fn dispatch(
+    msg: Message,
+    pending: &Pending,
+    notify: &(Sender<Message>, Receiver<Message>),
+) -> Option<(u32, ServerRequestReply)> {
+    let (notify_tx, notify_rx) = notify;
+    match msg {
+        Message::Response { id, result, error } => {
+            let tx = pending.lock().remove(&id);
+            match tx {
+                Some(tx) => {
+                    let value = match error {
+                        Some(e) => Err(anyhow!(e)),
+                        None => Ok(result.unwrap_or(Value::Null)),
+                    };
+                    // 接收端已被 drop（请求被取消）时忽略即可。
+                    let _ = tx.try_send(value);
+                }
+                None => log::warn!("lsp: response for unknown request id {id}"),
+            }
+        }
+        Message::Request { id, method, .. } => {
+            // 必须应答：服务器会一直等。具体应答内容见 `server_request_reply`。
+            log::debug!("lsp: server request {method} (id {id})");
+            return Some((id, server_request_reply(&method)));
+        }
+        Message::Notification { .. } => {
+            // 队列满时丢弃**最旧**的通知再塞新的：诊断是幂等的全量快照，
+            // 保留最新的一份才是对的（丢新的会让 UI 停在过期诊断上）。
+            if notify_tx.is_full() {
+                let _ = notify_rx.try_recv();
+            }
+            let _ = notify_tx.try_send(msg);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(body: &str) -> Vec<u8> {
+        encode_frame(body.as_bytes())
+    }
+
+    #[test]
+    fn encode_frame_has_content_length() {
+        let bytes = frame("{\"a\":1}");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("Content-Length: 7\r\n\r\n"), "got {text:?}");
+        assert!(text.ends_with("{\"a\":1}"));
+    }
+
+    #[test]
+    fn server_requests_get_answered_not_dropped() {
+        // 回归：早期版本只记日志不应答，rust-analyzer 会反复重发
+        // workDoneProgress/create 并卡住进度上报。
+        for method in [
+            "client/registerCapability",
+            "window/workDoneProgress/create",
+            "workspace/configuration",
+        ] {
+            let reply = server_request_reply(method);
+            match reply {
+                ServerRequestReply::Value(v) => {
+                    // configuration 必须回数组（空 = 用默认值）。
+                    if method == "workspace/configuration" {
+                        assert!(v.is_array(), "configuration must reply with an array");
+                    }
+                }
+                ServerRequestReply::Unimplemented => {
+                    panic!("{method} should be answered, not rejected")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_edit_is_rejected_explicitly() {
+        // 我们不支持让服务器直接写文件：明确报错，让它退回响应体返回编辑。
+        assert!(matches!(
+            server_request_reply("workspace/applyEdit"),
+            ServerRequestReply::Unimplemented
+        ));
+    }
+
+    #[test]
+    fn unknown_server_request_still_answered() {
+        // 未知请求也要应答（回 null），否则服务器会一直等。
+        assert!(matches!(
+            server_request_reply("custom/someRequest"),
+            ServerRequestReply::Value(_)
+        ));
+    }
+
+    #[test]
+    fn parses_notification() {
+        let body = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///a"}}"#;
+        let (msg, consumed) = parse_frame(&frame(body)).unwrap().unwrap();
+        assert_eq!(consumed, frame(body).len());
+        match msg {
+            Message::Notification { method, params } => {
+                assert_eq!(method, "textDocument/publishDiagnostics");
+                assert_eq!(params["uri"], "file:///a");
+            }
+            other => panic!("expected notification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_response_with_result() {
+        let body = r#"{"jsonrpc":"2.0","id":7,"result":{"capabilities":{}}}"#;
+        let (msg, _) = parse_frame(&frame(body)).unwrap().unwrap();
+        match msg {
+            Message::Response { id, result, error } => {
+                assert_eq!(id, 7);
+                assert!(result.is_some());
+                assert!(error.is_none());
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_response_with_error() {
+        let body = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"not found"}}"#;
+        let (msg, _) = parse_frame(&frame(body)).unwrap().unwrap();
+        match msg {
+            Message::Response { id, error, .. } => {
+                assert_eq!(id, 3);
+                let e = error.unwrap();
+                assert_eq!(e.code, -32601);
+                assert_eq!(e.message, "not found");
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_null_result_is_a_valid_response() {
+        // 回归：`{"result": null}` 是**合法**响应（方法成功但无返回值）。
+        // rust-analyzer 在 `completion` 无候选时正是这么回的；曾因把
+        // `Option<Value>` 的 null 当成「字段缺失」而误判为协议错误，
+        // 进而关掉整条连接。
+        let body = r#"{"jsonrpc":"2.0","id":3,"result":null}"#;
+        let (msg, _) = parse_frame(&frame(body)).unwrap().unwrap();
+        match msg {
+            Message::Response { id, result, error } => {
+                assert_eq!(id, 3);
+                assert!(error.is_none());
+                assert_eq!(result, Some(serde_json::Value::Null));
+            }
+            other => panic!("expected response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_without_result_or_error_is_protocol_error() {
+        // 真正的协议错误：两个字段都没有（不是「值为 null」）。
+        let body = r#"{"jsonrpc":"2.0","id":4}"#;
+        assert!(parse_frame(&frame(body)).is_err());
+    }
+
+    #[test]
+    fn parses_server_to_client_request() {
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"workspace/configuration","params":{}}"#;
+        let (msg, _) = parse_frame(&frame(body)).unwrap().unwrap();
+        match msg {
+            Message::Request { id, method, .. } => {
+                assert_eq!(id, 1);
+                assert_eq!(method, "workspace/configuration");
+            }
+            other => panic!("expected request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_header_returns_none() {
+        // 只有半个头：不是错误，是数据不够。
+        assert!(parse_frame(b"Content-Length: 10\r\n").unwrap().is_none());
+    }
+
+    #[test]
+    fn incomplete_body_returns_none() {
+        // 头完整但载荷不足。
+        let mut buf = frame(&"x".repeat(20));
+        buf.truncate(buf.len() - 5);
+        assert!(parse_frame(&buf).unwrap().is_none());
+    }
+
+    #[test]
+    fn multiple_frames_in_one_buffer() {
+        // 粘包：一次拿到两条消息，必须只消费第一条并报告正确偏移。
+        let mut buf = frame(r#"{"jsonrpc":"2.0","method":"a"}"#);
+        let second = frame(r#"{"jsonrpc":"2.0","method":"b"}"#);
+        buf.extend_from_slice(&second);
+
+        let (msg, consumed) = parse_frame(&buf).unwrap().unwrap();
+        assert_eq!(consumed, frame(r#"{"jsonrpc":"2.0","method":"a"}"#).len());
+        match msg {
+            Message::Notification { method, .. } => assert_eq!(method, "a"),
+            other => panic!("got {other:?}"),
+        }
+        // 剩余部分仍能解析出第二条。
+        let (msg, _) = parse_frame(&buf[consumed..]).unwrap().unwrap();
+        match msg {
+            Message::Notification { method, .. } => assert_eq!(method, "b"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowercase_content_length_is_accepted() {
+        // 真实服务器偶发小写头字段。
+        let body = r#"{"jsonrpc":"2.0","method":"x"}"#;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(format!("content-length: {}\r\n\r\n", body.len()).as_bytes());
+        buf.extend_from_slice(body.as_bytes());
+        let (msg, _) = parse_frame(&buf).unwrap().unwrap();
+        match msg {
+            Message::Notification { method, .. } => assert_eq!(method, "x"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_content_length_is_error() {
+        let buf = b"\r\n\r\n{}";
+        assert!(parse_frame(buf).is_err());
+    }
+
+    #[test]
+    fn dispatch_pairs_response_to_pending_request() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = bounded(1);
+        pending.lock().insert(42, tx);
+        let (ntx, nrx) = bounded(8);
+
+        dispatch(
+            Message::Response {
+                id: 42,
+                result: Some(serde_json::json!({"ok": true})),
+                error: None,
+            },
+            &pending,
+            &(ntx, nrx),
+        );
+
+        let value = rx.try_recv().unwrap().unwrap();
+        assert_eq!(value["ok"], true);
+        // 配对后从表内移除。
+        assert!(pending.lock().is_empty());
+    }
+
+    #[test]
+    fn dispatch_turns_error_into_err() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, rx) = bounded(1);
+        pending.lock().insert(1, tx);
+        let (ntx, nrx) = bounded(8);
+
+        dispatch(
+            Message::Response {
+                id: 1,
+                result: None,
+                error: Some(ResponseError {
+                    code: -32602,
+                    message: "bad params".into(),
+                    data: None,
+                }),
+            },
+            &pending,
+            &(ntx, nrx),
+        );
+
+        let err = rx.try_recv().unwrap().unwrap_err();
+        assert!(err.to_string().contains("bad params"));
+    }
+
+    #[test]
+    fn dispatch_forwards_notification() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (ntx, nrx) = bounded(8);
+        dispatch(
+            Message::Notification {
+                method: "textDocument/publishDiagnostics".into(),
+                params: serde_json::json!({"uri": "file:///x"}),
+            },
+            &pending,
+            &(ntx, nrx.clone()),
+        );
+        let msg = nrx.try_recv().unwrap();
+        match msg {
+            Message::Notification { method, .. } => {
+                assert_eq!(method, "textDocument/publishDiagnostics")
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dispatch_drops_oldest_notification_when_full() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (ntx, nrx) = bounded(2);
+        for i in 0..3 {
+            dispatch(
+                Message::Notification {
+                    method: format!("m{i}"),
+                    params: Value::Null,
+                },
+                &pending,
+                &(ntx.clone(), nrx.clone()),
+            );
+        }
+        // 容量 2，第三条挤掉第一条。
+        let first = nrx.try_recv().unwrap();
+        match first {
+            Message::Notification { method, .. } => assert_eq!(method, "m1"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serialize_request_uses_numeric_id_and_null_params_omitted() {
+        let out = OutgoingRequest {
+            jsonrpc: "2.0",
+            id: 5,
+            method: "shutdown",
+            params: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["method"], "shutdown");
+        // `skip_serializing_if` 生效：多数服务器对显式 null 参数更挑剔。
+        assert!(v.get("params").is_none());
+    }
+}

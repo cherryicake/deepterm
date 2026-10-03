@@ -67,6 +67,9 @@ fn main() {
             // keymap 依赖 settings（vim 开关决定是否加载 vim 键位表）。
             deepterm::keymap::init(cx);
             deepterm::file_manager::watcher::init(cx);
+            // LSP 全局管理器：必须在 `editor::init` 之前（编辑器开 tab 时会
+            // 向它查询/启动语言服务器）。它依赖 settings 的 lsp 段。
+            deepterm::lsp::init(cx);
             components::init(cx);
             terminal_view::init(cx);
             workspace::init(cx);
@@ -92,6 +95,12 @@ fn main() {
                         }
                     });
                 }
+                // 语言服务器走 LSP 关闭握手（shutdown → exit）再退出：
+                // 直接丢弃会让子进程变成孤儿（编辑器没了、服务器还在跑）。
+                // 握手是异步的，给它一点时间把帧写出去；`shutdown_all`
+                // 内部有 5s 上限，最坏情况会强杀，不会永久挂住退出。
+                deepterm::lsp::LspManager::shutdown_all(cx);
+                std::thread::sleep(std::time::Duration::from_millis(150));
                 cx.quit();
             });
 

@@ -177,6 +177,9 @@ pub(crate) struct TextElement {
     placeholder: SharedString,
 }
 
+/// 悬浮浮层与锚点行之间的间隙（Zed 的 `HOVER_POPOVER_GAP`）。
+const HOVER_POPOVER_GAP: Pixels = px(4.);
+
 impl TextElement {
     pub(super) fn new(state: Entity<InputState>) -> Self {
         Self {
@@ -3076,6 +3079,17 @@ impl TextElement {
             )
         });
 
+        // LSP 浮层/菜单的布局必须在这里做：`layout_as_root` 只允许在
+        // request_layout / prepaint 调用，放到 paint 会 panic。
+        // 用 prepaint 结束时算好的行布局与滚动偏移（Zed 同款）。
+        self.layout_lsp_popovers(
+            bounds,
+            &last_layout,
+            last_layout.line_height,
+            window,
+            cx,
+        );
+
         PrepaintState {
             bounds,
             last_layout,
@@ -3659,7 +3673,20 @@ impl TextElement {
         let mut fold_click_targets: Vec<(usize, Bounds<Pixels>)> = Vec::new();
         let fold_placeholder_bg = cx.theme().text.opacity(0.055);
 
-        for (i, (line, _)) in prepaint
+        // Inlay Hint 的渲染素材：在循环外取一次，避免每行都读一次实体锁、
+        // 也不必每行都重算字体。空时不进入绘制分支。
+        // 克隆一份：hint 只在可见行上，量很小；而下面的绘制循环要反复
+        // 可变借用 `cx`，持着实体读锁过不去借用检查。
+        let inlay_hints_by_line = self.state.read(cx).inlay_hints_by_line().clone();
+        let inlay_style = window.text_style();
+        let inlay_font = inlay_style.font();
+        let inlay_font_size = self
+            .state
+            .read(cx)
+            .font_size
+            .unwrap_or_else(|| inlay_style.font_size.to_pixels(window.rem_size()));
+
+        for (i, (line, buffer_line)) in prepaint
             .last_layout
             .lines
             .iter()
@@ -3683,8 +3710,45 @@ impl TextElement {
                 window,
                 cx,
             );
+
+            // LSP Inlay Hint：画在该行正文之后（行尾追加式）。
+            //
+            // 真正的 inlay 插在字符之间，需要把一行切成两段分别 shape 再拼
+            // 回去；首版用「行尾追加」这个更简单的形态——类型标注类 hint 的
+            // 语义基本保留，而实现成本与改动风险都低一个量级。
+            if let Some(hints) = inlay_hints_by_line.get(&buffer_line) {
+                let mut hint_x = p.x + line.longest_width;
+                for hint in hints {
+                    let run = window.text_system().shape_line(
+                        gpui::SharedString::from(hint.text.clone()),
+                        inlay_font_size,
+                        &[TextRun {
+                            len: hint.text.chars().count(),
+                            font: inlay_font.clone(),
+                            color: cx.theme().ui.text_muted,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                        None,
+                    );
+                    _ = run.paint(point(hint_x, line_y), line_height, TextAlign::Left, None, window, cx);
+                    hint_x += run.width;
+                }
+            }
+
             offset_y += line.size(line_height).height;
         }
+
+        // LSP 悬浮浮层：按 Zed 的 `layout_hover_popovers` 定位。
+        //
+        // 关键点：**在绘制时**用当前帧的行布局把文本锚点换算成像素，而不是
+        // 事先存一个像素坐标。滚动/软换行/行号栏宽度变化都会让事先算好的
+        // 坐标失效，这正是之前浮层位置错乱的原因。
+        // LSP 浮层/菜单不在这里画：它们在 prepaint 阶段已通过
+        // `window.defer_draw(...)` 交给 gpui，由其 deferred 队列统一
+        // prepaint + paint。在 paint 里再调 `defer_draw` 会入队一个
+        // 从未 prepaint 的元素，触发 "must call prepaint before paint"。
 
         // Paint the `⋯` pills and their trailing texts (e.g. `}`) inline at the
         // end of each folded header line — zed's fold placeholder replaces the
@@ -4214,6 +4278,170 @@ impl TextElement {
 
         self.paint_mouse_listeners(window, cx);
     }
+
+    /// 布局 LSP 浮层与补全菜单（照抄 Zed 的 `layout_hover_popovers`）。
+    ///
+    /// **必须在 prepaint 阶段调用**：`layout_as_root` 只允许在
+    /// request_layout / prepaint 里跑，在 paint 里调会 panic
+    /// （"this method can only be called during request_layout, or prepaint"）。
+    ///
+    /// 算法与 Zed 一致：
+    /// 1. 锚点（字节偏移）→ 可见行下标 + 行内列；
+    /// 2. `x` 由该行 `position_for_index(列)` 给出，`y` = 累计行高；
+    /// 3. 减去滚动偏移、加上内容原点 → **窗口坐标**；
+    /// 4. 先尝试画在锚点行上方，放不下再翻到下方（Zed 的
+    ///    `can_place_above` / `can_place_below`）。
+    fn layout_lsp_popovers(
+        &self,
+        bounds: Bounds<Pixels>,
+        last_layout: &LastLayout,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+
+        // 补全菜单优先：它在打字时出现，比 hover 更需要即时可见。
+        if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
+            let offset = state.completion_anchor()?;
+            let content =
+                crate::editor::completion::render_completion_menu_from_state(state, cx)?;
+            Some((offset, content))
+        }) && let Some(origin) = self.place_at_anchor(
+            anchor,
+            &mut content,
+            bounds,
+            last_layout,
+            line_height,
+            true,
+            window,
+            cx,
+        ) {
+            // `defer_draw` **必须**在 prepaint 阶段调用：它把元素入队，
+            // gpui 随后对队列里的元素统一跑 prepaint + paint。放到 paint
+            // 阶段调用会入队一个从未 prepaint 的元素，触发
+            // "must call prepaint before paint"。
+            window.defer_draw(content, origin, 2, None);
+        }
+
+        // hover 浮层：优先画在锚点行上方（不遮住正在看的词）。
+        if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
+            let (offset, _) = state.hover_popover()?;
+            let content = crate::editor::hover::render_hover_content_from_state(state, cx)?;
+            Some((offset, content))
+        }) && let Some(origin) = self.place_at_anchor(
+            anchor,
+            &mut content,
+            bounds,
+            last_layout,
+            line_height,
+            false,
+            window,
+            cx,
+        ) {
+            window.defer_draw(content, origin, 2, None);
+        }
+    }
+
+    /// 把浮层放在锚点行附近，返回它的绝对位置。
+    ///
+    /// `prefer_below` 为 true 时优先画在锚点行下方（补全菜单：跟着光标往下
+    /// 铺），否则优先上方（hover：不遮住正在读的那一行）。
+    #[allow(clippy::too_many_arguments)]
+    fn place_at_anchor(
+        &self,
+        anchor_offset: usize,
+        content: &mut gpui::AnyElement,
+        bounds: Bounds<Pixels>,
+        last_layout: &LastLayout,
+        line_height: Pixels,
+        prefer_below: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<gpui::Point<Pixels>> {
+        let row_ix = visible_row_for_offset(&last_layout.visible_line_byte_offsets, anchor_offset)?;
+
+        // 行顶与行高：与正文绘制**逐项对齐**（见 `row_top_in_viewport`）。
+        let (row_top, row_height) =
+            row_top_in_viewport(last_layout, row_ix, line_height, bounds.origin.y);
+
+        // 行内列 → 精确 x（`position_for_index` 处理软换行与对齐偏移）。
+        let col = anchor_offset.saturating_sub(last_layout.visible_line_byte_offsets[row_ix]);
+        let x_in_line = last_layout
+            .lines
+            .get(row_ix)
+            .and_then(|l| l.position_for_index(col, last_layout, false))
+            .map(|p| p.x)
+            .unwrap_or(px(0.));
+        let x = bounds.origin.x + last_layout.line_number_width + x_in_line;
+        let anchor_y = row_top;
+
+        // 量出尺寸以决定放哪边。
+        let size = content.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
+
+        let below = anchor_y + row_height;
+        let above = anchor_y - size.height - HOVER_POPOVER_GAP;
+        let viewport_bottom = bounds.origin.y + bounds.size.height;
+
+        let fits_below = below + size.height <= viewport_bottom;
+        let fits_above = above >= bounds.origin.y;
+
+        let y = match (prefer_below, fits_below, fits_above) {
+            (true, true, _) => below,
+            (true, false, true) => above,
+            (false, true, _) => above,
+            (false, false, true) => below,
+            // 两边都放不下：夹进可视区，至少不跑出屏幕。
+            _ => above.max(bounds.origin.y),
+        };
+
+        Some(point(x, y))
+    }
+}
+
+/// 计算可见行 `row_ix` 在**视口内的行顶 y** 与它的高度。
+///
+/// 公式与 `paint_inner` 的正文绘制循环逐项对齐：
+///
+/// ```text
+/// row_top = bounds.origin.y + visible_top + Σ(前面各行的 git 块高 + 行高)
+/// ```
+///
+/// **`bounds.origin.y` 已经含滚动偏移**（`layout_cursor` 里
+/// `bounds.origin += scroll_offset`），所以这里不能再加/减滚动量。
+/// 之前浮层位置错乱正是因为又减了一遍 `scroll_offset.y`。
+///
+/// 抽成纯函数便于单测：这是「浮层落在哪一行」的唯一决定因素。
+fn row_top_in_viewport(
+    last_layout: &LastLayout,
+    row_ix: usize,
+    line_height: Pixels,
+    bounds_top: Pixels,
+) -> (Pixels, Pixels) {
+    let mut row_top = bounds_top + last_layout.visible_top;
+    for (i, prev) in last_layout.lines.iter().enumerate().take(row_ix) {
+        // git 展开区的块高也要计入（用户展开过 hunk 时行间会多出这些块）。
+        row_top += line_height * last_layout.git_insert_delta(i) as f32;
+        row_top += prev.size(line_height).height;
+    }
+    let row_height = last_layout
+        .lines
+        .get(row_ix)
+        .map(|l| l.size(line_height).height)
+        .unwrap_or(line_height);
+    (row_top, row_height)
+}
+
+/// 锚点字节偏移 → 可见行下标（`visible_line_byte_offsets` 与 `lines` 平行）。
+///
+/// 抽成自由函数便于单测：hover 与补全菜单都用它定位。
+fn visible_row_for_offset(offsets: &[usize], offset: usize) -> Option<usize> {
+    if offsets.is_empty() {
+        return None;
+    }
+    offsets.iter().enumerate().find_map(|(i, start)| {
+        let end = offsets.get(i + 1).copied().unwrap_or(usize::MAX);
+        (offset >= *start && offset < end).then_some(i)
+    })
 }
 
 /// Get the runs for the given range.

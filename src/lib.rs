@@ -9,6 +9,7 @@ pub mod components;
 pub mod editor;
 pub mod file_manager;
 pub mod keymap;
+pub mod lsp;
 pub mod vim;
 pub mod settings;
 pub mod sidebar_view;

@@ -1,0 +1,251 @@
+//! LSP 悬浮提示浮层。
+//!
+//! 鼠标停在标识符上一段时间后，向服务器请求 `textDocument/hover`，把返回的
+//! markdown / 纯文本渲染成一张小卡片。
+//!
+//! **定位模型照抄 Zed**（`editor/src/hover_popover.rs` +
+//! `editor/src/element.rs::layout_hover_popovers`）：
+//!
+//! 1. 浮层状态只记录**文本锚点**（命中字符的字节偏移），不记录像素坐标。
+//!    像素坐标在编辑器每次布局时都会变（滚动、软换行、行号栏宽度变化），
+//!    存下来必然过期——这正是之前浮层位置错乱的根因。
+//! 2. 真正绘制时由 `TextElement::paint_inner` 用**当前帧的**行布局把锚点
+//!    换算成 `(x, y)`：`x` 由该行 `ShapedLine::x_for_index` 给出，`y` 由
+//!    行号 × 行高给出，再减去滚动偏移、加上内容原点。
+//! 3. 用 `window.defer_draw(element, origin, 2, None)` 画到绝对坐标上。
+//!    `defer_draw` 的坐标就是**窗口坐标**，与鼠标事件同一空间，不再需要
+//!    在两种坐标系之间换算。
+//! 4. 优先画在命中行**上方**；上方放不下才画到下方（Zed 的
+//!    `can_place_above` / `can_place_below` 判定）。
+//!
+//! 交互约定：
+//! - **防抖**：鼠标移动是连续事件，每次都发请求会把服务器打挂，停稳
+//!   [`HOVER_DELAY`] 才发；
+//! - **不抢焦点**：浮层不能聚焦，否则鼠标一进浮层编辑器就失焦。
+
+use std::ops::Range;
+use std::time::Duration;
+
+use gpui::{
+    App, Entity, IntoElement, ParentElement as _, Styled as _, div, px,
+};
+use lsp_types::Url;
+use ropey::Rope;
+
+use crate::components::input::InputState;
+use crate::lsp::features::{self, hover_contents};
+use crate::theme::ActiveTheme as _;
+
+/// 鼠标停稳多久才发 hover 请求。
+pub const HOVER_DELAY: Duration = Duration::from_millis(300);
+
+/// 浮层最大宽度（px）。
+pub const MAX_WIDTH: f32 = 520.0;
+/// 浮层最大高度（px）；超出后截断。
+pub const MAX_HEIGHT: f32 = 320.0;
+
+/// 一次 hover 的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoverInfo {
+    /// 展示文本（可能是 markdown，含 ``` 代码块）。
+    pub contents: String,
+    /// 命中的源区间，用于在编辑器里高亮。
+    pub range: Option<Range<usize>>,
+}
+
+/// hover 浮层的状态机。
+///
+/// 挂在 `Editor` 上：请求需要 `InputState`（文本）与 LSP 会话，
+/// 绘制需要 `Window`。
+pub struct HoverState {
+    /// 锚点：命中字符的字节偏移。
+    ///
+    /// **只存文本偏移，不存像素**——像素坐标随滚动/换行/行号栏宽度变化，
+    /// 存下来会过期（Zed 同样只存 `Anchor`）。
+    anchor_offset: usize,
+    /// 防抖任务：新的一次移动会替换（取消）它。
+    task: Option<gpui::Task<()>>,
+    /// 上次请求的目标位置，用于避免鼠标在同一字符内微动时重复请求。
+    last_offset: Option<usize>,
+}
+
+impl Default for HoverState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HoverState {
+    pub fn new() -> Self {
+        Self {
+            anchor_offset: 0,
+            task: None,
+            last_offset: None,
+        }
+    }
+
+    /// 浮层的文本锚点（字节偏移）。
+    pub fn anchor_offset(&self) -> usize {
+        self.anchor_offset
+    }
+
+    /// 隐藏浮层并取消在途请求（不清 `InputState`，见 [`Self::hide_in`]）。
+    pub fn hide(&mut self) {
+        self.task.take();
+        self.last_offset = None;
+    }
+
+    /// 鼠标移动：重置防抖，停稳后发请求。
+    ///
+    /// `offset` 是鼠标位置换算出的字节偏移；同一偏移内的重复移动不会
+    /// 重新请求（鼠标抖动不应产生流量）。
+    ///
+    /// `client` 为 `None`（该语言无服务器）时是空操作——调用方不需要
+    /// 先判断有没有 LSP。
+    pub fn on_mouse_moved(
+        &mut self,
+        offset: usize,
+        editor: &Entity<InputState>,
+        client: Option<std::sync::Arc<crate::lsp::client::LspClient>>,
+        uri: Url,
+        cx: &mut App,
+    ) {
+        let Some(client) = client else {
+            return;
+        };
+        // 同一字符内重复移动：不重发（鼠标抖动不该产生流量）。
+        if self.last_offset == Some(offset) {
+            return;
+        }
+        // 锚点立刻更新：这样请求回来后浮层就落在当前字符上。
+        self.anchor_offset = offset;
+        self.last_offset = Some(offset);
+        // 替换即取消上一次的防抖。
+        self.task.take();
+
+        let editor = editor.downgrade();
+        self.task = Some(cx.spawn(async move |cx| {
+            smol::Timer::after(HOVER_DELAY).await;
+
+            // 防抖结束后重新读文本：期间用户可能又打了字，位置会漂移。
+            let Some(position) = editor
+                .update(cx, |state, _| {
+                    features::offset_to_position(state.text(), offset)
+                })
+                .ok()
+            else {
+                return;
+            };
+
+            let result = client.hover(&uri, position).await;
+            let Ok(Some(hover)) = result else {
+                // 无 hover 内容（空白行/空白字符）时保持隐藏，不弹空卡片。
+                return;
+            };
+
+            editor
+                .update(cx, |state, _| {
+                    let info = hover_info(state.text(), &hover);
+                    // 结果先落进 `InputState` 的槽，由 Editor 取走
+                    // （后台任务拿不到 `Editor` 上的 `HoverState`）。
+                    state.set_pending_hover(info);
+                })
+                .ok();
+        }));
+    }
+
+    /// 把后台算好的结果落到 `InputState` 的浮层槽里（由 Editor 每帧调用）。
+    ///
+    /// `InputState` 是浮层状态的唯一真相源：`TextElement` 只持有
+    /// `Entity<InputState>`，绘制时要同时拿到锚点与内容才能定位排版。
+    pub fn take_pending(&mut self, editor: &Entity<InputState>, cx: &mut App) {
+        let anchor = self.anchor_offset;
+        editor.update(cx, |state, _cx| {
+            if let Some(info) = state.take_pending_hover() {
+                state.set_hover_popover(anchor, info);
+            }
+        });
+    }
+
+    /// 隐藏浮层：同时清掉 `InputState` 上的状态（绘制读的是那边）。
+    pub fn hide_in(&mut self, editor: &Entity<InputState>, cx: &mut App) {
+        self.hide();
+        editor.update(cx, |state, _cx| state.clear_hover_popover());
+    }
+
+}
+
+/// 渲染 hover 浮层的**内容**（不含定位），从 `InputState` 取状态。
+///
+/// 定位交给 `TextElement::paint_inner`：那里才有当前帧的行布局与滚动偏移。
+/// 这里只负责把文本排成卡片，并限制最大尺寸。
+pub fn render_hover_content_from_state(state: &InputState, cx: &App) -> Option<gpui::AnyElement> {
+    let (_, info) = state.hover_popover()?;
+    render_hover_card(info, cx)
+}
+
+/// 渲染 hover 浮层的**内容**（不含定位）。
+///
+/// 文本按行渲染，不解析 markdown——hover 内容里最常见的是带 ``` 的
+/// 代码块，用等宽字体整块呈现已经足够可读，引入完整的 markdown 渲染
+/// 会为此付出不必要的依赖与布局复杂度。
+pub fn render_hover_card(info: &HoverInfo, cx: &App) -> Option<gpui::AnyElement> {
+    if info.contents.trim().is_empty() {
+        return None;
+    }
+    let theme = cx.theme().ui;
+
+    // 等宽字体：与代码编辑器同一套设置（用户改了字号/字体，hover 里的
+    // 代码块也跟着变）。
+    let code_font = cx
+        .try_global::<crate::sidebar_view::font_settings::FontState>()
+        .map(|s| s.settings.editor_font_family.clone())
+        .unwrap_or_else(|| "Menlo".to_string());
+
+    let mut card = div()
+        .max_w(px(MAX_WIDTH))
+        .max_h(px(MAX_HEIGHT))
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .py(px(8.0))
+        .px(px(10.0))
+        .rounded(px(8.0))
+        .bg(theme.panel_background)
+        .border_1()
+        .border_color(theme.border)
+        .shadow_lg()
+        .text_size(px(12.0))
+        .text_color(theme.text);
+
+    // 按行渲染：``` 包裹的段落用等宽字体区分代码块。
+    let mut in_code = false;
+    for line in info.contents.lines() {
+        if line.trim_start().starts_with("```") {
+            in_code = !in_code;
+            continue;
+        }
+        let line_owned = line.to_string();
+        if in_code {
+            card = card.child(
+                div()
+                    .font_family(code_font.clone())
+                    .whitespace_nowrap()
+                    .text_color(theme.text)
+                    .child(line_owned),
+            );
+        } else {
+            card = card.child(div().child(line_owned));
+        }
+    }
+
+    Some(card.into_any_element())
+}
+
+/// 从 `Hover` 响应构造展示信息。
+pub fn hover_info(rope: &Rope, hover: &lsp_types::Hover) -> HoverInfo {
+    HoverInfo {
+        contents: hover_contents(hover),
+        range: features::hover_range(rope, hover),
+    }
+}

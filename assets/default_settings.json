@@ -29,5 +29,9 @@
     "default_mode": "normal",
     "normal_cursor_shape": "block",
     "relative_line_numbers": false
+  },
+  "lsp": {
+    "enabled": true,
+    "servers": {}
   }
 }
