@@ -118,7 +118,8 @@ impl CompletionState {
         uri: Url,
         cx: &mut App,
     ) {
-        self.fetch(editor, client, uri, None, cx);
+        // 手动触发（ctrl-space）：不带触发字符。
+        self.fetch(editor, client, uri, None, None, cx);
     }
 
     /// 输入后触发（带防抖）。
@@ -127,9 +128,10 @@ impl CompletionState {
         editor: &Entity<InputState>,
         client: Option<Arc<LspClient>>,
         uri: Url,
+        trigger_character: Option<String>,
         cx: &mut App,
     ) {
-        self.fetch(editor, client, uri, Some(AUTO_DELAY), cx);
+        self.fetch(editor, client, uri, trigger_character, Some(AUTO_DELAY), cx);
     }
 
     fn fetch(
@@ -137,6 +139,7 @@ impl CompletionState {
         editor: &Entity<InputState>,
         client: Option<Arc<LspClient>>,
         uri: Url,
+        trigger_character: Option<String>,
         delay: Option<Duration>,
         cx: &mut App,
     ) {
@@ -166,7 +169,14 @@ impl CompletionState {
             };
             let _ = offset;
 
-            match client.completion(&uri, position, None).await {
+            // 把触发字符原样传给服务器（对照 LSP 的
+            // `CompletionContext.triggerCharacter`）：服务器据此决定返回哪一
+            // 类候选（例如 `:` 后只给属性名）。此前恒传 `None`，服务器无法
+            // 区分「用户敲了触发字符」与「手动请求补全」。
+            match client
+                .completion(&uri, position, trigger_character)
+                .await
+            {
                 Ok((items, _incomplete)) => {
                     editor
                         .update(cx, |state, _| {

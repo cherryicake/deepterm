@@ -101,6 +101,19 @@ impl LspClient {
         &self.capabilities
     }
 
+    /// 服务器声明的补全触发字符（`completionProvider.triggerCharacters`）。
+    ///
+    /// 对照 Zed 的 `lsp_store.rs`：它从
+    /// `server.capabilities().completion_provider.trigger_characters` 取，
+    /// 存进 `completion_triggers_per_language_server` 用于触发补全。
+    ///
+    /// 典型值：Rust 的 `:` / `.`、CSS 的 `:` / `@`、HTML 的 `<`。
+    /// 之前完全不读这个字段，只按「标识符字符」触发，于是 `:`、`@`、`<`
+    /// 这些**服务器明确要求的**触发点永远不会请求补全。
+    pub fn completion_trigger_characters(&self) -> Vec<String> {
+        trigger_characters_of(&self.capabilities)
+    }
+
     /// 项目根。
     pub fn root(&self) -> &Path {
         &self.root
@@ -572,6 +585,20 @@ impl LspClient {
 ///
 /// 只声明真正实现的，避免服务器发来我们不会处理的请求。
 /// `text_document` 里声明了后续要用的全部方法。
+/// 从 `InitializeResult` 取服务器的补全触发字符。
+///
+/// 抽成自由函数便于单测：这是唯一读取该能力字段的地方，测试可以直接喂
+/// 真实的 `InitializeResult`（由 JSON 反序列化而来）验证取值路径。
+fn trigger_characters_of(result: &InitializeResult) -> Vec<String> {
+    result
+        .capabilities
+        .completion_provider
+        .as_ref()
+        .and_then(|provider| provider.trigger_characters.as_ref())
+        .map(|chars| chars.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         workspace: Some(lsp_types::WorkspaceClientCapabilities {
@@ -738,12 +765,15 @@ fn client_capabilities() -> ClientCapabilities {
             ..Default::default()
         }),
         general: Some(lsp_types::GeneralClientCapabilities {
-            // 声明支持 UTF-8 偏移之外的位置编码能力查询；默认按 UTF-16
-            // （LSP 基线），与 `RopeExt::offset_to_position` 的实现一致。
-            position_encodings: Some(vec![
-                lsp_types::PositionEncodingKind::UTF16,
-                lsp_types::PositionEncodingKind::UTF8,
-            ]),
+            // **只声明 UTF-16**（对照 Zed 的 `lsp.rs`，它同样只列
+            // `PositionEncodingKind::UTF16`）。
+            //
+            // 这里不能顺手把 UTF-8 也列上：LSP 规范规定服务器从客户端给的
+            // 列表里挑一个（优先第一个它支持的），而我们的位置换算全部按
+            // UTF-16 code unit 实现（`RopeExt::offset_to_position`）。声明了
+            // UTF-8 就等于允许服务器按**字节列**回位置，那会让含多字节字符的
+            // 文件里所有位置整体错位，且错得很隐蔽（BMP 内看不出来）。
+            position_encodings: Some(vec![lsp_types::PositionEncodingKind::UTF16]),
             ..Default::default()
         }),
         ..Default::default()
@@ -773,4 +803,77 @@ pub fn uri_to_path(uri: &Url) -> Option<PathBuf> {
 /// 从通知里取出 `textDocument/publishDiagnostics` 参数。
 pub fn as_publish_diagnostics(params: &serde_json::Value) -> Option<PublishDiagnosticsParams> {
     serde_json::from_value(params.clone()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 只声明 UTF-16 位置编码。
+    ///
+    /// 回归：曾同时声明 UTF-8。LSP 规范允许服务器从客户端给的列表里挑一个，
+    /// 而我们的位置换算全部按 UTF-16 code unit 实现——服务器挑了 UTF-8 就会
+    /// 让含多字节字符的文件里所有位置整体错位，且 BMP 内看不出来。
+    /// 对照 Zed 的 `lsp.rs`：它同样只列 `PositionEncodingKind::UTF16`。
+    #[test]
+    fn advertises_only_utf16_position_encoding() {
+        let caps = client_capabilities();
+        let encodings = caps
+            .general
+            .as_ref()
+            .and_then(|g| g.position_encodings.clone())
+            .expect("must declare position encodings");
+        assert_eq!(
+            encodings,
+            vec![lsp_types::PositionEncodingKind::UTF16],
+            "must advertise exactly UTF-16; adding UTF-8 would let the server \
+             pick byte-column semantics our conversions do not implement"
+        );
+    }
+
+    /// 补全能力里声明 `resolveSupport`（选中后再拉详情）与文档格式。
+    #[test]
+    fn declares_completion_item_resolve_support() {
+        let caps = client_capabilities();
+        let item = caps
+            .text_document
+            .as_ref()
+            .and_then(|t| t.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .expect("completion_item capabilities");
+        assert!(
+            item.resolve_support.is_some(),
+            "we call completionItem/resolve, so it must be advertised"
+        );
+    }
+
+    /// 触发字符取自服务器的 `completionProvider.triggerCharacters`。
+    ///
+    /// 用真实 `InitializeResult` 反序列化构造（不是手搓字段），确保读的就是
+    /// 服务器实际返回的那个位置——对照 Zed 的
+    /// `server.capabilities().completion_provider.trigger_characters`。
+    #[test]
+    fn reads_trigger_characters_from_server_capabilities() {
+        let result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "capabilities": {
+                "completionProvider": {
+                    "triggerCharacters": [":", ".", "@"]
+                }
+            }
+        }))
+        .expect("InitializeResult parses");
+
+        let chars = trigger_characters_of(&result);
+        assert_eq!(chars, vec![":".to_string(), ".".to_string(), "@".to_string()]);
+    }
+
+    /// 服务器没声明触发字符时返回空（不能因此 panic 或瞎触发）。
+    #[test]
+    fn missing_trigger_characters_yields_empty() {
+        let result: InitializeResult = serde_json::from_value(serde_json::json!({
+            "capabilities": {}
+        }))
+        .expect("InitializeResult parses");
+        assert!(trigger_characters_of(&result).is_empty());
+    }
 }

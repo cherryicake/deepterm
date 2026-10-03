@@ -3403,35 +3403,70 @@ impl Editor {
                         && this.active_file_id.as_deref() == Some(sync_tab_id.as_str())
                     {
                         let editor = this.open_files[idx].editor_state.clone();
-                        // 用与补全替换区间**同一个**字符分类器判定
-                        // （对照 Zed 的 `CharKind` / `completion_query`）：
-                        // 此前这里硬编码了 `'.'` 算词字符，而 Rust 里
-                        // `foo.` 的点是标点，导致「输入语法匹配不准确」。
-                        let in_identifier = {
+                        // 触发判定（对照 Zed 的 `completion_query` 与
+                        // `completion_triggers`）：
+                        // 1. 光标前是「词字符」→ 按标识符补全；
+                        // 2. 或者刚输入的字符是**服务器声明的触发字符**
+                        //    （`completionProvider.triggerCharacters`，如
+                        //    Rust 的 `:`、CSS 的 `@`）→ 带 triggerCharacter
+                        //    请求，服务器据此返回对应类别的候选。
+                        //
+                        // 此前只用第 1 条且把 `.` 硬编码成词字符，于是
+                        // 「输入语法匹配不准确」，且 `:`/`@`/`<` 这些服务器
+                        // 明确要求的触发点永远不会请求补全。
+                        let client = this.active_lsp_client(cx);
+                        let (prev_char, cursor) = {
                             let state = editor.read(cx);
                             let cursor = state.cursor();
-                            cursor > 0
-                                && state
-                                    .text()
-                                    .char_at(cursor.saturating_sub(1).min(state.text().len()))
-                                    .map(|c| {
-                                        crate::lsp::features::char_kind(
-                                            c,
-                                            crate::lsp::features::DEFAULT_EXTRA_WORD_CHARS,
-                                        ) == crate::lsp::features::CharKind::Word
-                                    })
-                                    .unwrap_or(false)
+                            (
+                                if cursor > 0 {
+                                    state
+                                        .text()
+                                        .char_at(cursor.saturating_sub(1).min(state.text().len()))
+                                } else {
+                                    None
+                                },
+                                cursor,
+                            )
                         };
-                        if in_identifier {
+                        let _ = cursor;
+
+                        // 服务器声明的触发字符集合。
+                        let declared_triggers: Vec<String> = client
+                            .as_ref()
+                            .map(|c| c.completion_trigger_characters())
+                            .unwrap_or_default();
+
+                        let trigger_character = prev_char.and_then(|c| {
+                            let s = c.to_string();
+                            declared_triggers.iter().any(|t| t == &s).then_some(s)
+                        });
+
+                        let in_identifier = prev_char
+                            .map(|c| {
+                                crate::lsp::features::char_kind(
+                                    c,
+                                    crate::lsp::features::DEFAULT_EXTRA_WORD_CHARS,
+                                ) == crate::lsp::features::CharKind::Word
+                            })
+                            .unwrap_or(false);
+
+                        if in_identifier || trigger_character.is_some() {
                             let uri = this
                                 .active_lsp_session()
                                 .map(|s| s.uri().clone());
                             if let Some(uri) = uri {
-                                let client = this.active_lsp_client(cx);
-                                this.completion.trigger_auto(&editor, client, uri, cx);
+                                this.completion.trigger_auto(
+                                    &editor,
+                                    client,
+                                    uri,
+                                    trigger_character,
+                                    cx,
+                                );
                             }
                         } else {
-                            // 光标离开标识符：收起候选（比如刚打完空格）。
+                            // 光标离开标识符且非触发字符：收起候选
+                            // （比如刚打完空格）。
                             this.completion.hide_in(&editor, cx);
                         }
                     }
