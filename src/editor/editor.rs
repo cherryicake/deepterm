@@ -52,6 +52,12 @@ actions!(
         GotoLine,
         /// 跳转定义（F12）。
         GotoDefinition,
+        /// 跳转声明（ctrl-F12）：C 头文件原型 vs .c 实现。
+        GotoDeclaration,
+        /// 跳转类型定义（ctrl-shift-F12）：变量 → 它的类型。
+        GotoTypeDefinition,
+        /// 跳转实现（cmd-F12）：trait → 实现类型。
+        GotoImplementation,
         /// 查找引用（shift-F12）。
         FindReferences,
         /// 重命名符号（F2）。
@@ -110,6 +116,9 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
         // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
         KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
+        KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
+        KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
+        KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
         KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
         KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
         KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
@@ -1486,9 +1495,8 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         let Some((client, uri)) = self
-            .active_lsp_session()
-            .map(|s| s.uri().clone())
-            .and_then(|uri| self.active_lsp_client(cx).map(|c| (c, uri)))
+            .active_lsp_client(cx)
+            .zip(self.active_lsp_session().map(|s| s.uri().clone()))
         else {
             return;
         };
@@ -1526,12 +1534,52 @@ impl Editor {
     /// 之前的实现只在目标 uri 与当前文件相同时才跳，跨文件时静默返回，
     /// 于是「跳转不工作」——而这恰恰是最常见的场景（跳到其它模块的定义）。
     fn goto_definition(&mut self, _: &GotoDefinition, window: &mut Window, cx: &mut Context<Self>) {
+        self.goto_kind(LspGotoKind::Definition, window, cx);
+    }
+
+    /// 跳转声明（`textDocument/declaration`）。
+    fn goto_declaration(
+        &mut self,
+        _: &GotoDeclaration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.goto_kind(LspGotoKind::Declaration, window, cx);
+    }
+
+    /// 跳转类型定义（`textDocument/typeDefinition`）。
+    fn goto_type_definition(
+        &mut self,
+        _: &GotoTypeDefinition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.goto_kind(LspGotoKind::TypeDefinition, window, cx);
+    }
+
+    /// 跳转实现（`textDocument/implementation`）。
+    fn goto_implementation(
+        &mut self,
+        _: &GotoImplementation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.goto_kind(LspGotoKind::Implementation, window, cx);
+    }
+
+    /// 跳转族的公共实现：四个动作只有请求方法不同。
+    fn goto_kind(&mut self, kind: LspGotoKind, window: &mut Window, cx: &mut Context<Self>) {
         let Some((editor, client, uri)) = self.lsp_context(cx) else {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
         cx.spawn_in(window, async move |this, cx| {
-            let result = client.goto_definition(&uri, position).await;
+            let result = match kind {
+                LspGotoKind::Definition => client.goto_definition(&uri, position).await,
+                LspGotoKind::Declaration => client.goto_declaration(&uri, position).await,
+                LspGotoKind::TypeDefinition => client.goto_type_definition(&uri, position).await,
+                LspGotoKind::Implementation => client.goto_implementation(&uri, position).await,
+            };
             let Ok(Some(response)) = result else {
                 return;
             };
@@ -1611,15 +1659,38 @@ impl Editor {
             return;
         };
         let tab_size = editor.read(cx).tab_size;
+
+        // 有选区时格式化**选区**（`textDocument/rangeFormatting`），
+        // 无选区才格式化整篇。对照 LSP 规范：两个方法分开正是为了这个
+        // 区分——此前一律调 `formatting`，用户选中几行按格式化会改掉整篇。
+        let selection = {
+            let state = editor.read(cx);
+            let range = state.selected_range;
+            if range.is_empty() {
+                None
+            } else {
+                let text = state.text();
+                Some(lsp_types::Range::new(
+                    crate::lsp::features::offset_to_position(text, range.start),
+                    crate::lsp::features::offset_to_position(text, range.end),
+                ))
+            }
+        };
+
         cx.spawn(async move |_this, cx| {
-            let Ok(edits) = client
-                .formatting(
-                    &uri,
-                    tab_size.tab_size as u32,
-                    !tab_size.hard_tabs,
-                )
-                .await
-            else {
+            let edits = match selection {
+                Some(range) => {
+                    client
+                        .range_formatting(&uri, range, tab_size.tab_size as u32, !tab_size.hard_tabs)
+                        .await
+                }
+                None => {
+                    client
+                        .formatting(&uri, tab_size.tab_size as u32, !tab_size.hard_tabs)
+                        .await
+                }
+            };
+            let Ok(edits) = edits else {
                 return;
             };
             cx.update_entity(&editor, |state, cx| {
@@ -1714,7 +1785,81 @@ impl Editor {
         if editor.read(cx).word_at_cursor().is_empty() {
             return;
         }
+
+        // 先问服务器「这里能重命名吗」（`textDocument/prepareRename`）。
+        //
+        // 对照 LSP 规范：服务器返回的 `range` 比客户端按词边界猜的更准
+        // （例如 `foo.bar` 只应替换 `bar`），且能在**不可重命名**的位置
+        // （关键字、字面量）明确拒绝。此前不问，用户在这些位置也会看到
+        // 输入框、输完却没有效果。
+        if let Some((client, uri)) = self
+            .active_lsp_client(cx)
+            .zip(self.active_lsp_session().map(|s| s.uri().clone()))
+        {
+            let position = editor.read(cx).lsp_cursor_position();
+            let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
+            cx.spawn_in(window, async move |this, cx| {
+                match client.prepare_rename(&uri, position).await {
+                    // 服务器说可重命名：开面板。
+                    Ok(Some(_range)) => {
+                        this.update_in(cx, |this, window, cx| {
+                            this.open_rename_panel(editor, handle, window, cx);
+                        })
+                        .ok();
+                    }
+                    // 服务器明确拒绝：不开面板，给用户一句反馈。
+                    Ok(None) => {
+                        this.update_in(cx, |this, _window, cx| {
+                            this.show_notification(
+                                "此处不可重命名",
+                                NotificationKind::Warning,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                    // 服务器**明确拒绝**（如 "No references found at
+                    // position"）：这不是网络问题，是真的不可重命名。
+                    // 实测 rust-analyzer 对关键字/无引用位置就回这个错。
+                    Err(e) if is_rename_rejection(&e) => {
+                        log::debug!("lsp: prepareRename rejected: {e}");
+                        this.update_in(cx, |this, _window, cx| {
+                            this.show_notification(
+                                "此处不可重命名",
+                                NotificationKind::Warning,
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                    // 其它失败（超时、方法未实现）：退回按词边界的老行为，
+                    // 不要因为一次传输问题就禁掉功能。
+                    Err(e) => {
+                        log::debug!("lsp: prepareRename failed, falling back: {e}");
+                        this.update_in(cx, |this, window, cx| {
+                            this.open_rename_panel(editor, handle, window, cx);
+                        })
+                        .ok();
+                    }
+                }
+            })
+            .detach();
+            return;
+        }
+
+        // 没有 LSP：直接开面板（按词边界）。
         let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
+        self.open_rename_panel(editor, handle, window, cx);
+    }
+
+    /// 打开重命名面板（`prepareRename` 通过后的落点）。
+    fn open_rename_panel(
+        &mut self,
+        editor: Entity<InputState>,
+        handle: gpui::AnyWindowHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let panel = rename::RenamePanel::new(cx.entity().downgrade(), editor, handle, window, cx);
         panel.update(cx, |p, cx| p.focus(window, cx));
         self.rename_panel = Some(panel);
@@ -1881,12 +2026,48 @@ impl Editor {
                     matches!(a, lsp_types::CodeActionOrCommand::CodeAction(a)
                         if a.is_preferred == Some(true))
                 })
-                .or_else(|| response.first());
-            let Some(lsp_types::CodeActionOrCommand::CodeAction(action)) = chosen else {
-                // Command 形态需要执行服务器命令（一套额外的执行协议），
-                // 首版不支持：静默跳过比报错好。
+                .or_else(|| response.first())
+                .cloned();
+            let Some(chosen) = chosen else {
                 return;
             };
+
+            // `Command` 形态：动作本体是服务器命令，必须让它执行。
+            // 此前直接跳过，用户看到的是「点了没反应」。
+            if let lsp_types::CodeActionOrCommand::Command(cmd) = &chosen {
+                if let Err(e) = client.execute_command(&cmd.command, cmd.arguments.clone().unwrap_or_default()).await {
+                    log::warn!("lsp: executeCommand `{}` failed: {e}", cmd.command);
+                }
+                return;
+            }
+
+            let lsp_types::CodeActionOrCommand::CodeAction(action) = chosen else {
+                return;
+            };
+
+            // 惰性动作：服务器可能只给了标题，`edit` 要通过 `codeAction/resolve`
+            // 现取（对照 LSP 的 `resolveProvider`）。
+            let action = match client.resolve_code_action(action).await {
+                Ok(resolved) => resolved,
+                Err(e) => {
+                    log::debug!("lsp: codeAction/resolve failed: {e}");
+                    return;
+                }
+            };
+
+            // resolve 之后仍可能只有 command（例如「应用到所有」类动作）。
+            if action.edit.is_none()
+                && let Some(cmd) = action.command.as_ref()
+            {
+                if let Err(e) = client
+                    .execute_command(&cmd.command, cmd.arguments.clone().unwrap_or_default())
+                    .await
+                {
+                    log::warn!("lsp: executeCommand `{}` failed: {e}", cmd.command);
+                }
+                return;
+            }
+
             let Some(edits) = action
                 .edit
                 .as_ref()
@@ -4712,6 +4893,15 @@ impl Render for Editor {
                 .on_action(cx.listener(|this, _: &GotoDefinition, window, cx| {
                     this.goto_definition(&GotoDefinition, window, cx);
                 }))
+                .on_action(cx.listener(|this, _: &GotoDeclaration, window, cx| {
+                    this.goto_declaration(&GotoDeclaration, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &GotoTypeDefinition, window, cx| {
+                    this.goto_type_definition(&GotoTypeDefinition, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &GotoImplementation, window, cx| {
+                    this.goto_implementation(&GotoImplementation, window, cx);
+                }))
                 .on_action(cx.listener(|this, _: &FindReferences, window, cx| {
                     this.find_references(&FindReferences, window, cx);
                 }))
@@ -5104,6 +5294,34 @@ fn render_lsp_status_chip(
     }
 
     chip.child(label).into_any_element()
+}
+
+/// 判断 `prepareRename` 的错误是否属于「服务器明确拒绝重命名」。
+///
+/// LSP 规范没有为「不可重命名」定义专用错误码，实践中服务器回
+/// `InvalidParams`(-32602)，消息形如 "No references found at position"
+/// （rust-analyzer 实测）。
+///
+/// 与「传输/超时失败」区分开很重要：前者应直接告诉用户不可重命名，
+/// 后者才该退回按词边界猜的老行为。混为一谈会让用户在关键字上看到输入框、
+/// 输完却没有任何效果。
+pub(crate) fn is_rename_rejection(err: &anyhow::Error) -> bool {
+    let msg = format!("{err}");
+    // 明确的语义拒绝。
+    msg.contains("No references found")
+        || msg.contains("cannot be renamed")
+        || msg.contains("not renameable")
+        || msg.contains("InvalidParams")
+        || msg.contains("-32602")
+}
+
+/// 跳转种类（四个动作只有请求方法不同）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LspGotoKind {
+    Definition,
+    Declaration,
+    TypeDefinition,
+    Implementation,
 }
 
 /// LSP 跳转该怎么做（纯决策，便于单测）。

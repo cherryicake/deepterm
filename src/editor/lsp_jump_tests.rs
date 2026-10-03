@@ -91,3 +91,43 @@ fn first_line_maps_to_line_one() {
         other => panic!("expected OpenFile, got {other:?}"),
     }
 }
+
+// ------------------------------------------------ prepareRename 错误分类
+
+/// 服务器**明确拒绝**重命名时要能识别出来。
+///
+/// 实测 rust-analyzer 对无引用/关键字位置回
+/// `-32602 No references found at position`。这类错误应直接告诉用户
+/// 「不可重命名」，而不是退回按词边界猜的行为（那样用户会看到输入框、
+/// 输完却没有任何效果）。
+#[test]
+fn recognizes_explicit_rename_rejection() {
+    for msg in [
+        "JSON-RPC error -32602: No references found at position",
+        "symbol cannot be renamed",
+        "element is not renameable",
+        "InvalidParams",
+    ] {
+        let err = anyhow::anyhow!("{msg}");
+        assert!(
+            super::is_rename_rejection(&err),
+            "{msg:?} should be classified as a rename rejection"
+        );
+    }
+}
+
+/// 传输类失败**不能**被当成「不可重命名」——那会因一次超时就禁掉功能。
+#[test]
+fn transport_failures_are_not_rename_rejections() {
+    for msg in [
+        "timed out after 30s waiting for `textDocument/prepareRename`",
+        "language server is closed",
+        "failed to write to language server stdin",
+    ] {
+        let err = anyhow::anyhow!("{msg}");
+        assert!(
+            !super::is_rename_rejection(&err),
+            "{msg:?} must NOT be treated as a rename rejection (should fall back)"
+        );
+    }
+}

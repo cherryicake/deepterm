@@ -295,6 +295,56 @@ impl LspClient {
         uri: &Url,
         position: Position,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        self.goto("textDocument/definition", uri, position).await
+    }
+
+    /// `textDocument/declaration`：跳到**声明**（与定义区分：C 头文件里的
+    /// 原型是声明，`.c` 里的实现是定义）。
+    pub async fn goto_declaration(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.goto("textDocument/declaration", uri, position).await
+    }
+
+    /// `textDocument/typeDefinition`：跳到**类型**的定义（变量 → 它的类型）。
+    pub async fn goto_type_definition(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.goto("textDocument/typeDefinition", uri, position).await
+    }
+
+    /// `textDocument/implementation`：跳到**实现**（trait → 各实现类型）。
+    pub async fn goto_implementation(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.goto("textDocument/implementation", uri, position).await
+    }
+
+    /// 跳转族请求的公共实现。
+    ///
+    /// `definition` / `declaration` / `typeDefinition` / `implementation`
+    /// 四个方法的参数与返回类型在 LSP 规范里完全一致（都是
+    /// `GotoDefinitionParams` → `GotoDefinitionResponse`），差别只有方法名。
+    /// 抽一个内部函数，避免四份几乎相同的代码各自漂移。
+    ///
+    /// **先查能力**：服务器没声明支持时直接返回 `None`，不发请求——
+    /// 部分服务器对不支持的方法回错误而不是空，白白多一次往返。
+    async fn goto(
+        &self,
+        method: &str,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        if !self.supports_goto(method) {
+            log::debug!("lsp: {method} not advertised by server, skipping");
+            return Ok(None);
+        }
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
@@ -304,14 +354,19 @@ impl LspClient {
             partial_result_params: PartialResultParams::default(),
         };
         let value = serde_json::to_value(&params)?;
-        let result = self
-            .conn
-            .request("textDocument/definition", Some(&value))
-            .await?;
+        let result = self.conn.request(method, Some(&value)).await?;
         if result.is_null() {
             return Ok(None);
         }
         Ok(serde_json::from_value(result)?)
+    }
+
+    /// 服务器是否声明支持某个跳转方法。
+    ///
+    /// 能力的声明形态有三种（LSP 允许）：`bool`、`{...}` 选项对象、
+    /// 或（动态注册时）缺省。这里按「有声明且不为 false」判定。
+    fn supports_goto(&self, method: &str) -> bool {
+        supports_goto(&self.capabilities.capabilities, method)
     }
 
     /// `textDocument/references`。
@@ -381,24 +436,93 @@ impl LspClient {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// `textDocument/prepareRename`：先问服务器「这里能重命名吗」。
+    ///
+    /// 返回 `Some(range)` = 可重命名，`range` 是要被替换的标识符区间；
+    /// `None` = 服务器说不可重命名（或方法未声明）。
+    ///
+    /// 对照 LSP 规范：响应的 `range` 比客户端按词边界猜的范围**更准**
+    /// （例如 `foo.bar` 里只应替换 `bar`，而不是整串）。此前直接按词边界
+    /// 猜，光标停在不可重命名的位置时也会弹出输入框。
+    pub async fn prepare_rename(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Result<Option<lsp_types::Range>> {
+        if self.capabilities.capabilities.rename_provider.is_none() {
+            return Ok(None);
+        }
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position,
+        };
+        let value = serde_json::to_value(&params)?;
+        let result = self
+            .conn
+            .request("textDocument/prepareRename", Some(&value))
+            .await?;
+        if result.is_null() {
+            return Ok(None);
+        }
+        // 规范允许两种形态：`Range`，或 `{ range, placeholder }`。
+        if let Ok(range) = serde_json::from_value::<lsp_types::Range>(result.clone()) {
+            return Ok(Some(range));
+        }
+        #[derive(serde::Deserialize)]
+        struct WithPlaceholder {
+            range: lsp_types::Range,
+        }
+        Ok(serde_json::from_value::<WithPlaceholder>(result).ok().map(|w| w.range))
+    }
+
     /// `textDocument/formatting`。
     pub async fn formatting(&self, uri: &Url, tab_size: u32, insert_spaces: bool) -> Result<Vec<TextEdit>> {
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
-            options: lsp_types::FormattingOptions {
-                tab_size,
-                insert_spaces,
-                insert_final_newline: None,
-                trim_final_newlines: None,
-                trim_trailing_whitespace: None,
-                properties: Default::default(),
-            },
+            options: formatting_options(tab_size, insert_spaces),
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let value = serde_json::to_value(&params)?;
         let result = self
             .conn
             .request("textDocument/formatting", Some(&value))
+            .await?;
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(result).unwrap_or_default())
+    }
+
+    /// `textDocument/rangeFormatting`：只格式化选区。
+    ///
+    /// 对照 LSP 规范：与 `formatting` 的区别是多一个 `range`；编辑器在用户
+    /// 有选区时应调用它（而不是格式化整篇）。
+    pub async fn range_formatting(
+        &self,
+        uri: &Url,
+        range: lsp_types::Range,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Vec<TextEdit>> {
+        if self
+            .capabilities
+            .capabilities
+            .document_range_formatting_provider
+            .is_none()
+        {
+            log::debug!("lsp: rangeFormatting not advertised, skipping");
+            return Ok(Vec::new());
+        }
+        let params = lsp_types::DocumentRangeFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            range,
+            options: formatting_options(tab_size, insert_spaces),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let value = serde_json::to_value(&params)?;
+        let result = self
+            .conn
+            .request("textDocument/rangeFormatting", Some(&value))
             .await?;
         if result.is_null() {
             return Ok(Vec::new());
@@ -458,6 +582,86 @@ impl LspClient {
             return Ok(Vec::new());
         }
         Ok(serde_json::from_value(result).unwrap_or_default())
+    }
+
+    /// `codeAction/resolve`：补全一个「惰性」Code Action 的完整内容。
+    ///
+    /// LSP 允许服务器在 `codeAction` 响应里只给标题（省带宽），真正的
+    /// `edit` 留到用户**选中**该动作时再通过本方法拉取。此前直接取
+    /// `action.edit`，对这类服务器永远是 `None`，表现为「一键修复没反应」。
+    pub async fn resolve_code_action(
+        &self,
+        action: lsp_types::CodeAction,
+    ) -> Result<lsp_types::CodeAction> {
+        // 服务器没声明 resolveProvider 时，edit 必然已经在响应里。
+        if !self.supports_code_action_resolve() {
+            return Ok(action);
+        }
+        let value = serde_json::to_value(&action)?;
+        let result = self
+            .conn
+            .request("codeAction/resolve", Some(&value))
+            .await?;
+        if result.is_null() {
+            return Ok(action);
+        }
+        Ok(serde_json::from_value(result).unwrap_or(action))
+    }
+
+    /// 服务器是否声明 `codeActionProvider.resolveProvider`。
+    fn supports_code_action_resolve(&self) -> bool {
+        supports_code_action_resolve(&self.capabilities.capabilities)
+    }
+
+    /// `workspace/symbol`：全项目符号搜索。
+    ///
+    /// `query` 为空串时按 LSP 规范返回「尽可能多的符号」。
+    pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<lsp_types::SymbolInformation>> {
+        if self.capabilities.capabilities.workspace_symbol_provider.is_none() {
+            log::debug!("lsp: workspace/symbol not advertised, skipping");
+            return Ok(Vec::new());
+        }
+        let params = lsp_types::WorkspaceSymbolParams {
+            query: query.to_string(),
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        let value = serde_json::to_value(&params)?;
+        let result = self.conn.request("workspace/symbol", Some(&value)).await?;
+        if result.is_null() {
+            return Ok(Vec::new());
+        }
+        // 规范允许 `SymbolInformation[]` 或 `WorkspaceSymbol[]`（后者多了
+        // 位置信息，用于未打开的文件）。两种都接。
+        if let Ok(items) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result.clone())
+        {
+            return Ok(items);
+        }
+        Ok(Vec::new())
+    }
+
+    /// `workspace/executeCommand`：执行服务器定义的命令。
+    ///
+    /// 部分 Code Action 以 `Command` 形式给出（而非直接给 `edit`），必须
+    /// 由服务器执行——此前这类动作被静默跳过，用户看到「点了没反应」。
+    pub async fn execute_command(
+        &self,
+        command: &str,
+        arguments: Vec<serde_json::Value>,
+    ) -> Result<()> {
+        if self.capabilities.capabilities.execute_command_provider.is_none() {
+            anyhow::bail!("server does not support workspace/executeCommand");
+        }
+        let params = lsp_types::ExecuteCommandParams {
+            command: command.to_string(),
+            arguments,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+        };
+        let value = serde_json::to_value(&params)?;
+        self.conn
+            .request("workspace/executeCommand", Some(&value))
+            .await?;
+        Ok(())
     }
 
     /// `textDocument/documentHighlight`：光标处符号的所有出现位置。
@@ -585,6 +789,44 @@ impl LspClient {
 ///
 /// 只声明真正实现的，避免服务器发来我们不会处理的请求。
 /// `text_document` 里声明了后续要用的全部方法。
+/// 构造 `FormattingOptions`（`formatting` 与 `rangeFormatting` 共用）。
+fn formatting_options(tab_size: u32, insert_spaces: bool) -> lsp_types::FormattingOptions {
+    lsp_types::FormattingOptions {
+        tab_size,
+        insert_spaces,
+        insert_final_newline: None,
+        trim_final_newlines: None,
+        trim_trailing_whitespace: None,
+        properties: Default::default(),
+    }
+}
+
+/// 服务器是否声明支持某个跳转方法。
+///
+/// 抽成自由函数（只依赖 `ServerCapabilities`）：单测可以直接喂 JSON 构造的
+/// 能力集验证判定，而不必起一个真实连接——**测试驱动的是同一份代码**，
+/// 不是复制一遍判定逻辑。
+fn supports_goto(caps: &lsp_types::ServerCapabilities, method: &str) -> bool {
+    match method {
+        "textDocument/definition" => caps.definition_provider.is_some(),
+        "textDocument/declaration" => caps.declaration_provider.is_some(),
+        "textDocument/typeDefinition" => caps.type_definition_provider.is_some(),
+        "textDocument/implementation" => caps.implementation_provider.is_some(),
+        // 未知方法不拦（交给服务器判断）。
+        _ => true,
+    }
+}
+
+/// 服务器是否声明 `codeActionProvider.resolveProvider`。
+fn supports_code_action_resolve(caps: &lsp_types::ServerCapabilities) -> bool {
+    match caps.code_action_provider.as_ref() {
+        Some(lsp_types::CodeActionProviderCapability::Options(opts)) => {
+            opts.resolve_provider.unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
 /// 从 `InitializeResult` 取服务器的补全触发字符。
 ///
 /// 抽成自由函数便于单测：这是唯一读取该能力字段的地方，测试可以直接喂
@@ -875,5 +1117,74 @@ mod tests {
         }))
         .expect("InitializeResult parses");
         assert!(trigger_characters_of(&result).is_empty());
+    }
+
+    // ------------------------------------------------ 新增请求的能力门控
+    //
+    // 这些用例驱动**真实**的 `supports_goto` / `supports_code_action_resolve`
+    // （只依赖 `ServerCapabilities`，可直接喂 JSON 构造的能力集），
+    // 不是复制一份判定逻辑——复制会让真实逻辑改错时测试照样通过。
+
+    fn caps_from(json: serde_json::Value) -> lsp_types::ServerCapabilities {
+        let result: InitializeResult =
+            serde_json::from_value(json).expect("InitializeResult parses");
+        result.capabilities
+    }
+
+    /// 服务器声明了就支持。
+    #[test]
+    fn goto_support_follows_server_capabilities() {
+        let caps = caps_from(serde_json::json!({
+            "capabilities": {
+                "definitionProvider": true,
+                "declarationProvider": true,
+                "typeDefinitionProvider": true,
+                "implementationProvider": true,
+            }
+        }));
+        for m in [
+            "textDocument/definition",
+            "textDocument/declaration",
+            "textDocument/typeDefinition",
+            "textDocument/implementation",
+        ] {
+            assert!(supports_goto(&caps, m), "{m} should be supported");
+        }
+    }
+
+    /// 未声明时不应声称支持（否则白跑一次注定失败的请求）。
+    #[test]
+    fn goto_support_is_false_when_unadvertised() {
+        let caps = caps_from(serde_json::json!({ "capabilities": {} }));
+        for m in [
+            "textDocument/definition",
+            "textDocument/declaration",
+            "textDocument/typeDefinition",
+            "textDocument/implementation",
+        ] {
+            assert!(!supports_goto(&caps, m), "{m} should NOT be supported");
+        }
+        // 未知方法不拦：交给服务器判断。
+        assert!(supports_goto(&caps, "textDocument/whatever"));
+    }
+
+    /// `codeActionProvider.resolveProvider` 决定是否要发 `codeAction/resolve`。
+    #[test]
+    fn code_action_resolve_support_is_read_from_capabilities() {
+        let with = caps_from(serde_json::json!({
+            "capabilities": { "codeActionProvider": { "resolveProvider": true } }
+        }));
+        assert!(supports_code_action_resolve(&with));
+
+        let without = caps_from(serde_json::json!({
+            "capabilities": { "codeActionProvider": { "codeActionKinds": [] } }
+        }));
+        assert!(!supports_code_action_resolve(&without));
+
+        // `bool` 形态（老式声明）没有 resolveProvider → false。
+        let plain = caps_from(serde_json::json!({
+            "capabilities": { "codeActionProvider": true }
+        }));
+        assert!(!supports_code_action_resolve(&plain));
     }
 }
