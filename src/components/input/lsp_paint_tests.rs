@@ -19,6 +19,7 @@ use gpui::{
     AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, px,
 };
 
+use crate::components::input::rope_ext::RopeExt as _;
 use crate::components::input::{EditorInput, InputState};
 
 /// 承载编辑器的视图：让 `EditorInput` 在一个真实渲染树里被 prepaint+paint。
@@ -279,4 +280,143 @@ fn stale_empty_push_does_not_clear_newer_diagnostics(cx: &mut gpui::TestAppConte
         let count = state.diagnostics().map(|d| d.items().len()).unwrap_or(0);
         assert_eq!(count, 1, "stale empty push must not clear diagnostics");
     });
+}
+
+// ==================== 浮层实际落点（端到端） ====================
+//
+// 这些用例驱动**真实的**绘制路径（`TextElement::prepaint` →
+// `layout_lsp_popovers` → `place_at_anchor` → `popover_y`），并断言浮层
+// 实际落在锚点上方还是下方。
+//
+// 为什么必须这样测：曾出现「顶部代码该往下弹却往上弹」的缺陷，根因是
+// **调用方传错了矩形**（把已加过滚动偏移的 bounds 当视口）。纯函数测试
+// 传自己的参数，完全看不见这类错误。
+
+/// 从当前可见行里挑哪一行作为锚点。
+#[derive(Clone, Copy)]
+enum VisibleRowPick {
+    /// 首个可见行（贴近视口顶部）。
+    First,
+    /// 中间的可见行。
+    Middle,
+    /// 末个可见行（贴近视口底部）。
+    Last,
+}
+
+/// 在给定滚动位置下放置 hover 浮层，返回 (锚点屏幕 y, 浮层实际 y)。
+///
+/// 流程：先绘制一帧拿到布局 → `scroll_to` 滚到目标行 → 再绘制一帧，
+/// 这样 prepaint 用的是滚动后的状态（`scroll_to` 依赖已有 `last_layout`）。
+fn hover_placement(
+    scroll_to_line: Option<usize>,
+    pick: VisibleRowPick,
+    cx: &mut gpui::TestAppContext,
+) -> Option<(f32, f32)> {
+    // 构造足够长的文本，便于滚动。
+    let text: String = (0..80).map(|i| format!("line {i}\n")).collect();
+    // 先建好编辑器（不设浮层），滚到目标位置后再设锚点——这样锚点一定
+    // 落在当前可见区内，测的才是「择位方向」而不是「锚点是否可见」。
+    let input = draw_with(&text, cx, |_state, _cx| {});
+
+    if let Some(line) = scroll_to_line {
+        let offset = input.read_with(cx, |state, _| state.text().line_start_offset(line));
+        input.update(cx, |state, cx| {
+            state.scroll_to(offset, None, cx);
+        });
+        let _ = cx.refresh();
+    }
+
+    // 滚动稳定后再设锚点：从**实际可见行**里挑一行，保证锚点确实可见
+    // （否则测的就成了「不可见锚点不画」而不是择位方向）。
+    // `anchor_selector` 决定挑哪一行：给 `VisibleRowPick::Middle` 取中部，
+    // 取 `VisibleRowPick::First` 取首行（贴近视口顶部）。
+    let anchor_line = input.read_with(cx, |state, _| {
+        let layout = state.last_layout.as_ref()?;
+        let vis = &layout.visible_buffer_lines;
+        if vis.is_empty() {
+            return None;
+        }
+        let ix = match pick {
+            VisibleRowPick::First => 0,
+            VisibleRowPick::Middle => vis.len() / 2,
+            VisibleRowPick::Last => vis.len().saturating_sub(1),
+        };
+        vis.get(ix).copied()
+    })?;
+
+    input.update(cx, |state, _cx| {
+        let offset = state.text().line_start_offset(anchor_line);
+        state.set_hover_popover(
+            offset,
+            crate::editor::hover::HoverInfo {
+                contents: "hover".to_string(),
+                range: None,
+            },
+        );
+    });
+    let _ = cx.refresh();
+
+    input.read_with(cx, |state, _| {
+        // 直接用实现记下的锚点行 y 作为基准：测试不再自己重算坐标公式，
+        // 避免「测试与实现各算一遍、一起算错」的自洽式通过。
+        let origin = state.last_popover_origin()?;
+        let anchor_y = state.last_popover_anchor_y()?;
+        Some((f32::from(anchor_y), f32::from(origin.y)))
+    })
+}
+
+/// 顶部代码（未滚动，锚点在第 1 行）：上方放不下 → 浮层必须在锚点**下方**。
+#[gpui::test]
+fn hover_at_top_places_popover_below(cx: &mut gpui::TestAppContext) {
+    let Some((anchor_y, popover_y)) = hover_placement(None, VisibleRowPick::First, cx) else {
+        panic!("popover was not placed");
+    };
+    assert!(
+        popover_y > anchor_y,
+        "top-of-screen code: popover must be placed BELOW the anchor \
+         (anchor_y={anchor_y}, popover_y={popover_y})"
+    );
+}
+
+/// 滚动到中部、锚点在屏幕中部：上方放得下 → 浮层在锚点**上方**。
+#[gpui::test]
+fn hover_in_the_middle_places_popover_above(cx: &mut gpui::TestAppContext) {
+    // 滚到第 20 行，锚点取可见区中部 → 上方放得下。
+    let Some((anchor_y, popover_y)) = hover_placement(Some(20), VisibleRowPick::Middle, cx) else {
+        panic!("popover was not placed");
+    };
+    assert!(
+        popover_y < anchor_y,
+        "mid-screen code: popover should prefer ABOVE the anchor \
+         (anchor_y={anchor_y}, popover_y={popover_y})"
+    );
+}
+
+/// 关键回归：**滚动不该改变择位方向**。
+///
+/// 同一行代码滚到视口顶部附近时，浮层该往下弹；这正是「传错矩形」会
+/// 破坏的不变量——把滚过的 bounds 当视口时，视口上沿会随滚动上移，
+/// 于是顶部代码被误判成「上方放得下」而往上弹。
+#[gpui::test]
+fn placement_direction_is_scroll_invariant(cx: &mut gpui::TestAppContext) {
+    // 同一份代码：滚到让锚点贴近视口顶部 vs 贴近视口底部。
+    let near_top = hover_placement(Some(20), VisibleRowPick::First, cx);
+    let near_bottom = hover_placement(Some(20), VisibleRowPick::Last, cx);
+
+    let (Some((a_top, p_top)), Some((a_bot, p_bot))) = (near_top, near_bottom) else {
+        panic!("popover was not placed in both scroll positions");
+    };
+
+    // 贴近视口顶部：必须往下弹。
+    assert!(
+        p_top > a_top,
+        "when the anchor sits at the viewport top (scrolled), the popover must go BELOW \
+         (anchor_y={a_top}, popover_y={p_top})"
+    );
+    // 贴近视口底部：必须往上弹。
+    assert!(
+        p_bot < a_bot,
+        "when the anchor sits at the viewport bottom (unscrolled), the popover must go ABOVE \
+         (anchor_y={a_bot}, popover_y={p_bot})"
+    );
 }

@@ -636,6 +636,15 @@ pub struct InputState {
     /// `None` = 尚未收到带版本号的推送（此时任何推送都接受）。
     /// `Some(v)` = 已应用到版本 v，只接受 `version >= v` 的推送。
     applied_diagnostics_version: Option<i32>,
+    /// 上一次实际放置 LSP 浮层的窗口坐标（观测点）。
+    ///
+    /// 浮层位置由 `TextElement` 在 prepaint 里算好后 `defer_draw` 出去，
+    /// 绘制阶段读不到。这里把算好的位置回写一份，便于测试断言
+    /// 「浮层到底落在锚点上方还是下方」——这是用户反复报告的缺陷点，
+    /// 只测纯函数无法覆盖调用方传错矩形这类错误。
+    last_popover_origin: Option<gpui::Point<gpui::Pixels>>,
+    /// 上一次浮层锚点行的屏幕 y（与 `last_popover_origin` 配对，测试用）。
+    last_popover_anchor_y: Option<gpui::Pixels>,
     /// LSP 悬浮浮层：(锚点字节偏移, 内容)。
     ///
     /// 放这里而不是 `Editor`：`TextElement` 只拿得到 `Entity<InputState>`，
@@ -768,6 +777,8 @@ impl InputState {
             size: Size::default(),
             _subscriptions,
             lsp_file_path: None,
+            last_popover_origin: None,
+            last_popover_anchor_y: None,
             applied_diagnostics_version: None,
             lsp_status: None,
             hover_request_generation: 0,
@@ -1066,6 +1077,30 @@ impl InputState {
     }
 
     /// 当前编辑器语言名（仅 [`InputMode::CodeEditor`]），如 "rust"、"python"。
+    /// 记录浮层实际落点与锚点行屏幕 y（由 `TextElement` 在 prepaint 里调用）。
+    ///
+    /// 同时记下锚点行的屏幕 y，测试就能直接比较「浮层在锚点上方还是下方」，
+    /// 不必在测试里重算一遍坐标公式——重算容易与实现漂移，那样测试会
+    /// 自洽地通过而真实行为是错的。
+    pub fn record_popover_placement(
+        &mut self,
+        origin: gpui::Point<gpui::Pixels>,
+        anchor_y: gpui::Pixels,
+    ) {
+        self.last_popover_origin = Some(origin);
+        self.last_popover_anchor_y = Some(anchor_y);
+    }
+
+    /// 上一次浮层落点（测试用观测点）。
+    pub fn last_popover_origin(&self) -> Option<gpui::Point<gpui::Pixels>> {
+        self.last_popover_origin
+    }
+
+    /// 上一次浮层锚点行的屏幕 y（测试用观测点）。
+    pub fn last_popover_anchor_y(&self) -> Option<gpui::Pixels> {
+        self.last_popover_anchor_y
+    }
+
     /// 语言服务器实时状态（`None` = 该文件没有 LSP）。
     pub fn lsp_status(&self) -> Option<&crate::lsp::status::LspStatus> {
         self.lsp_status.as_ref()
