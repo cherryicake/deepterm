@@ -54,9 +54,13 @@ fn vim_editor_with_language<'a>(
             content.vim.enabled = true;
         });
         crate::keymap::reload(cx);
-        // 寄存器是全局的，测试里也要装上。
-        crate::vim::Registers::init(cx);
-        crate::vim::Marks::init(cx);
+        // 走**真实入口** `vim::init`（而不是单独装 Registers/Marks）。
+        //
+        // 回归：`vim::init` 曾在 `main.rs` 里漏调用，导致 Registers/Marks
+        // 从未注册，用户按 `yy` 就 panic（`no global registered of type
+        // deepterm::vim::registers::Registers`）。测试里手动 init 两个全局
+        // 会让这个缺陷隐形——必须用与生产同一条路径。
+        crate::vim::init(cx);
         // `InputState::init` 注册 App 级击键拦截器：`f`/`t`/`r` 的参数
         // 必须靠它才能在绑定解析之前被截住。
         crate::components::input::state::init(cx);

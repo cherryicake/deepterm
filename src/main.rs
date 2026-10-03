@@ -60,21 +60,11 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
-            // 设置系统必须最先就绪：theme / font / editor / keymap 都从它取值。
-            deepterm::settings::init(cx);
-            theme::init(cx);
-            deepterm::sidebar_view::font_settings::FontState::init(cx);
-            // keymap 依赖 settings（vim 开关决定是否加载 vim 键位表）。
-            deepterm::keymap::init(cx);
-            deepterm::file_manager::watcher::init(cx);
-            // LSP 全局管理器：必须在 `editor::init` 之前（编辑器开 tab 时会
-            // 向它查询/启动语言服务器）。它依赖 settings 的 lsp 段。
-            deepterm::lsp::init(cx);
-            components::init(cx);
-            terminal_view::init(cx);
-            workspace::init(cx);
-            editor::init(cx);
-            WindowManager::init(cx);
+            // 所有子系统的初始化在库里（`deepterm::init`），这样它可被
+            // `cargo test --lib` 覆盖——`main.rs` 是二进制目标，测试看不到。
+            // 此前 `vim::init` 就是在这里漏掉的，导致 vim 的寄存器全局
+            // 从未注册、按 `yy` 直接 panic。
+            deepterm::init(cx);
             init_global_executor();
             deepterm::keymap::bind(cx, [
                 KeyBinding::new("cmd-q", Quit, None),
