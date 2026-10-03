@@ -603,13 +603,13 @@ async fn read_loop(
             if let Some((id, reply)) = dispatch(msg, &pending, &notify) {
                 // 就地应答服务器的主动请求：不应答它就会一直等。
                 let payload = match &reply {
-                    ServerRequestReply::Value(v) => serde_json::to_vec(&OutgoingResponse {
+                    ResolvedReply::Value(v) => serde_json::to_vec(&OutgoingResponse {
                         jsonrpc: "2.0",
                         id,
                         result: Some(v),
                         error: None,
                     }),
-                    ServerRequestReply::Unimplemented => {
+                    ResolvedReply::Unimplemented => {
                         let err = ResponseError {
                             code: -32601,
                             message: "method not implemented".to_string(),
@@ -653,12 +653,18 @@ async fn read_loop(
 }
 
 /// 服务器主动请求的处理结果。
+#[derive(Debug)]
 enum ServerRequestReply {
     /// 直接回这个值（多数请求回 `null` 即可）。
     Value(Value),
     /// 回一个「方法未实现」错误。用于我们确实不该假装支持的请求，
     /// 让服务器立刻降级而不是等着。
     Unimplemented,
+    /// 需要看请求参数才能决定回什么（`workspace/configuration`）。
+    ///
+    /// 规范要求**按请求项的顺序**逐项返回配置；回一个空数组会让服务器在
+    /// 取第 i 项时越界，回单个 `null` 则类型不符。
+    NeedsParams,
 }
 
 /// 服务器向我们发起的请求该怎么应答。
@@ -674,13 +680,42 @@ fn server_request_reply(method: &str) -> ServerRequestReply {
         }
         // 进度令牌：接受，我们只是不显示进度 UI。
         "window/workDoneProgress/create" => ServerRequestReply::Value(Value::Null),
-        // 拉取配置项：返回空数组 = 「都用默认值」。不回的话部分服务器
-        // （pyright、gopls）会一直等，表现为请求挂死。
-        "workspace/configuration" => ServerRequestReply::Value(Value::Array(Vec::new())),
+        // 拉取配置项：必须**按请求项逐项**应答（见 `NeedsParams`）。
+        "workspace/configuration" => ServerRequestReply::NeedsParams,
         // 服务器要求写入文件（格式化到文件等）：我们不支持，明确报错，
         // 让服务器退回「通过响应体返回编辑」的路径。
         "workspace/applyEdit" => ServerRequestReply::Unimplemented,
         // 其余（自定义请求等）：回 null，让服务器继续。
+        _ => ServerRequestReply::Value(Value::Null),
+    }
+}
+
+/// 已解析、可直接发送的应答（写帧的一方只见到这两态）。
+#[derive(Debug)]
+enum ResolvedReply {
+    Value(Value),
+    Unimplemented,
+}
+
+/// 需要看参数才能决定的应答（目前只有 `workspace/configuration`）。
+///
+/// LSP 规范：`workspace/configuration` 的响应是**与请求 `items` 等长、按顺序
+/// 对应**的数组；没有配置的项回 `null`。对照 Zed 的 `lsp_store.rs`：它遍历
+/// `params.items` 逐项查配置（查不到的项留空，序列化后即 `null`）。
+///
+/// 之前恒回空数组：服务器若请求 N 项，取第 0 项就越界（Rust 之外的语言多会
+/// 读到 `undefined`），拿到的不是「默认值」而是「没有这项」。
+fn reply_for_params(method: &str, params: &Value) -> ServerRequestReply {
+    match method {
+        "workspace/configuration" => {
+            let count = params
+                .get("items")
+                .and_then(|items| items.as_array())
+                .map(|items| items.len())
+                .unwrap_or(0);
+            // 逐项回 `null` = 「没有额外配置，用你的默认值」。
+            ServerRequestReply::Value(Value::Array(vec![Value::Null; count]))
+        }
         _ => ServerRequestReply::Value(Value::Null),
     }
 }
@@ -693,7 +728,7 @@ fn dispatch(
     msg: Message,
     pending: &Pending,
     notify: &(Sender<Message>, Receiver<Message>),
-) -> Option<(u32, ServerRequestReply)> {
+) -> Option<(u32, ResolvedReply)> {
     let (notify_tx, notify_rx) = notify;
     match msg {
         Message::Response { id, result, error } => {
@@ -710,10 +745,22 @@ fn dispatch(
                 None => log::warn!("lsp: response for unknown request id {id}"),
             }
         }
-        Message::Request { id, method, .. } => {
+        Message::Request { id, method, params } => {
             // 必须应答：服务器会一直等。具体应答内容见 `server_request_reply`。
             log::debug!("lsp: server request {method} (id {id})");
-            return Some((id, server_request_reply(&method)));
+            // 需要看参数的（`workspace/configuration`）在这里解析完，
+            // 写帧的一方只会拿到可直接发送的两态。
+            let reply = match server_request_reply(&method) {
+                ServerRequestReply::NeedsParams => match reply_for_params(&method, &params) {
+                    ServerRequestReply::Value(v) => ResolvedReply::Value(v),
+                    ServerRequestReply::Unimplemented => ResolvedReply::Unimplemented,
+                    // `reply_for_params` 不会返回 NeedsParams（不是递归的）。
+                    ServerRequestReply::NeedsParams => ResolvedReply::Value(Value::Null),
+                },
+                ServerRequestReply::Value(v) => ResolvedReply::Value(v),
+                ServerRequestReply::Unimplemented => ResolvedReply::Unimplemented,
+            };
+            return Some((id, reply));
         }
         Message::Notification { .. } => {
             // 队列满时丢弃**最旧**的通知再塞新的：诊断是幂等的全量快照，
@@ -747,23 +794,62 @@ mod tests {
     fn server_requests_get_answered_not_dropped() {
         // 回归：早期版本只记日志不应答，rust-analyzer 会反复重发
         // workDoneProgress/create 并卡住进度上报。
-        for method in [
-            "client/registerCapability",
-            "window/workDoneProgress/create",
-            "workspace/configuration",
-        ] {
-            let reply = server_request_reply(method);
-            match reply {
-                ServerRequestReply::Value(v) => {
-                    // configuration 必须回数组（空 = 用默认值）。
-                    if method == "workspace/configuration" {
-                        assert!(v.is_array(), "configuration must reply with an array");
-                    }
-                }
-                ServerRequestReply::Unimplemented => {
-                    panic!("{method} should be answered, not rejected")
-                }
+        for method in ["client/registerCapability", "window/workDoneProgress/create"] {
+            match server_request_reply(method) {
+                ServerRequestReply::Value(_) => {}
+                other => panic!("{method} should be answered with a value, got {other:?}"),
             }
+        }
+        // `workspace/configuration` 需要看参数才能答（按项数逐项回）。
+        assert!(matches!(
+            server_request_reply("workspace/configuration"),
+            ServerRequestReply::NeedsParams
+        ));
+    }
+
+    /// `workspace/configuration` 必须**按请求项数**逐项应答。
+    ///
+    /// 回归：曾恒回空数组。LSP 规范要求响应与 `items` 等长且按序对应，
+    /// 服务器取第 i 项时会越界（拿到「没有这项」而不是「默认值」）。
+    /// 对照 Zed 的 `lsp_store.rs`：它遍历 `params.items` 逐项查配置。
+    #[test]
+    fn workspace_configuration_replies_one_entry_per_item() {
+        let params = serde_json::json!({
+            "items": [
+                {"scopeUri": "file:///proj", "section": "rust-analyzer"},
+                {"scopeUri": "file:///proj", "section": "editor"},
+                {"section": "files"},
+            ]
+        });
+        match reply_for_params("workspace/configuration", &params) {
+            ServerRequestReply::Value(Value::Array(items)) => {
+                assert_eq!(items.len(), 3, "must reply one entry per requested item");
+                assert!(
+                    items.iter().all(|v| v.is_null()),
+                    "each entry is null = 'no config, use your defaults'"
+                );
+            }
+            other => panic!("expected an array reply, got {other:?}"),
+        }
+    }
+
+    /// 没有 `items`（或为空）时回空数组，不 panic。
+    #[test]
+    fn workspace_configuration_handles_missing_items() {
+        for params in [serde_json::json!({}), serde_json::json!({"items": []})] {
+            match reply_for_params("workspace/configuration", &params) {
+                ServerRequestReply::Value(Value::Array(items)) => assert!(items.is_empty()),
+                other => panic!("expected an empty array, got {other:?}"),
+            }
+        }
+    }
+
+    /// 未知方法的参数化应答回 `null`（不能让服务器等）。
+    #[test]
+    fn unknown_params_request_replies_null() {
+        match reply_for_params("custom/whatever", &serde_json::json!({"a": 1})) {
+            ServerRequestReply::Value(Value::Null) => {}
+            other => panic!("expected null, got {other:?}"),
         }
     }
 

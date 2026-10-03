@@ -37,7 +37,11 @@ pub struct LspSession {
     uri: Url,
     language_id: String,
     /// 文档版本号，每次 didChange 递增。
-    version: i32,
+    /// 已**送达**服务器的文档版本。
+    ///
+    /// 用原子是因为防抖任务在后台跑，发送成功后要回写这个值
+    /// （对照 Zed：版本号随实际发出的 `didChangeTextDocument` 递增）。
+    version: std::sync::Arc<std::sync::atomic::AtomicI32>,
     /// 已连接的服务器；`None` 表示尚未就绪或启动失败。
     client: Option<Arc<LspClient>>,
     /// 发送 didChange 的防抖任务。新编辑到来时替换旧任务即取消它。
@@ -63,13 +67,21 @@ impl LspSession {
             path: path.to_path_buf(),
             uri,
             language_id: language_id.to_string(),
-            version: 0,
+            version: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
             client: None,
             change_task: None,
             notify_task: None,
             editor,
             opened: false,
         })
+    }
+
+    /// 已送达服务器的文档版本（测试观测点）。
+    ///
+    /// 对照 Zed：这个值应等于「实际发出过多少次 `didChangeTextDocument`」，
+    /// 而不是「用户敲了多少次键」。
+    pub fn sent_version(&self) -> i32 {
+        self.version.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// 文件路径。
@@ -201,7 +213,7 @@ impl LspSession {
     pub fn on_connected(&mut self, client: Arc<LspClient>, text: &Rope) {
         self.client = Some(client.clone());
         self.opened = true;
-        self.version = 0;
+        self.version.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let uri = self.uri.clone();
         let language_id = self.language_id.clone();
@@ -228,21 +240,34 @@ impl LspSession {
         if client.is_closed() {
             return;
         }
-        self.version += 1;
-        let version = self.version;
         let uri = self.uri.clone();
         let text_str = text.to_string();
 
-        // 替换旧任务即取消它——这是防抖的实现方式，与编辑器里语法树的
-        // `parse_task` 同一套手法。
+        // **版本号在真正发送时递增，而不是每次击键**。
+        //
+        // 对照 Zed 的 `lsp_store.rs`：它在发出 `didChangeTextDocument` 的那一
+        // 刻算 `next_version = previous_snapshot.version + 1`，让版本号与
+        // 「服务器实际收到过多少版本文档」一一对应。
+        //
+        // 此前每次击键都 `+= 1`，而防抖会取消绝大多数任务——于是版本号远
+        // 远跑在服务器已收到的版本前面。而 `publishDiagnostics` 的版本门控
+        // 拿它当基准比较，服务器的诊断版本永远追不上，**所有诊断都会被当成
+        // 「过期」丢弃**（用户看到的就是「没有诊断」）。
+        let version_slot = self.version.clone();
+        let base_version = version_slot.load(std::sync::atomic::Ordering::SeqCst);
         self.change_task.take();
         self.change_task = Some(cx.spawn(async move |_cx| {
             // 用 smol 的定时器：gpui 的 background_executor 在这里拿不到
             // （`cx` 是 `WeakEntity` 上下文，没有 executor 句柄）。
             smol::Timer::after(std::time::Duration::from_millis(CHANGE_DEBOUNCE_MS)).await;
+            // 发送那一刻才定版本：`base + 1`。取消掉的任务不会推进版本。
+            let version = base_version + 1;
             // 全量同步：不构造增量 TextEdit，避免与服务器文本漂移。
             if let Err(e) = client.did_change(&uri, version, &text_str, &[]).await {
                 log::debug!("lsp didChange failed for {uri}: {e}");
+            } else {
+                // 记录已送达的版本，供下一次递增取基准。
+                version_slot.fetch_max(version, std::sync::atomic::Ordering::SeqCst);
             }
         }));
     }
