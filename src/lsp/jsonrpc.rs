@@ -823,7 +823,7 @@ const NOTIFY_QUEUE_CAPACITY: usize = 256;
 /// 因为某个订阅者积压就跳过它，那正是「A 文件的诊断被 B 的监听器抢走」这类
 /// 错投的根源。
 fn broadcast(msg: &Message, subscribers: &Mutex<Vec<Subscription>>) {
-    let mut subs = subscribers.lock();
+    let subs = subscribers.lock();
     for sub in subs.iter() {
         if sub.tx.is_full() {
             // 队列满：丢最旧的一条再塞新的。诊断是幂等的全量快照，保留最新的

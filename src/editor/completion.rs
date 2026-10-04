@@ -179,8 +179,18 @@ impl CompletionState {
             {
                 Ok((items, _incomplete)) => {
                     editor
-                        .update(cx, |state, _| {
+                        .update(cx, |state, cx| {
                             state.set_pending_completions(items, position);
+                            // **必须 notify**：候选只是先存进 `InputState` 的
+                            // pending 槽，真正搬到浮层状态要等
+                            // `Editor::drain_lsp_results`，而它只在 `render`
+                            // 里调用。没有这次 notify 就不会产生新的一帧，
+                            // `render` 不跑，候选永远搬不出来 —— 表现为
+                            // 「服务器明明返回了候选，却没有弹窗」。
+                            //
+                            // 对照同文件的签名帮助路径（`editor.rs` 的
+                            // `request_signature_help`）：那里就带`cx.notify()`。
+                            cx.notify();
                         })
                         .ok();
                 }

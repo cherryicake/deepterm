@@ -871,6 +871,54 @@ fn indent_level_bounds(line_text: &str) -> Vec<usize> {
 
 // ==================== LSP 补全应用 ====================
 
+/// 补全候选必须能被 `render` 驱动的那次调用取走，且取出是一次性的。
+///
+/// 回归：`Editor::drain_lsp_results`（把 pending 槽里的结果搬进浮层状态的
+/// 唯一入口）只在 `render` 里调用。后台任务拿到结果后若不 notify，就不会
+/// 有新的一帧，`render` 不跑，候选永远搬不出来 —— 症状是「服务器明明返回
+/// 了候选，界面上却没有弹窗」，且日志里看不到任何错误。
+///
+/// 这里钉住流水线的后半段：写入 pending 槽 → 取走 → 再取为空。
+#[gpui::test]
+fn pending_completion_is_drained_exactly_once(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input.update(cx, |state, cx| {
+        let item = lsp_types::CompletionItem {
+            label: "foo_bar".into(),
+            ..Default::default()
+        };
+        state.set_pending_completions(vec![item], lsp_types::Position::new(0, 0));
+        // 契约：写入后必须 notify，否则不会产生新的一帧，`render` 不跑，
+        // `drain_lsp_results` 也就永远不会把候选搬进浮层状态。
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let first = input.update(cx, |state, _cx| state.take_pending_completions());
+    assert!(
+        first.is_some_and(|(items, _)| !items.is_empty()),
+        "第一次取应拿到候选"
+    );
+    let second = input.update(cx, |state, _cx| state.take_pending_completions());
+    assert!(
+        second.is_none(),
+        "第二次取应为空（取出即清空，否则同一菜单会被反复重画）"
+    );
+}
+
 #[gpui::test]
 fn apply_completion_replaces_range_and_moves_cursor(cx: &mut gpui::TestAppContext) {
     struct Host(#[allow(dead_code)] gpui::Entity<InputState>);

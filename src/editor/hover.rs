@@ -144,11 +144,16 @@ impl HoverState {
             };
 
             editor
-                .update(cx, |state, _| {
+                .update(cx, |state, cx| {
                     let info = hover_info(state.text(), &hover);
                     // 结果先落进 `InputState` 的槽，由 Editor 取走
                     // （后台任务拿不到 `Editor` 上的 `HoverState`）。
                     state.set_pending_hover(info);
+                    // **必须 notify**：`Editor::drain_lsp_results`（真正把结果
+                    // 搬到浮层状态的地方）只在 `render` 里调用。没有这次
+                    // notify 就不会产生新的一帧，render 不跑，hover 永远
+                    // 搬不出来。补全那边曾有同一个缺陷。
+                    cx.notify();
                 })
                 .ok();
         }));

@@ -2027,8 +2027,13 @@ impl Editor {
             let Ok(response) = client.document_symbols(&uri).await else {
                 return;
             };
-            cx.update_entity(&editor, |state, _cx| {
+            cx.update_entity(&editor, |state, cx| {
                 state.set_pending_symbols(response);
+                // 结果是异步到达的，必须在**这里** notify：下面那句
+                // `cx.notify()` 发生在任务创建之前，对后续到达的结果无效。
+                // 少了这次 notify，`drain_lsp_results` 不会被触发，符号面板
+                // 拿不到结果。
+                cx.notify();
             });
         })
         .detach();
