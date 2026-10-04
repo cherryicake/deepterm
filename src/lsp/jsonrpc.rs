@@ -287,8 +287,25 @@ pub struct Connection {
     stdin: Arc<AsyncMutex<ChildStdin>>,
     pending: Pending,
     next_id: AtomicU32,
-    /// 服务器主动通知的接收端。
-    pub notifications: Receiver<Message>,
+    /// 服务器主动通知的**订阅者列表**（广播）。
+    ///
+    /// 每个订阅者一份独立队列，`dispatch` 向**全部**订阅者各投一份。
+    ///
+    /// 为什么必须是广播而不是共享队列：一个服务器进程服务整个项目
+    /// （`LspManager` 按「项目根 + 语言」复用），而每个打开的标签都要收
+    /// 诊断。共享一个 `async_channel` 队列是 MPMC——每条消息只到**一个**
+    /// 接收者，于是 A 文件的诊断会被 B 标签的监听器抢走，而那个监听器只认
+    /// 自己的 uri，于是 `continue` 掉，**没有任何人处理这条诊断**。实测三个
+    /// 标签里有一个的诊断被静默丢弃，表现为「诊断时有时无、多开几个文件后
+    /// 基本失效」。
+    ///
+    /// 对照 VSCode：它的语言服务器通知走 `Emitter.fire()`，每个订阅者都拿到
+    /// 一份；「这条 uri 不是我的」由订阅者自己判断，而不是由队列决定谁该收到。
+    ///
+    /// 存 `(Sender, Receiver)` 对而非只存 `Sender`：队列满时要丢**最旧**的一
+    /// 条，而 `Sender` 没有出队接口，只有 `Receiver` 能 `try_recv`。持有
+    /// Receiver 不会额外消费——只有分发路径在用它。
+    subscribers: Arc<Mutex<Vec<Subscription>>>,
     /// 子进程句柄：drop 时用来 `kill`，避免僵尸进程。
     child: Arc<Mutex<Option<Child>>>,
     /// 读循环是否已经退出（进程关闭/崩溃）。置位后所有请求立即失败，
@@ -327,16 +344,15 @@ impl Connection {
         let stdout = child.stdout.take().context("language server has no stdout")?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        // 通知队列有界：服务器狂发诊断时不能无限堆积内存。满时丢**最旧**的
-        // 一条（见 `dispatch`），所以读循环同时持有接收端用于出队。
-        let (notify_tx, notify_rx) = bounded(256);
-        let notify_rx_loop = notify_rx.clone();
+        // 通知走**广播**：订阅者列表初始为空，由每个打开的标签经
+        // `Connection::subscribe` 注册（理由见字段文档）。
+        let subscribers: Arc<Mutex<Vec<Subscription>>> = Arc::new(Mutex::new(Vec::new()));
 
         let conn = Self {
             stdin: Arc::new(AsyncMutex::new(stdin)),
             pending: pending.clone(),
             next_id: AtomicU32::new(1),
-            notifications: notify_rx,
+            subscribers: subscribers.clone(),
             child: Arc::new(Mutex::new(Some(child))),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registered_methods: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -345,18 +361,10 @@ impl Connection {
         // 读循环：独立于任何请求，寿命与连接相同。
         let pending2 = pending.clone();
         let closed2 = conn.closed.clone();
-        let notify_tx2 = notify_tx.clone();
         let stdin2 = Arc::clone(&conn.stdin);
         let registered2 = Arc::clone(&conn.registered_methods);
         smol::spawn(async move {
-            let result = read_loop(
-                stdout,
-                stdin2,
-                pending2,
-                (notify_tx2, notify_rx_loop),
-                registered2,
-            )
-            .await;
+            let result = read_loop(stdout, stdin2, pending2, subscribers, registered2).await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -390,6 +398,29 @@ impl Connection {
     /// 服务器是否动态注册过某个方法（`client/registerCapability`）。
     pub fn is_registered(&self, method: &str) -> bool {
         self.registered_methods.lock().contains(method)
+    }
+
+    /// 订阅服务器主动通知，返回本订阅者**专属**的句柄。
+    ///
+    /// 广播语义：每条通知都会投给**每一个**订阅者一份。调用方按自己的 uri
+    /// 过滤即可——被过滤掉的只是「这份副本」，不影响别的订阅者。
+    ///
+    /// 句柄 drop 即退订（见 [`NotificationSub`]），标签关闭时必须让它离开
+    /// 作用域，否则订阅者会泄漏。
+    pub fn subscribe(&self) -> NotificationSub {
+        let (tx, rx) = bounded(NOTIFY_QUEUE_CAPACITY);
+        let mut subs = self.subscribers.lock();
+        let id = subs.len() as u64 + 1;
+        subs.push(Subscription {
+            id,
+            tx,
+            rx: rx.clone(),
+        });
+        NotificationSub {
+            rx,
+            registry: Arc::clone(&self.subscribers),
+            id,
+        }
     }
 
     /// 发送一个请求并等待应答。
@@ -585,15 +616,15 @@ impl Connection {
 
     /// 取一份只含关闭所需字段的轻量句柄。
     ///
-    /// `Connection` 本身不能 `Clone`（`Receiver` 不实现 `Clone` 的语义是
-    /// 「唯一的通知消费者」），但关闭路径只需要写端、pending 表与子进程
-    /// 句柄，所以单独复制这几项。
+    /// 关闭路径只需要写端、pending 表与子进程句柄，所以单独复制这几项。
+    ///
+    /// 订阅者列表是 `Arc`，共享即可——关闭时不需要再收通知。
     fn clone_for_shutdown(&self) -> Connection {
         Connection {
             stdin: Arc::clone(&self.stdin),
             pending: Arc::clone(&self.pending),
             next_id: AtomicU32::new(self.next_id.load(Ordering::SeqCst)),
-            notifications: self.notifications.clone(),
+            subscribers: Arc::clone(&self.subscribers),
             child: Arc::clone(&self.child),
             closed: Arc::clone(&self.closed),
             registered_methods: Arc::clone(&self.registered_methods),
@@ -614,7 +645,7 @@ async fn read_loop(
     stdout: ChildStdout,
     stdin: Arc<AsyncMutex<ChildStdin>>,
     pending: Pending,
-    notify: (Sender<Message>, Receiver<Message>),
+    subscribers: Arc<Mutex<Vec<Subscription>>>,
     registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
@@ -630,7 +661,7 @@ async fn read_loop(
             if let Message::Request { method, params, .. } = &msg {
                 record_dynamic_registration(&registered_methods, method, params);
             }
-            if let Some((id, reply)) = dispatch(msg, &pending, &notify) {
+            if let Some((id, reply)) = dispatch(msg, &pending, &subscribers) {
                 // 就地应答服务器的主动请求：不应答它就会一直等。
                 let payload = match &reply {
                     ResolvedReply::Value(v) => serde_json::to_vec(&OutgoingResponse {
@@ -781,14 +812,77 @@ fn reply_for_params(method: &str, params: &Value) -> ServerRequestReply {
 
 /// 分发一条入站消息：有 id 且在 pending 表里 → 应答；否则按通知转发。
 ///
+/// 每个订阅者的通知队列上限。
+///
+/// 服务器狂推诊断时不能无限堆积内存；满了丢最旧的一条（见 [`broadcast`]）。
+const NOTIFY_QUEUE_CAPACITY: usize = 256;
+
+/// 把一条通知**广播**给所有订阅者。
+///
+/// 逐个投递到各自的队列。某个订阅者队列满时只丢它自己最旧的一条——**不能**
+/// 因为某个订阅者积压就跳过它，那正是「A 文件的诊断被 B 的监听器抢走」这类
+/// 错投的根源。
+fn broadcast(msg: &Message, subscribers: &Mutex<Vec<Subscription>>) {
+    let mut subs = subscribers.lock();
+    for sub in subs.iter() {
+        if sub.tx.is_full() {
+            // 队列满：丢最旧的一条再塞新的。诊断是幂等的全量快照，保留最新的
+            // 一份才是对的（丢新的会让 UI 停在过期诊断上）。
+            let _ = sub.rx.try_recv();
+        }
+        let _ = sub.tx.try_send(msg.clone());
+    }
+}
+
+/// 订阅者列表里的一项：id + 收发两端。
+///
+/// 之所以把 `Receiver` 也存在表里：队列满时要丢**最旧**的一条，而
+/// `async_channel::Sender` 没有出队接口，只有 `Receiver` 能 `try_recv`。
+struct Subscription {
+    id: u64,
+    tx: Sender<Message>,
+    rx: Receiver<Message>,
+}
+
+/// 一个标签的通知订阅句柄。**drop 即退订**。
+///
+/// 退订必须由句柄的 `Drop` 显式做，不能靠「接收端是否 closed」判断：表里持有的
+/// 那个 `Receiver` 克隆本身就让通道永远不会 closed（实测 `is_closed()` 恒为
+/// false），订阅者会永久泄漏，每来一条通知都往一个没人消费的队列里塞一份。
+pub struct NotificationSub {
+    rx: Receiver<Message>,
+    registry: Arc<Mutex<Vec<Subscription>>>,
+    id: u64,
+}
+
+impl NotificationSub {
+    /// 接收下一条通知；通道关闭返回 `Err`。
+    pub async fn recv(&self) -> Result<Message, async_channel::RecvError> {
+        self.rx.recv().await
+    }
+
+    /// 非阻塞取一条已到达的通知（队列空则 `Err`）。
+    ///
+    /// 只给「先把已到达的诊断扫干净再睡」的轮询循环用（见真机用例）：
+    /// 那种循环靠「有没有待处理」决定是否再等，不能被一条通知永久阻塞。
+    pub fn try_recv(&self) -> Result<Message, async_channel::TryRecvError> {
+        self.rx.try_recv()
+    }
+}
+
+impl Drop for NotificationSub {
+    fn drop(&mut self) {
+        self.registry.lock().retain(|s| s.id != self.id);
+    }
+}
+
 /// 服务器的**主动请求**不进通知队列，而是直接就地应答——`dispatch` 拿不到
 /// 写端（在 `Connection` 上），所以返回待应答项由读循环发送。
 fn dispatch(
     msg: Message,
     pending: &Pending,
-    notify: &(Sender<Message>, Receiver<Message>),
+    subscribers: &Mutex<Vec<Subscription>>,
 ) -> Option<(u32, ResolvedReply)> {
-    let (notify_tx, notify_rx) = notify;
     match msg {
         Message::Response { id, result, error } => {
             let tx = pending.lock().remove(&id);
@@ -822,12 +916,7 @@ fn dispatch(
             return Some((id, reply));
         }
         Message::Notification { .. } => {
-            // 队列满时丢弃**最旧**的通知再塞新的：诊断是幂等的全量快照，
-            // 保留最新的一份才是对的（丢新的会让 UI 停在过期诊断上）。
-            if notify_tx.is_full() {
-                let _ = notify_rx.try_recv();
-            }
-            let _ = notify_tx.try_send(msg);
+            broadcast(&msg, subscribers);
         }
     }
     None
@@ -1072,6 +1161,11 @@ mod tests {
         let (tx, rx) = bounded(1);
         pending.lock().insert(42, tx);
         let (ntx, nrx) = bounded(8);
+        let subs: Mutex<Vec<Subscription>> = Mutex::new(vec![Subscription {
+            id: 1,
+            tx: ntx,
+            rx: nrx.clone(),
+        }]);
 
         dispatch(
             Message::Response {
@@ -1080,7 +1174,7 @@ mod tests {
                 error: None,
             },
             &pending,
-            &(ntx, nrx),
+            &subs,
         );
 
         let value = rx.try_recv().unwrap().unwrap();
@@ -1095,6 +1189,11 @@ mod tests {
         let (tx, rx) = bounded(1);
         pending.lock().insert(1, tx);
         let (ntx, nrx) = bounded(8);
+        let subs: Mutex<Vec<Subscription>> = Mutex::new(vec![Subscription {
+            id: 1,
+            tx: ntx,
+            rx: nrx.clone(),
+        }]);
 
         dispatch(
             Message::Response {
@@ -1107,7 +1206,7 @@ mod tests {
                 }),
             },
             &pending,
-            &(ntx, nrx),
+            &subs,
         );
 
         let err = rx.try_recv().unwrap().unwrap_err();
@@ -1118,13 +1217,18 @@ mod tests {
     fn dispatch_forwards_notification() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (ntx, nrx) = bounded(8);
+        let subs: Mutex<Vec<Subscription>> = Mutex::new(vec![Subscription {
+            id: 1,
+            tx: ntx,
+            rx: nrx.clone(),
+        }]);
         dispatch(
             Message::Notification {
                 method: "textDocument/publishDiagnostics".into(),
                 params: serde_json::json!({"uri": "file:///x"}),
             },
             &pending,
-            &(ntx, nrx.clone()),
+            &subs,
         );
         let msg = nrx.try_recv().unwrap();
         match msg {
@@ -1138,7 +1242,14 @@ mod tests {
     #[test]
     fn dispatch_drops_oldest_notification_when_full() {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let subs: Mutex<Vec<Subscription>> = Mutex::new(Vec::new());
+        // 容量 2 的一个订阅者
         let (ntx, nrx) = bounded(2);
+        subs.lock().push(Subscription {
+            id: 1,
+            tx: ntx,
+            rx: nrx.clone(),
+        });
         for i in 0..3 {
             dispatch(
                 Message::Notification {
@@ -1146,7 +1257,7 @@ mod tests {
                     params: Value::Null,
                 },
                 &pending,
-                &(ntx.clone(), nrx.clone()),
+                &subs,
             );
         }
         // 容量 2，第三条挤掉第一条。
@@ -1155,6 +1266,81 @@ mod tests {
             Message::Notification { method, .. } => assert_eq!(method, "m1"),
             other => panic!("got {other:?}"),
         }
+    }
+
+    /// 辅助：往订阅者列表里塞一个容量 `cap` 的订阅者，返回它的接收端。
+    fn add_sub(subs: &Mutex<Vec<Subscription>>, cap: usize, id: u64) -> Receiver<Message> {
+        let (tx, rx) = bounded(cap);
+        subs.lock().push(Subscription { id, tx, rx: rx.clone() });
+        rx
+    }
+
+    /// 通知必须**广播**给每个订阅者。
+    ///
+    /// 回归：一个服务器进程服务整个项目（`LspManager` 按项目根+语言复用），
+    /// 每个打开的标签都要收诊断。此前所有标签共享一个 `async_channel` 队列，
+    /// 而它是 MPMC——每条消息只到**一个**接收者。于是 A 文件的诊断被 B 标签
+    /// 的监听器抢走，B 只认自己的 uri 便`continue` 掉，这条诊断**无人处理**。
+    /// 最小复现（三个标签各认一个文件、服务器推三条诊断）实测只落地 2/3。
+    #[test]
+    fn dispatch_broadcasts_to_every_subscriber() {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let subs: Mutex<Vec<Subscription>> = Mutex::new(Vec::new());
+
+        // 三个订阅者，各自认一个 uri（模拟三个标签的诊断监听器）
+        let receivers: Vec<_> = (1..=3).map(|i| add_sub(&subs, 8, i)).collect();
+
+        // 服务器推 3 条诊断，分属不同文件
+        for uri in ["file:///p/a.rs", "file:///p/b.rs", "file:///p/c.rs"] {
+            dispatch(
+                Message::Notification {
+                    method: "textDocument/publishDiagnostics".into(),
+                    params: serde_json::json!({ "uri": uri }),
+                },
+                &pending,
+                &subs,
+            );
+        }
+
+        // 每个订阅者都必须收到全部 3 条（各自再按 uri 过滤）
+        for (i, rx) in receivers.iter().enumerate() {
+            let mut n = 0;
+            while rx.try_recv().is_ok() {
+                n += 1;
+            }
+            assert_eq!(n, 3, "订阅者 {i} 应收到全部 3 条通知，实际 {n} 条");
+        }
+    }
+
+    /// 订阅句柄 drop 后必须从列表里摘除，否则订阅者泄漏。
+    ///
+    /// 退订**不能**靠「接收端是否 closed」判断：表里持有的 `Receiver` 克隆本身
+    /// 就让通道永远不会 closed（`is_closed()` 恒为 false，实测过），订阅者会永
+    /// 久留下，每来一条通知都往一个没人消费的队列里塞一份。
+    #[test]
+    fn dropping_the_subscription_handle_unsubscribes() {
+        let registry: Arc<Mutex<Vec<Subscription>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, rx) = bounded(8);
+        registry.lock().push(Subscription {
+            id: 7,
+            tx,
+            rx: rx.clone(),
+        });
+        assert_eq!(registry.lock().len(), 1);
+
+        let id = 7u64;
+        let sub = NotificationSub {
+            rx: rx.clone(),
+            registry: Arc::clone(&registry),
+            id,
+        };
+        assert_eq!(registry.lock().len(), 1, "句柄存活期间应仍在列表里");
+        drop(sub);
+        assert_eq!(
+            registry.lock().len(),
+            0,
+            "句柄 drop 后必须退订，否则订阅者泄漏"
+        );
     }
 
     #[test]

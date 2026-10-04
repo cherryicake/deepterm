@@ -124,9 +124,17 @@ impl LspClient {
         self.conn.is_closed()
     }
 
-    /// 服务器主动通知的接收端（诊断等）。
-    pub fn notifications(&self) -> Receiver<Message> {
-        self.conn.notifications.clone()
+    /// 订阅服务器主动通知（诊断等），返回本订阅者**专属**的句柄。
+    ///
+    /// 广播语义：每条通知都会投给每一个订阅者一份。**每个打开的标签都要
+    /// 各自订阅一次**——共享一个接收端是错的（那是 MPMC 抢消息，A 文件的
+    /// 诊断会被 B 标签的监听器消费掉，而后者只认自己的 uri，于是这条诊断
+    /// 无人处理）。
+    ///
+    /// 返回的句柄**drop 即退订**：标签关闭时务必让它离开作用域（诊断监听
+    /// 任务结束时自然 drop），否则订阅者会泄漏。
+    pub fn notifications(&self) -> crate::lsp::jsonrpc::NotificationSub {
+        self.conn.subscribe()
     }
 
     // ---------------------------------------------------------------- 文档同步

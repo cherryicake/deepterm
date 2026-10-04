@@ -312,8 +312,15 @@ impl LspSession {
 
     /// 订阅服务器的 `publishDiagnostics`，写进编辑器的 `DiagnosticSet`。
     ///
-    /// 只在**本文件的 uri** 上生效：一个服务器进程服务整个项目，它会推
-    /// 所有打开文件的诊断，必须按 uri 过滤，否则 A 文件的诊断会画到 B 上。
+    /// **每个标签一份独立订阅**（`client.notifications()` 现在是广播订阅，
+    /// 不是共享队列）：一个服务器进程服务整个项目，多个标签同时打开时，
+    /// 每个标签都要收到**全部**诊断通知，再按自己的 uri 过滤。
+    ///
+    /// 共享队列是错的：`async_channel` 是 MPMC（每条消息只到一个接收者），
+    /// A 文件的诊断会被 B 标签的监听器消费掉，而后者只认自己的 uri，于是
+    /// `continue` 掉——**没有任何人处理这条诊断**。实测三个标签里有一个的
+    /// 诊断被静默丢弃。对照 VSCode：它的通知走 `Emitter.fire()` 广播，
+    /// 过滤 uri 的是订阅者自己。
     pub fn spawn_diagnostic_listener(
         &mut self,
         editor: &Entity<InputState>,
