@@ -309,6 +309,10 @@ impl Connection {
     /// 不阻塞编辑器。
     pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
         let mut command = Command::new(program);
+        // 语言服务器是**常驻**子进程（不是跑一下就退的那种），所以 windows 上
+        // 若不抑制控制台，用户会看到编辑器旁边长期挂着一个跑 rust-analyzer 的
+        // 黑框。`CREATE_NO_WINDOW` 只影响是否分配可见控制台，管道照常。
+        crate::utils::console::hide_console_window_async(&mut command);
         command
             .args(args)
             .stdin(Stdio::piped())
