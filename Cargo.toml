@@ -35,7 +35,17 @@ russh-sftp = "2.1.1"
 async-trait = "0.1"
 
 # Credential storage (for secure password/key storage)
-keyring = { version = "3.6", features = ["apple-native"] }
+#
+# feature 按平台显式声明各自的后端：macOS 是 Keychain、Windows 是 Credential
+# Manager、linux 是 freedesktop Secret Service（GNOME Keyring / KWallet 的共同
+# 后端）。
+#
+# 注意这不是「漏了某个平台就一定不能用」——实测 keyring 3.6 在 Windows 上即使
+# 只开 `apple-native` 也能正常读写 Credential Manager（库内有兜底）。显式列出
+# 的价值在于两点：一是 linux 侧确实需要一个真实后端（`linux-native` 是
+# keyutils，属于**会话级**内存键环、重启即失，承担不了「记住 SSH 密码」，所以
+# 选 Secret Service）；二是让依赖关系写在明面上，而不是依赖库的隐式兜底行为。
+keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 
 # Async runtime compatibility
 tokio = { version = "1", features = [

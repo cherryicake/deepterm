@@ -807,7 +807,49 @@ fn infer_key_algorithm(path: &Path) -> Option<String> {
 mod tests {
     use std::fs;
 
-    use super::normalize_private_key_path;
+    use super::{KeychainStore, normalize_private_key_path};
+
+    /// 系统凭据后端必须**真的可用**——写入、回读、再删掉。
+    ///
+    /// 这条钉住的是「编译得过但运行期没有后端」这类静默故障：
+    /// `keyring` 3.x 把每个平台的凭据后端做成独立 feature，漏启当前平台那个
+    /// 时库仍可编译，只是所有操作一律返回 `NoStorageAccess`。
+    ///
+    /// **只碰 `keyring` 本身，绝不走 `KeychainStore`。** `KeychainStore` 的
+    /// `save()` 会写用户真实的 `keychain.json`——用例只借它的 `entry()` 拿
+    /// `keyring::Entry`，测试名也带随机 uuid，用完即删，不碰任何用户数据。
+    ///
+    /// 不按平台裁剪：macOS 是 Keychain、Windows 是 Credential Manager、
+    /// linux 是 Secret Service，三条链路都要各自证明一遍。环境本身没有可用
+    /// 后端时（如无桌面会话的 CI）打印原因并跳过，而不是让用例变成随机失败。
+    #[test]
+    fn system_credential_backend_can_round_trip_a_secret() {
+        let id = format!("deepterm-selftest-{}", uuid::Uuid::new_v4());
+        let password = format!("pw-{}", uuid::Uuid::new_v4());
+        let entry = KeychainStore::entry("selftest", &id).expect("创建 keyring 入口失败");
+
+        let cleanup = || {
+            let _ = entry.delete_credential();
+        };
+
+        if let Err(err) = entry.set_password(&password) {
+            eprintln!("跳过：当前环境无可用凭据后端（{err}）");
+            cleanup();
+            return;
+        }
+
+        assert_eq!(
+            entry.get_password().expect("回读失败"),
+            password,
+            "写入后必须能读回同一个值"
+        );
+
+        entry.delete_credential().expect("删除测试凭据失败");
+        assert!(
+            entry.get_password().is_err(),
+            "删除后不应再读得到"
+        );
+    }
 
     fn temp_ssh_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
