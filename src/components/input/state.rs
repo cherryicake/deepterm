@@ -624,6 +624,10 @@ pub struct InputState {
     /// 读，而进度通知的监听任务也只持有 `Entity<InputState>`。
     /// `None` = 该文件没有 LSP（远程文件 / 无服务器 / 已禁用）。
     lsp_status: Option<crate::lsp::status::LspStatus>,
+    /// 当前 hover 请求代号；见 [`Self::hover_request_generation`]。
+    hover_request_generation: u64,
+    /// 当前补全请求代号；见 [`Self::completion_request_generation`]。
+    completion_request_generation: u64,
     /// 进行中的 `$/progress` 令牌表（服务器可同时开多个）。
     lsp_progress: crate::lsp::status::ProgressTracker,
     /// 已应用诊断对应的文档版本（`publishDiagnostics.version`）。
@@ -780,6 +784,8 @@ impl InputState {
             last_popover_anchor_y: None,
             applied_diagnostics_version: None,
             lsp_status: None,
+            hover_request_generation: 0,
+            completion_request_generation: 0,
             lsp_progress: crate::lsp::status::ProgressTracker::default(),
             hover_popover: None,
             pending_hover: None,
@@ -1329,6 +1335,31 @@ impl InputState {
     /// 存放后台 hover 请求的结果（供浮层取走）。
     pub fn set_pending_hover(&mut self, info: crate::editor::hover::HoverInfo) {
         self.pending_hover = Some(info);
+    }
+
+    /// 记录当前 hover 请求的代号（见 `HoverState::request_generation`）。
+    ///
+    /// 存在这里而不是只留在 `HoverState` 上，是为了让后台任务能比对：
+    /// 任务持有 `WeakEntity<InputState>`，够不到 `HoverState`。
+    /// 用途是让**过期响应**自我丢弃 —— GPUI 的 `Task` drop 只是 detach，
+    /// 旧任务照样会跑完并回写。
+    pub fn set_hover_request_generation(&mut self, generation: u64) {
+        self.hover_request_generation = generation;
+    }
+
+    /// 当前 hover 请求代号（供后台任务判断自己的响应是否过期）。
+    pub fn hover_request_generation(&self) -> u64 {
+        self.hover_request_generation
+    }
+
+    /// 记录当前补全请求代号（见 [`Self::completion_request_generation`]）。
+    pub fn set_completion_request_generation(&mut self, generation: u64) {
+        self.completion_request_generation = generation;
+    }
+
+    /// 当前补全请求代号（供后台任务判断自己的响应是否过期）。
+    pub fn completion_request_generation(&self) -> u64 {
+        self.completion_request_generation
     }
 
     /// 取走后台 hover 结果（取走即清空，避免重复弹出同一张卡片）。

@@ -55,6 +55,16 @@ pub struct CompletionState {
     visible: bool,
     /// 防抖任务。
     task: Option<gpui::Task<()>>,
+    /// 请求代号：每次触发自增，用来作废在飞的旧任务。
+    ///
+    /// **必须有这个**。GPUI 的 `Task` 被 drop 只是 detach、**不会取消**（同一个
+    /// 坑见 `TerminalView::wsl_scan_seq` 与 `HoverState::request_generation`），
+    /// 所以 [`Self::task`].take() 拦不住旧任务：它照样会跑完、照样会回写。
+    ///
+    /// 不作废的后果：每次击键都留一个任务，返回顺序与击键顺序无关，于是
+    /// 「最后落地的那份候选」可能属于几秒前的位置——菜单要么不出现，要么
+    /// 一闪就消失。
+    request_generation: u64,
     /// 触发时用的 uri（结果回来时校验文件没被切走）。
     uri: Option<Url>,
 }
@@ -74,6 +84,7 @@ impl CompletionState {
             visible: false,
             task: None,
             uri: None,
+            request_generation: 0,
         }
     }
 
@@ -118,6 +129,7 @@ impl CompletionState {
         uri: Url,
         cx: &mut App,
     ) {
+        log::info!("lsp: completion 手动触发 (ctrl-space)");
         // 手动触发（ctrl-space）：不带触发字符。
         self.fetch(editor, client, uri, None, None, cx);
     }
@@ -131,6 +143,11 @@ impl CompletionState {
         trigger_character: Option<String>,
         cx: &mut App,
     ) {
+        log::info!(
+            "lsp: completion 自动触发 trigger={:?} delay={:?}",
+            trigger_character,
+            AUTO_DELAY
+        );
         self.fetch(editor, client, uri, trigger_character, Some(AUTO_DELAY), cx);
     }
 
@@ -144,9 +161,14 @@ impl CompletionState {
         cx: &mut App,
     ) {
         let Some(client) = client else {
+            log::warn!("lsp: completion 无 client（服务器未就绪？）");
             return;
         };
+        log::info!("lsp: completion 客户端就绪，is_closed={}", client.is_closed());
+        // `take()` 只是 detach（GPUPI 的 Task drop 不取消），真正作废靠代号。
         self.task.take();
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let generation = self.request_generation;
         self.uri = Some(uri.clone());
 
         let editor = editor.downgrade();
@@ -168,16 +190,48 @@ impl CompletionState {
                 return;
             };
             let _ = offset;
+            // 代号落在 InputState 上供本任务比对（CompletionState 自身在
+            // 后台任务里不可达）。
+            editor
+                .update(cx, |state, _| state.set_completion_request_generation(generation))
+                .ok();
 
             // 把触发字符原样传给服务器（对照 LSP 的
             // `CompletionContext.triggerCharacter`）：服务器据此决定返回哪一
             // 类候选（例如 `:` 后只给属性名）。此前恒传 `None`，服务器无法
             // 区分「用户敲了触发字符」与「手动请求补全」。
+            let t0 = std::time::Instant::now();
+            log::info!(
+                "lsp: → textDocument/completion pos={}:{} trigger={:?} uri={uri}",
+                position.line,
+                position.character,
+                trigger_character
+            );
             match client
                 .completion(&uri, position, trigger_character)
                 .await
             {
-                Ok((items, _incomplete)) => {
+                Ok((items, incomplete)) => {
+                    // **await 之后必须再验代号**：等待期间用户可能又敲了几个
+                    // 字符，那几轮的任务也会发请求。旧响应回来就写pending 槽，
+                    // 会把新位置的结果覆盖掉（或反过来让菜单迟迟不出现）。
+                    let still_current = editor
+                        .update(cx, |state, _| {
+                            state.completion_request_generation() == generation
+                        })
+                        .unwrap_or(false);
+                    if !still_current {
+                        log::info!(
+                            "lsp: completion 响应已过期，丢弃 {} 个候选",
+                            items.len()
+                        );
+                        return;
+                    }
+                    log::info!(
+                        "lsp: ← completion 返回 {} 个候选 (incomplete={incomplete}) 耗时={:?}",
+                        items.len(),
+                        t0.elapsed()
+                    );
                     editor
                         .update(cx, |state, cx| {
                             state.set_pending_completions(items, position);
@@ -196,7 +250,7 @@ impl CompletionState {
                 }
                 Err(e) => {
                     // 降级：补全失败只是没有候选，不影响编辑。
-                    log::debug!("lsp completion failed: {e}");
+                    log::warn!("lsp: ← completion 失败: {e}");
                 }
             }
         }));
@@ -209,11 +263,13 @@ impl CompletionState {
             return;
         };
         if items.is_empty() {
+            log::info!("lsp: completion 候选为空 -> 收起菜单");
             self.hide_in(editor, cx);
             return;
         }
         let (replace_range, cursor) =
             editor.update(cx, |state, _| (state.completion_replace_range_for(&items), state.cursor()));
+        let range_for_log = replace_range.clone();
         self.candidates = items
             .into_iter()
             .map(|item| Candidate {
@@ -225,6 +281,10 @@ impl CompletionState {
         self.replace_range = replace_range;
         self.selected = 0;
         self.visible = true;
+        log::info!(
+            "lsp: completion 菜单已显示，{} 个候选，replace_range={range_for_log:?} anchor={cursor}",
+            self.candidates.len()
+        );
 
         // 把锚点与候选快照写进 `InputState`：绘制发生在 `TextElement` 里，
         // 那里只拿得到 `Entity<InputState>`。

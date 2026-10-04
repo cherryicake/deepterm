@@ -53,6 +53,13 @@ pub struct HoverInfo {
     pub range: Option<Range<usize>>,
 }
 
+/// 鼠标移出编辑区后，延迟多久收起 hover 浮层。
+///
+/// 对照 Zed 的 `hover_popover_hiding_delay`（默认 300ms 左右）。之所以要延迟
+/// 而不是立刻消失：用户常把鼠标往浮层方向移去点里面的链接/按钮，立刻收起会让
+/// 目标在指针到达前就没了。
+const HOVER_HIDING_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// hover 浮层的状态机。
 ///
 /// 挂在 `Editor` 上：请求需要 `InputState`（文本）与 LSP 会话，
@@ -65,8 +72,23 @@ pub struct HoverState {
     anchor_offset: usize,
     /// 防抖任务：新的一次移动会替换（取消）它。
     task: Option<gpui::Task<()>>,
+    /// 延迟隐藏任务：鼠标移到空白处时启动，到期才真正收起。
+    ///
+    /// 对照 Zed 的 `hiding_delay_task`（`hover_popover.rs`）。收起得「延迟」而不是
+    /// 「立刻」，是为了让指针有机会移到浮层上操作里面的内容。
+    hiding_delay_task: Option<gpui::Task<()>>,
     /// 上次请求的目标位置，用于避免鼠标在同一字符内微动时重复请求。
     last_offset: Option<usize>,
+    /// 请求代号：每次 `on_mouse_moved` 自增。
+    ///
+    /// **用来作废在飞的后台任务**。GPUI 的 `Task` 被 drop 只是 detach、**不会
+    /// 取消**（同一个坑见 `TerminalView::wsl_scan_seq`），所以 `self.task.take()`
+    /// 拦不住旧任务：它照样会跑完、照样会回写结果。
+    ///
+    /// 不作废的后果很具体：鼠标从符号划到空白，那条「无内容 → 收起浮层」的
+    /// 旧任务若晚于新请求返回，就会把**刚弹出**的卡片擦掉；任务越积越多，
+    /// 最后一个返回的总是过期的，于是浮层再也不出现。
+    request_generation: u64,
 }
 
 impl Default for HoverState {
@@ -80,7 +102,9 @@ impl HoverState {
         Self {
             anchor_offset: 0,
             task: None,
+            hiding_delay_task: None,
             last_offset: None,
+            request_generation: 0,
         }
     }
 
@@ -92,7 +116,39 @@ impl HoverState {
     /// 隐藏浮层并取消在途请求（不清 `InputState`，见 [`Self::hide_in`]）。
     pub fn hide(&mut self) {
         self.task.take();
+        self.hiding_delay_task = None;
         self.last_offset = None;
+    }
+
+    /// 安排一次**延迟隐藏**（鼠标移到空白处时调用）。
+    ///
+    /// 已在隐藏中就不重复起计时器——否则连续扫过一片空白会攒出大量任务。
+    ///
+    /// `owner` 是发起隐藏的那个实体（`Editor`）的弱引用：`HoverState` 只是它
+    /// 的字段，自己拿不到自己的实体句柄。延迟到期后由 `on_expired` 回调完成
+    /// 真正的收起 —— 回调由 `Editor` 侧提供，那里才有权改`InputState` 上的
+    /// 浮层状态（绘制读的是那边，见 [`Self::hide_in`]）。
+    pub fn schedule_hide<F>(&mut self, cx: &mut gpui::App, on_expired: F)
+    where
+        F: FnOnce(&mut gpui::AsyncApp) + Send + 'static,
+    {
+        if self.hiding_delay_task.is_some() {
+            return;
+        }
+        self.hiding_delay_task = Some(cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(HOVER_HIDING_DELAY)
+                .await;
+            on_expired(cx);
+        }));
+    }
+
+    /// 立即收起浮层（延迟到期，或调用方明确要求立刻隐藏时）。
+    pub fn hide_now(&mut self) {
+        self.hiding_delay_task = None;
+        self.task.take();
+        self.last_offset = None;
+        log::info!("lsp: hover 浮层已收起（延迟到期）");
     }
 
     /// 鼠标移动：重置防抖，停稳后发请求。
@@ -120,12 +176,37 @@ impl HoverState {
         // 锚点立刻更新：这样请求回来后浮层就落在当前字符上。
         self.anchor_offset = offset;
         self.last_offset = Some(offset);
-        // 替换即取消上一次的防抖。
+        // 替换即取消上一次的防抖。注意这**只是 detach**（GPUI 语义），
+        // 真正作废靠 `request_generation` —— 任务回写前会比对代号。
         self.task.take();
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let generation = self.request_generation;
+        // 新一轮查询开始，撤销上一轮的延迟隐藏（否则正在显示的卡片会在
+        // 鼠标还在符号上时被收走）。对照 Zed `hover_popover.rs` 的
+        // `show_hover`：它进来就会把 `hiding_delay_task` 置空。
+        self.hiding_delay_task = None;
 
         let editor = editor.downgrade();
+        // 另留一份弱引用：收起浮层后要 notify 才会重绘，而 `WeakEntity`
+        // 本身没有 `notify`（那是 `Context` 的方法），得回到实体上调用。
+        let editor_for_notify = editor.clone();
+        // 代号要比对，放在任务够得到的 `InputState` 上。
+        editor
+            .update(cx, |state, _| state.set_hover_request_generation(generation))
+            .ok();
         self.task = Some(cx.spawn(async move |cx| {
             smol::Timer::after(HOVER_DELAY).await;
+
+            // 代号已变 = 期间又发了新请求（鼠标继续移动）：这次的结果过期，
+            // 必须整体丢弃。`smol::Timer` 醒来不会自动取消，所以这个检查点
+            // 不可省 —— 漏掉它就会用旧位置的响应覆盖新位置的状态。
+            let still_current = editor
+                .update(cx, |state, _| state.hover_request_generation() == generation)
+                .unwrap_or(false);
+            if !still_current {
+                log::info!("lsp: hover 请求已过期（防抖后），丢弃");
+                return;
+            }
 
             // 防抖结束后重新读文本：期间用户可能又打了字，位置会漂移。
             let Some(position) = editor
@@ -138,10 +219,44 @@ impl HoverState {
             };
 
             let result = client.hover(&uri, position).await;
+
+            // 响应回来时再验一次代号：等待期间可能又发了新请求。
+            // 代号存在 `InputState` 上（任务拿得到弱引用），`HoverState` 自身
+            // 在后台任务里不可达。
+            let still_current = editor
+                .update(cx, |state, _| state.hover_request_generation() == generation)
+                .unwrap_or(false);
+            if !still_current {
+                log::info!(
+                    "lsp: hover 响应已过期，丢弃 pos={}:{}",
+                    position.line, position.character
+                );
+                return;
+            }
+
             let Ok(Some(hover)) = result else {
-                // 无 hover 内容（空白行/空白字符）时保持隐藏，不弹空卡片。
+                // **空白处（服务器无内容）必须把已显示的浮层收掉。**
+                //
+                // 此前这里只是 `return`，于是鼠标从符号移到空白行/空格时，
+                // 旧卡片就一直挂着 —— 用户看到的是「弹窗不会自动关闭」。
+                let hidden = editor
+                    .update(cx, |state, _cx| state.clear_hover_popover())
+                    .is_ok();
+                if hidden {
+                    log::info!(
+                        "lsp: hover 无内容 -> 收起已显示浮层 pos={}:{}",
+                        position.line, position.character
+                    );
+                    // 收起发生在 `InputState` 上，重绘由 `Editor` 的 render 读那边
+                    // 的状态，所以要显式 notify 让下一帧跑起来。
+                    editor_for_notify.update(cx, |_, cx| cx.notify()).ok();
+                }
                 return;
             };
+            log::info!(
+                "lsp: hover 返回内容 pos={}:{}",
+                position.line, position.character
+            );
 
             editor
                 .update(cx, |state, cx| {
