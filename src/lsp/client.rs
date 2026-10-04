@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use async_channel::Receiver;
 use lsp_types::{
     ClientCapabilities, CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams, CodeActionResponse,
@@ -23,7 +22,7 @@ use lsp_types::{
     TextDocumentPositionParams, TextEdit, Url, WorkDoneProgressParams, WorkspaceEdit,
 };
 
-use crate::lsp::jsonrpc::{Connection, Message};
+use crate::lsp::jsonrpc::Connection;
 
 /// 一次 `initialize` 握手的结果。
 pub struct LspClient {
