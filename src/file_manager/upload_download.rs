@@ -300,6 +300,8 @@ impl DirTransferDriver for RemoteToLocalDirDriver<'_> {
 
     fn prepare_destination_dir(
         &mut self,
+        // 仅 unix 用它落地远端权限（chmod）；其他平台没有对应语义。
+        #[cfg_attr(not(unix), allow(unused_variables))]
         remote_dir: &str,
         destination_dir: &PathBuf,
     ) -> anyhow::Result<()> {
@@ -359,6 +361,9 @@ pub fn download_remote_file_to_local_path(
     cancelled: &Arc<AtomicBool>,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<TransferSummary> {
+    // 远端权限只用于 unix 侧的落地 chmod；其他平台没有对应语义，
+    // 但仍保留这次查询（它同时验证远端路径可读，避免白跑一次下载）。
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let remote_permissions = session.permissions(remote_path).ok().flatten();
 
     if let Some(parent) = destination_path.parent() {

@@ -481,10 +481,19 @@ mod tests {
         // 符号链接：只删链接本身，不递归删链接目标
         let outside = dir.join("outside.txt");
         std::fs::write(&outside, "secret").unwrap();
+        // windows 创建符号链接需要开发者模式或 SeCreateSymbolicLink 权限，
+        // 拿不到就跳过这一段（上面的递归删除已经覆盖主路径）。
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, dir.join("link")).is_ok();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
-        assert!(LocalFileSystem.remove_path(&dir.join("link")).is_ok());
-        assert!(outside.exists(), "链接目标必须保留");
+        let linked = {
+            std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+            true
+        };
+        if linked {
+            assert!(LocalFileSystem.remove_path(&dir.join("link")).is_ok());
+            assert!(outside.exists(), "链接目标必须保留");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

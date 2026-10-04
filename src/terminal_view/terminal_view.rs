@@ -119,6 +119,14 @@ pub enum TerminalBlink {
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
 const TAB_LABEL_DEBOUNCE_DELAY: Duration = Duration::from_millis(100);
 
+/// WSL cwd 轮询的「输出静默窗口」。
+///
+/// 每次轮询都要进发行版起一个 `wsl.exe`（扫 `/proc/*/environ`），所以不能跟着
+/// 输出走——长输出（`ls -R`、编译日志）期间 cwd 并不会变，扫了纯属浪费。改成
+/// **尾沿**防抖：只要还在出字就把窗口往后推，输出停下来才真扫一次。`cd foo`
+/// 回车 → 回显与新提示符到齐 → 静默 250ms → 扫一次 → 文件树换根。
+const WSL_CWD_QUIET_DELAY: Duration = Duration::from_millis(250);
+
 /// 拖拽选择边缘自动滚动：指针距视口上下边缘小于此行数时激活。
 const SELECTION_AUTOSCROLL_EDGE_LINES: f32 = 1.5;
 /// 边缘自动滚动周期。过快会在高频终端上产生过多重绘，过慢则滚动不连贯。
@@ -167,6 +175,23 @@ pub fn init(cx: &mut App) {
         // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
         KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
     ]);
+
+    // Windows：把「默认发行版名」提前在后台问好。
+    //
+    // `TerminalSessionState::file_tree_target` 要用它把 Linux 路径翻成 UNC，而那个
+    // 查询要起一个 `wsl.exe`（几百毫秒，冷启动发行版更久）。虽然结果有
+    // `OnceLock` 缓存，但**首次**调用发生在 UI 线程上（文件树订阅 TitleChanged），
+    // 于是第一个 WSL 标签页会卡一下。启动时预热掉这次查询。
+    #[cfg(windows)]
+    {
+        let background = cx.background_executor().clone();
+        cx.spawn(async move |_cx| {
+            background
+                .spawn(async { crate::utils::wsl::default_distro() })
+                .await;
+        })
+        .detach();
+    }
 }
 
 /// 广播消息 - 广播组内同步的内容。
@@ -357,6 +382,10 @@ struct ProcessCwdCache {
 ///
 /// 之所以还需要这个 struct 而不是散落两个字段：TTL 与 in-flight 是同一件
 /// 事的两个面（「最近查过没有」/「正在查」），放一起不容易用错。
+///
+/// 仅 unix：前台 agent 检测要 `tcgetpgrp`（`Terminal::detect_agent_for_local`
+/// 本身是 `#[cfg(unix)]`）。
+#[cfg(unix)]
 #[derive(Default)]
 struct ForegroundAgentCache {
     /// 最近一次检测时间。含「查不了」的结果——那也是一次有效的轮询，
@@ -431,7 +460,26 @@ pub struct TerminalView {
     cached_working_directory: Option<String>,
     /// 本地 shell 进程 cwd（后台线程刷新，UI 路径只读）
     process_cwd: ProcessCwdCache,
+    /// WSL 标签页的 **Linux 侧** cwd（/home/you/...）。
+    ///
+    /// 与 process_cwd 分开：那个存的是 Windows 进程 cwd，对 WSL 没有意义
+    /// （见 current_local_working_directory）。
+    wsl_cwd: Option<String>,
+    /// [`Self::poll_wsl_cwd`] 的静默窗口：全程只留一个计时任务，
+    /// 靠 [`Self::wsl_scan_seq`] 判断「睡的这一觉里有没有被打断」。
+    ///
+    /// GPUI 的 `Task` 被 drop 只是 detach（见 `search_request_id` 的注释），
+    /// 所以重置窗口既不能靠丢任务，也不能每戳一次就 spawn 一个（刷屏时会攒
+    /// 出几百个）。任务醒来比对序号：变了就重睡一轮，没变才去扫描。
+    wsl_scan_task: Option<Task<()>>,
+    /// 每次输出把 `poll_wsl_cwd` 打进来的「戳」计数，供上面的计时器比对。
+    wsl_scan_seq: u64,
+    /// 一次 `/proc` 扫描正在后台跑（防重入）。
+    wsl_scan_in_flight: bool,
+    /// 扫描期间又来了新输出：跑完立刻再扫一次，免得漏掉最后一次 `cd`。
+    wsl_scan_again: bool,
     /// 本地前台 agent（后台线程检测，UI 路径只读）
+    #[cfg(unix)]
     foreground_agent: ForegroundAgentCache,
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
@@ -858,8 +906,139 @@ impl TerminalView {
             );
             this.update_title(cx);
             this.last_tab_label = Some(this.tab_label(cx));
+            this.refresh_wsl_cwd(cx);
             this
         })
+    }
+
+    /// WSL 标签页：一次性量出发行版的 Linux 家目录，存进 `wsl_cwd`。
+    ///
+    /// 为什么需要：WSL 的 cwd 在 Linux 侧，而 Windows 侧的进程 cwd 查询拿到的是
+    /// `wsl.exe` 的目录（会翻译成 `/mnt/c/...`），完全对不上。发行版家目录只能
+    /// 由 `wsl.exe` 自己说（`--cd ~ -- pwd`）。
+    ///
+    /// 只在**没有** OSC 7 上报时兜底（`wsl_cwd` 已有值就跳过）：bash 的
+    /// 交互式启动没有干净的环境变量注入点，所以拿不到实时 cwd，这里给一个
+    /// 正确的起点；shell 若上报了 OSC 7，会走 `on_working_directory_changed`。
+    ///
+    /// 放后台线程：起一个 wsl 进程要几百毫秒到数秒（发行版冷启动更久），不能
+    /// 挡住 UI。
+    fn refresh_wsl_cwd(&mut self, cx: &mut Context<Self>) {
+        if !self.is_wsl_terminal() || self.wsl_cwd.is_some() {
+            return;
+        }
+        let Some(distro) = crate::utils::wsl::distro_from_args(&self.command_args)
+            .or_else(|| crate::utils::wsl::default_distro().map(str::to_string))
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let home = cx
+                .background_executor()
+                .spawn(async move { crate::utils::wsl::distro_home(&distro) })
+                .await;
+                let _ = this.update(cx, |this, cx| {
+                    if let Some(home) = home {
+                        this.wsl_cwd = Some(home);
+                        // 文件树要换根到发行版家目录。
+                        cx.emit(Event::TitleChanged);
+                    }
+                    cx.notify();
+                });
+        })
+        .detach();
+    }
+
+    /// WSL 标签页：终端有新输出时，尾沿防抖一次，再去问「shell 现在在哪」。
+    ///
+    /// 为什么靠「新输出」而不是定时器：WSL 的 bash 没有 OSC 7（没有 shell
+    /// integration），`cd` 之后唯一可靠的信号就是终端又吐了东西。防抖窗口
+    /// [`WSL_CWD_QUIET_DELAY`] 内的连打（粘贴脚本、make 刷屏）只触发一次扫描。
+    ///
+    /// # 为什么是「一个会自己重置的计时器」而不是每次戳一个新任务
+    ///
+    /// GPUI 的 `Task` 被 drop **只是 detach，不会取消**（见
+    /// [`Self::wsl_scan_task`] 的字段注释），所以既不能靠丢任务来重置窗口，
+    /// 也不能每次输出都 spawn 一个——刷屏时那样会攒出几百个各睡各的计时器。
+    /// 这里全程只留一个：戳一下就把序号 [`Self::wsl_scan_seq`] 加一，任务醒来
+    /// 比对序号，对不上说明窗口被推后过，回去重睡；对得上才开枪。
+    fn poll_wsl_cwd(&mut self, cx: &mut Context<Self>) {
+        if !self.is_wsl_terminal() {
+            return;
+        }
+        self.wsl_scan_seq = self.wsl_scan_seq.wrapping_add(1);
+        if self.wsl_scan_task.is_some() {
+            // 已有计时器在睡：序号已更新，它醒来自然会重睡一轮。
+            return;
+        }
+        let first_seq = self.wsl_scan_seq;
+        let task = cx.spawn(async move |this, cx| {
+            let mut seen = first_seq;
+            loop {
+                cx.background_executor().timer(WSL_CWD_QUIET_DELAY).await;
+                let settled = match this.update(cx, |this, cx| {
+                    if this.wsl_scan_seq != seen {
+                        // 窗口内又被戳了：往后推，重睡一轮。
+                        seen = this.wsl_scan_seq;
+                        return false;
+                    }
+                    this.wsl_scan_task = None;
+                    this.scan_wsl_cwd(cx);
+                    true
+                }) {
+                    Ok(settled) => settled,
+                    // 视图已销毁：没人等这把计时器了，自己了断。
+                    Err(_) => return,
+                };
+                if settled {
+                    return;
+                }
+            }
+        });
+        self.wsl_scan_task = Some(task);
+    }
+
+    /// 扫一次发行版里的 shell cwd；结果变了就往外发事件。
+    ///
+    /// 扫描本身起子进程（`wsl.exe --exec sh`），几十到几百毫秒，必须放后台。
+    /// 期间再来输出只会置 [`Self::wsl_scan_again`]，等这一趟跑完再补一趟——
+    /// 不会并发起两个 `wsl.exe`。
+    fn scan_wsl_cwd(&mut self, cx: &mut Context<Self>) {
+        if self.wsl_scan_in_flight {
+            self.wsl_scan_again = true;
+            return;
+        }
+        let Some(distro) = crate::utils::wsl::distro_from_args(&self.command_args)
+            .or_else(|| crate::utils::wsl::default_distro().map(str::to_string))
+        else {
+            return;
+        };
+        let Some(token) = self.terminal.read(cx).wsl_cwd_token().map(str::to_string) else {
+            return;
+        };
+        self.wsl_scan_in_flight = true;
+        cx.spawn(async move |this, cx| {
+            let cwd = cx
+                .background_executor()
+                .spawn(async move { crate::utils::wsl::query_distro_cwd(Some(&distro), &token) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.wsl_scan_in_flight = false;
+                if let Some(cwd) = cwd {
+                    if this.wsl_cwd.as_deref() != Some(cwd.as_str()) {
+                        this.wsl_cwd = Some(cwd);
+                        // 文件树换根 + tab 标签里的 `~/...` 都要跟着走。
+                        cx.emit(Event::WorkingDirectoryChanged);
+                        this.check_tab_label_changed(cx);
+                    }
+                }
+                cx.notify();
+                if std::mem::take(&mut this.wsl_scan_again) {
+                    this.scan_wsl_cwd(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// 从既有 Terminal 实体构建视图值。
@@ -892,6 +1071,7 @@ impl TerminalView {
                 TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
                     this.check_remote_os(terminal.clone(), cx);
                     this.check_tab_label_changed(cx);
+                    this.poll_wsl_cwd(cx);
                     cx.notify();
                 }
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
@@ -959,6 +1139,12 @@ impl TerminalView {
             remote_os: None,
             cached_working_directory: None,
             process_cwd: ProcessCwdCache::default(),
+            wsl_cwd: None,
+            wsl_scan_task: None,
+            wsl_scan_seq: 0,
+            wsl_scan_in_flight: false,
+            wsl_scan_again: false,
+            #[cfg(unix)]
             foreground_agent: ForegroundAgentCache::default(),
             pending_remote_cwd_restore: None,
             hovered_link: None,
@@ -1217,6 +1403,12 @@ impl TerminalView {
                 remote_os: None,
                 cached_working_directory: None,
                 process_cwd: ProcessCwdCache::default(),
+                wsl_cwd: None,
+                wsl_scan_task: None,
+                wsl_scan_seq: 0,
+                wsl_scan_in_flight: false,
+                wsl_scan_again: false,
+                #[cfg(unix)]
                 foreground_agent: ForegroundAgentCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
@@ -1451,9 +1643,37 @@ impl TerminalView {
         });
     }
 
+    /// 本标签页是否是一个 WSL 终端（命令是 `wsl.exe` 之类的启动器）。
+    ///
+    /// `cfg!(windows)` 前置：WSL 标签页只在 Windows 上存在。非 Windows 上即使
+    /// 命令名恰好叫 `wsl` 也必须返回 `false`，否则下面两条 WSL 分支会生效——
+    /// 给普通 shell 注入 WSLENV，或把它的 `/home/...` 翻成打不开的 UNC 路径。
+    fn is_wsl_terminal(&self) -> bool {
+        if !cfg!(windows) {
+            return false;
+        }
+        self.command
+            .as_deref()
+            .is_some_and(crate::utils::wsl::is_wsl_command)
+    }
+
     fn current_local_working_directory(&self, cx: &App) -> Option<PathBuf> {
         if let Some(cwd) = self.cached_working_directory.as_deref() {
             return Some(PathBuf::from(cwd));
+        }
+
+        // WSL：cwd 在 **Linux 侧**，形状是 `/home/you/...`。
+        //
+        // 绝不能拿 `process_cwd`（Windows 进程 cwd 查询）来填：那是 `wsl.exe`
+        // 这个 Windows 进程的目录，会被翻译成 `/mnt/c/...`（宿主目录），与发行版
+        // 里的 shell 位置毫无关系。只能用 shell 自己上报的 OSC 7，或一次
+        // `wsl.exe -- pwd` 量出来的发行版家目录。
+        if self.is_wsl_terminal() {
+            return self
+                .wsl_cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| self.working_directory.clone());
         }
 
         let terminal = self.terminal.read(cx);
@@ -1497,12 +1717,39 @@ impl TerminalView {
                 })
                 .await;
             let _ = this.update(cx, |this, cx| {
+                // cwd 变了要**主动发事件**（仅 windows），不能只 `notify()`。
+                //
+                // tab 标签里含 cwd（见 `tab_label`），侧边栏又是靠
+                // `TitleChanged` 把文件树换根到本终端的 cwd。只重绘的话标签
+                // 文字会变（渲染时重算），但订阅方收不到通知，文件树就停在
+                // 旧目录——要等下一次终端输出事件才补上。
+                //
+                // 这条对没有 OSC 7 的 shell 尤其关键：windows 的
+                // PowerShell/cmd 不上报 OSC 7，进程 cwd 查询是唯一来源。
+                // OSC 7 优先（见 `current_local_working_directory`），所以它
+                // 仍在上报时以 `WorkingDirectoryChanged` 为准，这里只在
+                // 进程查询是唯一来源时补一次通知。
+                //
+                // `cfg(windows)`：unix 上 OSC 7 / shell integration 一直在供
+                // cwd，事件早已由 `WorkingDirectoryChanged` 发出；在这里补发只会
+                // 让无 OSC 7 的 unix shell 多触发一轮文件树换根——那是超出
+                // 「Windows 兼容」范围的既有行为变更，故不启用。
+                #[cfg(windows)]
+                if this.process_cwd.cwd.as_deref() != cwd.as_deref()
+                    && this.cached_working_directory.is_none()
+                    && this
+                        .terminal
+                        .read(cx)
+                        .reported_working_directory()
+                        .is_none()
+                {
+                    cx.emit(Event::TitleChanged);
+                }
                 this.process_cwd = ProcessCwdCache {
                     cwd,
                     checked_at: Some(Instant::now()),
                     refresh_in_flight: false,
                 };
-                // cwd 变化会影响 tab 标签与会话保存
                 cx.notify();
             });
         })
@@ -1977,15 +2224,11 @@ impl TerminalView {
             .foreground_process_name()
             .or_else(|| term.shell_name().map(|s| s.to_string()));
 
-        // 优先使用缓存的 cwd（OSC 7 / 远程上报），fallback 到后台刷新的进程 cwd 缓存。
+        // 优先走 current_local_working_directory：它认得 WSL（Linux 侧 cwd，
+        // 见其文档），而这里的三段 fallback 全是 Windows 侧视角——WSL 标签页
+        // 会落到 `process_cwd`，显示成 `/mnt/c/Users/...` 这种宿主路径。
         // 不在标签/拖拽路径同步起 lsof（由 do_check_tab_label_changed 后台预热）。
-        let cwd = self
-            .cached_working_directory
-            .as_deref()
-            .map(PathBuf::from)
-            .or_else(|| term.reported_working_directory().map(PathBuf::from))
-            .or_else(|| self.process_cwd.cwd.clone())
-            .or_else(|| self.working_directory.clone());
+        let cwd = self.current_local_working_directory(cx);
 
         let cwd_display = cwd.as_ref().and_then(|p| {
             let path = p.to_string_lossy();
@@ -2344,7 +2587,7 @@ impl TerminalView {
             .ok_or_else(|| "拼装 PATH 失败".to_string())?;
         env.insert("PATH".to_string(), path);
 
-        let output = std::process::Command::new("codex")
+        let output = crate::utils::console::hidden_command("codex")
             .args(["features", "enable", "hooks"])
             .envs(env)
             .output()
@@ -5320,12 +5563,57 @@ impl TerminalView {
     }
 }
 
-#[cfg(test)]
+    #[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
     use crate::terminal::terminal::TerminalBounds;
     use gpui::{TestAppContext, size};
+
+    /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。
+    ///
+    /// 这条不需要真 PTY：`build_headless` 出的视图没有后台线程，gpui 的测试
+    /// 调度器才允许断言（真起 conpty 会被判为「测试不确定」——PTY 读线程会在
+    /// 调度器之外碰 app 状态）。进程 cwd 能不能跟随 `cd` 由
+    /// `utils::win_process_cwd` 的用例单独负责。
+    #[gpui::test]
+    fn file_tree_target_uses_the_process_cwd_cache(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        // 缓存为空 → 退回启动目录（headless 下为 None）。
+        let (cwd, _) = view.read_with(cx, |v, cx| v.session_state(cx).file_tree_target());
+        assert!(cwd.is_none(), "无任何 cwd 来源时不应编造一个根");
+
+        // 写入缓存 → 文件树目标立刻跟着变。
+        let dir = std::path::PathBuf::from(if cfg!(windows) {
+            "C:\\Users\\Public\\dt-ft-cache"
+        } else {
+            "/tmp/dt-ft-cache"
+        });
+        view.update(cx, |v, _cx| {
+            v.process_cwd = ProcessCwdCache {
+                cwd: Some(dir.clone()),
+                checked_at: Some(std::time::Instant::now()),
+                refresh_in_flight: false,
+            };
+        });
+        let (cwd, _) = view.read_with(cx, |v, cx| v.session_state(cx).file_tree_target());
+        assert_eq!(cwd.as_deref(), Some(dir.as_path()));
+
+        // 标签里也应带上 cwd（侧边栏靠标签变化感知「要换根了」）。
+        let label = view.read_with(cx, |v, cx| v.tab_label(cx));
+        assert!(
+            label.contains("dt-ft-cache"),
+            "tab 标签应包含 cwd，实际={label:?}"
+        );
+    }
 
     /// 搜索全链路（输入 → 后台比对 → 回写 → 内容漂移后重算）。
     ///

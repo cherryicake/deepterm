@@ -111,7 +111,6 @@ tree-sitter-make = "1.1.1"
 regex = "1.12.3"
 imara-diff = "0.1.8"
 open = "5"
-mimalloc = "0.1.52"
 tree-sitter-yaml = "0.7"
 tree-sitter-java = "0.23"
 tree-sitter-xml = "0.7"
@@ -120,6 +119,21 @@ merman = { version = "0.7.0", features = ["render"] }
 # 不用 walkdir 自己实现——忽略规则的层级语义（父目录规则约束子目录、
 # 白名单 `!` 反选、`.git/info/exclude`、全局 gitignore）极易写错。
 ignore = "0.4.32"
+
+# mimalloc 只在非 Windows 上启用。
+#
+# 真实原因是**构建机的 cargo 源码路径不能含非 ASCII 字符**：`libmimalloc-sys`
+# 用 `cc` 编译 vendored C 源码，而 MSVC 的 `cl.exe` 打不开含中文的路径
+# （实测 `C:\Users\<中文名>\...` → `c1xx: fatal error C1083: 无法打开源文件`）。
+# 同一份源码放在纯 ASCII 路径下用 MSVC 编译是**成功**的，所以这不是 mimalloc
+# 缺 Windows 产物，而是工具链的路径限制。
+#
+# 因此这层 gate 是「让本机/中文路径的 Windows 构建能过」的必要绕行：它对
+# 最终用户无影响（发布产物本就不含编译期依赖），代价只是 Windows 端退回系统
+# 分配器。若构建路径改为纯 ASCII（例如 `CARGO_HOME=C:\cargo`），可以把这层
+# gate 去掉、恢复 Windows 上的 mimalloc。
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+mimalloc = "0.1.52"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -132,6 +146,14 @@ gpui = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a5
 windows = { version = "0.52", features = [
     "Win32_System_Console",
     "Win32_Foundation",
+    # 读他进程 cwd（`utils::win_process_cwd`）：OpenProcess / ReadProcessMemory /
+    # IsWow64Process 在 Threading 与 Diagnostics::Debug 下，NtQueryInformationProcess
+    # 属于 WDK 的 System::Threading；`PROCESS_BASIC_INFORMATION` 结构本身挂在
+    # `Win32_System_Kernel` 后面。
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Wdk_System_Threading",
 ] }
 russh = { version = "0.61.1", default-features = false, features = [
     "flate2",
@@ -166,10 +188,17 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 # #[gpui::bench] 生成的代码调用 gpui_platform::current_headless_renderer，
 # 需要 bench-support（仅 test/bench 构建参与特性合并，不影响正式产物）。
+#
+# 该依赖必须是**全平台**的：非 macOS 上 `current_headless_renderer` 返回 `None`
+# （无头渲染器只有 Metal），gpui 会跳过 present —— prepaint/paint 路径仍可测量。
+# 只在 macOS 声明会让 `cargo check --all-targets` 在 windows/linux 上直接失败。
+gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = [
+    "bench-support",
+] }
+
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "ac099b4a809a564f06907125e7a536c33cb60084", features = [
     "font-kit",
-    "bench-support",
 ] }
 
 [package.metadata.bundle]

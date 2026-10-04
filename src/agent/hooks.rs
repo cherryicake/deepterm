@@ -1203,9 +1203,12 @@ fn esc_for_shell_single_quoted(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::parse_agent_event;
+    // 只有跑真实 `/bin/sh` 的用例需要它，那些用例是 `#[cfg(unix)]`。
+    #[cfg(unix)]
     use std::process::Command;
 
     /// 取出 OSC 的**内容**部分（`ESC ]` 与 BEL 之间）。
+    #[cfg(unix)]
     fn osc_content(sequence: &[u8]) -> &[u8] {
         let start = sequence
             .strip_prefix(b"\x1b]")
@@ -1225,6 +1228,7 @@ mod tests {
     /// `default_terminal_env` 补的 Homebrew 表是唯一能找到 Homebrew
     /// `codex` 的线索——丢了这个，从 Finder 启动就装不上。
     #[test]
+    #[cfg(unix)]
     fn path_with_user_bins_prepends_and_keeps_the_base() {
         let home = std::path::Path::new("/home/someone");
         let base: Vec<std::path::PathBuf> =
@@ -1248,7 +1252,10 @@ mod tests {
     /// 远端那条已经由 `codex_enable_hooks_command_finds_codex_without_inherited_path`
     /// 用真实 shell 覆盖；本地这条**不走 shell**，靠的是 `Command` 在子进程
     /// 环境里按我们设的 `PATH` 查找——两条机制不同，必须各自验证。
+    ///
+    /// 用例造的是 POSIX shell 脚本并依赖可执行位，故只在 unix 上跑。
     #[test]
+    #[cfg(unix)]
     fn path_with_user_bins_lets_command_resolve_a_standalone_codex() {
         let home = std::env::temp_dir().join(format!(
             "deepterm-local-codex-test-{}",
@@ -1320,7 +1327,10 @@ mod tests {
     /// 用真实的 `/bin/sh` 跑一遍：造一个假的 `codex`（记录 argv 后退出 0），
     /// 只放进 `~/.local/bin`，然后把 `PATH` 清空。若命令没自带兜底，这一步会
     /// 以 127 失败——与远端现场一致。
+    ///
+    /// 被验的是**远端**（POSIX）命令串，故只在 unix 上跑。
     #[test]
+    #[cfg(unix)]
     fn codex_enable_hooks_command_finds_codex_without_inherited_path() {
         let home = std::env::temp_dir().join(format!(
             "deepterm-codex-path-test-{}",
@@ -1582,6 +1592,7 @@ mod tests {
     /// 脚本写 tty 的目标可用 `DEEPTERM_REPORT_TARGET` 覆盖（给测试留的口子），
     /// 这里指到临时文件再解析。
     #[test]
+    #[cfg(unix)]
     fn reporter_script_run_by_real_sh_produces_parsable_bytes() {
         let dir = std::env::temp_dir().join(format!("deepterm-reporter-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1625,6 +1636,7 @@ mod tests {
     /// `json_str` 对嵌不进载荷的值（引号/反斜杠/控制字节/缺失）必须返回非零，
     /// 对干净值原样输出——否则整条序列会被终端解析器丢弃，事件全部丢失。
     #[test]
+    #[cfg(unix)]
     fn reporter_script_json_str_rejects_unsafe_values() {
         let script = agent_report_script();
         let start = script.find("json_str() {").expect("必须有 json_str");
@@ -1668,6 +1680,7 @@ mod tests {
     ///
     /// 断言的是**最终产出的事件名**（端到端经真实 `/bin/sh`），不是脚本文本。
     #[test]
+    #[cfg(unix)]
     fn reporter_script_routes_events_like_the_old_cli() {
         let dir = std::env::temp_dir().join(format!(
             "deepterm-reporter-routing-{}",

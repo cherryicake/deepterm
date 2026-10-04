@@ -8,10 +8,9 @@
 //! 2. **协议分片**（`m=1`/`m=0`）：多条独立完整的 APC 组成一张图 →
 //!    由 `ImageStore` 内部的 `LoadingImage` 累积状态处理。
 
-use crate::terminal::escape_scan::{self, Extract};
+use crate::terminal::escape_scan::{self, Extract, GridState, PtyScanner};
 use crate::terminal::kitty::command::Parser;
 use crate::terminal::kitty::exec::ImageStore;
-use crate::terminal::local_pty::PtyScanner;
 
 /// 回写响应的通道。
 ///
@@ -471,7 +470,7 @@ impl PtyScanner for KittyGraphicsScanner {
         data: &[u8],
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
-        grid: &mut dyn FnMut() -> crate::terminal::local_pty::GridState,
+        grid: &mut dyn FnMut() -> GridState,
     ) {
         // 有跨读残尾时先拼接（仅在确有残尾时拷贝一次）。
         let joined: Vec<u8>;
@@ -653,8 +652,8 @@ mod tests {
 
     /// 测试用的网格状态：光标在左上角，可见窗口覆盖 0..=23 行（24 行视口、
     /// 未滚动）。需要别的窗口的用例自行构造 `GridState`。
-    fn grid_state_fixture() -> crate::terminal::local_pty::GridState {
-        crate::terminal::local_pty::GridState {
+    fn grid_state_fixture() -> GridState {
+        GridState {
             cursor: (0, 0),
             visible: crate::terminal::kitty::storage::VisibleRows::new(0, 24),
         }
@@ -1118,7 +1117,7 @@ mod tests {
             &mut || {
                 let t = term.borrow();
                 let point = t.grid().cursor.point;
-                crate::terminal::local_pty::GridState {
+                GridState {
                     cursor: (point.line.0, point.column.0 as u32),
                     visible: crate::terminal::kitty::storage::VisibleRows::new(
                         t.grid().display_offset(),

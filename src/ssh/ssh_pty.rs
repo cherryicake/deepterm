@@ -214,6 +214,8 @@ impl SshPtyTerminal {
             working_directory: None,
             drain_on_exit: true,
             env,
+            #[cfg(target_os = "windows")]
+            escape_args: true,
         };
 
         // 转换窗口大小

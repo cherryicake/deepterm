@@ -312,6 +312,9 @@ pub fn parse_ssh_target(target: &str) -> (String, String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `remote_shell_tracking_command_is_posix_shell_parseable` 用真实 `/bin/sh`
+    // 解析命令串，是 `#[cfg(unix)]`；其余用例不写文件。
+    #[cfg(unix)]
     use std::io::Write;
 
     #[test]
@@ -408,6 +411,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remote_shell_tracking_command_is_posix_shell_parseable() {
         let command = remote_shell_tracking_command(Some("/tmp/deepterm cwd"));
         let path = std::env::temp_dir().join(format!(

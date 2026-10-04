@@ -7,7 +7,6 @@ use std::{
     cell::Cell,
     collections::HashMap,
     fs,
-    io::Write as _,
     path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
@@ -435,6 +434,7 @@ fn write_local_shell_integration_files() -> Option<PathBuf> {
         // 脚本只允许属主读写（0600），防止被同机其他用户篡改
         #[cfg(unix)]
         {
+            use std::io::Write as _;
             use std::os::unix::fs::OpenOptionsExt;
             fs::OpenOptions::new()
                 .write(true)
@@ -846,11 +846,19 @@ pub struct Terminal {
     /// 本地 PTY 启动出来的首个子进程 pid，通常就是 shell 进程。
     pub child_process_id: Option<u32>,
     /// shell 所在的进程组 id，用来判断当前前台程序是否仍然是 shell。
+    #[cfg(unix)]
     shell_process_group_id: Option<i32>,
     /// 本地 PTY master fd，用来读取当前 TTY 的前台进程组。
+    #[cfg(unix)]
     pty_master_fd: Option<i32>,
     /// 启动时使用的 shell 程序路径（如 "/bin/zsh"），用于生成 tab 标签。
     shell_program: Option<String>,
+    /// 本会话注入发行版的 cwd 标记值（仅 WSL 标签页，见
+    /// [`crate::utils::wsl::inject_cwd_token`]）。
+    ///
+    /// spawn 时随 `WSLENV` 送进发行版，之后轮询用同一个值去 `/proc` 里认出
+    /// 这个标签页的 shell——没有它，`cd` 之后的 Linux 侧 cwd 就没人能问到。
+    wsl_cwd_token: Option<String>,
     /// 远程 shell 提示符是否已准备好。
     remote_shell_ready: bool,
     /// 终端通过 OSC 7 / CurrentDir 等序列主动上报的工作目录。
@@ -1081,9 +1089,12 @@ impl Terminal {
         cx.new(|_cx| Self {
             term,
             child_process_id: None,
+            #[cfg(unix)]
             shell_process_group_id: None,
+            #[cfg(unix)]
             pty_master_fd: None,
             shell_program: None,
+            wsl_cwd_token: None,
             remote_shell_ready: false,
             reported_working_directory: None,
             remote_os: None,
@@ -1167,6 +1178,23 @@ impl Terminal {
                 }
             }
         }
+        // WSL 标签页：给本会话的 shell 打一个唯一 cwd 标记，并把它点名进
+        // WSLENV——WSL 只透传 WSLENV 里列出的变量，不加就没法把标记送进发行版。
+        //
+        // 这是「cd 之后文件树根跟着走」的**唯一**实时来源：WSL 标签页没有
+        // shell integration（拿不到 OSC 7），Windows 侧的进程 cwd 查询又只看得到
+        // `wsl.exe` 自己。后续轮询用这个值进 `/proc` 里认出本标签页的 shell。
+        //
+        // `cfg(windows)`：WSL 标签页只在 Windows 上存在。unix 上不能进这个分支
+        // ——那里若有个恰好叫 `wsl` 的程序，给它注入 `WSLENV`/`DEEPTERM_CWD_TOKEN`
+        // 就是凭空改变用户 shell 的环境。
+        #[cfg(windows)]
+        let wsl_cwd_token = shell_program
+            .as_deref()
+            .filter(|program| crate::utils::wsl::is_wsl_command(program))
+            .map(|_| crate::utils::wsl::inject_cwd_token(&mut pty_options.env));
+        #[cfg(not(windows))]
+        let wsl_cwd_token: Option<String> = None;
         let (events_tx, events_rx) = unbounded();
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
@@ -1196,8 +1224,7 @@ impl Terminal {
             )
         };
         #[cfg(not(unix))]
-        let (child_process_id, shell_process_group_id, pty_master_fd) =
-            (pty.child_watcher().pid().map(|p| p.get()), None, None);
+        let child_process_id = pty.child_watcher().pid().map(|p| p.get());
 
         // Kitty 图形协议：读线程/扫描器写入，UI 线程渲染。存储在这两条
         // 管线之间共享，因此这里先建好再分别交给扫描器与 `Terminal`。
@@ -1243,8 +1270,18 @@ impl Terminal {
                 }
             }
         };
+        // windows：conpty 无裸 fd，字节流交给 alacritty 的 `EventLoop`。
+        //
+        // **必须**在 spawn 之前取走它的 channel（`EventLoop::spawn` 消费
+        // self）并存进 `Terminal::sender`：用户输入、`Msg::Resize`、以及
+        // 关闭时的 `Msg::Shutdown` 全部只走这一条通道。
+        //
+        // 为什么这条接线值得单独盯：`EventLoop` 自己照常解析 PTY 字节，
+        // 所以丢掉 sender 时**输出完全正常**——提示符、目录、命令回显都在，
+        // 唯独 `Terminal::write` 找不到投递通道，把每个按键静默丢弃。症状
+        // 表现为「终端能打开，但打不进任何字」，很容易被误判成焦点问题。
         #[cfg(not(unix))]
-        let (local_reader, local_notices) = {
+        let event_loop_sender = {
             let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
                 Ok(event_loop) => event_loop,
                 Err(e) => {
@@ -1252,8 +1289,9 @@ impl Terminal {
                     return cx.new(|_cx| Self::create_error_terminal());
                 }
             };
+            let sender = event_loop.channel();
             let _ = event_loop.spawn();
-            (None, None)
+            Some(sender)
         };
 
         cx.new(|cx| {
@@ -1270,6 +1308,9 @@ impl Terminal {
 
             // unix：把读线程的通知（重绘 / 子进程退出）泵到 UI 线程。
             // 读线程自身只做 vte 解析，凡需要 `Context` 的副作用都在这里完成。
+            //
+            // windows 走 alacritty 的 `EventLoop`（无自建读线程），没有通知可泵。
+            #[cfg(unix)]
             let reader_notice_task = local_notices.map(|notices| {
                 cx.spawn(async move |this, cx| {
                     while let Ok(notice) = notices.recv().await {
@@ -1282,13 +1323,18 @@ impl Terminal {
                     }
                 })
             });
+            #[cfg(not(unix))]
+            let reader_notice_task: Option<Task<()>> = None;
 
             Self {
                 term: term_clone,
                 child_process_id,
+                #[cfg(unix)]
                 shell_process_group_id,
+                #[cfg(unix)]
                 pty_master_fd,
                 shell_program,
+                wsl_cwd_token,
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os,
@@ -1297,8 +1343,15 @@ impl Terminal {
                 foreground_agent: None,
                 agent_session: None,
                 window_title: None,
+                // unix 的本地终端走自建读线程（`local_sender`）；windows 走
+                // alacritty `EventLoop`，输入/尺寸/关闭都走 `sender`。
+                #[cfg(unix)]
                 sender: None,
+                #[cfg(not(unix))]
+                sender: event_loop_sender,
+                #[cfg(unix)]
                 local_sender: local_reader.as_ref().map(|r| r.sender()),
+                #[cfg(unix)]
                 _local_reader: local_reader,
                 images,
                 kitty_replies,
@@ -1354,29 +1407,32 @@ impl Terminal {
     }
 
     pub fn new(cx: &mut App, working_directory: Option<PathBuf>) -> Entity<Self> {
-        let default_shell = if cfg!(windows) {
-            if std::process::Command::new("powershell.exe")
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg("exit 0")
-                .output()
-                .is_ok()
-            {
+        // Windows 上「挑默认 shell」是靠**真的跑一次**探测进程完成的，而
+        // powershell/pwsh 都是控制台程序：从 GUI 子系统进程里用
+        // `Command::output()` 启动它们，Windows 会新分配控制台并显示窗口，
+        // 用户看到的是「标签页还没出来，先闪一个黑框」。
+        // `hidden_command` 加上 `CREATE_NO_WINDOW` 消掉这个闪烁。
+        #[cfg(windows)]
+        let default_shell = {
+            let probe_runs = |program: &str| {
+                crate::utils::console::hidden_command(program)
+                    .arg("-NoProfile")
+                    .arg("-Command")
+                    .arg("exit 0")
+                    .output()
+                    .is_ok()
+            };
+            if probe_runs("powershell.exe") {
                 "powershell.exe".to_string()
-            } else if std::process::Command::new("pwsh.exe")
-                .arg("-NoProfile")
-                .arg("-Command")
-                .arg("exit 0")
-                .output()
-                .is_ok()
-            {
+            } else if probe_runs("pwsh.exe") {
                 "pwsh.exe".to_string()
             } else {
                 std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
             }
-        } else {
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
         };
+        #[cfg(not(windows))]
+        let default_shell: String =
+            std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
 
         let remote_os = Some(detect_local_os());
 
@@ -1446,9 +1502,12 @@ impl Terminal {
         Self {
             term,
             child_process_id: None,
+            #[cfg(unix)]
             shell_process_group_id: None,
+            #[cfg(unix)]
             pty_master_fd: None,
             shell_program: None,
+            wsl_cwd_token: None,
             remote_shell_ready: false,
             reported_working_directory: None,
             remote_os: None,
@@ -1751,9 +1810,12 @@ impl Terminal {
             Self {
                 term: term_clone,
                 child_process_id: None,
+                #[cfg(unix)]
                 shell_process_group_id: None,
+                #[cfg(unix)]
                 pty_master_fd: None,
                 shell_program: None,
+                wsl_cwd_token: None,
                 remote_shell_ready: false,
                 reported_working_directory: None,
                 remote_os: None,
@@ -1980,6 +2042,14 @@ impl Terminal {
 
     pub fn reported_working_directory(&self) -> Option<&str> {
         self.reported_working_directory.as_deref()
+    }
+
+    /// 本会话注入发行版的 cwd 标记（仅 WSL 标签页；见 [`Self::wsl_cwd_token`]）。
+    ///
+    /// 没有它就进 `/proc` 认不出哪个进程是这个标签页的 shell，也就问不到它
+    /// `cd` 之后的实时目录。
+    pub fn wsl_cwd_token(&self) -> Option<&str> {
+        self.wsl_cwd_token.as_deref()
     }
 
     /// 检查 SSH 连接是否已就绪（russh 已连接）
@@ -5243,6 +5313,37 @@ mod tests {
         });
     }
 
+    /// 回归：新建的本地终端必须持有**一条**输入通道，否则用户打的每个字符
+    /// 都被 `Terminal::write` 静默丢弃。
+    ///
+    /// 症状极具迷惑性：终端能打开、提示符照常出现（输出侧正常，因为解析
+    /// PTY 字节的读线程 / `EventLoop` 都在跑），但**打不进任何字**。
+    ///
+    /// 根因是平台相关的接线漏了一条：unix 走自建读线程的 `local_sender`，
+    /// windows 走 alacritty `EventLoop` 的 `sender`——而
+    /// `EventLoop::spawn` 会消费 self，channel 必须在 spawn **之前**取走。
+    /// 漏掉时同一根因还顺带废掉了 `Msg::Resize` 与 `kill()` 的
+    /// `Msg::Shutdown`（两者都只走 `sender`）。
+    ///
+    /// 这类「只在一半平台接线」的缺陷正是 macOS-only 的 CI 看不见的，所以
+    /// 用例不按平台裁剪：两条分支都断言。
+    #[gpui::test]
+    fn local_terminal_keeps_an_input_channel(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new(cx, None));
+        terminal.update(cx, |t, _| {
+            #[cfg(unix)]
+            assert!(
+                t.local_sender.is_some(),
+                "unix 本地终端必须持有 LocalReader 的 sender，否则输入被静默丢弃"
+            );
+            #[cfg(not(unix))]
+            assert!(
+                t.sender.is_some(),
+                "windows 本地终端必须持有 EventLoop 的 channel，否则输入被静默丢弃"
+            );
+        });
+    }
+
     /// OSC 终止符落在下一个 chunk 时应被拼接重扫，而不是永久丢失。
     #[gpui::test]
     fn osc133_b_split_across_chunks_is_reassembled(cx: &mut TestAppContext) {
@@ -5267,6 +5368,57 @@ mod tests {
             t.handle_pty_data(&data, false, cx);
             assert!(t.pending_osc.is_empty());
         });
+    }
+
+    /// 端到端：windows 本地终端里写入的字节必须真的到达子进程。
+    ///
+    /// `local_terminal_keeps_an_input_channel` 只钉住「有通道」这个不变量；
+    /// 这条钉住「按键确实穿过 conpty 到了对端」。做法是让子进程自己把读到的
+    /// 那一行落盘（`set /p` 读一行 → 重定向到文件），再等文件出现——
+    /// 不依赖渲染层的单元格内容，因此不受排版/光标动画影响。
+    #[cfg(windows)]
+    #[gpui::test]
+    fn windows_local_terminal_delivers_typed_bytes_to_the_child(cx: &mut TestAppContext) {
+        let out = std::env::temp_dir().join(format!(
+            "deepterm-e2e-input-{}-{}.txt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let _ = std::fs::remove_file(&out);
+        // `!VAR!` + `/v:on`（延迟展开）：`%VAR%` 会在整行解析期就展开，
+        // 那时 `set /p` 还没跑，读到的永远是空串。
+        let script = format!(
+            "set /p DEEPTERM_PROBE=&& echo !DEEPTERM_PROBE!>\"{}\"",
+            out.display()
+        );
+
+        let terminal = cx.update(|cx| {
+            Terminal::new_with_command(
+                cx,
+                None,
+                "cmd.exe",
+                &["/v:on".to_string(), "/c".to_string(), script],
+            )
+        });
+        terminal.update(cx, |t, _| t.write(b"deepterm-e2e-ok\r\n"));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut written = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            if let Ok(text) = std::fs::read_to_string(&out) {
+                if !text.trim().is_empty() {
+                    written = Some(text);
+                    break;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(
+            written.as_deref().map(str::trim),
+            Some("deepterm-e2e-ok"),
+            "写入终端的字节必须到达子进程（cmd.exe 未读到该行）"
+        );
     }
 
     // ===== 本地路径 OSC 拦截测试（仅 unix）=====

@@ -172,7 +172,17 @@ impl PathResolver {
             .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    /// Windows：读目标进程的 PEB 取 `CurrentDirectory`。
+    ///
+    /// Windows 没有 lsof 也没有 `/proc`，唯一途径是读 PEB（见
+    /// [`crate::utils::win_process_cwd`]）。查不到（进程已退出 / 提权 / 跨用户）
+    /// 返回 `None`，与 unix 分支的失败语义一致。
+    #[cfg(windows)]
+    pub fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
+        crate::utils::win_process_cwd::query_process_working_directory(pid)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
     pub fn query_process_working_directory(_pid: u32) -> Option<PathBuf> {
         None
     }

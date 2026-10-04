@@ -56,25 +56,42 @@ impl LocalTerminalOption {
     }
 }
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-
 /// 检测命令是否可用（仅 Windows 的终端扫描使用）
 #[cfg(windows)]
 fn is_command_available(cmd: &str, args: &[&str]) -> bool {
-    let mut command = std::process::Command::new(cmd);
+    let mut command = crate::utils::console::hidden_command(cmd);
     command.args(args);
-    command.creation_flags(CREATE_NO_WINDOW);
     command
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// 扫描 Windows 本地终端
+/// WSL 发行版的启动参数。
+///
+/// 用**文档化的显式选项** `-d <distro> --cd ~`，理由是实测（`wsl.exe --exec pwd`）：
+///
+/// | 参数形态                                | 起点                          |
+/// |-----------------------------------------|-------------------------------|
+/// | `~ -d <distro>`（旧）                    | `/home/<user>`✓ 但依赖「首个非选项参数当起始目录」这一未文档化行为 |
+/// | `-d <distro>`（曾经的修法）               | `/mnt/c/<宿主 cwd>` ✗ 起点变成宿主目录 |
+/// | `-d <distro> --cd ~`（本函数）            | `/home/<user>` ✓              |
+///
+/// `wsl.exe` 的第一个**非选项**参数按文档是「要在发行版里执行的命令」，旧形态把
+/// `~` 放在那个位置是靠未文档化行为兜住的——一旦 WSL 收紧解析，症状是 conpty 立刻
+/// 退出、终端打不开且无日志线索。显式的 `--cd` 没有这个歧义。
+///
+/// `--cd ~` 里的 `~` 由 `wsl.exe` 自己展开（不经 shell），已实测生效。
+#[cfg(windows)]
+fn wsl_launch_args(distro: &str) -> Vec<String> {
+    vec![
+        "-d".to_string(),
+        distro.to_string(),
+        "--cd".to_string(),
+        "~".to_string(),
+    ]
+}
+
 #[cfg(windows)]
 fn scan_windows_terminals() -> Vec<LocalTerminalOption> {
     let mut options = Vec::new();
@@ -108,33 +125,15 @@ fn scan_windows_terminals() -> Vec<LocalTerminalOption> {
     ));
 
     // WSL 发行版
-    let mut wsl_cmd = std::process::Command::new("wsl.exe");
-    wsl_cmd.args(["--list", "--quiet"]);
-    #[cfg(windows)]
-    {
-        wsl_cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    if let Ok(output) = wsl_cmd.output() {
-        if output.status.success() {
-            let output_str = decode_wsl_output(&output.stdout);
-            for line in output_str.lines() {
-                let distro = line.trim().replace('\0', "");
-                if !distro.is_empty() {
-                    let os = RemoteOS::from_id(&distro);
-                    let icon = if os != RemoteOS::Unknown {
-                        os.icon()
-                    } else {
-                        Icon::Linux
-                    };
-                    options.push(LocalTerminalOption::new(
-                        format!("WSL: {distro}"),
-                        "wsl.exe",
-                        vec!["~".to_string(), "-d".to_string(), distro],
-                        icon,
-                    ));
-                }
-            }
-        }
+    for distro in crate::utils::wsl::installed_distros() {
+        let icon = crate::utils::wsl::distro_icon(&distro);
+        // 参数顺序必须是 `-d <distro>`（见 `wsl_launch_args` 的文档）。
+        options.push(LocalTerminalOption::new(
+            format!("WSL: {distro}"),
+            "wsl.exe",
+            wsl_launch_args(&distro),
+            icon,
+        ));
     }
 
     options
@@ -736,5 +735,101 @@ impl Render for SshPicker {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::wsl_launch_args;
+    use crate::utils::wsl::decode_list_output;
+
+    /// 启动参数必须是 `-d <distro> --cd ~`，且不能出现裸的 `~` 位置参数。
+    ///
+    /// 两条各钉一类故障：
+    /// - 裸 `~` 位置参数（旧的 `["~", "-d", distro]`）落在 `wsl.exe` 文档里
+    ///   「首个非选项参数 = 要执行的命令」的位置，靠未文档化行为才没出错；
+    /// - 漏掉 `--cd ~` 则起点从家目录变成宿主目录（`/mnt/c/...`）。
+    #[test]
+    fn wsl_args_use_documented_flags_and_start_at_home() {
+        let args = wsl_launch_args("Ubuntu-24.04");
+        assert_eq!(
+            args,
+            vec![
+                "-d".to_string(),
+                "Ubuntu-24.04".to_string(),
+                "--cd".to_string(),
+                "~".to_string(),
+            ],
+            "WSL 启动参数只能是 -d <distro> --cd ~"
+        );
+        assert_eq!(args.first().map(String::as_str), Some("-d"));
+        // 发行版名后面必须紧跟 --cd，而不是让 `~` 裸占一个位置参数。
+        assert_eq!(args.get(2).map(String::as_str), Some("--cd"));
+    }
+
+    /// 把字符串编码成「无 BOM 的 UTF-16LE」，即本机 `wsl.exe --list --quiet`
+    /// 经管道重定向时的真实形态。
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    /// 无 BOM 的 UTF-16LE 必须真解码，不能掉进 UTF-8 分支。
+    ///
+    /// 掉进去的代价不是「显示难看」而是**打不开终端**：NUL 夹在 CR/LF 之间
+    /// 使 `lines()` 剥不掉行尾 `\r`，`Ubuntu-24.04\r` 随后作为 `-d` 的参数
+    /// 发给 `wsl.exe`，发行版找不到。
+    #[test]
+    fn decodes_utf16le_without_bom() {
+        let decoded = decode_list_output(&utf16le("Ubuntu-24.04\r\narchlinux\r\n\r\n"));
+        let distros: Vec<&str> = decoded
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(distros, vec!["Ubuntu-24.04", "archlinux"]);
+        // 关键：行尾不能残留 `\r`，否则 `-d` 会带上它。
+        assert!(
+            distros.iter().all(|d| !d.contains('\r')),
+            "解码后不得残留 CR：{distros:?}"
+        );
+    }
+
+    /// 带 BOM 的 UTF-16LE 仍要正确处理（BOM 本身不计入内容）。
+    #[test]
+    fn decodes_utf16le_with_bom() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(utf16le("Ubuntu-24.04\r\n"));
+        assert_eq!(decode_list_output(&bytes).trim(), "Ubuntu-24.04");
+    }
+
+    /// 真的就是 UTF-8 时（老版本 / 控制台直出）不能被误判成 UTF-16LE。
+    #[test]
+    fn keeps_plain_utf8_intact() {
+        let decoded = decode_list_output(b"Ubuntu-24.04\narchlinux\n");
+        let distros: Vec<&str> = decoded.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(distros, vec!["Ubuntu-24.04", "archlinux"]);
+    }
+
+    /// 本机 `wsl.exe --list --quiet` 经管道重定向的**逐字节实录**
+    /// （`C:\Users\<u>\AppData\Local\Temp` 下抓的 50 字节原样贴进来）。
+    ///
+    /// 钉住两个事实：无 BOM；CRLF 是 UTF-16 编码的，所以 NUL 夹在 CR 与 LF
+    /// 之间。用它跑一遍完整链路（解码 → 按行取名），确保拼出来的 `-d` 参数
+    /// 就是干净的发行版名。
+    #[test]
+    fn decodes_real_wsl_list_capture() {
+        let captured: Vec<u8> = vec![
+            0x55, 0x00, 0x62, 0x00, 0x75, 0x00, 0x6e, 0x00, 0x74, 0x00, 0x75, 0x00, 0x2d, 0x00,
+            0x32, 0x00, 0x34, 0x00, 0x2e, 0x00, 0x30, 0x00, 0x34, 0x00, 0x0d, 0x00, 0x0a, 0x00,
+            0x61, 0x00, 0x72, 0x00, 0x63, 0x00, 0x68, 0x00, 0x6c, 0x00, 0x69, 0x00, 0x6e, 0x00,
+            0x75, 0x00, 0x78, 0x00, 0x0d, 0x00, 0x0a, 0x00,
+        ];
+        // 复现 `scan_windows_terminals` 里的取名方式。
+        let distros: Vec<String> = decode_list_output(&captured)
+            .lines()
+            .map(|l| l.trim().replace('\0', ""))
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(distros, vec!["Ubuntu-24.04", "archlinux"]);
     }
 }

@@ -22,6 +22,17 @@ const FIND_TTL: Duration = Duration::from_secs(30);
 /// status+numstat 合并命令两段输出之间的分隔标记（含前导 NUL）。
 const STATUS_NUMSTAT_MARKER: &[u8] = b"\0__DEEPTERM_NUMSTAT__\n";
 
+/// 构造一次 `git` 调用，**不弹控制台窗口**（仅 windows 生效）。
+///
+/// `git.exe` 是控制台程序，而 deepterm 是 GUI 子系统进程；用
+/// `Command::output()` / `spawn()` 启动它时 stdio 走管道，子进程无法继承
+/// 我们的控制台，Windows 就会新分配一个并显示出来。git 调用点很多
+/// （`rev-parse` 找仓、status 轮询、`merge-file`…），逐个加标志迟早会漏，
+/// 所以统一走这里——新增调用点默认就是对的。
+pub(crate) fn git_command() -> Command {
+    crate::utils::console::hidden_command("git")
+}
+
 /// 在字节序列中查找子序列（`[u8]::windows` 对 1 字节 needle 的特化不通用，
 /// 简单实现足够：仅在合并命令输出中找一次固定短标记）。
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -355,7 +366,7 @@ impl GitRepository {
     }
 
     fn find_local(from: &str) -> Result<Option<Self>, String> {
-        let output = Command::new("git")
+        let output = git_command()
             .args(["rev-parse", "--show-toplevel"])
             .current_dir(from)
             .output()
@@ -1071,7 +1082,7 @@ impl GitRepository {
         std::fs::write(&t_base, base).map_err(io_err)?;
         std::fs::write(&t_ours, ours).map_err(io_err)?;
         std::fs::write(&t_theirs, theirs).map_err(io_err)?;
-        let output = std::process::Command::new("git")
+        let output = git_command()
             .args(["merge-file", "-p", "--union"])
             .arg(&t_ours)
             .arg(&t_base)
@@ -1421,7 +1432,7 @@ impl GitRepository {
         use std::io::Write;
         match &self.backend {
             GitBackend::Local => {
-                let mut child = Command::new("git")
+                let mut child = git_command()
                     .args(["apply", "--cached", "--unidiff-zero", "-"])
                     .current_dir(&self.root)
                     .stdin(std::process::Stdio::piped())
@@ -1493,7 +1504,7 @@ fn execute_local_git(args: &[&str], cwd: &str) -> Result<String, String> {
 
 /// 与 [`execute_local_git`] 相同，但返回未解码的原始字节（供编码探测使用）。
 fn execute_local_git_bytes(args: &[&str], cwd: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -1573,6 +1584,14 @@ mod tests {
             .output();
         let _ = Command::new("git")
             .args(["config", "user.name", "Test"])
+            .current_dir(path)
+            .output();
+        // 关掉 `autocrlf`：否则 Git for Windows 的**系统级**配置
+        // （C:/Program Files/Git/etc/gitconfig，默认 true）会把提交进 blob 的
+        // LF 折成 CRLF，`assert_eq!(blob, "v2\n")` 这类断言只在没装过 Git 的
+        // 机器上成立。用例必须与开发机的 git 配置无关。
+        let _ = Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
             .current_dir(path)
             .output();
     }
@@ -2111,7 +2130,11 @@ mod tests {
     }
 
     /// 合并命令的 shell 形态验证：marker 的 printf 转义与远端实际输出一致。
+    ///
+    /// 被验的是**远端** POSIX shell 的字节输出，windows 上没有 `sh`，故只在
+    /// unix 上跑。
     #[test]
+    #[cfg(unix)]
     fn test_status_numstat_marker_printf() {
         // printf '\0__DEEPTERM_NUMSTAT__\n' 输出的字节必须逐字节等于
         // STATUS_NUMSTAT_MARKER，否则切分永远失败（这类错误只有远端能暴露，
@@ -2164,8 +2187,18 @@ mod tests {
         let upstream = temp_dir("deepterm-git-branch-status-up");
         let up_clone = temp_dir("deepterm-git-branch-status-clone");
         let _ = std::fs::create_dir_all(&upstream);
+        // 显式指定裸库的初始分支：不指定时 git 用 `init.defaultBranch`
+        // （未配置就是 `master`），而下面推的是 `refs/heads/main`。
+        // 裸库 HEAD 指错分支时 clone 会得到另一个分支名，上游那次 push
+        // 就落到别的 ref 上，`behind` 永远是 0——与实现无关的环境陷阱。
         let _ = Command::new("git")
-            .args(["init", "--quiet", "--bare", upstream.to_str().unwrap()])
+            .args([
+                "init",
+                "--quiet",
+                "--bare",
+                "--initial-branch=main",
+                upstream.to_str().unwrap(),
+            ])
             .output();
 
         let repo = GitRepository::find(&temp, true, None)
@@ -2210,7 +2243,7 @@ mod tests {
             .current_dir(&up_clone)
             .output();
         let _ = Command::new("git")
-            .args(["push", "--quiet"])
+            .args(["push", "--quiet", "origin", "HEAD:refs/heads/main"])
             .current_dir(&up_clone)
             .output();
         let _ = Command::new("git")

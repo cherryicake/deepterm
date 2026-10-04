@@ -26,7 +26,7 @@ use alacritty_terminal::{
 use polling::{Event as PollEvent, Events, PollMode, Poller};
 
 use super::terminal::ZedListener;
-use crate::terminal::escape_scan;
+use crate::terminal::escape_scan::{self, GridState, PtyScanner};
 
 /// 单次 read 的缓冲上限（对齐 alacritty `event_loop.rs` 的 `READ_BUFFER_SIZE`）。
 const READ_BUFFER_SIZE: usize = 0x10_0000;
@@ -43,90 +43,6 @@ const MAX_LOCKED_READ: usize = u16::MAX as usize;
 const PTY_READ_WRITE_TOKEN: usize = 0;
 /// 子进程 SIGCHLD 通知 fd 的轮询 token（同上，必须与上游一致）。
 const PTY_CHILD_EVENT_TOKEN: usize = 1;
-
-/// 应用层序列处理器。
-///
-/// 读线程把每次读到的字节交给它做旁路识别：需要应用层消费的序列
-/// （OSC 133/7/9、Kitty 图形 APC）被摘除，其余写入 `out` 交给 vte。
-///
-/// 为什么是「重写输出缓冲」而不是「返回已消费长度」：被摘除的序列可能
-/// 位于数据中段（多个 APC 夹着普通文本），单一边界无法表达这种裁剪。
-///
-/// 实现运行在读线程上，**不得**依赖 GPUI 的 `Context`；需要通知 UI 的
-/// 事情通过 [`LocalNotice`] 回传。
-/// 扫描器在处理一条 APC 时需要的网格状态快照。
-///
-/// 两者都随解析推进而变化（前面的文本可能移动光标、可能触发滚动），所以由
-/// 调用方在处理序列的间隙**重新查询**，而不是先切完再一次性喂——否则同一个
-/// read 里常见的 `CSI <定位> + APC <贴图>` 组合会把锚点算到旧位置。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GridState {
-    /// 当前光标（行、列）。
-    pub cursor: (i32, u32),
-    /// 当前可见的网格行窗口（`d=a` 的「屏幕上可见」判定）。
-    pub visible: crate::terminal::kitty::storage::VisibleRows,
-}
-
-pub trait PtyScanner: Send {
-    /// 处理一段字节。
-    ///
-    /// `pending` 为跨读残尾缓冲：未完成的序列尾部留在其中，与下次读到的
-    /// 字节拼接后重新扫描。
-    ///
-    /// `emit` 用于把「序列之前的普通文本」按序交给 vte，`grid` 用于在
-    /// 交出序列时查询当前网格状态（光标与可见窗口）。两者分两步（而非先切完
-    /// 再一次性喂）是为了让 APC 的锚点精确反映它前面那些文本的效果——同一个
-    /// read 里常见 `CSI <定位> + APC <贴图>` 的组合，若等整块文本都喂完才处理
-    /// APC，锚点会落后一个 chunk。
-    ///
-    /// 为什么是回调而不是「返回区段列表」：文本与需消费序列是交替的，
-    /// 回调天然表达顺序，且调用方无需为每次扫描分配区段向量。
-    fn scan(
-        &mut self,
-        data: &[u8],
-        pending: &mut Vec<u8>,
-        emit: &mut dyn FnMut(&[u8]),
-        grid: &mut dyn FnMut() -> GridState,
-    );
-
-    /// 取走扫描器攒下的、需要回写给终端应用的应答字节。
-    ///
-    /// 为什么由读线程回写而不是走 UI 线程：终端应用（如 kitty 图形协议的能力
-    /// 探测）发出请求后会在**极短超时**内等待应答——terminal-browser 只等
-    /// 500ms。若把应答经 `LocalNotice` 绕到 UI 线程再回写，必须依赖 UI 的重绘
-    /// 泵及时被唤醒；而重绘泵的触发条件是关于 vte 字节吞吐的（见 `pty_read`
-    /// 末尾），被扫描器**消费掉**的 APC 不产生任何 vte 字节，于是探测类负载
-    /// 恰恰是最不保证能唤醒 UI 的那一种。读线程本来就独占 `Pty` 的写端，直接
-    /// 回写既省一次跨线程跃点，也不依赖重绘节奏。
-    ///
-    /// 默认无应答（透传类扫描器用不到）。
-    fn take_replies(&mut self) -> Vec<u8> {
-        Vec::new()
-    }
-
-    /// 终端几何变更（行列数 + 单元格像素尺寸）。
-    ///
-    /// 读线程在收到 `LocalMsg::Resize` 时转发；`spawn` 时也会先注入一次初始
-    /// 几何，使得终端应用在**任何 resize 之前**发出的尺寸查询
-    /// （如 terminal-browser 启动时的 `CSI 16 t`）也能被正确应答。
-    ///
-    /// 默认空实现：不关心几何的扫描器（透传、OSC 过滤）无需实现。
-    fn set_geometry(&mut self, geometry: escape_scan::TermGeometry) {
-        let _ = geometry;
-    }
-
-    /// 接管 OSC 序列的去处。
-    ///
-    /// 由 `LocalReader::spawn` 在启动时注入（[`NoticeOscSink`]），因为扫描器
-    /// 构造时还不知道通知通道长什么样——扫描器可能在 `Terminal::new` 的很早
-    /// 阶段就被建好，而通道与读线程一起创建。
-    ///
-    /// 默认空实现：不解析 OSC 的扫描器（透传）无需实现；未实现则所有 OSC
-    /// 原样交给 vte，行为与拦截之前完全一致。
-    fn set_osc_sink(&mut self, sink: Box<dyn crate::terminal::kitty::scanner::OscSink>) {
-        let _ = sink;
-    }
-}
 
 /// 全量透传的扫描器：不做任何识别，字节原样交给 vte。
 pub struct PassThroughScanner;

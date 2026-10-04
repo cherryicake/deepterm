@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -953,7 +953,7 @@ fn sanitize_filename(value: &str) -> String {
 }
 
 #[cfg(target_os = "macos")]
-fn choose_file_with_osascript(initial_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn choose_file_with_osascript(initial_dir: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
     // 关键安全修复：`initial_dir` 来自用户路径（如克隆仓的恶意目录名），
     // 不得仅转义双引号。AppleScript 双引号字符串中 `\` 与 `"` 均需转义，
     // 且换行/控制字符必须剔除，否则可跳出字符串字面量执行任意 AppleScript。

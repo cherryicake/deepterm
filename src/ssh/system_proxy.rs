@@ -11,6 +11,7 @@
 //! 协议支持 SOCKS5 与 HTTP CONNECT，两者都只实现无认证形态：系统代理通常只监听
 //! 回环、不要求认证；代理要求认证时会明确报错，而不是静默退回直连。
 
+#[cfg(any(target_os = "macos", test))]
 use std::collections::HashMap;
 
 use anyhow::{anyhow, bail};
@@ -436,6 +437,10 @@ fn proxy_from_system_settings() -> Option<SystemProxy> {
 /// 解析 `scutil --proxy` 的输出（纯函数，便于单测）。
 ///
 /// SOCKS 优先：它承载任意 TCP，不要求代理端实现 CONNECT 语义。
+///
+/// 只有 macOS 会调用它，但 `test` 下一律编译：这样纯解析逻辑的用例能在
+/// 任意平台跑，不必绑到 macOS 机器上。
+#[cfg(any(target_os = "macos", test))]
 fn parse_scutil_proxy(output: &str) -> Option<SystemProxy> {
     let mut values: HashMap<&str, &str> = HashMap::new();
     let mut exceptions: Vec<String> = Vec::new();

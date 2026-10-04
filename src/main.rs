@@ -2,8 +2,6 @@
 // 在 Windows Release 构建时隐藏控制台窗口，避免双击启动时弹出终端
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use mimalloc::MiMalloc;
-
 use deepterm::{
     AppWindow, NewWindow, Quit,
     builtin_commands::executor::init_global_executor,
@@ -13,16 +11,32 @@ use deepterm::{
 };
 use gpui::{App, KeyBinding};
 
+// 分配器：非 Windows 用 mimalloc，Windows 用系统分配器。
+//
+// Windows 侧退回 `System` 的原因见 `Cargo.toml` 里同名的 gate 注释——是
+// MSVC 无法处理含非 ASCII 字符的 cargo 源码路径，不是 mimalloc 缺 Windows 产物。
+#[cfg(not(target_os = "windows"))]
+type BaseAllocator = mimalloc::MiMalloc;
+#[cfg(not(target_os = "windows"))]
+const BASE_ALLOCATOR: BaseAllocator = mimalloc::MiMalloc;
+
+#[cfg(target_os = "windows")]
+type BaseAllocator = std::alloc::System;
+#[cfg(target_os = "windows")]
+const BASE_ALLOCATOR: BaseAllocator = std::alloc::System;
+
 // 计数分配器仅用于 bench/测试环境的分配抖动测量；
-// 正式产物保持纯 mimalloc。
+// 正式产物保持纯基础分配器。
 #[cfg(feature = "alloc-probe")]
 #[global_allocator]
-static GLOBAL: deepterm::utils::alloc_probe::CountingAllocator<MiMalloc> =
-    deepterm::utils::alloc_probe::CountingAllocator { inner: MiMalloc };
+static GLOBAL: deepterm::utils::alloc_probe::CountingAllocator<BaseAllocator> =
+    deepterm::utils::alloc_probe::CountingAllocator {
+        inner: BASE_ALLOCATOR,
+    };
 
 #[cfg(not(feature = "alloc-probe"))]
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: BaseAllocator = BASE_ALLOCATOR;
 
 fn main() {
     let default_level = if cfg!(debug_assertions) {

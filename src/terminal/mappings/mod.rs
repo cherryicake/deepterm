@@ -21,6 +21,7 @@ const HOMEBREW_PATHS: &[&str] = &[
 ];
 
 /// Parse paths from file content, adding valid paths to the collection
+#[cfg(target_os = "macos")]
 fn parse_paths_content(content: &str, paths: &mut Vec<String>) {
     for line in content.lines() {
         let line = line.trim();

@@ -4022,8 +4022,6 @@ fn atomic_write_local(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let orig_mode = std::fs::metadata(path)
         .ok()
         .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()));
-    #[cfg(not(unix))]
-    let orig_mode: Option<u32> = None;
 
     let tmp = {
         let nanos = std::time::SystemTime::now()
@@ -4195,6 +4193,26 @@ impl IntoElement for EditorResizeElement {
 mod tests {
     use super::*;
 
+    /// `line_ending = None` 表示「跟平台默认」，即 [`LineEnding::detect`] 对
+    /// **无换行文本**的取值（windows 为 CRLF，其余为 LF）。断言必须跟着平台走，
+    /// 否则同一份用例在 unix 与 windows 上结论相反。
+    fn platform_default_eol() -> LineEnding {
+        if cfg!(windows) {
+            LineEnding::Windows
+        } else {
+            LineEnding::Unix
+        }
+    }
+
+    /// 把只含 LF 的文本按平台默认行尾展开。
+    fn with_platform_default_eol(text: &str) -> String {
+        if cfg!(windows) {
+            text.replace('\n', "\r\n")
+        } else {
+            text.to_string()
+        }
+    }
+
     /// 回归：标签页组切换后 `#live` 的 md 文件必须保持实时渲染。
     /// `restore_file_from_cache` 曾构造了 `LiveMarkdownView` 却以 `live: None`
     /// 存入 `EditorFile`，导致切组回来后退化为纯文本编辑态。
@@ -4337,7 +4355,7 @@ mod tests {
         // 断言只关心 tab 重建后 `diff.is_some()`（非空白纯文本）。
         let tmp = std::env::temp_dir().join(format!("deepterm-diff-restore-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
-        let _ = std::process::Command::new("git")
+        let _ = crate::editor::git_repository::git_command()
             .args(["init", "--quiet"])
             .current_dir(&tmp)
             .output();
@@ -4429,7 +4447,7 @@ mod tests {
             let dir = std::env::temp_dir()
                 .join(format!("deepterm-diff-collide-{tag}-{}", std::process::id()));
             let _ = std::fs::create_dir_all(&dir);
-            let _ = std::process::Command::new("git")
+            let _ = crate::editor::git_repository::git_command()
                 .args(["init", "--quiet"])
                 .current_dir(&dir)
                 .output();
@@ -4923,7 +4941,8 @@ mod tests {
     #[test]
     fn detect_line_ending_lf() {
         assert_eq!(LineEnding::detect("line1\nline2\n"), LineEnding::Unix);
-        assert_eq!(LineEnding::detect("hello world"), LineEnding::Unix); // 无换行 → 平台默认
+        // 无换行 → 平台默认
+        assert_eq!(LineEnding::detect("hello world"), platform_default_eol());
     }
 
     #[test]
@@ -5002,8 +5021,9 @@ mod tests {
             FileEncoding::Utf8,
         )
         .unwrap();
-        assert_eq!(written, "hello\n");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let expected = with_platform_default_eol("hello\n");
+        assert_eq!(written, expected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -5020,13 +5040,14 @@ mod tests {
             FileEncoding::Gbk,
         )
         .unwrap();
-        assert_eq!(written, "你好，世界\n");
+        let expected = with_platform_default_eol("你好，世界\n");
+        assert_eq!(written, expected);
         // 磁盘上是 GBK 字节，不足 UTF-8
         let bytes = std::fs::read(&path).unwrap();
-        assert_ne!(bytes, "你好，世界\n".as_bytes());
+        assert_ne!(bytes, "你好，世界\r\n".as_bytes());
         let decoded = crate::editor::encoding::decode_bytes(&bytes);
         assert_eq!(decoded.encoding, FileEncoding::Gbk);
-        assert_eq!(decoded.text, "你好，世界\n");
+        assert_eq!(decoded.text, expected);
         std::fs::remove_dir_all(&dir).ok();
     }
 

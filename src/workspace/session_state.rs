@@ -209,20 +209,64 @@ impl TerminalSessionState {
         }
     }
 
+    /// 这个本地会话是不是一个 WSL 标签页。
+    ///
+    /// **只在 Windows 上真为 true。** 理由是代价不对称：判真的代价是给普通 shell
+    /// 注入 WSLENV（见 [`crate::terminal::terminal`]）以及把一条 `/home/...`
+    /// 翻成 Windows 上打不开的 `\\wsl$\...`；判假的代价只是 WSL 标签页少了
+    /// 文件树换根。unix/macOS 上没有 WSL 标签页，恒为 false 就是正确行为。
+    ///
+    /// `args` 仅为签名对称（发行版名可能藏在参数里，见
+    /// [`crate::utils::wsl::distro_from_args`]）；判定本身只看命令名。
+    #[cfg(windows)]
+    fn is_wsl_session(command: Option<&str>, _args: &[String]) -> bool {
+        command.is_some_and(crate::utils::wsl::is_wsl_command)
+    }
+
+    #[cfg(not(windows))]
+    fn is_wsl_session(_command: Option<&str>, _args: &[String]) -> bool {
+        false
+    }
+
     /// 提取终端 CWD 路径和文件树显示名
+    ///
+    /// 返回的 `path` 是**可直接浏览**的：WSL 标签页的 cwd 是 Linux 路径
+    /// （`/home/you/project`），在 Windows 上打不开，这里翻译成
+    /// `\\wsl$\<distro>\home\you\project`——同一个 `LocalFileSystem` 就能列
+    /// 目录，不需要为 WSL 写第二套后端。显示名仍取 Linux 路径的最后一段。
+    ///
+    /// 非 Windows 平台上没有 WSL 标签页（见 [`Self::is_wsl_session`]），行为与
+    /// 加 WSL 支持之前完全一致。
     pub fn file_tree_target(&self) -> (Option<PathBuf>, String) {
         let default_label = match self {
             Self::Local { .. } => "本地文件树",
             Self::Ssh { .. } => "远程文件树",
         };
-        let path = match self {
-            Self::Local { cwd, .. } => cwd.as_ref().map(PathBuf::from),
-            Self::Ssh { remote_cwd, .. } => remote_cwd.as_ref().map(PathBuf::from),
+        let (path, label_path) = match self {
+            Self::Local { cwd, command, args } => {
+                let raw = cwd.as_ref().map(PathBuf::from);
+                if Self::is_wsl_session(command.as_deref(), args) {
+                    // 发行版没在参数里显式给时，就是默认发行版。
+                    let distro = crate::utils::wsl::distro_from_args(args)
+                        .or_else(|| crate::utils::wsl::default_distro().map(str::to_string));
+                    let browsable = raw
+                        .as_deref()
+                        .and_then(|p| crate::utils::wsl::to_browsable_path(distro.as_deref(), p));
+                    (browsable, raw)
+                } else {
+                    (raw.clone(), raw)
+                }
+            }
+            Self::Ssh { remote_cwd, .. } => {
+                let raw = remote_cwd.as_ref().map(PathBuf::from);
+                (raw.clone(), raw)
+            }
         };
-        let label = path
+        let label = label_path
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
             .unwrap_or(default_label)
             .to_string();
         (path, label)
@@ -295,5 +339,70 @@ mod tests {
         };
         assert!(!state.use_system_proxy());
         assert!(state.ssh_config_with_proxy().is_none());
+    }
+
+    /// WSL 标签页的文件树根必须是 **UNC** 形式，否则在 Windows 上打不开。
+    ///
+    /// `cwd` 是 Linux 侧路径（`/home/you/project`），而 Windows 只有
+    /// `\\wsl$\<distro>\home\you\project` 能列目录。
+    ///
+    /// 仅 windows：非 Windows 上没有 WSL 标签页，翻译分支根本不会进（见
+    /// [`TerminalSessionState::is_wsl_session`]），跨平台跑只会断言一个在那些
+    /// 平台上不该发生的行为。
+    #[cfg(windows)]
+    #[test]
+    fn wsl_local_tree_target_is_a_browsable_unc_path() {
+        let state = TerminalSessionState::Local {
+            cwd: Some("/home/you/project".to_string()),
+            command: Some("wsl.exe".to_string()),
+            args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
+        };
+        let (path, label) = state.file_tree_target();
+        assert_eq!(
+            path.as_deref(),
+            Some(std::path::Path::new(
+                r"\\wsl$\Ubuntu-24.04\home\you\project"
+            )),
+            "WSL 的 Linux 路径必须翻成 UNC，否则文件树打不开"
+        );
+        assert_eq!(label, "project", "显示名取 Linux 路径最后一段");
+    }
+
+    /// **非 Windows 上叫 `wsl` 的命令不得被当成 WSL 标签页**。
+    ///
+    /// 这是「WSL 支持不外溢到其他平台」的回归钉子：unix 上完全可能有个可执行文件
+    /// 就叫 `wsl`。一旦被误判，`/home/you/project` 会被翻成
+    /// `\\wsl$\<distro>\home\you\project`——在 unix 上根本打不开，文件树直接废掉。
+    #[cfg(not(windows))]
+    #[test]
+    fn a_command_named_wsl_is_not_a_wsl_session_off_windows() {
+        let state = TerminalSessionState::Local {
+            cwd: Some("/home/you/project".to_string()),
+            command: Some("/usr/local/bin/wsl".to_string()),
+            args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
+        };
+        let (path, label) = state.file_tree_target();
+        assert_eq!(
+            path.as_deref(),
+            Some(std::path::Path::new("/home/you/project")),
+            "非 Windows 上不得翻译成 UNC 路径"
+        );
+        assert_eq!(label, "project");
+    }
+
+    /// 非 WSL 的本地终端不受翻译影响。
+    #[test]
+    fn plain_local_tree_target_is_unchanged() {
+        let state = TerminalSessionState::Local {
+            cwd: Some(r"C:\Users\you\project".to_string()),
+            command: Some("powershell.exe".to_string()),
+            args: vec![],
+        };
+        let (path, label) = state.file_tree_target();
+        assert_eq!(
+            path.as_deref(),
+            Some(std::path::Path::new(r"C:\Users\you\project"))
+        );
+        assert_eq!(label, "project");
     }
 }

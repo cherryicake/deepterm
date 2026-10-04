@@ -743,11 +743,15 @@ mod tests {
     #[test]
     fn test_open_path_handler_local() {
         let handler = OpenPathHandler;
+        // 工作目录与入参都用 `Path` 构造：`resolve_local` 会做词法归一化
+        // （windows 上把 `/` 折成 `\`），硬编码 unix 字符串只在一半平台成立。
+        let working_directory = std::env::temp_dir();
+        let relative = PathBuf::from("src").join("main.rs");
         let result = handler.execute(
-            Some("src/main.rs"),
+            Some(relative.to_string_lossy().as_ref()),
             CommandContext {
                 terminal_view: None,
-                working_directory: Some(PathBuf::from("/home/user/project")),
+                working_directory: Some(working_directory.clone()),
                 process_cwd: None,
                 remote_cwd: None,
                 is_remote: false,
@@ -759,7 +763,11 @@ mod tests {
             CommandResult::OpenPath {
                 path, ssh_config, ..
             } => {
-                assert_eq!(path, "/home/user/project/src/main.rs");
+                let expected = working_directory
+                    .join(&relative)
+                    .to_string_lossy()
+                    .into_owned();
+                assert_eq!(path, expected);
                 assert!(ssh_config.is_none());
             }
             _ => panic!("Expected OpenPath result"),
@@ -891,8 +899,15 @@ mod tests {
         let req = unwrap_transfer(result);
         match &req.sources[0] {
             FileEndpoint::Local { path } => {
-                // `./` 组件被词法规范化去除（避免同一文件的不同写法落到不同并发锁条）
-                assert_eq!(path.to_str(), Some("/home/user/project/Cargo.toml"));
+                // `./` 组件被词法规范化去除（避免同一文件的不同写法落到不同并发锁条）。
+                // 期望值从 `scp_ctx()` 的 process_cwd 推出：归一化走的是平台
+                // 分隔符，硬编码 `/home/user/project/...` 只在 unix 上成立。
+                assert_eq!(
+                    path.as_path(),
+                    PathBuf::from("/home/user/project")
+                        .join("Cargo.toml")
+                        .as_path()
+                );
             }
             _ => panic!("expected local source"),
         }

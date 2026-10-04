@@ -1188,26 +1188,22 @@ mod tests {
         use std::path::Path;
         let from = Path::new("/a/b");
         let to = Path::new("/a/c");
+        // 断言用 `Path` 而非 `to_string_lossy()`：`Path::join` 在 windows 上
+        // 用 `\` 拼回，字符串比对会把平台差异误判成逻辑错误。
         // 自身
+        assert_eq!(rekey_path(Path::new("/a/b"), from, to), Path::new("/a/c"));
+        // 后代多层
         assert_eq!(
-            rekey_path(Path::new("/a/b"), from, to).to_string_lossy(),
-            "/a/c"
-        );
-        // 后代保持层级
-        assert_eq!(
-            rekey_path(Path::new("/a/b/x/y.md"), from, to).to_string_lossy(),
-            "/a/c/x/y.md"
+            rekey_path(Path::new("/a/b/x/y.md"), from, to),
+            to.join("x").join("y.md")
         );
         // 无关路径原样返回
         assert_eq!(
-            rekey_path(Path::new("/a/bb/other"), from, to).to_string_lossy(),
-            "/a/bb/other"
+            rekey_path(Path::new("/a/bb/other"), from, to),
+            Path::new("/a/bb/other")
         );
-        // 前缀相似但不匹配的路径不受影响（/a/b2 不是 /a/b 的后代）
-        assert_eq!(
-            rekey_path(Path::new("/a/b2"), from, to).to_string_lossy(),
-            "/a/b2"
-        );
+        // 前缀不是按路径层级匹配的：/a/b2 不是 /a/b 的后代
+        assert_eq!(rekey_path(Path::new("/a/b2"), from, to), Path::new("/a/b2"));
     }
 
     #[test]
