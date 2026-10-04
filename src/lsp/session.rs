@@ -345,8 +345,14 @@ impl LspSession {
 
                 // `$/progress`：服务器的工作进度（索引、扫描…）→ 状态栏。
                 if method == "$/progress" {
-                    let parsed = serde_json::from_value::<lsp_types::ProgressParams>(params);
+                    let parsed = serde_json::from_value::<lsp_types::ProgressParams>(
+                        params.clone(),
+                    );
                     let Ok(progress) = parsed else {
+                        // 解析失败**必须留日志**：这里原本是静默 `continue`，
+                        // 于是「`end` 解析不上 → 令牌永不删除 → 状态栏永远卡在
+                        // Indexing 0%」这类故障完全没有线索可查。
+                        log::debug!("lsp: $/progress unparsable, dropped: {params}");
                         continue;
                     };
                     let lsp_types::ProgressParamsValue::WorkDone(value) = progress.value;
