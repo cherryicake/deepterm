@@ -28,7 +28,11 @@ pub mod status;
 mod feature_tests;
 #[cfg(test)]
 mod integration_tests;
-#[cfg(test)]
+// 协议层用例用一个 `python3` 脚本当替身服务器，存活探测走 `libc::kill`。
+// 两者都是 POSIX 专有（`libc` 只在 `cfg(unix)` 下依赖），故整模块按 unix 裁剪。
+// 被验的协议行为本身与平台无关——换掉替身实现即可在 Windows 上跑，
+// 但那属于另写一份用例，不在「让本机能编译」的范围内。
+#[cfg(all(test, unix))]
 mod protocol_tests;
 
 pub use client::LspClient;

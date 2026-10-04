@@ -15,14 +15,22 @@ use ropey::Rope;
 use crate::lsp::client::LspClient;
 use crate::lsp::features;
 
-/// 服务器可执行文件名 → 是否存在于 PATH。
+/// 服务器可执行文件名 → 是否**真的可用**。
+///
+/// 必须看退出码，不能只看「进程起没起得来」。rustup 在 PATH 里放的
+/// `rust-analyzer.exe` 往往只是个代理存根：若当前 toolchain 没装该组件，
+/// 启动它会立刻打印 `error: Unknown binary 'rust-analyzer.exe' ...` 并以
+/// 非零退出。只判`status().is_ok()` 会让这类「装了代理但组件缺失」的环境
+/// 误判为可用，随后用例在握手处炸掉（`language server closed`），而真正
+/// 的原因——服务器根本跑不起来——被完全掩盖。
 fn has_server(name: &str) -> bool {
     std::process::Command::new(name)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// 临时目录里搭一个最小 Cargo 项目。

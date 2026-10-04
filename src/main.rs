@@ -3,11 +3,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use deepterm::{
-    AppWindow, NewWindow, Quit,
-    builtin_commands::executor::init_global_executor,
-    components, editor, ssh_view::picker::ShowSshPicker, terminal_view,
-    theme,
-    workspace::{self, window_manager::WindowManager},
+    AppWindow, NewWindow, Quit, builtin_commands::executor::init_global_executor,
+    ssh_view::picker::ShowSshPicker, workspace::window_manager::WindowManager,
 };
 use gpui::{App, KeyBinding};
 

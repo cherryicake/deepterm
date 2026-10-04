@@ -43,13 +43,18 @@ where
     }
 }
 
+/// 服务器是否**真的可用**（判退出码，理由见 `integration_tests::has_server`）。
+///
+/// rustup 的代理存根能启动但会以非零退出——只判`status().is_ok()` 会把
+/// 「toolchain 没装该组件」误判成可用，用例随后在握手处炸掉且掩盖真实原因。
 fn has_server(name: &str) -> bool {
     std::process::Command::new(name)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .is_ok()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 fn rust_project(name: &str) -> PathBuf {

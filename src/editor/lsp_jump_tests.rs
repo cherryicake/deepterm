@@ -17,9 +17,7 @@
 //! 逻辑完整覆盖，而文件打开本身复用已有的 `open_file_at_line_col_no_notify`
 //! （它有自己的测试）。
 
-use std::path::PathBuf;
-
-use gpui::{AppContext as _, IntoElement as _, ParentElement as _, Styled as _};
+use gpui::AppContext as _;
 use lsp_types::{Location, Position, Range, Url};
 
 use super::{LspJumpAction, lsp_location_action};
@@ -31,16 +29,30 @@ fn loc(uri: &str, line: u32, col: u32) -> Location {
     }
 }
 
+/// 构造一个 `file://` uri，指向给定的**平台本地路径**。
+///
+/// 必须走 `Url::from_file_path` 而不是手写 `file:///tmp/x.rs`：windows 上
+/// 合法形式是 `file:///C:/tmp/x.rs`，`to_file_path()` 遇到 `/tmp/x.rs`
+/// 会因「不是本机绝对路径」返回 `Err`，于是 `uri_to_path` 给出 `None`、
+/// 跳转退化成 `Ignore`——被验的「行号换算」根本没机会执行。
+fn file_loc(path: &std::path::Path, line: u32, col: u32) -> Location {
+    Location {
+        uri: Url::from_file_path(path).expect("必须是合法的本地路径"),
+        range: Range::new(Position::new(line, col), Position::new(line, col + 4)),
+    }
+}
+
 /// 跨文件跳转必须产出 `OpenFile`（而不是放弃）。
 ///
 /// 这是用户报的「跳转不工作」的核心场景。
 #[test]
 fn cross_file_location_opens_target_file() {
-    let location = loc("file:///tmp/other.rs", 9, 2);
+    let target = std::env::temp_dir().join("other.rs");
+    let location = file_loc(&target, 9, 2);
     let action = lsp_location_action(&location, false);
     match action {
         LspJumpAction::OpenFile { path, line, col } => {
-            assert_eq!(path, PathBuf::from("/tmp/other.rs"));
+            assert_eq!(path, target);
             // LSP 0 基 → 编辑器 1 基：行、列**都要** +1。
             assert_eq!(line, 10, "LSP line is 0-based; editor line is 1-based");
             assert_eq!(col, 3, "LSP col is 0-based; editor col is 1-based");
@@ -52,7 +64,7 @@ fn cross_file_location_opens_target_file() {
 /// 同文件跳转必须原地跳（不重复打开标签）。
 #[test]
 fn same_file_location_jumps_in_place() {
-    let location = loc("file:///tmp/same.rs", 3, 0);
+    let location = file_loc(&std::env::temp_dir().join("same.rs"), 3, 0);
     let action = lsp_location_action(&location, true);
     match action {
         LspJumpAction::JumpInPlace { line, col } => {
@@ -86,7 +98,7 @@ fn same_file_takes_precedence_over_uri_shape() {
 /// 行号换算在边界上正确（第 0 行 → 第 1 行）。
 #[test]
 fn first_line_maps_to_line_one() {
-    let location = loc("file:///tmp/a.rs", 0, 0);
+    let location = file_loc(&std::env::temp_dir().join("a.rs"), 0, 0);
     match lsp_location_action(&location, false) {
         LspJumpAction::OpenFile { line, .. } => assert_eq!(line, 1),
         other => panic!("expected OpenFile, got {other:?}"),
