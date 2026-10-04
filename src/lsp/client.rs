@@ -24,6 +24,28 @@ use lsp_types::{
 
 use crate::lsp::jsonrpc::Connection;
 
+/// 错误是否属于「服务器暂时不接受查询」，值得重试。
+///
+/// 判定**同时看错误码与消息文本**：rust-analyzer 对同一语义用了不同消息
+/// （`content modified` / `server is loading`），而 `ServerCancelled(-32802)`
+/// 也是一个纯瞬时态码。硬绑某一个字符串会在版本升级后静默失效。
+///
+/// 对照 Zed `lsp_store.rs:4221` 的 `should_log_lsp_request_failure`：它也是按
+/// 消息后缀匹配 `content modified` / `server cancelled the request`。
+fn is_transient_lsp_error(e: &anyhow::Error) -> bool {
+    // 错误链上任何一层命中都算：`anyhow` 会把下层 `ResponseError` 的 Display
+    // 拼进消息，所以整条链的文本都要看。
+    e.chain().any(|cause| {
+        let text = cause.to_string().to_ascii_lowercase();
+        text.contains("content modified")
+            // ServerCancelled：服务器自己撤销了请求，重发即可。
+            || text.contains("server is loading")
+            || text.contains("server cancelled")
+            || text.contains("-32801")
+            || text.contains("-32802")
+    })
+}
+
 /// 一次 `initialize` 握手的结果。
 pub struct LspClient {
     conn: Arc<Connection>,
@@ -37,6 +59,47 @@ pub struct LspClient {
 }
 
 impl LspClient {
+    /// 发一个请求，遇到**瞬时态**错误就重试。
+    ///
+    /// 为什么需要：rust-analyzer 在重新加载工程期间会对所有请求回
+    /// `-32801 content modified`（文档还在被内部改写）。这**不是**请求有问题，
+    /// 而是「服务器此刻不接受查询」。仓库里的集成测试早就知道这一点，用
+    /// `retry_until_ready` 重试到成功；但生产路径的 hover / completion 是
+    /// 单发，撞上就静默失败——用户看到的就是「补全偶尔不出现」。
+    ///
+    /// 只重试**瞬时态**（`content modified` / `server is loading` /
+    /// `server cancelled`），其余错误（真失败、无权限、方法不支持）立刻返回：
+    /// 那些重试多少次都一样，只会白等。
+    ///
+    /// 退避 300ms、上限约 3s：够覆盖一次 reload 窗口，又不至于让界面卡住
+    /// 明显（hover 是一次鼠标移动，3 秒无响应本来就该放弃）。
+    async fn request_retrying_transient(
+        &self,
+        method: &str,
+        params: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        const MAX_ATTEMPTS: u32 = 10;
+        const BACKOFF: std::time::Duration = std::time::Duration::from_millis(300);
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=MAX_ATTEMPTS {
+            match self.conn.request(method, params).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if !is_transient_lsp_error(&e) || self.conn.is_closed() {
+                        return Err(e);
+                    }
+                    log::debug!(
+                        "lsp: `{method}` 瞬时态错误（第 {attempt} 次），重试: {e:#}"
+                    );
+                    last_err = Some(e);
+                    smol::Timer::after(BACKOFF).await;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("`{method}` 重试 {MAX_ATTEMPTS} 次仍失败")))
+    }
+
     /// 启动服务器并完成 `initialize` / `initialized` 握手。
     pub async fn start(
         program: &str,
@@ -220,6 +283,12 @@ impl LspClient {
     ///
     /// 对照 Zed 的 `lsp_store.rs`：它订阅文件系统事件后调用
     /// `language_server.notify::<DidChangeWatchedFiles>`。
+    ///
+    /// **过滤在调用方做**（[`Self::should_notify_watched_file`]），因为过滤器要
+    /// 读服务器注册过的 glob，那是 `Connection` 上的状态。理由不可省：不过滤就
+    /// 会把 `target/` 里每个中间产物都推给 rust-analyzer，它收到就重载工程，
+    /// 而它自己的 `cargo check` 又在写 `target/`——自持循环，19 分钟实测
+    /// reload 了 401 次，期间补全与 hover 全被回 `-32801` 而失效。
     pub async fn did_change_watched_files(
         &self,
         changes: Vec<lsp_types::FileEvent>,
@@ -227,19 +296,19 @@ impl LspClient {
         if changes.is_empty() {
             return Ok(());
         }
-        // **不按注册状态过滤**：对照 Zed 的 `lsp_store.rs:10849`，它在
-        // `!changes.is_empty()` 时就发，不检查服务器是否动态注册过该能力。
-        //
-        // 实测 rust-analyzer 根本不发 `client/registerCapability`（探针确认
-        // 注册集合为空），却仍然依赖这个通知来感知外部改动。按注册状态过滤
-        // 会把功能整个关掉。
-        //
-        // 服务器没声明支持时忽略未知通知是它的自由；我们只保证「该发的发出去」。
+        // 不按「是否动态注册过方法」过滤：rust-analyzer 未必发
+        // `client/registerCapability`，却仍然会读这个通知来感知外部改动。
+        // 过滤的是**路径**（服务器注册的 glob / 构建产物目录），不是方法。
         let params = lsp_types::DidChangeWatchedFilesParams { changes };
         let value = serde_json::to_value(&params)?;
         self.conn
             .notify("workspace/didChangeWatchedFiles", Some(&value))
             .await
+    }
+
+    /// 这个路径变化是否值得通知服务器（见 [`Connection::should_notify_watched_file`]）。
+    pub fn should_notify_watched_file(&self, path: &std::path::Path) -> bool {
+        self.conn.should_notify_watched_file(path)
     }
 
     /// `textDocument/didClose`。
@@ -263,7 +332,11 @@ impl LspClient {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let value = serde_json::to_value(&params)?;
-        let result = self.conn.request("textDocument/hover", Some(&value)).await?;
+        // 走重试路径：rust-analyzer 在 reload 期间回 `-32801`，单发必失败
+        // （见 [`Self::request_retrying_transient`]）。
+        let result = self
+            .request_retrying_transient("textDocument/hover", Some(&value))
+            .await?;
         // 无 hover 时服务器返回 `null`，而不是空对象。
         if result.is_null() {
             return Ok(None);
@@ -298,9 +371,11 @@ impl LspClient {
             partial_result_params: PartialResultParams::default(),
         };
         let value = serde_json::to_value(&params)?;
+        // 走重试路径：rust-analyzer 在 reload 期间回 `-32801`，单发必失败
+        // （见 [`Self::request_retrying_transient`]）。补全对延迟更敏感，
+        // 但 3 秒上限仍在「用户还停在那里」的心理预期内。
         let result = self
-            .conn
-            .request("textDocument/completion", Some(&value))
+            .request_retrying_transient("textDocument/completion", Some(&value))
             .await?;
 
         if result.is_null() {
@@ -890,6 +965,22 @@ fn client_capabilities() -> ClientCapabilities {
             // 直接下发编辑而不走响应体。
             apply_edit: Some(true),
             workspace_folders: Some(true),
+            // 声明这一项服务器才会用 `client/registerCapability` 告诉我们
+            // **它关心哪些路径**（`registerOptions.watchers` 的 glob 列表）。
+            //
+            // 不声明的后果很具体：注册集合永远是空的，我们就只能对所有文件
+            // 一视同仁地发 `didChangeWatchedFiles`，而 `target/` 里每次
+            // `cargo check` 的写入都会让 rust-analyzer 重载整个工程，
+            // 形成自持循环（实测 19 分钟 401 次）。声明之后就能按 glob 精确
+            // 过滤 —— 对照 Zed：它的过滤依据也正是这份注册。
+            did_change_watched_files: Some(
+                lsp_types::DidChangeWatchedFilesClientCapabilities {
+                    dynamic_registration: Some(true),
+                    // 3.17 的相对 glob 形状（`baseUri` + `pattern`）。
+                    // 声明支持才可能收到这种形式，两种都做了兼容解析。
+                    relative_pattern_support: Some(true),
+                },
+            ),
             ..Default::default()
         }),
         text_document: Some(lsp_types::TextDocumentClientCapabilities {

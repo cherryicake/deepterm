@@ -1015,6 +1015,13 @@ impl Editor {
             && let Some(path) = crate::lsp::client::path_to_uri(&event.path).ok()
             && let Some(session) = self.active_lsp_session()
             && let Some(client) = session.client().cloned()
+            // **路径过滤**：服务器只关心它注册过的 glob（服务器没注册过时
+            // 退回排除 `target/` 等构建产物目录）。缺这一步会形成自持循环 ——
+            // rust-analyzer 自己在跑的 `cargo check` 持续写 `target/`，我们把
+            // 每次写入都推过去，它就重载工程、再跑 cargo、再写……实测 19 分钟
+            // 重载 401 次，期间所有请求都被回 `-32801 content modified`，
+            // 表现为「补全不出现、hover 弹几次就没了、状态栏反复变加载中」。
+            && client.should_notify_watched_file(&event.path)
         {
             let change_type = match event.kind {
                 FsChangeKind::Create => lsp_types::FileChangeType::CREATED,
@@ -2266,6 +2273,30 @@ impl Editor {
         .detach();
     }
 
+    /// 安排延迟收起 hover 浮层（鼠标移到空白处时调用）。
+    ///
+    /// 与 Zed 的 `hiding_delay_task` 同构：收起被推迟 `HOVER_HIDING_DELAY`，
+    /// 让指针有机会移到浮层上操作里面的内容；期间若鼠标又回到符号上，
+    /// `HoverState::on_mouse_moved` 会取消这个任务。
+    fn schedule_hover_hide(&mut self, cx: &mut Context<Self>) {
+        // `target` 是承载浮层状态的 `InputState`（绘制读的是它），
+        // `owner` 是 `Editor` 自身——`HoverState` 只清自己的计时器，
+        // 清 `InputState` 上的浮层状态得由 `Editor` 走 `hide_in`。
+        let Some(target) = self.active_text_editor(cx) else {
+            return;
+        };
+        let owner = cx.entity().downgrade();
+        self.hover.schedule_hide(cx, move |async_cx| {
+            // 延迟到期时实体可能已销毁 —— `update` 返回 `None` 即「无需处理」。
+            owner
+                .update(async_cx, |this, cx| {
+                    this.hover.hide_in(&target, cx);
+                    cx.notify();
+                })
+                .ok();
+        });
+    }
+
     /// 取走后台算好的 hover / 补全 / 符号结果。
     ///
     /// 在 `render` 里调用：后台任务完成时只能把结果放进 `InputState` 的槽，
@@ -2275,6 +2306,21 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
+        // 只在「可见性变化」时记录：`drain_lsp_results` 每帧都跑，逐帧打
+        // 会瞬间灌满日志文件（实测一次会话 6.9 万行），把有用线索冲掉。
+        {
+            use std::cell::Cell;
+            thread_local! {
+                static LAST_VIS: Cell<bool> = const { Cell::new(false) };
+            }
+            let visible = self.completion.is_visible();
+            LAST_VIS.with(|last| {
+                if last.get() != visible {
+                    log::info!("lsp: completion 可见性 -> {visible}");
+                    last.set(visible);
+                }
+            });
+        }
         self.hover.take_pending(&editor, cx);
         self.completion.take_pending(&editor, cx);
         if let Some(panel) = self.symbols_panel.clone() {
@@ -3739,9 +3785,19 @@ impl Editor {
                     // 自动补全：只在光标处于标识符内时触发。
                     // 不对每次击键都请求——否则敲注释/字符串也会打服务器，
                     // 而且候选会一直闪。
-                    if this.open_files[idx].lsp.is_some()
-                        && this.active_file_id.as_deref() == Some(sync_tab_id.as_str())
-                    {
+                    //
+                    // 两个守卫任一不满足都会静默跳过，而「打字完全没有反应」
+                    // 正是最难查的一类问题，所以未命中时要说清是哪一条挡住的。
+                    let has_session = this.open_files[idx].lsp.is_some();
+                    let is_active =
+                        this.active_file_id.as_deref() == Some(sync_tab_id.as_str());
+                    if !(has_session && is_active) {
+                        log::info!(
+                            "lsp: 跳过自动补全 has_session={has_session} is_active_tab={is_active} (active={:?} this={sync_tab_id})",
+                            this.active_file_id
+                        );
+                    }
+                    if has_session && is_active {
                         let editor = this.open_files[idx].editor_state.clone();
                         // 触发判定（对照 Zed 的 `completion_query` 与
                         // `completion_triggers`）：
@@ -3795,6 +3851,10 @@ impl Editor {
                             let uri = this
                                 .active_lsp_session()
                                 .map(|s| s.uri().clone());
+                            log::info!(
+                                "lsp: 补全触发判定命中 in_identifier={in_identifier} trigger={trigger_character:?} 有session={}",
+                                uri.is_some()
+                            );
                             if let Some(uri) = uri {
                                 this.completion.trigger_auto(
                                     &editor,
@@ -4933,6 +4993,8 @@ impl Render for Editor {
                                                 .active_lsp_session()
                                                 .map(|s| s.uri().clone());
                                             let Some(uri) = uri else {
+                                                // 没有 LSP 会话：把可能还挂着的浮层收掉。
+                                                this.schedule_hover_hide(cx);
                                                 return;
                                             };
                                             let client = this.active_lsp_client(cx);
@@ -5407,6 +5469,19 @@ fn render_lsp_status_chip(
     use crate::lsp::status::LspStatus;
 
     let label = status.label();
+    // 状态栏是「用户唯一能看到 LSP 状态的地方」，它不变化就没有任何线索。
+    // 这里只在标签真的变化时记录（`render` 每帧都跑，逐帧打会淹掉日志）。
+    thread_local! {
+        static LAST_LABEL: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    LAST_LABEL.with(|last| {
+        let mut last = last.borrow_mut();
+        if last.as_deref() != Some(label.as_str()) {
+            log::info!("lsp-status: {label}   (raw={status:?})");
+            *last = Some(label.clone());
+        }
+    });
     let (color, show_spinner) = match status {
         LspStatus::Starting | LspStatus::Working { .. } => (theme.accent, true),
         LspStatus::Ready { errors, warnings } => {

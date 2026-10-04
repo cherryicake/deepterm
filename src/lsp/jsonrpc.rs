@@ -317,6 +317,23 @@ pub struct Connection {
     /// `InitializeResult.capabilities` 里，而是启动后由服务器动态注册。
     /// 不记录就无法判断「该不该发这个通知」。
     registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 服务器通过 `client/registerCapability` 注册的
+    /// `workspace/didChangeWatchedFiles` **glob 模式**。
+    ///
+    /// 只记方法名是不够的：`didChangeWatchedFiles` 通知的是「你关心哪些路径
+    /// 变了」，而服务器关心哪些路径由它的 `watchers` 列表给出。不按这个列表
+    /// 过滤就会把工作区里**每一个**文件改动都推给服务器。
+    ///
+    /// 代价不是浪费流量，而是**服务器被迫重载整个工程**：rust-analyzer 收到
+    /// `didChangeWatchedFiles` 会触发一次 workspace reload，而它自己在跑的
+    /// `cargo check` / `cargo metadata` 不断写 `target/`，于是形成自持循环 ——
+    /// 实测 19 分钟内 reload 了 401 次，期间所有请求都被回
+    /// `-32801 content modified`，补全与 hover 因此全部失效，状态栏也在
+    /// Ready 与 Fetching 之间反复翻转。
+    ///
+    /// 对照 Zed `lsp_store.rs:12289`：它用 `DidChangeWatchedFilesRegistrationOptions`
+    /// 建出 `GlobSet`，发通知前逐个 `is_match()`，不匹配的直接丢弃。
+    watched_globs: Arc<Mutex<Vec<String>>>,
 }
 
 impl Connection {
@@ -356,6 +373,7 @@ impl Connection {
             child: Arc::new(Mutex::new(Some(child))),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registered_methods: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            watched_globs: Arc::new(Mutex::new(Vec::new())),
         };
 
         // 读循环：独立于任何请求，寿命与连接相同。
@@ -363,8 +381,9 @@ impl Connection {
         let closed2 = conn.closed.clone();
         let stdin2 = Arc::clone(&conn.stdin);
         let registered2 = Arc::clone(&conn.registered_methods);
+        let globs2 = Arc::clone(&conn.watched_globs);
         smol::spawn(async move {
-            let result = read_loop(stdout, stdin2, pending2, subscribers, registered2).await;
+            let result = read_loop(stdout, stdin2, pending2, subscribers, registered2, globs2).await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -398,6 +417,34 @@ impl Connection {
     /// 服务器是否动态注册过某个方法（`client/registerCapability`）。
     pub fn is_registered(&self, method: &str) -> bool {
         self.registered_methods.lock().contains(method)
+    }
+
+    /// 服务器注册过的 `didChangeWatchedFiles` glob（空 = 没注册过）。
+    pub fn watched_globs(&self) -> Vec<String> {
+        self.watched_globs.lock().clone()
+    }
+
+    /// 这个路径变化是否值得通知服务器。
+    ///
+    /// 两道闸门，缺一不可：
+    ///
+    /// 1. **服务器注册过 glob 就按 glob 过滤**（对照 Zed `lsp_store.rs:12289`
+    ///    的 `watched_paths.is_match()`）。服务器只关心 `Cargo.toml`、
+    ///    `.cargo/config*`、`rust-project.json` 这些清单文件，把源码改动也
+    ///    推过去只是浪费——而每个多余的清单文件事件都会让 rust-analyzer
+    ///    重载整个工程。
+    /// 2. **没注册过 glob 就退回排除构建产物目录**。rust-analyzer 在我们
+    ///    声明 `didChangeWatchedFiles` 之前不会发注册项，但仍然会读我们推的
+    ///    通知；此时若不过滤，`target/` 里 `cargo check` 写的每个中间文件都会
+    ///    触发一次 reload，自持循环就是这么来的。
+    pub fn should_notify_watched_file(&self, path: &std::path::Path) -> bool {
+        let globs = self.watched_globs.lock().clone();
+        if !globs.is_empty() {
+            return globs
+                .iter()
+                .any(|g| crate::lsp::glob::glob_match(g, path));
+        }
+        !crate::lsp::glob::is_build_artifact(path)
     }
 
     /// 订阅服务器主动通知，返回本订阅者**专属**的句柄。
@@ -628,6 +675,7 @@ impl Connection {
             child: Arc::clone(&self.child),
             closed: Arc::clone(&self.closed),
             registered_methods: Arc::clone(&self.registered_methods),
+            watched_globs: Arc::clone(&self.watched_globs),
         }
     }
 }
@@ -647,6 +695,7 @@ async fn read_loop(
     pending: Pending,
     subscribers: Arc<Mutex<Vec<Subscription>>>,
     registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
+    watched_globs: Arc<Mutex<Vec<String>>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -659,7 +708,7 @@ async fn read_loop(
             // 记录/清除服务器动态注册的能力（在应答之前处理，保证
             // 「注册成功」与「我们记住了」是同一时刻）。
             if let Message::Request { method, params, .. } = &msg {
-                record_dynamic_registration(&registered_methods, method, params);
+                record_dynamic_registration(&registered_methods, &watched_globs, method, params);
             }
             if let Some((id, reply)) = dispatch(msg, &pending, &subscribers) {
                 // 就地应答服务器的主动请求：不应答它就会一直等。
@@ -687,13 +736,23 @@ async fn read_loop(
                 match payload {
                     Ok(payload) => {
                         let frame = encode_frame(&payload);
+                        let t0 = std::time::Instant::now();
                         let mut guard = stdin.lock().await;
+                        let waited = t0.elapsed();
+                        if waited > std::time::Duration::from_millis(200) {
+                            log::warn!(
+                                "lsp: 应答服务器请求 id {id} 前等锁 {waited:?}（pending={}）",
+                                pending.lock().len()
+                            );
+                        }
                         // 写入失败只记日志：服务器请求应答丢了不会损坏本地
                         // 状态，下一次请求照常。
                         if let Err(e) = guard.write_all(&frame).await {
                             log::warn!("lsp: failed to reply to server request {id}: {e}");
                         } else if let Err(e) = guard.flush().await {
                             log::warn!("lsp: failed to flush reply {id}: {e}");
+                        } else {
+                            log::debug!("lsp: replied to server request id {id}");
                         }
                     }
                     Err(e) => log::warn!("lsp: failed to serialize reply {id}: {e}"),
@@ -755,8 +814,14 @@ fn server_request_reply(method: &str) -> ServerRequestReply {
 ///
 /// `params.registrations[].method` 是要注册的方法名（如
 /// `workspace/didChangeWatchedFiles`）。只有注册过的方法才应该发通知。
+///
+/// `workspace/didChangeWatchedFiles` 的注册项里还带 `registerOptions.watchers`
+/// ——服务器**关心哪些路径**的 glob 列表。必须一并记下：发通知前要按它过滤，
+/// 否则工作区里任何一个文件改动都会被推给服务器，而 rust-analyzer 收到就
+/// 重载整个工程（理由见 [`Connection::watched_globs`]）。
 fn record_dynamic_registration(
     set: &Mutex<std::collections::HashSet<String>>,
+    watched_globs: &Mutex<Vec<String>>,
     request_method: &str,
     params: &Value,
 ) {
@@ -764,6 +829,7 @@ fn record_dynamic_registration(
         return;
     };
     let mut guard = set.lock();
+    let mut globs = watched_globs.lock();
     for item in items {
         let Some(method) = item.get("method").and_then(|m| m.as_str()) else {
             continue;
@@ -771,9 +837,49 @@ fn record_dynamic_registration(
         match request_method {
             "client/registerCapability" => {
                 guard.insert(method.to_string());
+                if method == "workspace/didChangeWatchedFiles" {
+                    // 累加而非覆盖：服务器可能分多次注册不同 glob，
+                    // 而 `unregisterCapability` 按 id 撤销（见下）。
+                    collect_watcher_globs(item, &mut globs);
+                }
             }
             "client/unregisterCapability" => {
                 guard.remove(method);
+                if method == "workspace/didChangeWatchedFiles" {
+                    // 注册项按 `id` 撤销。这里保守处理：清空全部 glob，
+                    // 让过滤退回「按构建产物目录排除」的兜底（宁可多发，
+                    // 也不能因为漏记而永远不发）。下一轮 register 会补回来。
+                    globs.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// 从一个 `workspace/didChangeWatchedFiles` 注册项里取出所有 watcher 的 glob。
+///
+/// 兼容两种写法（服务器实现不一）：
+/// - `watchers[].globPattern` 为字符串（3.16 之前的形状）
+/// - `watchers[].globPattern` 为 `{ baseUri, pattern }`（3.17 的相对模式）
+fn collect_watcher_globs(item: &Value, out: &mut Vec<String>) {
+    let Some(watchers) = item
+        .get("registerOptions")
+        .and_then(|o| o.get("watchers"))
+        .and_then(|w| w.as_array())
+    else {
+        return;
+    };
+    for watcher in watchers {
+        let Some(pattern) = watcher.get("globPattern") else {
+            continue;
+        };
+        match pattern {
+            Value::String(s) => out.push(s.clone()),
+            Value::Object(o) => {
+                if let Some(p) = o.get("pattern").and_then(|p| p.as_str()) {
+                    out.push(p.to_string());
+                }
             }
             _ => {}
         }
@@ -885,6 +991,15 @@ fn dispatch(
 ) -> Option<(u32, ResolvedReply)> {
     match msg {
         Message::Response { id, result, error } => {
+            // 逐条记录到达的响应：这是区分「服务器根本没回」与「回了但没接上」
+            // 的唯一依据。请求 id 是客户端与服务器**共用**的计数器，两侧都会
+            // 自增，因此只有把到达的 id 全部打出来才能对齐。
+            log::debug!(
+                "lsp: ← response id={id} has_result={} has_error={} pending_before={}",
+                result.is_some(),
+                error.is_some(),
+                pending.lock().len()
+            );
             let tx = pending.lock().remove(&id);
             match tx {
                 Some(tx) => {
@@ -1369,13 +1484,14 @@ mod tests {
     #[test]
     fn records_dynamically_registered_methods() {
         let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
         let params = serde_json::json!({
             "registrations": [
                 { "id": "r1", "method": "workspace/didChangeWatchedFiles" },
                 { "id": "r2", "method": "workspace/didChangeConfiguration" },
             ]
         });
-        record_dynamic_registration(&set, "client/registerCapability", &params);
+        record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
 
         assert!(set.lock().contains("workspace/didChangeWatchedFiles"));
         assert!(set.lock().contains("workspace/didChangeConfiguration"));
@@ -1386,13 +1502,14 @@ mod tests {
     #[test]
     fn unregister_removes_the_method() {
         let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
         let reg = serde_json::json!({
             "registrations": [{ "id": "r1", "method": "workspace/didChangeWatchedFiles" }]
         });
-        record_dynamic_registration(&set, "client/registerCapability", &reg);
+        record_dynamic_registration(&set, &globs, "client/registerCapability", &reg);
         assert!(set.lock().contains("workspace/didChangeWatchedFiles"));
 
-        record_dynamic_registration(&set, "client/unregisterCapability", &reg);
+        record_dynamic_registration(&set, &globs, "client/unregisterCapability", &reg);
         assert!(
             !set.lock().contains("workspace/didChangeWatchedFiles"),
             "unregister must remove the method"
@@ -1403,6 +1520,7 @@ mod tests {
     #[test]
     fn malformed_registrations_are_ignored() {
         let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
         for params in [
             serde_json::json!({}),
             serde_json::json!({ "registrations": [] }),
@@ -1410,8 +1528,80 @@ mod tests {
             serde_json::json!({ "registrations": [{ "method": 42 }] }),
             serde_json::json!("not an object"),
         ] {
-            record_dynamic_registration(&set, "client/registerCapability", &params);
+            record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
         }
         assert!(set.lock().is_empty(), "malformed input must not register anything");
+    }
+
+    /// 注册项里的 `watchers` glob 必须被记下来——发通知前就靠它过滤。
+    ///
+    /// 回归的意义很大：不记 glob 就只能对所有文件一视同仁，而 `target/` 里每次
+    /// `cargo check` 的写入都会让 rust-analyzer 重载整个工程（自持循环）。
+    #[test]
+    fn records_watcher_globs_from_registration() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
+        // 两种 glob 形状都要兼容：3.16 的字符串、3.17 的 {baseUri, pattern}。
+        let params = serde_json::json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": {
+                    "watchers": [
+                        { "globPattern": "**/Cargo.toml", "kind": 7 },
+                        { "globPattern": { "baseUri": "file:///ws", "pattern": "**/.cargo/config*" } }
+                    ]
+                }
+            }]
+        });
+        record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
+
+        let recorded = globs.lock().clone();
+        assert!(
+            recorded.contains(&"**/Cargo.toml".to_string()),
+            "string globPattern must be recorded, got {recorded:?}"
+        );
+        assert!(
+            recorded.contains(&"**/.cargo/config*".to_string()),
+            "3.17 relative glob must be recorded, got {recorded:?}"
+        );
+    }
+
+    /// 别的方法的注册项不能混进 glob 列表（否则会把无关文件也算成「服务器关心」）。
+    #[test]
+    fn globs_only_come_from_watched_files_registration() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
+        let params = serde_json::json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "textDocument/rename",
+                "registerOptions": { "watchers": [{ "globPattern": "**/*.rs" }] }
+            }]
+        });
+        record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
+        assert!(globs.lock().is_empty(), "non-watched-files registration must not add globs");
+    }
+
+    /// 撤销注册要清空 glob，让过滤退回「排除构建产物」的兜底。
+    ///
+    /// 保守清空是有意的：漏记某个 glob 会让服务器收不到它关心的变更，而多记
+    /// 只多发一点通知。宁可多发也不能永远不发。
+    #[test]
+    fn unregister_clears_globs() {
+        let set = Mutex::new(std::collections::HashSet::new());
+        let globs = Mutex::new(Vec::new());
+        let reg = serde_json::json!({
+            "registrations": [{
+                "id": "r1",
+                "method": "workspace/didChangeWatchedFiles",
+                "registerOptions": { "watchers": [{ "globPattern": "**/Cargo.toml" }] }
+            }]
+        });
+        record_dynamic_registration(&set, &globs, "client/registerCapability", &reg);
+        assert_eq!(globs.lock().len(), 1);
+
+        record_dynamic_registration(&set, &globs, "client/unregisterCapability", &reg);
+        assert!(globs.lock().is_empty(), "unregister must clear globs");
     }
 }

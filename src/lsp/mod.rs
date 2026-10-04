@@ -18,6 +18,7 @@
 
 pub mod client;
 pub mod features;
+pub mod glob;
 pub mod jsonrpc;
 pub mod project;
 pub mod registry;
