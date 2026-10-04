@@ -362,7 +362,10 @@ impl LspSession {
                 let Some(publish) = crate::lsp::client::as_publish_diagnostics(&params) else {
                     continue;
                 };
-                if publish.uri != uri {
+                // 必须走 `uri_eq`：windows 上服务器回的盘符大小写可能与本地不一致，
+                // 精确比较会让这份诊断被当成「别人的」丢掉（于是文件改了、
+                // 诊断不刷新）。
+                if !crate::lsp::client::uri_eq(&publish.uri, &uri) {
                     continue;
                 }
                 log::debug!(

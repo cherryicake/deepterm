@@ -1718,9 +1718,13 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // 目标就是当前文件：直接跳，避免多余的「打开」往返。
+        //
+        // 必须走 `uri_eq` 而不是 `==`：windows 上 rust-analyzer 回的盘符
+        // 小写（`/c:/...`）而我们存的是大写（`/C:/...`），精确比较会把
+        // 同文件跳转误判成跨文件 → 每次跳转都新开标签而非原地移光标。
         let same_file = self
             .active_lsp_session()
-            .map(|s| s.uri() == &location.uri)
+            .map(|s| crate::lsp::client::uri_eq(s.uri(), &location.uri))
             .unwrap_or(false);
 
         match lsp_location_action(location, same_file) {

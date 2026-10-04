@@ -189,9 +189,13 @@ pub fn edits_for_uri(edit: &WorkspaceEdit, uri: &Url) -> Option<Vec<TextEdit>> {
     if let Some(document_changes) = &edit.document_changes {
         match document_changes {
             // `TextDocumentEdit[]`：每个条目属于一个 uri，带若干编辑。
+            //
+            // uri 比较走 `uri_eq`：windows 上服务器回的盘符大小写可能与本地
+            // 不一致，精确比较会把本文件的编辑当成「别的文件的」丢掉
+            // （症状：代码动效 / 重命名 / 格式化对该文件不生效）。
             lsp_types::DocumentChanges::Edits(edits) => {
                 for e in edits {
-                    if &e.text_document.uri == uri {
+                    if crate::lsp::client::uri_eq(&e.text_document.uri, uri) {
                         // `OneOf<TextEdit, AnnotatedTextEdit>`：两种都取出
                         // 底层 `TextEdit`（我们暂不消费 annotation id）。
                         for edit in &e.edits {
@@ -205,7 +209,7 @@ pub fn edits_for_uri(edit: &WorkspaceEdit, uri: &Url) -> Option<Vec<TextEdit>> {
             lsp_types::DocumentChanges::Operations(ops) => {
                 for op in ops {
                     if let lsp_types::DocumentChangeOperation::Edit(e) = op
-                        && &e.text_document.uri == uri
+                        && crate::lsp::client::uri_eq(&e.text_document.uri, uri)
                     {
                         for edit in &e.edits {
                             out.push(one_of_text_edit(edit));

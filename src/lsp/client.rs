@@ -1077,6 +1077,32 @@ pub fn uri_to_path(uri: &Url) -> Option<PathBuf> {
     uri.to_file_path().ok()
 }
 
+/// 两个 `file://` URI 是否指向同一个文件。
+///
+/// **不能直接比字符串。** Windows 上同一个文件有两种合法写法：`Url::from_file_path`
+/// 产出 `/C:/dir/f.rs`，而语言服务器（实测 rust-analyzer）会回`/c:/dir/f.rs`
+/// —— 盘符小写。精确比较会把「跳转到当前文件」误判成「跳转到另一个文件」，
+/// 于是每次跳转都新开一个标签而不是原地移光标（用户看到的就是「跳转会
+/// 打开文件，但光标没落过去」）。
+///
+/// 判定方式：先各自转成 `PathBuf`，再按平台规则比。Windows 上文件系统
+/// 大小写不敏感，故用 `eq_ignore_ascii_case`；其余平台走精确相等。
+/// 非 `file://` 的 uri（`untitled:` 等）没有路径可比，退回字符串相等。
+pub fn uri_eq(a: &Url, b: &Url) -> bool {
+    match (uri_to_path(a), uri_to_path(b)) {
+        (Some(pa), Some(pb)) => {
+            if cfg!(windows) {
+                // 归一化分隔符：服务器可能回 `/c:/a/b`，本地是 `C:\a\b`。
+                let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+                norm(&pa) == norm(&pb)
+            } else {
+                pa == pb
+            }
+        }
+        _ => a == b,
+    }
+}
+
 /// 从通知里取出 `textDocument/publishDiagnostics` 参数。
 pub fn as_publish_diagnostics(params: &serde_json::Value) -> Option<PublishDiagnosticsParams> {
     serde_json::from_value(params.clone()).ok()
@@ -1152,6 +1178,34 @@ mod tests {
         }))
         .expect("InitializeResult parses");
         assert!(trigger_characters_of(&result).is_empty());
+    }
+
+    /// 同一文件的两种 URI 写法必须判为相等。
+    ///
+    /// 回归：windows 上 `Url::from_file_path` 产出 `/C:/dir/f.rs`，而
+    /// rust-analyzer 回`/c:/dir/f.rs`（盘符小写）。曾用`==` 直接比字符串，
+    /// 于是「跳转到当前文件」被误判成跨文件 —— 每次跳转都新开一个标签，
+    /// 光标留在原地，正是用户报的「跳转会开文件但光标没落过去」。
+    #[test]
+    fn uri_eq_tolerates_windows_drive_letter_case() {
+        let lower = Url::parse("file:///c:/dir/f.rs").unwrap();
+        let upper = Url::parse("file:///C:/dir/f.rs").unwrap();
+        assert!(
+            uri_eq(&lower, &upper),
+            "同一文件的盘符大小写差异必须判为相等"
+        );
+        assert!(uri_eq(&lower, &lower.clone()));
+    }
+
+    /// 不同文件仍必须判为不等（别把`uri_eq` 写成恒真）。
+    #[test]
+    fn uri_eq_distinguishes_different_files() {
+        let a = Url::parse("file:///c:/dir/a.rs").unwrap();
+        let b = Url::parse("file:///c:/dir/b.rs").unwrap();
+        assert!(!uri_eq(&a, &b));
+        // 前缀相似但不是同一文件
+        let c = Url::parse("file:///c:/dir2/a.rs").unwrap();
+        assert!(!uri_eq(&a, &c));
     }
 
     // ------------------------------------------------ 新增请求的能力门控

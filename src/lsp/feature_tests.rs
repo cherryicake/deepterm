@@ -158,7 +158,13 @@ fn rust_analyzer_feature_requests() {
         let location = goto.as_ref().and_then(features::first_location);
         assert!(location.is_some(), "no definition found for `add`");
         let loc = location.unwrap();
-        assert_eq!(loc.uri, uri, "definition should be in the same file");
+        // 用 `uri_eq` 而非 `==`：windows 上 rust-analyzer 回的盘符大小写
+        // 与本地构造的 uri 不一致（`/c:/` vs `/C:/`），精确比较会误报。
+        assert!(
+            crate::lsp::client::uri_eq(&loc.uri, &uri),
+            "definition should be in the same file (got {})",
+            loc.uri
+        );
         // 定义在第 0 行（`fn add(...)`）。
         assert_eq!(loc.range.start.line, 0, "wrong definition line");
 

@@ -108,7 +108,7 @@ fn rust_analyzer_reports_diagnostics() {
                     if let crate::lsp::jsonrpc::Message::Notification { method, params } = msg {
                         if method == "textDocument/publishDiagnostics"
                             && let Some(p) = crate::lsp::client::as_publish_diagnostics(&params)
-                            && p.uri == uri
+                            && crate::lsp::client::uri_eq(&p.uri, &uri)
                             && !p.diagnostics.is_empty()
                         {
                             return true;
@@ -159,7 +159,7 @@ fn clangd_reports_diagnostics() {
                     if let crate::lsp::jsonrpc::Message::Notification { method, params } = msg {
                         if method == "textDocument/publishDiagnostics"
                             && let Some(p) = crate::lsp::client::as_publish_diagnostics(&params)
-                            && p.uri == uri
+                            && crate::lsp::client::uri_eq(&p.uri, &uri)
                             && !p.diagnostics.is_empty()
                         {
                             return true;
