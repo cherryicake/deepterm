@@ -76,6 +76,12 @@ impl LspSession {
         })
     }
 
+    /// 测试用：替换会话的 uri（模拟「目标就是当前文件」）。
+    #[cfg(test)]
+    pub fn set_uri_for_test(&mut self, uri: lsp_types::Url) {
+        self.uri = uri;
+    }
+
     /// 已送达服务器的文档版本（测试观测点）。
     ///
     /// 对照 Zed：这个值应等于「实际发出过多少次 `didChangeTextDocument`」，

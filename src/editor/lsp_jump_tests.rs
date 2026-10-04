@@ -19,6 +19,7 @@
 
 use std::path::PathBuf;
 
+use gpui::{AppContext as _, IntoElement as _, ParentElement as _, Styled as _};
 use lsp_types::{Location, Position, Range, Url};
 
 use super::{LspJumpAction, lsp_location_action};
@@ -40,9 +41,9 @@ fn cross_file_location_opens_target_file() {
     match action {
         LspJumpAction::OpenFile { path, line, col } => {
             assert_eq!(path, PathBuf::from("/tmp/other.rs"));
-            // LSP 0 基行 9 → 编辑器 1 基行 10。
+            // LSP 0 基 → 编辑器 1 基：行、列**都要** +1。
             assert_eq!(line, 10, "LSP line is 0-based; editor line is 1-based");
-            assert_eq!(col, 2);
+            assert_eq!(col, 3, "LSP col is 0-based; editor col is 1-based");
         }
         other => panic!("cross-file jump must open the target file, got {other:?}"),
     }
@@ -56,7 +57,7 @@ fn same_file_location_jumps_in_place() {
     match action {
         LspJumpAction::JumpInPlace { line, col } => {
             assert_eq!(line, 4, "0-based LSP line 3 -> 1-based editor line 4");
-            assert_eq!(col, 0);
+            assert_eq!(col, 1, "0-based LSP col 0 -> 1-based editor col 1");
         }
         other => panic!("same-file jump must jump in place, got {other:?}"),
     }
@@ -191,4 +192,126 @@ fn consecutive_identical_jumps_are_deduplicated() {
         history.push(entry.clone());
     }
     assert_eq!(history.len(), 1, "identical consecutive entries must collapse");
+}
+
+// ------------------------------------------------ 端到端：跳到目标函数上
+
+struct Host(gpui::Entity<super::Editor>);
+impl gpui::Render for Host {
+    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+        gpui::div()
+    }
+}
+
+fn editor_ctx<'a>(
+    cx: &'a mut gpui::TestAppContext,
+) -> (gpui::Entity<super::Editor>, &'a mut gpui::VisualTestContext) {
+    cx.update(|cx| {
+        crate::settings::SettingsStore::init_for_test(cx);
+        crate::theme::init(cx);
+        crate::sidebar_view::font_settings::FontState::init(cx);
+        crate::file_manager::watcher::init(cx);
+        // 打开文件时会向 LspManager 查询服务器（本地文件即使没有 server
+        // 也会走这条路径），缺这个全局会 panic。
+        crate::lsp::init(cx);
+    });
+    let (host, cx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| super::Editor::new(window, cx))));
+    (host.read_with(cx, |h, _| h.0.clone()), cx)
+}
+
+/// 跳到**尚未打开**的文件里的某个函数：必须打开该文件并把光标移到那一行。
+///
+/// 回归：用户报「只能打开对应的代码文件，没有跳到函数上」。此前的测试只
+/// 断言「文件被打开」（`cross_file_location_opens_target_file` 走纯决策函数），
+/// **没有断言光标落点**——所以「打开了但没跳」这个缺陷完全隐形。
+#[gpui::test]
+fn jump_lands_cursor_on_target_function(cx: &mut gpui::TestAppContext) {
+    // 关掉 LSP 接入：打开文件会尝试连服务器（`smol::spawn` 到全局执行器），
+    // 会被 gpui 的 TestScheduler 判为非确定性并 abort 整个测试二进制。
+    super::with_lsp_disabled(|| {
+    let (editor, cx) = editor_ctx(cx);
+    let dir = std::env::temp_dir().join("deepterm-lsp-jump-cursor");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("defs.rs");
+    // 目标函数在第 20 行（0 基 19），前面填足够多的行以证明真的跳了。
+    let mut body = String::new();
+    for i in 1..=19 {
+        body.push_str(&format!("// filler line {i}\n"));
+    }
+    body.push_str("fn target_function() {}\n");
+    body.push_str("// trailing\n");
+    std::fs::write(&target, &body).unwrap();
+
+    let uri = Url::from_file_path(&target).unwrap();
+    // LSP 行号 0 基：第 20 行 → 19。列 3（`fn ` 之后，`target_function` 起点）。
+    let location = Location {
+        uri,
+        range: Range::new(Position::new(19, 3), Position::new(19, 18)),
+    };
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.open_lsp_location_for_test(&location, window, cx);
+    });
+    // 文件加载是异步的：跑到空闲让 pending jump 落地。
+    cx.run_until_parked();
+
+    let pos = editor
+        .read_with(cx, |editor, cx| editor.cursor_position_of_open_path(&target, cx))
+        .expect("target file must be open");
+    assert_eq!(
+        pos.0, 19,
+        "cursor must land on the definition line (0-based 19), got line {} (col {})",
+        pos.0, pos.1
+    );
+    assert_eq!(
+        pos.1, 3,
+        "cursor must land on the definition column (0-based 3), got {}",
+        pos.1
+    );
+    });
+}
+
+/// 同文件跳转：光标必须移到目标行（不重复开标签）。
+#[gpui::test]
+fn same_file_jump_moves_cursor(cx: &mut gpui::TestAppContext) {
+    super::with_lsp_disabled(|| {
+    let (editor, cx) = editor_ctx(cx);
+    let dir = std::env::temp_dir().join("deepterm-lsp-jump-same-cursor");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("one.rs");
+    let mut body = String::new();
+    for i in 1..=30 {
+        body.push_str(&format!("// line {i}\n"));
+    }
+    body.push_str("fn here() {}\n");
+    std::fs::write(&file, &body).unwrap();
+
+    // 先把文件打开。
+    editor.update_in(cx, |editor, window, cx| {
+        editor.open_file(file.clone(), window, cx);
+    });
+    cx.run_until_parked();
+
+    // 让 `open_lsp_location` 认为目标是「当前文件」。
+    editor.update_in(cx, |editor, _window, _cx| {
+        editor.set_session_uri_for_test(Url::from_file_path(&file).unwrap());
+    });
+
+    let uri = Url::from_file_path(&file).unwrap();
+    let location = Location {
+        uri,
+        range: Range::new(Position::new(30, 3), Position::new(30, 7)),
+    };
+    editor.update_in(cx, |editor, window, cx| {
+        editor.open_lsp_location_for_test(&location, window, cx);
+    });
+    cx.run_until_parked();
+
+    let pos = editor
+        .read_with(cx, |editor, cx| editor.cursor_position_of_open_path(&file, cx))
+        .expect("file must be open");
+    assert_eq!(pos.0, 30, "same-file jump must move the cursor to line 30");
+    });
 }

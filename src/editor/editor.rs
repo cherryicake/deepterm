@@ -2303,6 +2303,20 @@ impl Editor {
         Some((pos.line as usize, pos.character as usize))
     }
 
+    /// 测试用：把当前 tab 的 LSP 会话 uri 设成给定值。
+    ///
+    /// `open_lsp_location` 用「会话 uri 是否等于目标 uri」判断同文件跳转；
+    /// 测试里没有真实服务器，所以直接注入。
+    #[cfg(test)]
+    pub(crate) fn set_session_uri_for_test(&mut self, uri: lsp_types::Url) {
+        if let Some(id) = self.active_file_id.clone()
+            && let Some(file) = self.open_files.iter_mut().find(|f| f.id == id)
+            && let Some(session) = file.lsp.as_mut()
+        {
+            session.set_uri_for_test(uri);
+        }
+    }
+
     /// 测试用：直接走 `open_lsp_location` 这条跳转路径。
     #[cfg(test)]
     pub(crate) fn open_lsp_location_for_test(
@@ -3913,6 +3927,14 @@ impl Editor {
     /// 全流程异步且可失败：拿到服务器后 didOpen，再订阅诊断。任何一步失败
     /// 都只记日志，编辑器退回纯 tree-sitter 状态（诊断仍由语法树产出）。
     fn start_lsp_for_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        // 测试可关掉 LSP 接入：`server_for_file` 会 `smol::spawn` 到全局
+        // 执行器（真实线程），而 gpui 的 `TestScheduler` 会把「其它线程有活动」
+        // 判为非确定性并 abort 整个测试二进制。测试关心的是跳转/打开逻辑，
+        // 不需要真实语言服务器。
+        #[cfg(test)]
+        if TEST_DISABLE_LSP.with(|f| f.get()) {
+            return;
+        }
         let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
             return;
         };
@@ -5454,6 +5476,27 @@ pub(crate) fn is_rename_rejection(err: &anyhow::Error) -> bool {
         || msg.contains("-32602")
 }
 
+/// 测试用：关掉 LSP 接入（见 `Editor::start_lsp_for_tab`）。
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_DISABLE_LSP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 测试用：在闭包内关掉 LSP 接入。
+///
+/// 打开文件会尝试连接语言服务器，而那条路径用 `smol::spawn`（全局执行器，
+/// 真实线程）——gpui 的 `TestScheduler` 会因此判定测试非确定性并 abort
+/// 整个二进制。跳转/打开类测试不关心 LSP，关掉即可。
+#[cfg(test)]
+pub(crate) fn with_lsp_disabled<R>(f: impl FnOnce() -> R) -> R {
+    TEST_DISABLE_LSP.with(|flag| {
+        let prev = flag.replace(true);
+        let out = f();
+        flag.set(prev);
+        out
+    })
+}
+
 /// 跳转历史里的一项：从哪个文件的哪个偏移跳出去的。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct NavLocation {
@@ -5507,8 +5550,14 @@ pub(crate) fn lsp_location_action(
     location: &lsp_types::Location,
     same_file: bool,
 ) -> LspJumpAction {
+    // LSP 是 **0 基**行/列；`jump_to_line_col` 收 **1 基**（终端 Cmd+Click
+    // 传的是编译器输出的 `line:col`，那是 1 基）。
+    //
+    // 这里两个都要 +1。此前只把行 +1、列原样传下去，于是光标总是落在目标
+    // 列**左边一格**——用户看到的现象就是「文件开了，但没跳到函数上」
+    // （列偏一格通常落在空格或前一个字符上）。
     let line = location.range.start.line + 1;
-    let col = location.range.start.character;
+    let col = location.range.start.character + 1;
 
     if same_file {
         return LspJumpAction::JumpInPlace { line, col };
