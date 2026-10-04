@@ -492,4 +492,93 @@ mod tests {
             );
         });
     }
+
+    /// vim 的 `g` 系列 LSP 跳转绑定必须解析到真实动作。
+    ///
+    /// 回归：`g d`（跳转定义）此前**完全没有绑定**——键位表里只有
+    /// `g g` / `g v` / `g c`，用户按 `gd` 毫无反应。这是 vim 用户最常用的
+    /// 跳转手势，缺失等于「LSP 跳转不工作」。
+    ///
+    /// 断言的是**解析出的动作名**（而非「表里有这条记录」）：动作名或命名
+    /// 空间写错会被 `build_action` 拒绝，键位会静默失效。
+    #[gpui::test]
+    fn vim_g_series_lsp_bindings_resolve(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            reload(cx);
+
+            // 与 `EditorInput` 在 Normal 模式下产出的上下文一致。
+            let mut context = gpui::KeyContext::new_with_defaults();
+            context.add("Input");
+            context.add("VimControl");
+            context.set("vim_mode", "normal");
+            context.set("vim_operator", "none");
+            let stack = [context];
+
+            // 多键序列（`g d`）必须把**所有**键一起喂进去才会「matched」；
+            // 只喂 `g` 时它是 pending。`bindings_for_input` 返回
+            // `(matched, pending)`，这里取 matched。
+            let resolve = |cx: &mut gpui::App, keys: &str| -> Option<String> {
+                let strokes: Vec<gpui::Keystroke> = keys
+                    .split_whitespace()
+                    .map(|k| gpui::Keystroke::parse(k).unwrap())
+                    .collect();
+                let (matched, _pending) =
+                    cx.key_bindings().borrow().bindings_for_input(&strokes, &stack);
+                matched
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+
+            // VSCodeVim 的 g 系列约定。
+            assert_eq!(
+                resolve(cx, "g d").as_deref(),
+                Some("editor_panel::GotoDefinition"),
+                "gd 必须绑定到跳转定义"
+            );
+            assert_eq!(
+                resolve(cx, "g D").as_deref(),
+                Some("editor_panel::GotoDeclaration"),
+                "gD 必须绑定到跳转声明"
+            );
+            assert_eq!(
+                resolve(cx, "g y").as_deref(),
+                Some("editor_panel::GotoTypeDefinition"),
+                "gy 必须绑定到跳转类型定义"
+            );
+            assert_eq!(
+                resolve(cx, "g i").as_deref(),
+                Some("editor_panel::GotoImplementation"),
+                "gi 必须绑定到跳转实现"
+            );
+            assert_eq!(
+                resolve(cx, "g r").as_deref(),
+                Some("editor_panel::FindReferences"),
+                "gr 必须绑定到查找引用"
+            );
+        });
+    }
+
+    /// 键位表里的所有动作都必须能构造（名字与命名空间正确）。
+    ///
+    /// 通用护栏：写错动作名只会被记进 errors 而**不会让加载失败**，
+    /// 表现为「这个键静默失效」——`g d` 缺失时同类的隐形故障。
+    #[gpui::test]
+    fn all_keymap_actions_resolve(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            // 打开 vim，让三份表都被解析。
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            let (_, errors) = super::load_builtin(cx);
+            assert!(
+                errors.is_empty(),
+                "键位表存在无法解析的动作/上下文：{errors:#?}"
+            );
+        });
+    }
 }

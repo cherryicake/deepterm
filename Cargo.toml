@@ -130,6 +130,19 @@ merman = { version = "0.7.0", features = ["render"] }
 # 白名单 `!` 反选、`.git/info/exclude`、全局 gitignore）极易写错。
 ignore = "0.4.32"
 
+# 语言服务器协议（LSP）：类型定义 + 客户端实现所需的 JSON-RPC 编解码。
+# 0.95 是最后一个用 `url::Url` 的版本——`Url::from_file_path`/`to_file_path`
+# 是路径与 URI 互转的可靠入口；0.96+ 换成 `fluent_uri::Uri`（无文件路径
+# 转换），自行实现容易在 Windows 盘符与 UNC 上出错。能力结构体名也在
+# 0.96 后有变动，故锁定 0.95。
+lsp-types = "0.95.1"
+# 异步子进程：语言服务器以 stdio 管道通信，需要 `Command`/`Child` 的
+# 异步版本以在后台线程驱动读写循环（smol 已在依赖树内，版本与其对齐）。
+async-process = "2"
+# 异步互斥锁：写语言服务器 stdin 需跨 `await` 持锁，而 `parking_lot` 的
+# guard 不是 `Send`，会让承载它的 future 无法送进后台执行器。
+async-lock = "3"
+
 # mimalloc 只在非 Windows 上启用。
 #
 # 真实原因是**构建机的 cargo 源码路径不能含非 ASCII 字符**：`libmimalloc-sys`

@@ -11,6 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::store::Settings;
+pub use crate::lsp::registry::LspContent;
 use crate::sidebar_view::font_settings::{
     default_editor_font_family, default_editor_font_size, default_terminal_font_family,
     default_terminal_font_size, default_terminal_font_weight, default_terminal_line_height,
@@ -25,6 +26,8 @@ pub struct SettingsContent {
     pub editor: EditorContent,
     pub terminal: TerminalContent,
     pub vim: VimContent,
+    /// 语言服务器配置。缺省时走 [`crate::lsp::registry`] 的内置默认表。
+    pub lsp: LspContent,
 }
 
 impl SettingsContent {
@@ -39,6 +42,7 @@ impl SettingsContent {
         merge(&mut self.editor, &other.editor);
         merge(&mut self.terminal, &other.terminal);
         merge(&mut self.vim, &other.vim);
+        merge(&mut self.lsp, &other.lsp);
     }
 }
 
@@ -199,6 +203,12 @@ impl Settings for TerminalContent {
 impl Settings for VimContent {
     fn from_settings(content: &SettingsContent) -> Self {
         content.vim.clone()
+    }
+}
+
+impl Settings for LspContent {
+    fn from_settings(content: &SettingsContent) -> Self {
+        content.lsp.clone()
     }
 }
 

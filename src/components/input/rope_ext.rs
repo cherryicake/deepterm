@@ -35,8 +35,11 @@ pub struct InputEdit {
 
 /// A zero-based line/character position in a text document.
 ///
-/// `line` is the 0-based line index, `character` the 0-based character
-/// column within that line (in characters, not bytes).
+/// `line` is the 0-based line index, `character` the 0-based column within
+/// that line measured in **UTF-16 code units** — the encoding the LSP spec
+/// mandates by default (and what Zed uses via `PointUtf16`). A character
+/// outside the BMP (e.g. an emoji) counts as 2 code units, so `character`
+/// is neither a byte offset nor a Unicode scalar count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Position {
     pub line: u32,
@@ -268,12 +271,13 @@ pub trait RopeExt {
 
     /// Get the byte offset from the given line, column [`Position`] (0-based).
     ///
-    /// The column is in characters.
+    /// The column is in **UTF-16 code units** (the LSP default encoding).
+    /// A character outside the BMP counts as 2 units.
     fn position_to_offset(&self, line_col: &Position) -> usize;
 
     /// Get the line, column [`Position`] (0-based) from the given byte offset.
     ///
-    /// The column is in characters.
+    /// The column is in **UTF-16 code units** (the LSP default encoding).
     fn offset_to_position(&self, offset: usize) -> Position;
 
     /// Get point (row, column) from the given byte offset.
@@ -486,22 +490,46 @@ impl RopeExt for Rope {
         self.clip_offset(offset, Bias::Left)
     }
 
+    /// LSP `Position` → 字节偏移。
+    ///
+    /// `character` 是 **UTF-16 code unit** 计数（LSP 规范默认编码，Zed 同此），
+    /// 不是字符数也不是字节数——星体字符（emoji 等）占 2 个 code unit，
+    /// 按字符数换算会让其后的所有位置整体偏移。
+    ///
+    /// 列超出本行内容时钳到行尾（不含换行符），与 `point_to_offset` 一致：
+    /// 服务器给出的过期列不该越到下一行。
     fn position_to_offset(&self, pos: &Position) -> usize {
-        let line = self.slice_line(pos.line as usize);
-        self.line_start_offset(pos.line as usize)
-            + line
-                .chars()
-                .take(pos.character as usize)
-                .map(|c| c.len_utf8())
-                .sum::<usize>()
+        let row = pos.line as usize;
+        if row >= self.lines_len() {
+            return self.len();
+        }
+        let line = self.slice_line(row);
+        let line_start = self.line_start_offset(row);
+        // 行内容长度（不含 `\n` / `\r\n`）：列的上限。
+        let content_len = content_len(&line);
+        // 先把列钳到本行的 UTF-16 长度**再**换算：`utf16_to_byte_idx` 对
+        // 越界列会 `assert!` panic，服务器给的过期列不能直接喂进去。
+        let line_utf16_len = line.len_utf16();
+        let character = (pos.character as usize).min(line_utf16_len);
+        let byte_col = line.utf16_to_byte_idx(character);
+        // 再钳到行内容长度：`line` 可能带换行符，而列不该跨过它。
+        let byte_col = byte_col.min(content_len);
+        line_start + byte_col
     }
 
+    /// 字节偏移 → LSP `Position`。
+    ///
+    /// `character` 输出 **UTF-16 code unit** 计数（见 `position_to_offset`）。
+    /// 与 `position_to_offset` 严格互逆：对任意字符边界偏移，往返得到原值。
     fn offset_to_position(&self, offset: usize) -> Position {
-        let point = self.offset_to_point(offset);
-        let line = self.slice_line(point.row);
-        let offset = line.utf16_to_byte_idx(line.byte_to_utf16_idx(point.column));
-        let character = line.slice(..offset).chars().count();
-        Position::new(point.row as u32, character as u32)
+        let offset = offset.min(self.len());
+        let row = self.byte_to_line_idx(offset, LineType::LF);
+        let line = self.slice_line(row);
+        let line_start = self.line_start_offset(row);
+        // 行内字节列（不含换行符），再换算成 UTF-16 code unit 计数。
+        let byte_col = offset.saturating_sub(line_start).min(content_len(&line));
+        let character = line.byte_to_utf16_idx(byte_col);
+        Position::new(row as u32, character as u32)
     }
 
     fn line_end_offset(&self, row: usize) -> usize {
@@ -721,10 +749,13 @@ mod tests {
 
     #[test]
     fn test_line_column() {
+        // 列按 **UTF-16 code unit** 计数（LSP 语义）：
+        //   'a'=0..1  ' '=1..2  '中'=2..3  '文'=3..4  '🎉'=4..6  ' '=6..7 ...
         let rope = Rope::from("a 中文🎉 test\nRope");
         assert_eq!(rope.position_to_offset(&Position::new(0, 3)), "a 中".len());
+        // 列 6 才是 emoji 之后（emoji 占 4..6 两个 code unit）。
         assert_eq!(
-            rope.position_to_offset(&Position::new(0, 5)),
+            rope.position_to_offset(&Position::new(0, 6)),
             "a 中文🎉".len()
         );
         assert_eq!(
@@ -738,7 +769,8 @@ mod tests {
         );
         assert_eq!(
             rope.offset_to_position("a 中文🎉".len()),
-            Position::new(0, 5)
+            Position::new(0, 6),
+            "emoji counts as 2 UTF-16 code units"
         );
     }
 
@@ -814,6 +846,71 @@ mod tests {
         assert_eq!(rope.offset_utf16_to_offset(8), "hello 中文".len());
         assert_eq!(rope.offset_utf16_to_offset(10), "hello 中文🎉".len());
         assert_eq!(rope.offset_utf16_to_offset(100), rope.len());
+    }
+
+    /// LSP `Position` ↔ 字节偏移：`character` 必须是 **UTF-16 code unit**。
+    ///
+    /// 回归：曾用字符数（`.chars().count()`）换算，星体字符（emoji）只算 1
+    /// 而 LSP 要求算 2，导致 emoji 之后的所有位置整体偏移 1。
+    #[test]
+    fn test_position_uses_utf16_code_units() {
+        // "a🎉b"：a=1 unit, 🎉=2 units, b=1 unit → 共 4 units / 6 bytes。
+        let rope = Rope::from("a🎉b");
+
+        // 行内 UTF-16 列 → 字节偏移。
+        assert_eq!(rope.position_to_offset(&Position::new(0, 0)), 0);
+        assert_eq!(rope.position_to_offset(&Position::new(0, 1)), 1, "after 'a'");
+        // 🎉 起点：UTF-16 列 1（= 'a' 之后）。
+        assert_eq!(rope.position_to_offset(&Position::new(0, 3)), 5, "after emoji");
+        assert_eq!(rope.position_to_offset(&Position::new(0, 4)), 6, "after 'b'");
+
+        // 字节偏移 → UTF-16 列。emoji 之后必须是 3，而不是 2（字符数）。
+        assert_eq!(rope.offset_to_position(0), Position::new(0, 0));
+        assert_eq!(rope.offset_to_position(1), Position::new(0, 1));
+        assert_eq!(
+            rope.offset_to_position(5),
+            Position::new(0, 3),
+            "emoji occupies 2 UTF-16 code units, not 1 character"
+        );
+        assert_eq!(rope.offset_to_position(6), Position::new(0, 4));
+    }
+
+    /// 往返必须精确：任意字符边界偏移 → Position → 原偏移。
+    #[test]
+    fn test_position_offset_roundtrip_is_exact_with_non_bmp() {
+        let rope = Rope::from("let s = \"🎉🎉\";\nlet t = \"中文\";\n");
+        for offset in 0..=rope.len() {
+            if !rope.is_char_boundary(offset) {
+                continue;
+            }
+            let pos = rope.offset_to_position(offset);
+            let back = rope.position_to_offset(&pos);
+            assert_eq!(back, offset, "round-trip broke at byte {offset} (pos {pos:?})");
+        }
+    }
+
+    /// 多行 + 星体字符：行号与列都要对。
+    #[test]
+    fn test_position_multiline_with_emoji() {
+        let rope = Rope::from("🎉x\ny🎉z\n");
+        // 第 1 行（0 基）"y🎉z"：y=1, 🎉=2, z=1。
+        assert_eq!(rope.offset_to_position(rope.line_start_offset(1)), Position::new(1, 0));
+        assert_eq!(rope.offset_to_position(rope.line_start_offset(1) + 1), Position::new(1, 1));
+        assert_eq!(
+            rope.offset_to_position(rope.line_start_offset(1) + 5),
+            Position::new(1, 3),
+            "after emoji on line 1"
+        );
+    }
+
+    /// 列超出本行内容时钳到行尾，不越到下一行（服务器给过期列时的兜底）。
+    #[test]
+    fn test_position_column_clamps_to_line_end() {
+        let rope = Rope::from("ab\ncd\n");
+        // 第 0 行内容长 2（字节）/"ab"：列 99 钳到行尾。
+        assert_eq!(rope.position_to_offset(&Position::new(0, 99)), 2);
+        // 行号越界 → 文本末尾。
+        assert_eq!(rope.position_to_offset(&Position::new(99, 0)), rope.len());
     }
 
     #[test]

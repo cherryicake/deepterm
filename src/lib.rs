@@ -9,6 +9,7 @@ pub mod components;
 pub mod editor;
 pub mod file_manager;
 pub mod keymap;
+pub mod lsp;
 pub mod vim;
 pub mod settings;
 pub mod sidebar_view;
@@ -1658,3 +1659,74 @@ static TEST_ALLOCATOR: utils::alloc_probe::CountingAllocator<std::alloc::System>
         inner: std::alloc::System,
     };
 
+/// 应用启动时的子系统初始化（`main.rs` 调用）。
+///
+/// 抽到库里是为了**可测**：`main.rs` 是二进制目标，`cargo test --lib`
+/// 覆盖不到它。此前 `vim::init` 漏调用导致 `Registers` / `Marks` 两个全局
+/// 从未注册，用户按 `yy` 直接 panic——而测试全绿，因为它们各自手动装了
+/// 那两个全局，走的不是生产路径。
+///
+/// 顺序有依赖，不要随意调整：
+/// 1. `settings` 必须最先（theme/font/keymap 都从它取值）；
+/// 2. `keymap` 依赖 settings（vim 开关决定是否加载 vim 键位表）；
+/// 3. `lsp` 必须在 `editor` 之前（开 tab 时向它查询服务器）；
+/// 4. `vim` 必须在任何编辑操作之前（寄存器/标记是编辑路径上的全局）。
+pub fn init(cx: &mut gpui::App) {
+    settings::init(cx);
+    theme::init(cx);
+    sidebar_view::font_settings::FontState::init(cx);
+    keymap::init(cx);
+    file_manager::watcher::init(cx);
+    lsp::init(cx);
+    vim::init(cx);
+    components::init(cx);
+    terminal_view::init(cx);
+    workspace::init(cx);
+    editor::init(cx);
+    workspace::window_manager::WindowManager::init(cx);
+}
+
+#[cfg(test)]
+mod init_tests {
+    /// 启动初始化必须注册 vim 的两个全局。
+    ///
+    /// 回归：`vim::init` 曾在 `main.rs` 里漏调用，`Registers` / `Marks`
+    /// 从未注册，用户按 `yy` 就 panic
+    /// （`no global registered of type deepterm::vim::registers::Registers`）。
+    ///
+    /// 这条用例驱动的是**生产同一条初始化函数**（`crate::init`），
+    /// 而不是测试里手动装全局——后者会让这类漏接线永远隐形。
+    #[gpui::test]
+    fn init_registers_vim_globals(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+        });
+        cx.update(|cx| {
+            assert!(
+                cx.has_global::<crate::vim::Registers>(),
+                "crate::init must register vim Registers"
+            );
+            assert!(
+                cx.has_global::<crate::vim::Marks>(),
+                "crate::init must register vim Marks"
+            );
+        });
+    }
+
+    /// 启动初始化必须注册其余关键全局（同一类缺陷的通用护栏）。
+    #[gpui::test]
+    fn init_registers_core_globals(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::init(cx);
+        });
+        cx.update(|cx| {
+            assert!(cx.has_global::<crate::settings::SettingsStore>(), "SettingsStore");
+            assert!(cx.has_global::<crate::theme::ThemeState>(), "ThemeState");
+            assert!(
+                cx.has_global::<crate::sidebar_view::font_settings::FontState>(),
+                "FontState"
+            );
+            assert!(cx.has_global::<crate::lsp::LspManager>(), "LspManager");
+        });
+    }
+}

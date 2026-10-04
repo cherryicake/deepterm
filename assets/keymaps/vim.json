@@ -41,6 +41,16 @@
       "g g": "vim::StartOfDocument",
       "shift-g": "vim::EndOfDocument",
 
+      // LSP 跳转（VSCodeVim 的 g 系列约定）：
+      //   gd 定义 / gD 声明 / gy 类型定义 / gi 实现 / gr 引用
+      // 这些动作由 `editor::init` 注册在 `EditorPanel` 上下文里，vim 的
+      // normal 模式位于该上下文内，所以直接引用即可。
+      "g d": "editor_panel::GotoDefinition",
+      "g D": "editor_panel::GotoDeclaration",
+      "g y": "editor_panel::GotoTypeDefinition",
+      "g i": "editor_panel::GotoImplementation",
+      "g r": "editor_panel::FindReferences",
+
       // 操作符（进入 vim_operator 上下文，后续键在下方各段绑定）
       "d": "vim::PushDelete",
       "y": "vim::PushYank",

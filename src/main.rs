@@ -60,18 +60,11 @@ fn main() {
     gpui::Application::with_platform(gpui_platform::current_platform(false))
         .with_assets(Assets)
         .run(|cx: &mut App| {
-            // 设置系统必须最先就绪：theme / font / editor / keymap 都从它取值。
-            deepterm::settings::init(cx);
-            theme::init(cx);
-            deepterm::sidebar_view::font_settings::FontState::init(cx);
-            // keymap 依赖 settings（vim 开关决定是否加载 vim 键位表）。
-            deepterm::keymap::init(cx);
-            deepterm::file_manager::watcher::init(cx);
-            components::init(cx);
-            terminal_view::init(cx);
-            workspace::init(cx);
-            editor::init(cx);
-            WindowManager::init(cx);
+            // 所有子系统的初始化在库里（`deepterm::init`），这样它可被
+            // `cargo test --lib` 覆盖——`main.rs` 是二进制目标，测试看不到。
+            // 此前 `vim::init` 就是在这里漏掉的，导致 vim 的寄存器全局
+            // 从未注册、按 `yy` 直接 panic。
+            deepterm::init(cx);
             init_global_executor();
             deepterm::keymap::bind(cx, [
                 KeyBinding::new("cmd-q", Quit, None),
@@ -92,6 +85,12 @@ fn main() {
                         }
                     });
                 }
+                // 语言服务器走 LSP 关闭握手（shutdown → exit）再退出：
+                // 直接丢弃会让子进程变成孤儿（编辑器没了、服务器还在跑）。
+                // 握手是异步的，给它一点时间把帧写出去；`shutdown_all`
+                // 内部有 5s 上限，最坏情况会强杀，不会永久挂住退出。
+                deepterm::lsp::LspManager::shutdown_all(cx);
+                std::thread::sleep(std::time::Duration::from_millis(150));
                 cx.quit();
             });
 

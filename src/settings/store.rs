@@ -140,6 +140,7 @@ impl SettingsStore {
         self.register::<super::content::EditorContent>();
         self.register::<super::content::TerminalContent>();
         self.register::<super::content::VimContent>();
+        self.register::<super::content::LspContent>();
     }
 
     pub fn register<T: Settings>(&mut self) {
