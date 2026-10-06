@@ -177,29 +177,45 @@ impl CompletionState {
         self.uri = Some(uri.clone());
 
         let editor = editor.downgrade();
-        let offset = editor.update(cx, |state, _| state.cursor()).unwrap_or(0);
+        // 代号必须在 **spawn 之前**同步写到 `InputState` 上，不能等防抖醒来
+        // 再写。写在任务里会留下一个真空期：防抖期间 `InputState` 上仍是**上一
+        // 次**的代号，此时若有更早的任务醒来，它会拿旧代号通过校验并把过期
+        // 候选写进 pending 槽 —— 用户看到的就是「候选内容和光标处不匹配」。
+        //
+        // hover 那边本来就是同步写的（`on_mouse_moved` 里），此前两边不一致。
+        editor
+            .update(cx, |state, _| {
+                state.set_completion_request_generation(generation)
+            })
+            .ok();
 
         self.task = Some(cx.spawn(async move |cx| {
             if let Some(delay) = delay {
                 smol::Timer::after(delay).await;
             }
-            // 防抖后重读光标：期间用户可能继续打字或移开了光标。
-            let Some(position) = editor
+            // 防抖醒来先验代号：期间用户又敲了字符，这一份就已经过期，
+            // 连请求都不必发。
+            let still_current = editor
                 .update(cx, |state, _| {
-                    features::offset_to_position(state.text(), state.cursor())
+                    state.completion_request_generation() == generation
+                })
+                .unwrap_or(false);
+            if !still_current {
+                log::info!("lsp: completion 请求已过期（防抖后），不发请求");
+                return;
+            }
+            // 防抖后重读光标：期间用户可能继续打字或移开了光标。
+            let Some((position, cursor_at_request)) = editor
+                .update(cx, |state, _| {
+                    (
+                        features::offset_to_position(state.text(), state.cursor()),
+                        state.cursor(),
+                    )
                 })
                 .ok()
             else {
                 return;
             };
-            let _ = offset;
-            // 代号落在 InputState 上供本任务比对（CompletionState 自身在
-            // 后台任务里不可达）。
-            editor
-                .update(cx, |state, _| {
-                    state.set_completion_request_generation(generation)
-                })
-                .ok();
 
             // 把触发字符原样传给服务器（对照 LSP 的
             // `CompletionContext.triggerCharacter`）：服务器据此决定返回哪一
@@ -207,7 +223,7 @@ impl CompletionState {
             // 区分「用户敲了触发字符」与「手动请求补全」。
             let t0 = std::time::Instant::now();
             log::info!(
-                "lsp: → textDocument/completion pos={}:{} trigger={:?} uri={uri}",
+                "lsp: → textDocument/completion pos={}:{} offset={cursor_at_request} trigger={:?} uri={uri}",
                 position.line,
                 position.character,
                 trigger_character
@@ -233,7 +249,7 @@ impl CompletionState {
                     );
                     editor
                         .update(cx, |state, cx| {
-                            state.set_pending_completions(items, position);
+                            state.set_pending_completions(items, position, cursor_at_request);
                             // **必须 notify**：候选只是先存进 `InputState` 的
                             // pending 槽，真正搬到浮层状态要等
                             // `Editor::drain_lsp_results`，而它只在 `render`
@@ -257,19 +273,21 @@ impl CompletionState {
 
     /// 取走后台结果（Editor 每帧调用）。
     pub fn take_pending(&mut self, editor: &Entity<InputState>, cx: &mut App) {
-        let Some((items, _position)) =
-            editor.update(cx, |state, _| state.take_pending_completions())
-        else {
+        let Some(pending) = editor.update(cx, |state, _| state.take_pending_completions()) else {
             return;
         };
+        let items = pending.items;
         if items.is_empty() {
             log::info!("lsp: completion 候选为空 -> 收起菜单");
             self.hide_in(editor, cx);
             return;
         }
-        let (replace_range, cursor) = editor.update(cx, |state, _| {
-            (state.completion_replace_range_for(&items), state.cursor())
-        });
+        // `take_pending_completions` 已经确认光标没动过（否则它会返回
+        // `None`），所以这里的 `cursor` 就是**发请求时**那个偏移，可以放心
+        // 拿它当菜单锚点、拿去算替换区间。
+        let cursor = pending.cursor_offset;
+        let replace_range =
+            editor.update(cx, |state, _| state.completion_replace_range_at(cursor, &items));
         let range_for_log = replace_range.clone();
         self.candidates = items
             .into_iter()
@@ -346,6 +364,19 @@ impl CompletionState {
     pub fn uri(&self) -> Option<&Url> {
         self.uri.as_ref()
     }
+}
+
+/// 后台补全结果在 `InputState` 里的落地形态。
+///
+/// 单独成类型而不是裸元组：三个字段各自都有用途，而元组里那个 `position`
+/// 之前被写成 `_position` 丢掉了 —— 结果就是无法判断候选是否还对得上光标。
+/// 见 [`crate::components::input::InputState::take_pending_completions`]。
+pub struct PendingCompletions {
+    pub items: Vec<lsp_types::CompletionItem>,
+    /// 发请求时的位置，仅用于日志与诊断。
+    pub position: lsp_types::Position,
+    /// 发请求时的光标字节偏移；取出时拿它和当前光标比对。
+    pub cursor_offset: usize,
 }
 
 /// 补全菜单的只读快照（绘制用）。
