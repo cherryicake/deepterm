@@ -35,22 +35,55 @@ static GLOBAL: deepterm::utils::alloc_probe::CountingAllocator<BaseAllocator> =
 #[global_allocator]
 static GLOBAL: BaseAllocator = BASE_ALLOCATOR;
 
+/// 日志文件路径（`<config>/deepterm/deepterm.log`）。
+///
+/// 与 `keychain.json` / `ssh.json` 同一目录约定。路径取不到就返回 `None`
+/// （退回仅 stderr，不影响启动）。
+fn log_file_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("deepterm").join("deepterm.log"))
+}
+
 fn main() {
     let default_level = if cfg!(debug_assertions) {
         log::LevelFilter::Debug
     } else {
-        log::LevelFilter::Info
+        log::LevelFilter::Debug
     };
-    env_logger::Builder::from_default_env()
+    let mut builder = env_logger::Builder::from_default_env();
+    builder
         .filter_level(default_level)
         .filter_module("russh", log::LevelFilter::Warn)
         // macOS 的 .AppleSystemUIFont 存在重复注册的字体条目，gpui 的文本系统
         // 每次启动都会为此打 WARN（上游已知噪音，gpui 为固定 rev 的 git 依赖），
         // 静音到 Error 级别。
         .filter_module("gpui_macos", log::LevelFilter::Error)
-        .init();
+        // gpui 每帧都在打 a11y 树更新（实测一次会话 6.9 万行），会把日志文件
+        // 撑爆并冲掉真正有用的线索。
+        .filter_module("gpui::window", log::LevelFilter::Warn);
+
+    // 日志同时落文件：GUI 程序没有可用的stderr（release 下还是
+    // `windows_subsystem = "windows"`，连控制台都没有），排查「补全不弹窗」
+    // 这类问题时只能靠日志文件。写失败就退回仅stderr，不能因此起不来。
+    if let Some(path) = log_file_path() {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+            }
+            Err(e) => {
+                eprintln!("deepterm: cannot open log file {}: {e}", path.display());
+            }
+        }
+    }
+    builder.init();
 
     log::info!("=== DeepTerm 启动 ===");
+    if let Some(path) = log_file_path() {
+        log::info!("日志文件: {}", path.display());
+    }
 
     use deepterm::assets::Assets;
 

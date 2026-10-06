@@ -74,10 +74,7 @@ fn hover_popover_paints_without_panic(cx: &mut gpui::TestAppContext) {
         // 锚在第 2 行（`let x`），内容非空 → 绘制路径会走 defer_draw。
         state.set_hover_popover(
             16,
-            crate::editor::hover::HoverInfo {
-                contents: "```rust\nlet x: i32\n```".to_string(),
-                range: None,
-            },
+crate::editor::hover::HoverInfo::from_plain_text("```rust\nlet x: i32\n```", _cx)
         );
     });
     // 走到这里说明 prepaint + paint 都跑通了。
@@ -114,10 +111,7 @@ fn both_popovers_paint_together(cx: &mut gpui::TestAppContext) {
     let input = draw_with("fn main() {\n    let x = 1;\n}\n", cx, |state, _cx| {
         state.set_hover_popover(
             16,
-            crate::editor::hover::HoverInfo {
-                contents: "hover text".to_string(),
-                range: None,
-            },
+crate::editor::hover::HoverInfo::from_plain_text("hover text", _cx)
         );
         state.set_completion_anchor(16);
         state.set_completion_menu(
@@ -143,10 +137,7 @@ fn popover_with_out_of_range_anchor_is_safe(cx: &mut gpui::TestAppContext) {
         state.set_hover_popover(
             // 远超文本长度：`visible_row_for_offset` 返回 None → 跳过绘制。
             999_999,
-            crate::editor::hover::HoverInfo {
-                contents: "unreachable".to_string(),
-                range: None,
-            },
+crate::editor::hover::HoverInfo::from_plain_text("unreachable", _cx)
         );
     });
 }
@@ -157,10 +148,7 @@ fn empty_popover_content_is_skipped(cx: &mut gpui::TestAppContext) {
     let _ = draw_with("fn main() {}\n", cx, |state, _cx| {
         state.set_hover_popover(
             0,
-            crate::editor::hover::HoverInfo {
-                contents: "   \n  ".to_string(),
-                range: None,
-            },
+crate::editor::hover::HoverInfo::from_plain_text("   \n  ", _cx)
         );
     });
 }
@@ -342,10 +330,7 @@ fn hover_placement(
         let offset = state.text().line_start_offset(anchor_line);
         state.set_hover_popover(
             offset,
-            crate::editor::hover::HoverInfo {
-                contents: "hover".to_string(),
-                range: None,
-            },
+crate::editor::hover::HoverInfo::from_plain_text("hover", _cx)
         );
     });
     let _ = cx.refresh();

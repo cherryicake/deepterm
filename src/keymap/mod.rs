@@ -87,15 +87,30 @@ thread_local! {
 fn load_builtin(cx: &App) -> (Vec<KeyBinding>, Vec<String>) {
     let mut bindings = Vec::new();
     let mut errors = Vec::new();
+    // 逐来源的条数，用来在日志里回答「vim 键位到底加载了没有」。
+    // 此前成功路径完全静默，于是「vim 按键没反应」既无法证实也无法证伪 ——
+    // 分不清是没开、没加载、还是加载了但匹配不上。
+    let mut per_source: Vec<(&str, usize)> = Vec::new();
 
     for (label, source) in builtin_sources(cx) {
         let (loaded, mut errs) = file::parse(source, cx);
+        per_source.push((label, loaded.len()));
         bindings.extend(loaded);
         for error in &errs {
             errors.push(format!("{label}: {error}"));
         }
         errs.clear();
     }
+
+    log::info!(
+        "keymap: 内置键位表已加载，总 {} 条（{}）",
+        bindings.len(),
+        per_source
+            .iter()
+            .map(|(label, n)| format!("{label}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     (bindings, errors)
 }

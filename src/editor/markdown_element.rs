@@ -322,15 +322,34 @@ impl MarkdownElementBuilder {
                         .overflow_hidden();
                     outer.style().refine(&self.style.code_block);
                     self.push_div(outer, &range, markdown_end);
-                    let mut inner = div()
-                        .id(format!("code-inner-{}", code_block_id))
-                        .overflow_x_scroll();
+                    // 代码块默认**不换行**（长签名横向滚动，与 Zed 一致），
+                    // 但**尊重样式自己的设置**：hover 卡片只有 520~680px 宽，
+                    // 又没有可见的横向滚动条，不换行就等于「长内容渲染不出来」。
+                    //
+                    // 所以判据是 `style.code_block.text.white_space`：预览 tab 的
+                    // `MarkdownStyle::themed` 不设这一项（保持 Nowrap，行为不变），
+                    // 而 `hover_style` 显式设成 `Normal` 来要求换行。
+                    //
+                    // 此前这里是无条件 `Nowrap`，把样式里给的设置直接丢掉了。
+                    let wrap = self.style.code_block.text.white_space
+                        == Some(gpui::WhiteSpace::Normal);
+                    let mut inner = div().id(format!("code-inner-{}", code_block_id));
+                    // 换行时不能留 `overflow_x_scroll`：不换行才有横向内容，
+                    // 留着它会让 GPUI 把超宽内容当可滚动区，鼠标一进去就变成
+                    // 横滚而不是纵滚。
+                    inner = if wrap {
+                        inner.overflow_hidden()
+                    } else {
+                        inner.overflow_x_scroll()
+                    };
                     if has_language {
                         inner = inner.pt(px(24.0));
                     }
                     self.push_div(inner, &range, markdown_end);
                     let mut code_text_style = self.style.code_block.text.clone();
-                    code_text_style.white_space = Some(gpui::WhiteSpace::Nowrap);
+                    if !wrap {
+                        code_text_style.white_space = Some(gpui::WhiteSpace::Nowrap);
+                    }
                     self.push_text_style(code_text_style);
                 }
                 MarkdownTag::List(start) => {
