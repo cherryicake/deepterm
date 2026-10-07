@@ -779,11 +779,28 @@ pub fn render_hover_card(
         // 编辑器侧还留了一份几何判断（`hover_popover_contains`）做兜底：
         // 卡片 hitbox 要到它自己那一帧的 prepaint 才存在，两帧之间靠它拦。
         .occlude()
+        // 宽度上限 + 换行的**唯一**来源。两件事必须由同一条约束提供：
+        //
+        //   * 夹住卡片盒子 —— 段落是 `flex().flex_wrap()` 的行容器，它的主轴
+        //     尺寸在 taffy 的内在尺寸算法里取**内容贡献**（不看可用宽度），
+        //     会把卡片顶到内容的自然宽度（实测 1599 / 3183 / …）。
+        //   * 给子内容一个定宽 —— 文本只有拿到 `AvailableSpace::Definite`
+        //     才换行（见 `place_at_anchor::wrap_at` 的注释），可用宽度定下来后
+        //     正好是 `MAX_WIDTH - padding`，段落与代码块都按它折行。
+        //
+        // 老代码为什么坏：`max_w` 把第一遍测量的结果夹成 680，于是「自然宽度
+        // 超上限才改用定宽」的判断 `680 > 680` 恒为假、定宽那一遍从不执行 ——
+        // 卡片 680 宽、里面只有一行高，文字与代码块全溢出到卡片外面。现在
+        // 只量一遍、直接给定宽。
         .max_w(px(MAX_WIDTH))
         .max_h(px(MAX_HEIGHT))
         .flex()
         .flex_col()
         .overflow_y_scroll()
+        // 横向兜底裁剪：换行之后仍可能有**不可断**的长串（长 URL、无空格的
+        // 类型路径）超出卡片；`overflow_y_scroll` 只管纵轴，横轴不裁就会画到
+        // 卡片外面去。
+        .overflow_x_hidden()
         .track_scroll(&scroll_handle)
         .py(px(8.0))
         .px(px(10.0))
