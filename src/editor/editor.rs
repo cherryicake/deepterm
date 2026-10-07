@@ -2350,7 +2350,10 @@ impl Editor {
         .detach();
     }
 
-    /// 安排延迟收起 hover 浮层（鼠标移到空白处时调用）。
+    /// 安排延迟收起 hover 浮层。
+    ///
+    /// 调用方：鼠标移出正文（[`Self::hover_pointer_off_target`]）、当前标签
+    /// 没有 LSP 会话。启动前会先挡掉「键盘接管」「指针在卡片上」两种情形。
     ///
     /// 与 Zed 的 `hiding_delay_task` 同构：收起被推迟 `HOVER_HIDING_DELAY`，
     /// 让指针有机会移到浮层上操作里面的内容；期间若鼠标又回到符号上，
@@ -2388,6 +2391,46 @@ impl Editor {
                 })
                 .ok();
         });
+    }
+
+    /// 指针离开了 hover 的**目标**（落进 gutter/行号栏，Zed
+    /// `element/mouse.rs` 里 `text_hitbox` 不 hovered 的情形）。
+    ///
+    /// 判定本身在 [`hover::HoverState::off_target_action`]（Zed `hover_at(...
+    /// None, position)` 的三支），这里只负责执行：
+    ///
+    /// 1. 没有卡片 → 作废在飞请求；
+    /// 2. 在走远且计时器已排 → 不动它，让计时器跑完；
+    /// 3. 在靠近 / 还没起表 → 重启延迟隐藏，给指针时间赶到浮层上。
+    ///
+    /// `mouse_position` 给 `None` 时判不了远近，一律按「不在靠近」处理 ——
+    /// 与 Zed `if let Some(mouse_position) = ...` 的默认值一致。
+    fn hover_pointer_off_target(
+        &mut self,
+        mouse_position: Option<gpui::Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.active_text_editor(cx) else {
+            return;
+        };
+        // 键盘接管 / 指针已在卡片上：Zed 由 `hover_state.focused(..)` 与卡片的
+        // `stop_propagation` 提前挡掉，我们放在这里省得白跑一遍距离计算。
+        if target.read(cx).hover_keyboard_takeover() || target.read(cx).hover_pointer_inside() {
+            return;
+        }
+        let action = {
+            let state = target.read(cx);
+            self.hover.off_target_action(
+                state.hover_popover().is_some(),
+                mouse_position,
+                state.hover_popover_bounds(),
+            )
+        };
+        match action {
+            hover::OffTargetAction::CancelRequest => self.hover.cancel_request(&target, cx),
+            hover::OffTargetAction::KeepHidingDelay => {}
+            hover::OffTargetAction::ScheduleHide => self.schedule_hover_hide(cx),
+        }
     }
 
     /// 取走后台算好的 hover / 补全 / 符号结果。
@@ -5122,9 +5165,23 @@ impl Render for Editor {
                                             // 用当前帧的行布局算（照抄 Zed 的
                                             // `layout_hover_popovers`）——在这里预先算
                                             // 像素会随滚动/软换行过期，正是之前位置错乱的根因。
-                                            let offset = editor
-                                                .read(cx)
-                                                .index_for_mouse_position(event.position);
+                                            //
+                                            // 取不到偏移 = 指针不在正文上（gutter），
+                                            // 走 Zed `hover_at(..., None, position)` 那一支。
+                                            let offset =
+                                                match editor.read(cx).hover_offset_for_mouse(
+                                                    event.position,
+                                                ) {
+                                                    Some(offset) => offset,
+                                                    None => {
+                                                        this.hover_pointer_off_target(
+                                                            Some(event.position),
+                                                            cx,
+                                                        );
+                                                        cx.notify();
+                                                        return;
+                                                    }
+                                                };
                                             let uri = this
                                                 .active_lsp_session()
                                                 .map(|s| s.uri().clone());

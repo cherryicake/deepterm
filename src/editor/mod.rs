@@ -20,4 +20,6 @@ pub mod syntax;
 pub use editor::*;
 
 #[cfg(test)]
+mod hover_sticky_tests;
+#[cfg(test)]
 mod lsp_jump_tests;

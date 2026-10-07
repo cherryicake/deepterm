@@ -35,19 +35,23 @@
 //!   `on_mouse_move` 根本不会触发，自然也不会再把卡片下的坐标当字符去发
 //!   hover 请求。
 //!
-//! **一处刻意偏离 Zed**：它的 `show_hover` 在新锚点与当前卡片不同时会
-//! `hide_hover()` 立刻收起旧卡片，我们**不**这么做 —— 卡片画在锚点行上方
-//! 10px，从符号往卡片去的路上必然扫过其它行，Zed 那套会让卡片在半路消失
-//! （指针还没到就跑了）。我们的等价物是「无内容 / 移出编辑区 → 延迟
-//! [`HOVER_HIDING_DELAY`] 收起」，见 `request_at` 里的空白响应分支与
-//! [`HoverState::schedule_hide`]。
+//! **立即收起与延迟收起各管一半**（两者都与 Zed 对齐，别再改回单一语义）：
+//! - 换到**另一个符号** → 立刻 `hide_in()` 收起旧卡片（Zed `show_hover` 在
+//!   `same_info_hover` 不成立时先 `hide_hover()`，见 `request_at`）；
+//! - 指针**离开正文**（gutter）→ 走 Zed `hover_at(..., None, ...)` 那一支：
+//!   没有卡片就作废在飞请求；有卡片则按「靠近 / 走远」决定**重启**计时器
+//!   还是让已排的 [`HOVER_HIDING_DELAY`] 走完，见
+//!   [`HoverState::is_mouse_getting_closer`] 与 `Editor::hover_pointer_off_target`。
+//!   延迟的意义是给指针时间赶到浮层上点里面的链接；
+//! - 服务器返回**无内容** → 同样只安排延迟收起，不立刻收（否则从符号去卡片的
+//!   路上经过的其它字符会先把卡片擦掉），见 `request_at` 的空白响应分支。
 
 use std::ops::Range;
 use std::time::Duration;
 
 use gpui::{
-    App, AppContext as _, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
-    StatefulInteractiveElement as _, Styled as _, div, px,
+    App, AppContext as _, Bounds, Entity, InteractiveElement as _, IntoElement, ParentElement as _,
+    Pixels, Point, StatefulInteractiveElement as _, Styled as _, div, px,
 };
 use lsp_types::Url;
 use ropey::Rope;
@@ -141,6 +145,32 @@ pub struct HoverState {
     /// 旧任务若晚于新请求返回，就会把**刚弹出**的卡片擦掉；任务越积越多，
     /// 最后一个返回的总是过期的，于是浮层再也不出现。
     request_generation: u64,
+    /// 指针离浮层**最近**的一次距离（Zed `HoverState::closest_mouse_distance`）。
+    ///
+    /// 只在「指针已经离开 hover 目标」期间有意义：Zed 的 `hover_at(None)`
+    /// 每次移动都调 `is_mouse_getting_closer`，用这个单调量区分「正在往浮层
+    /// 去」与「在走远」—— 往近了才允许把隐藏计时器往后推（给指针时间赶到），
+    /// 走远了就让已排的计时器自己走完。见 [`Self::is_mouse_getting_closer`]。
+    closest_mouse_distance: Option<Pixels>,
+}
+
+/// 指针离开 hover 目标时的处置（Zed `hover_popover.rs::hover_at(..., None, ...)`
+/// 的分支），由 [`HoverState::off_target_action`] 判定、`Editor` 执行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffTargetAction {
+    /// 没有卡片在显示 → 作废在飞的请求（Zed `info_task = None`），免得它晚一步
+    /// 把卡片弹在行号栏上。
+    CancelRequest,
+    /// 指针在走远、且延迟隐藏计时器已排 → 什么都不做，让计时器跑完。
+    ///
+    /// Zed：`if !getting_closer && hiding_delay_task.is_some() { return; }`。
+    /// 少了这句，指针每动一下都会把计时器往后推，卡片永远不收。
+    KeepHidingDelay,
+    /// 指针在靠近浮层，或压根还没起表 → （重启）排一次延迟隐藏。
+    ///
+    /// 判定时**已顺手清掉旧计时器**（否则 [`HoverState::schedule_hide`] 会因为
+    /// 「已经排过」而早退，等于没有重启），调用方直接排新的即可。
+    ScheduleHide,
 }
 
 impl Default for HoverState {
@@ -156,6 +186,7 @@ impl HoverState {
             task: None,
             hiding_delay_task: None,
             request_generation: 0,
+            closest_mouse_distance: None,
         }
     }
 
@@ -168,9 +199,119 @@ impl HoverState {
     pub fn hide(&mut self) {
         self.task.take();
         self.hiding_delay_task = None;
+        self.closest_mouse_distance = None;
     }
 
-    /// 安排一次**延迟隐藏**（鼠标移到空白处时调用）。
+    /// 是否已经排了延迟隐藏（Zed `hiding_delay_task.is_some()`）。
+    pub fn has_pending_hide(&self) -> bool {
+        self.hiding_delay_task.is_some()
+    }
+
+    /// 撤掉已排的延迟隐藏，好让下一次 [`Self::schedule_hide`] 重新起表。
+    ///
+    /// 对应 Zed `hover_at(None)` 里那句
+    /// `if !getting_closer && hiding_delay_task.is_some() { return; }` 的
+    /// **另一半**：指针正在靠近浮层（或压根还没起表）时要**重启**计时器。
+    pub fn cancel_pending_hide(&mut self) {
+        self.hiding_delay_task = None;
+    }
+
+    /// 重新起「最近距离」的尺子。
+    ///
+    /// 对照 Zed `hover_at(Some(anchor))` 开头的
+    /// `closest_mouse_distance = None`：换锚点之后，上一张卡片的几何信息
+    /// 就过期了，留着会把「靠近/走远」判错。
+    pub fn reset_closest_distance(&mut self) {
+        self.closest_mouse_distance = None;
+    }
+
+    /// 指针离开 hover 目标时该做什么（Zed `hover_at(..., None, position)` 的
+    /// 整段分支，判定逻辑抽出来是为了能脱离 `Editor` 单测）。
+    ///
+    /// 三支与 Zed 逐行对应：
+    /// 1. `else if !visible() { info_task = None }` → [`OffTargetAction::CancelRequest`]；
+    /// 2. `if !getting_closer && hiding_delay_task.is_some() { return; }`
+    ///    → [`OffTargetAction::KeepHidingDelay`]；
+    /// 3. 其余（在靠近 / 还没起表）→ [`OffTargetAction::ScheduleHide`]，
+    ///    且先把已排的计时器清掉，好让 [`Self::schedule_hide`] 重新起表。
+    ///
+    /// Zed 的 `hover_popover_sticky = false`（立刻收）那一支 DeepTerm 没有
+    /// 对应设置项，恒按默认的 `true` 处理，故不出现在这里。
+    pub fn off_target_action(
+        &mut self,
+        popover_visible: bool,
+        mouse_position: Option<Point<Pixels>>,
+        popover_bounds: Option<Bounds<Pixels>>,
+    ) -> OffTargetAction {
+        if !popover_visible {
+            return OffTargetAction::CancelRequest;
+        }
+        let getting_closer = mouse_position
+            .is_some_and(|position| self.is_mouse_getting_closer(position, popover_bounds));
+        if !getting_closer && self.has_pending_hide() {
+            return OffTargetAction::KeepHidingDelay;
+        }
+        self.cancel_pending_hide();
+        OffTargetAction::ScheduleHide
+    }
+
+    /// 作废在飞的 hover 请求（**不清**浮层）。
+    ///
+    /// 对照 Zed `hover_at(None)` 里 `!visible()` 的那一支
+    /// （`editor.hover_state.info_task = None`）：指针已经不在正文上了，还让
+    /// 请求晚一步把卡片弹在 gutter 上没有意义。
+    ///
+    /// 只 `task.take()` 拦不住旧任务 —— GPUI 的 `Task` 一 drop 就是 detach、
+    /// 不会取消（见 [`Self::request_generation`]），所以必须连代号一起抬。
+    pub fn cancel_request(&mut self, editor: &Entity<InputState>, cx: &mut App) {
+        self.task.take();
+        self.request_generation = self.request_generation.wrapping_add(1);
+        let generation = self.request_generation;
+        editor.update(cx, |state, _| state.set_hover_request_generation(generation));
+    }
+
+    /// 指针是否正往浮层靠近（Zed `HoverState::is_mouse_getting_closer`）。
+    ///
+    /// 返回 `true` 时调用方应当**重启**延迟隐藏计时器；`false` 分两种情形：
+    /// 没有浮层几何信息（判不了），或者指针已经走过头、正在拉远。
+    ///
+    /// 「拉远」的判据是「比历史最近距离还远 4px 以上」，并且此时**不更新**
+    /// 最近距离 —— 否则指针先冲过头再折返一点点，也会被当成朝浮层去，计时器
+    /// 被无限往后推、卡片永远不收。
+    pub fn is_mouse_getting_closer(
+        &mut self,
+        mouse_position: Point<Pixels>,
+        popover_bounds: Option<Bounds<Pixels>>,
+    ) -> bool {
+        let Some(bounds) = popover_bounds else {
+            return false;
+        };
+        let distance = Self::distance_from_point_to_bounds(mouse_position, bounds);
+        if let Some(closest) = self.closest_mouse_distance
+            && distance > closest + px(4.0)
+        {
+            return false;
+        }
+        self.closest_mouse_distance = Some(distance.min(self.closest_mouse_distance.unwrap_or(distance)));
+        true
+    }
+
+    /// 点到矩形的欧氏距离：在矩形内为 0，否则是到矩形边缘的最短距离。
+    ///
+    /// 照抄 Zed `HoverState::distance_from_point_to_bounds`。
+    fn distance_from_point_to_bounds(point: Point<Pixels>, bounds: Bounds<Pixels>) -> Pixels {
+        let center_x = bounds.origin.x + bounds.size.width / 2.;
+        let center_y = bounds.origin.y + bounds.size.height / 2.;
+        let dx: f32 = ((point.x - center_x).abs() - bounds.size.width / 2.)
+            .max(px(0.0))
+            .into();
+        let dy: f32 = ((point.y - center_y).abs() - bounds.size.height / 2.)
+            .max(px(0.0))
+            .into();
+        px((dx.powi(2) + dy.powi(2)).sqrt())
+    }
+
+    /// 安排一次**延迟隐藏**（指针离开正文、或服务器返回无内容时调用）。
     ///
     /// 已在隐藏中就不重复起计时器——否则连续扫过一片空白会攒出大量任务。
     ///
@@ -260,7 +401,11 @@ impl HoverState {
         // 它在调 `show_hover` **之前**就置空 `hiding_delay_task`，所以这一步
         // 必须在 `same_info_hover` 早退**之前**做：鼠标回到已显示的符号上时，
         // 挂着的收起计划同样该作废。
+        //
+        // 同一位置还有 `closest_mouse_distance = None`（Zed 同款）：新锚点的
+        // 卡片几何不同，旧的最近距离会让「靠近 / 走远」判错。
         self.hiding_delay_task = None;
+        self.closest_mouse_distance = None;
         editor.update(cx, |state, _| state.cancel_hover_hide());
 
         // 对照 Zed `same_info_hover`：卡片已经显示、且这次的偏移仍落在它

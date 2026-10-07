@@ -4642,6 +4642,25 @@ impl InputState {
         self.input_bounds.origin.x + gutter
     }
 
+    /// 鼠标位置 → **hover 目标**的字节偏移；`None` = 指针不在正文上。
+    ///
+    /// 对照 Zed `element/mouse.rs`：它用 `text_hitbox.is_hovered` 分流 ——
+    /// 指针压在正文上调 `hover_at(Some(anchor))`，压在 gutter（行号栏）上则
+    /// `hover_at(None, position)`，走「浮层延迟收起」那条分支
+    /// （`hover_popover.rs::hover_at`）。我们 gutter 与正文共用同一个
+    /// `on_mouse_move` 监听器、没有独立 hitbox，这里用 [`Self::content_left_x`]
+    /// 复现同一条分界线：**恰好**是下面 `index_for_mouse_position` 会把 x 钳回
+    /// 正文左缘的那些位置。
+    ///
+    /// 刻意**不**管「行尾右侧的空白」：那块在 Zed 里同样属于 text hitbox
+    /// （照样 `hover_at(Some)`），我们钳到该行末尾偏移，行为一致。
+    pub fn hover_offset_for_mouse(&self, position: Point<Pixels>) -> Option<usize> {
+        if position.x < self.content_left_x() {
+            return None;
+        }
+        Some(self.index_for_mouse_position(position))
+    }
+
     /// 鼠标位置 → 字节偏移。
     ///
     /// 公开（去掉 `pub(crate)`）供 LSP 的悬浮命中测试使用：LSP 代码在

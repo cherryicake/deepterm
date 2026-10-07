@@ -626,3 +626,52 @@ fn hover_card_wraps_at_every_length(cx: &mut gpui::TestAppContext) {
         "内容翻四倍后卡片应当更高（换行在生效）: {heights:?}"
     );
 }
+
+/// 指针压在行号 gutter 上时取不到 hover 目标。
+///
+/// Zed 靠 `text_hitbox.is_hovered` 分流：gutter 上走 `hover_at(..., None, ...)`
+/// （作废在飞请求 / 排延迟收起），正文上才走 `hover_at(Some(anchor))`。我们
+/// gutter 与正文共用一个 `on_mouse_move`，没有独立 hitbox，改用
+/// `content_left_x` 复现同一条分界线。
+///
+/// 少了这一支：`index_for_mouse_position` 会把 gutter 上的 x 钳回正文左缘、
+/// 当成「正在 hover 第一个字符」，于是一张卡片弹在行号栏上并一直挂着。
+#[gpui::test]
+fn hover_target_is_none_over_the_line_numbers(cx: &mut gpui::TestAppContext) {
+    let input = draw_with("fn main() {\n    let x = 1;\n}\n", cx, |_, _| {});
+    let (content_left, top) = input.read_with(cx, |state, _| {
+        (state.content_left_x(), state.input_bounds.origin.y)
+    });
+    // 前提：行号栏确实有宽度，否则下面的断言退化成「输入框外」的判断。
+    assert!(
+        input.read_with(cx, |state, _| {
+            state
+                .last_layout
+                .as_ref()
+                .map(|layout| layout.line_number_width)
+                .unwrap_or(px(0.))
+        }) > px(0.),
+        "测试前提：代码编辑器必须渲染行号栏"
+    );
+
+    let over_gutter = input.read_with(cx, |state, _| {
+        state.hover_offset_for_mouse(gpui::point(content_left - px(1.), top + px(30.)))
+    });
+    assert_eq!(
+        over_gutter,
+        None,
+        "行号栏上不该有 hover 目标（正文左缘以左一律算 gutter）"
+    );
+
+    // 正文上必须取得到，且不随 y 挑剔（行上方钳到行首、行下方钳到文末，
+    // 都仍是「在正文上」）。
+    for y in [0., 10., 30., 60., 120., 400.] {
+        let offset = input.read_with(cx, |state, _| {
+            state.hover_offset_for_mouse(gpui::point(content_left, top + px(y)))
+        });
+        assert!(
+            offset.is_some(),
+            "正文左缘（y = {y}）必须能取到 hover 目标"
+        );
+    }
+}
