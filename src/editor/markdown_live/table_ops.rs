@@ -85,9 +85,6 @@ pub fn table_col_count(lines: &[Line], block: (usize, usize)) -> usize {
     table_cell_spans(lines.get(probe).map(|l| l.as_str()).unwrap_or("")).len()
 }
 
-
-
-
 /// 生成分隔行（`align` 与 Typora 的生成规则一致：最小宽度 4）。
 pub fn delimiter_for(cols: usize, aligns: &[Align]) -> String {
     let cells: Vec<String> = (0..cols)
@@ -225,11 +222,7 @@ pub fn delete_row(model: &mut EditorModel) -> bool {
         model.move_to(cur.line, end_col, true);
     }
     model.delete_selection();
-    model.move_to(
-        cur.line.min(model.line_count().saturating_sub(1)),
-        0,
-        false,
-    );
+    model.move_to(cur.line.min(model.line_count().saturating_sub(1)), 0, false);
     true
 }
 
@@ -605,18 +598,11 @@ pub fn delete_table(model: &mut EditorModel) -> bool {
     if block.1 + 1 < model.line_count() {
         model.move_to(block.1 + 1, 0, true);
     } else {
-        let end_col = lines
-            .get(block.1)
-            .map(|l| l.chars().count())
-            .unwrap_or(0);
+        let end_col = lines.get(block.1).map(|l| l.chars().count()).unwrap_or(0);
         model.move_to(block.1, end_col, true);
     }
     model.delete_selection();
-    model.move_to(
-        block.0.min(model.line_count().saturating_sub(1)),
-        0,
-        false,
-    );
+    model.move_to(block.0.min(model.line_count().saturating_sub(1)), 0, false);
     true
 }
 
@@ -657,7 +643,13 @@ pub fn prettify_edits(lines: &[Line], block: (usize, usize)) -> Option<Vec<(usiz
     for &i in &rows {
         let cells = split_table_row(&lines[i]);
         let out: Vec<String> = (0..cols)
-            .map(|c| pad(cells.get(c).map(|l| l.as_str()).unwrap_or(""), widths[c], aligns[c]))
+            .map(|c| {
+                pad(
+                    cells.get(c).map(|l| l.as_str()).unwrap_or(""),
+                    widths[c],
+                    aligns[c],
+                )
+            })
             .collect();
         edits.push((i, format!("| {} |", out.join(" | "))));
     }
@@ -715,10 +707,7 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
         return false;
     }
     let Some((row, col, _)) = crate::editor::markdown_live::interactions::table_cell_at(
-        &lines,
-        &is_table,
-        cur.line,
-        cur.col,
+        &lines, &is_table, cur.line, cur.col,
     ) else {
         return false;
     };
@@ -736,7 +725,9 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
             let t = l.trim();
             let t = t.strip_prefix('|').unwrap_or(t);
             let t = t.strip_suffix('|').unwrap_or(t);
-            t.split('|').map(|c| c.trim().to_string()).collect::<Vec<_>>()
+            t.split('|')
+                .map(|c| c.trim().to_string())
+                .collect::<Vec<_>>()
         })
         .filter(|r| !r.is_empty())
         .collect();
@@ -789,10 +780,7 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
     // 写入粘贴内容。
     for (dr, cells) in pasted.iter().enumerate() {
         for (dc, cell) in cells.iter().enumerate() {
-            if let Some(slot) = grid
-                .get_mut(row + dr)
-                .and_then(|r| r.get_mut(col + dc))
-            {
+            if let Some(slot) = grid.get_mut(row + dr).and_then(|r| r.get_mut(col + dc)) {
                 *slot = cell.clone();
             }
         }
@@ -819,14 +807,7 @@ pub fn paste_into_table(model: &mut EditorModel, text: &str) -> bool {
     let last_row = row + pasted.len() - 1;
     let last_col = col + pasted.last().map(Vec::len).unwrap_or(1).saturating_sub(1);
     crate::editor::markdown_live::interactions::table_goto_cell(
-        model,
-        &after,
-        &is_t,
-        cur.line,
-        last_row,
-        last_col,
-        true,
-        false,
+        model, &after, &is_t, cur.line, last_row, last_col, true, false,
     );
     true
 }
@@ -1012,11 +993,7 @@ pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool 
             ops.push((byte_for_col(text, cs), byte_for_col(text, ce), ""));
         }
         if l == start.line {
-            ops.push((
-                byte_for_col(text, s_cs),
-                byte_for_col(text, s_ce),
-                &merged,
-            ));
+            ops.push((byte_for_col(text, s_cs), byte_for_col(text, s_ce), &merged));
         }
         let mut new_text = text.to_string();
         for (bs, be, repl) in ops {
@@ -1282,7 +1259,10 @@ mod tests {
         m.move_to(0, 1, false);
         assert!(prettify_table(&mut m));
         // 各列按最宽内容补齐（CJK 按 2 列宽）。
-        assert_eq!(m.text(), "| a    | bb   |\n| ---- | ---- |\n| ccc  | d    |\n");
+        assert_eq!(
+            m.text(),
+            "| a    | bb   |\n| ---- | ---- |\n| ccc  | d    |\n"
+        );
     }
 
     #[test]
@@ -1326,7 +1306,10 @@ mod tests {
     fn paste_skips_delimiter_lines_and_refuses_plain_text() {
         // 分隔行跳过。
         let mut m = model_at(2, 2);
-        assert!(paste_into_table(&mut m, "| p | q |\n|---|---|\n| r | s |\n"));
+        assert!(paste_into_table(
+            &mut m,
+            "| p | q |\n|---|---|\n| r | s |\n"
+        ));
         assert_eq!(
             m.text(),
             "| a | b | c |\n|---|---|---|\n| p | q | 3 |\n| r | s | 6 |\n\ntail\n"
@@ -1363,14 +1346,22 @@ mod tests {
         let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(
             "用 `a | b` 表示或运算\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾部 | 段落\n",
         );
-        assert_eq!(table_block_range(&lines, 2), Some((1, 3)), "前导段落行不得进块");
+        assert_eq!(
+            table_block_range(&lines, 2),
+            Some((1, 3)),
+            "前导段落行不得进块"
+        );
         // 块内数据行：表头 + 1 条数据（段落行不在其中）。
         assert_eq!(table_data_rows(&lines, (1, 3)), vec![1, 3]);
         // 表头保护仍然生效：对表头行删行 = 无操作。
         let mut m = EditorModel::new(&crate::editor::markdown_live::model::join_lines(&lines));
         m.move_to(1, 2, false);
         assert!(!delete_row(&mut m), "表头不可删");
-        assert_eq!(m.text(), crate::editor::markdown_live::model::join_lines(&lines), "拒绝时不得改动文本");
+        assert_eq!(
+            m.text(),
+            crate::editor::markdown_live::model::join_lines(&lines),
+            "拒绝时不得改动文本"
+        );
         // 块范围与渲染器分类一致（同源，不可能再出现「op 改了渲染器不认为
         // 是表格的行」）。
         let classified = classify_document(&lines);

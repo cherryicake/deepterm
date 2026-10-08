@@ -194,7 +194,10 @@ fn real_diagnostics_convert_to_byte_ranges() {
     };
     let out = features::to_diagnostics(&rope, vec![d]);
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].severity, crate::editor::syntax::DiagnosticSeverity::Warning);
+    assert_eq!(
+        out[0].severity,
+        crate::editor::syntax::DiagnosticSeverity::Warning
+    );
     // 区间必须落在文本内且在字符边界上——`DiagnosticSet::set` 依赖这一点。
     assert!(out[0].range.end <= rope.len());
     assert!(rope.is_char_boundary(out[0].range.start));

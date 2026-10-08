@@ -60,10 +60,7 @@ fn kitty_sequence_for(keystroke: &Keystroke, mode: &TermMode) -> Option<Vec<u8>>
             keystroke.key.as_str(),
             "tab" | "return" | "enter" | "backspace"
         ) && mods == 0b0000_0001;
-        let needs_csi_u = keystroke.key == "escape"
-            || encode_all
-            || has_mods
-            || shift_only_named;
+        let needs_csi_u = keystroke.key == "escape" || encode_all || has_mods || shift_only_named;
         if needs_csi_u {
             // 这些键不产出文本（除 Space），text 段为 None。
             let text = if keystroke.key == "space" {
@@ -112,12 +109,7 @@ fn kitty_sequence_for(keystroke: &Keystroke, mode: &TermMode) -> Option<Vec<u8>>
 /// - `base` / `payload` 二选一：数字基础码或含 alternate 的复合 payload；
 /// - 修饰键位序（kitty 协议）：shift=1, alt=2, ctrl=4, super=8，
 ///   序列中值 = 位集 + 1；无修饰且无文本时可省略（kitty 默认 1）。
-fn kitty_csi_u(
-    base: Option<u32>,
-    payload: Option<String>,
-    mods: u8,
-    text: Option<u32>,
-) -> Vec<u8> {
+fn kitty_csi_u(base: Option<u32>, payload: Option<String>, mods: u8, text: Option<u32>) -> Vec<u8> {
     let mut seq = String::from("\x1b[");
     if let Some(p) = payload.as_deref() {
         seq.push_str(p);
@@ -415,8 +407,7 @@ mod tests {
     // ── Kitty keyboard protocol ───────────────────────────────────────────────────
 
     fn kitty_esc(key: &str, mode: TermMode) -> Option<String> {
-        to_esc_str(&keystroke(key), &mode, false)
-            .map(|b| String::from_utf8(b).unwrap())
+        to_esc_str(&keystroke(key), &mode, false).map(|b| String::from_utf8(b).unwrap())
     }
 
     fn disambiguate() -> TermMode {
@@ -439,10 +430,22 @@ mod tests {
 
     #[test]
     fn kitty_disambiguate_modified_control_keys_use_csi_u() {
-        assert_eq!(kitty_esc("ctrl-enter", disambiguate()).unwrap(), "\u{1b}[13;5u");
-        assert_eq!(kitty_esc("shift-tab", disambiguate()).unwrap(), "\u{1b}[9;2u");
-        assert_eq!(kitty_esc("alt-backspace", disambiguate()).unwrap(), "\u{1b}[127;3u");
-        assert_eq!(kitty_esc("shift-enter", disambiguate()).unwrap(), "\u{1b}[13;2u");
+        assert_eq!(
+            kitty_esc("ctrl-enter", disambiguate()).unwrap(),
+            "\u{1b}[13;5u"
+        );
+        assert_eq!(
+            kitty_esc("shift-tab", disambiguate()).unwrap(),
+            "\u{1b}[9;2u"
+        );
+        assert_eq!(
+            kitty_esc("alt-backspace", disambiguate()).unwrap(),
+            "\u{1b}[127;3u"
+        );
+        assert_eq!(
+            kitty_esc("shift-enter", disambiguate()).unwrap(),
+            "\u{1b}[13;2u"
+        );
     }
 
     #[test]
@@ -452,7 +455,10 @@ mod tests {
         // alt+a → CSI 97;3u（替换 legacy ESC a）
         assert_eq!(kitty_esc("alt-a", disambiguate()).unwrap(), "\u{1b}[97;3u");
         // ctrl+shift+a → CSI 97;6u
-        assert_eq!(kitty_esc("ctrl-shift-a", disambiguate()).unwrap(), "\u{1b}[97;6u");
+        assert_eq!(
+            kitty_esc("ctrl-shift-a", disambiguate()).unwrap(),
+            "\u{1b}[97;6u"
+        );
     }
 
     #[test]

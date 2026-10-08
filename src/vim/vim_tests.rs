@@ -70,7 +70,9 @@ fn vim_editor_with_language<'a>(
     let cell = std::cell::RefCell::new(None);
     let (host, cx) = cx.add_window_view(|window, cx| {
         let state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).code_editor(language.clone()).multi_line(true);
+            let mut state = InputState::new(window, cx)
+                .code_editor(language.clone())
+                .multi_line(true);
             state.vim = Some(VimState::default());
             state
         });
@@ -147,7 +149,11 @@ fn normal_mode_swallows_printable_keys(cx: &mut TestAppContext) {
 
     // `h` 在 Normal 下是「左移」，绝不能插入字符。
     press(cx, "h");
-    assert_eq!(text_of(&state, cx), "hello world\n", "Normal 模式不得插入字符");
+    assert_eq!(
+        text_of(&state, cx),
+        "hello world\n",
+        "Normal 模式不得插入字符"
+    );
 
     // 一个未绑定的键（vim 里是「无操作」）同样不得插入。
     press(cx, "z");
@@ -179,7 +185,11 @@ fn normal_mode_motions_move_the_cursor(cx: &mut TestAppContext) {
 
     // `$` 停在行内最后一个字符上（vim 语义），即 "hello world" 的 `d`（偏移 10）。
     press(cx, "$");
-    assert_eq!(cursor_of(&state, cx), 10, "`$` 应停在行尾字符上，而非换行之后");
+    assert_eq!(
+        cursor_of(&state, cx),
+        10,
+        "`$` 应停在行尾字符上，而非换行之后"
+    );
 
     // `w` 从行首跳到下一个词首。
     press(cx, "0");
@@ -307,7 +317,9 @@ fn vim_disabled_leaves_editing_untouched(cx: &mut TestAppContext) {
     let cell = std::cell::RefCell::new(None);
     let (_host, cx) = cx.add_window_view(|window, cx| {
         let state = cx.new(|cx| {
-            InputState::new(window, cx).code_editor("text").multi_line(true)
+            InputState::new(window, cx)
+                .code_editor("text")
+                .multi_line(true)
         });
         state.update(cx, |state, cx| {
             state.set_value("abc", window, cx);
@@ -539,7 +551,11 @@ fn delete_inner_word_leaves_surrounding_space(cx: &mut TestAppContext) {
 
     // `diw` 只删词本身，保留空格。
     press_all(cx, "d i w");
-    assert_eq!(text_of(&state, cx), " world\n", "`diw` 应只删词，保留分隔空白");
+    assert_eq!(
+        text_of(&state, cx),
+        " world\n",
+        "`diw` 应只删词，保留分隔空白"
+    );
 }
 
 // ==================== Visual 模式 ====================
@@ -569,7 +585,10 @@ fn visual_motion_extends_selection(cx: &mut TestAppContext) {
     press(cx, "l");
     press(cx, "l");
     let selected = state.read_with(cx, |state, _| state.selected_range.len());
-    assert!(selected > 0, "可视模式下移动应产生非空选区（实际 {selected}）");
+    assert!(
+        selected > 0,
+        "可视模式下移动应产生非空选区（实际 {selected}）"
+    );
 }
 
 #[gpui::test]
@@ -585,7 +604,8 @@ fn visual_delete_removes_selection(cx: &mut TestAppContext) {
         press(cx, "l");
         let cursor = cursor_of(&state, cx);
         assert_eq!(
-            cursor, expected,
+            cursor,
+            expected,
             "第 {} 次 `l` 后光标应在 {expected}（实际 {cursor}）",
             i + 1
         );
@@ -651,7 +671,11 @@ fn visual_change_replaces_selection_and_enters_insert(cx: &mut TestAppContext) {
         press(cx, "l");
     }
     press(cx, "c");
-    assert_eq!(mode_of(&state, cx), VimMode::Insert, "可视 `c` 应进入 Insert");
+    assert_eq!(
+        mode_of(&state, cx),
+        VimMode::Insert,
+        "可视 `c` 应进入 Insert"
+    );
 
     type_text(cx, "HI");
     assert_eq!(text_of(&state, cx), "HI world\n", "应替换原选区");
@@ -917,11 +941,7 @@ fn unnamed_register_holds_last_delete(cx: &mut TestAppContext) {
     assert_eq!(text_of(&state, cx), "two\n");
 
     press(cx, "p");
-    assert_eq!(
-        text_of(&state, cx),
-        "two\none\n",
-        "`p` 应粘贴刚删除的整行"
-    );
+    assert_eq!(text_of(&state, cx), "two\none\n", "`p` 应粘贴刚删除的整行");
 }
 
 #[gpui::test]
@@ -1015,7 +1035,10 @@ fn disabling_vim_clears_state_and_restores_typing(cx: &mut TestAppContext) {
     // 回归背景：关掉 vim 开关后，编辑器残留的 Normal 模式会继续吞掉按键，
     // 而 vim 键位表已随开关卸载——编辑器在重启前无法输入。
     let (state, cx) = vim_editor(cx, "hello\n");
-    assert!(state.read_with(cx, |s, _| s.vim.is_some()), "前置：vim 已启用");
+    assert!(
+        state.read_with(cx, |s, _| s.vim.is_some()),
+        "前置：vim 已启用"
+    );
 
     cx.update(|_window, cx| {
         crate::settings::SettingsStore::update_user(cx, |content| {
@@ -1031,11 +1054,7 @@ fn disabling_vim_clears_state_and_restores_typing(cx: &mut TestAppContext) {
 
     // 清掉之后按键应恢复为普通文本输入（不再被吞）。
     type_text(cx, "Z");
-    assert_eq!(
-        text_of(&state, cx),
-        "Zhello\n",
-        "关闭 vim 后输入应恢复正常"
-    );
+    assert_eq!(text_of(&state, cx), "Zhello\n", "关闭 vim 后输入应恢复正常");
 }
 
 #[gpui::test]
@@ -1053,7 +1072,9 @@ fn enabling_vim_installs_state_on_existing_editors(cx: &mut TestAppContext) {
     let cell = std::cell::RefCell::new(None);
     let (_, cx) = cx.add_window_view(|window, cx| {
         let state = cx.new(|cx| {
-            InputState::new(window, cx).code_editor("text").multi_line(true)
+            InputState::new(window, cx)
+                .code_editor("text")
+                .multi_line(true)
         });
         state.update(cx, |state, cx| {
             state.set_value("hello\n", window, cx);
@@ -1064,7 +1085,10 @@ fn enabling_vim_installs_state_on_existing_editors(cx: &mut TestAppContext) {
         VimHost { state }
     });
     let state = cell.into_inner().unwrap();
-    assert!(state.read_with(cx, |s, _| s.vim.is_none()), "前置：vim 未启用");
+    assert!(
+        state.read_with(cx, |s, _| s.vim.is_none()),
+        "前置：vim 未启用"
+    );
 
     cx.update(|_window, cx| {
         crate::settings::SettingsStore::update_user(cx, |content| {
@@ -1112,9 +1136,7 @@ fn input_host_with(
 /// 起一个 vim 已启用、但输入框是普通单行框的环境，返回该输入框。
 ///
 /// 与 `vim_editor` 的区别只在输入框类型：那条路径建的是代码编辑器。
-fn plain_input_host(
-    cx: &mut TestAppContext,
-) -> (Entity<InputState>, &mut VisualTestContext) {
+fn plain_input_host(cx: &mut TestAppContext) -> (Entity<InputState>, &mut VisualTestContext) {
     input_host_with(cx, |window, cx| {
         // 单行普通输入框：与搜索框、表单字段、提交框同一条构造路径。
         cx.new(|cx| InputState::new(window, cx).placeholder("搜索"))
@@ -1200,10 +1222,7 @@ fn vim_is_not_installed_on_plain_inputs(cx: &mut TestAppContext) {
     });
 
     state.read_with(cx, |state, _| {
-        assert!(
-            state.vim.is_none(),
-            "普通单行输入框不得装上 vim 状态"
-        );
+        assert!(state.vim.is_none(), "普通单行输入框不得装上 vim 状态");
         assert!(!state.vim_capable(), "普通单行输入框不是 vim 的适用面");
     });
 }
@@ -1265,7 +1284,9 @@ fn vim_applies_to_code_editors_but_not_plain_inputs(cx: &mut TestAppContext) {
     let cells = std::cell::RefCell::new(None);
     let (_, cx) = cx.add_window_view(|window, cx| {
         let code = cx.new(|cx| {
-            InputState::new(window, cx).code_editor("rust").multi_line(true)
+            InputState::new(window, cx)
+                .code_editor("rust")
+                .multi_line(true)
         });
         let plain = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
         let multiline = cx.new(|cx| InputState::new(window, cx).multi_line(true));
@@ -1343,7 +1364,11 @@ fn nested_find_input_keeps_typing_in_normal_mode(cx: &mut TestAppContext) {
     let find_input = find_input.expect("打开查找后应有搜索面板");
 
     // 前置：编辑器处于 Normal 模式——这正是 vim 键位生效的条件。
-    assert_eq!(mode_of(&state, cx), VimMode::Normal, "前置：编辑器应在 Normal");
+    assert_eq!(
+        mode_of(&state, cx),
+        VimMode::Normal,
+        "前置：编辑器应在 Normal"
+    );
 
     // 前置：焦点确实在查找框里，否则这条测的就成了别的东西。
     let focused = cx.update(|window, cx| {
@@ -1486,7 +1511,9 @@ fn marks_survive_across_editors(cx: &mut TestAppContext) {
     let cell = std::cell::RefCell::new(None);
     let (_, cx) = cx.add_window_view(|window, cx| {
         let state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).code_editor("text").multi_line(true);
+            let mut state = InputState::new(window, cx)
+                .code_editor("text")
+                .multi_line(true);
             state.vim = Some(VimState::default());
             state
         });
@@ -1531,7 +1558,10 @@ fn stale_count_does_not_leak_into_next_operator(cx: &mut TestAppContext) {
         )
     });
     assert_eq!(cursor, 31, "`3j` 应下移三行（到 line4 行首）");
-    assert_eq!(count, None, "`3j` 之后计数必须已清空（否则泄漏到下一个命令）");
+    assert_eq!(
+        count, None,
+        "`3j` 之后计数必须已清空（否则泄漏到下一个命令）"
+    );
 
     // 回到首行再 `dw`：只应删一个词。
     press_all(cx, "g g");
@@ -1555,11 +1585,7 @@ fn gg_works_after_a_counted_motion(cx: &mut TestAppContext) {
     assert_eq!(cursor_of(&state, cx), 31, "前置：`3j` 应到第四行");
 
     press_all(cx, "g g");
-    assert_eq!(
-        cursor_of(&state, cx),
-        0,
-        "`3j` 之后 `gg` 仍应回到文档开头"
-    );
+    assert_eq!(cursor_of(&state, cx), 0, "`3j` 之后 `gg` 仍应回到文档开头");
 }
 
 /// `2dd` 应删两行。
@@ -1657,21 +1683,14 @@ fn gv_restores_exact_selection_after_toggle(cx: &mut TestAppContext) {
     cx.refresh().unwrap();
     press(cx, "l");
     press(cx, "l");
-    let original = state.read_with(cx, |s, _| {
-        (s.selected_range.start, s.selected_range.end)
-    });
+    let original = state.read_with(cx, |s, _| (s.selected_range.start, s.selected_range.end));
 
     // 再按 `v` 退出（toggle 路径），然后 `gv` 恢复。
     press(cx, "v");
     press_all(cx, "g v");
 
-    let restored = state.read_with(cx, |s, _| {
-        (s.selected_range.start, s.selected_range.end)
-    });
-    assert_eq!(
-        original, restored,
-        "`gv` 应恢复与原选区完全一致的范围"
-    );
+    let restored = state.read_with(cx, |s, _| (s.selected_range.start, s.selected_range.end));
+    assert_eq!(original, restored, "`gv` 应恢复与原选区完全一致的范围");
 }
 
 /// 可视模式下 `$` 应扩展选区到行尾，而不是塌缩选区。
@@ -1978,11 +1997,7 @@ fn delete_around_quote_removes_quotes(cx: &mut TestAppContext) {
     press(cx, "d");
     press(cx, "a");
     press(cx, "\"");
-    assert_eq!(
-        text_of(&state, cx),
-        "let x = ;",
-        "`da\"` 应连引号一起删掉"
-    );
+    assert_eq!(text_of(&state, cx), "let x = ;", "`da\"` 应连引号一起删掉");
 }
 
 #[gpui::test]
@@ -2029,11 +2044,7 @@ fn delete_inner_paragraph_removes_lines(cx: &mut TestAppContext) {
     press(cx, "d");
     press(cx, "i");
     press(cx, "p");
-    assert_eq!(
-        text_of(&state, cx),
-        "\nthree\n",
-        "`dip` 应删掉整段（两行）"
-    );
+    assert_eq!(text_of(&state, cx), "\nthree\n", "`dip` 应删掉整段（两行）");
 }
 
 #[gpui::test]
@@ -2047,11 +2058,7 @@ fn delete_inner_tag_removes_tag_content(cx: &mut TestAppContext) {
     press(cx, "d");
     press(cx, "i");
     press(cx, "t");
-    assert_eq!(
-        text_of(&state, cx),
-        "<div></div>\n",
-        "`dit` 应只删标签内容"
-    );
+    assert_eq!(text_of(&state, cx), "<div></div>\n", "`dit` 应只删标签内容");
 }
 
 #[gpui::test]
@@ -2076,7 +2083,11 @@ fn missing_object_leaves_text_unchanged(cx: &mut TestAppContext) {
     press(cx, "d");
     press(cx, "i");
     press(cx, "\"");
-    assert_eq!(text_of(&state, cx), "no quotes here\n", "找不到对象时不得改动文本");
+    assert_eq!(
+        text_of(&state, cx),
+        "no quotes here\n",
+        "找不到对象时不得改动文本"
+    );
     state.read_with(cx, |state, _| {
         assert_eq!(
             state.vim.as_ref().unwrap().active_operator_id(),
@@ -2160,7 +2171,11 @@ fn join_lines_merges_with_space(cx: &mut TestAppContext) {
     let (state, cx) = vim_editor(cx, "one\ntwo\n");
 
     press(cx, "shift-j");
-    assert_eq!(text_of(&state, cx), "one two\n", "`J` 应把下一行接上来并补空格");
+    assert_eq!(
+        text_of(&state, cx),
+        "one two\n",
+        "`J` 应把下一行接上来并补空格"
+    );
 }
 
 #[gpui::test]
@@ -2222,11 +2237,7 @@ fn undo_restores_the_deleted_line(cx: &mut TestAppContext) {
 
     // `u` 必须把删掉的内容找回来——这是最基础的编辑循环。
     press(cx, "u");
-    assert_eq!(
-        text_of(&state, cx),
-        "one\ntwo\nthree\n",
-        "`u` 应撤销 `dd`"
-    );
+    assert_eq!(text_of(&state, cx), "one\ntwo\nthree\n", "`u` 应撤销 `dd`");
 }
 
 #[gpui::test]
@@ -2357,11 +2368,7 @@ fn open_line_below_inserts_new_line(cx: &mut TestAppContext) {
     assert_eq!(mode_of(&state, cx), VimMode::Insert, "`o` 应进入 Insert");
     type_text(cx, "mid");
     press(cx, "escape");
-    assert_eq!(
-        text_of(&state, cx),
-        "one\nmid\ntwo\n",
-        "`o` 应在下方开新行"
-    );
+    assert_eq!(text_of(&state, cx), "one\nmid\ntwo\n", "`o` 应在下方开新行");
 }
 
 #[gpui::test]
@@ -2371,11 +2378,7 @@ fn open_line_above_inserts_new_line(cx: &mut TestAppContext) {
     press(cx, "shift-o");
     type_text(cx, "top");
     press(cx, "escape");
-    assert_eq!(
-        text_of(&state, cx),
-        "top\none\ntwo\n",
-        "`O` 应在上方开新行"
-    );
+    assert_eq!(text_of(&state, cx), "top\none\ntwo\n", "`O` 应在上方开新行");
 }
 
 #[gpui::test]
@@ -2403,10 +2406,7 @@ fn capital_y_yanks_whole_line(cx: &mut TestAppContext) {
     press(cx, "j");
     press(cx, "p");
     let text = text_of(&state, cx);
-    assert!(
-        text.contains("one"),
-        "`Y` + `p` 应粘贴整行：{text:?}"
-    );
+    assert!(text.contains("one"), "`Y` + `p` 应粘贴整行：{text:?}");
 }
 
 #[gpui::test]
@@ -2604,7 +2604,11 @@ fn find_works_as_operator_target(cx: &mut TestAppContext) {
     press(cx, "d");
     press(cx, "f");
     type_char_via_interceptor(cx, &state, 'o');
-    assert_eq!(text_of(&state, cx), " world\n", "`dfo` 应删到 `o` 为止（含）");
+    assert_eq!(
+        text_of(&state, cx),
+        " world\n",
+        "`dfo` 应删到 `o` 为止（含）"
+    );
 }
 
 #[gpui::test]
@@ -2614,10 +2618,7 @@ fn toggle_comment_comments_the_line(cx: &mut TestAppContext) {
 
     press_all(cx, "g c");
     let text = text_of(&state, cx);
-    assert!(
-        text.contains("//"),
-        "`gc` 应给当前行加注释：{text:?}"
-    );
+    assert!(text.contains("//"), "`gc` 应给当前行加注释：{text:?}");
 }
 
 #[gpui::test]
@@ -2679,4 +2680,3 @@ fn matching_bracket_jumps_between_pair(cx: &mut TestAppContext) {
     });
     assert_ne!(back, target, "往返跳转必须真的移动光标");
 }
-

@@ -79,7 +79,8 @@ fn rust_analyzer_feature_requests() {
         return;
     }
     let dir = rust_project("requests");
-    let src = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\nfn main() {\n    let _ = add(1, 2);\n}\n";
+    let src =
+        "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\nfn main() {\n    let _ = add(1, 2);\n}\n";
     let file = dir.join("src").join("main.rs");
     std::fs::write(&file, src).unwrap();
 
@@ -88,7 +89,10 @@ fn rust_analyzer_feature_requests() {
             .await
             .expect("start");
         let uri = Url::from_file_path(&file).unwrap();
-        client.did_open(&uri, "rust", 0, src).await.expect("didOpen");
+        client
+            .did_open(&uri, "rust", 0, src)
+            .await
+            .expect("didOpen");
 
         // 服务器的首次分析要跑 cargo metadata，并行跑测试时明显变慢；
         // 所有请求都走 `retry_until_ready`，避开分析期间返回的瞬时态错误。
@@ -142,7 +146,9 @@ fn rust_analyzer_feature_requests() {
         assert!(!items.is_empty(), "rust-analyzer returned no completions");
         // 每条候选都要能取出可展示的 label。
         assert!(
-            items.iter().any(|i| !features::completion_label(i).is_empty()),
+            items
+                .iter()
+                .any(|i| !features::completion_label(i).is_empty()),
             "no completion item had a label"
         );
 
@@ -211,12 +217,15 @@ fn clangd_feature_requests() {
     let dir = std::env::temp_dir().join("deepterm-lsp-feat-clangd");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let src = "int mul(int a, int b) {\n    return a * b;\n}\n\nint main() {\n    return mul(2, 3);\n}\n";
+    let src =
+        "int mul(int a, int b) {\n    return a * b;\n}\n\nint main() {\n    return mul(2, 3);\n}\n";
     let file = dir.join("main.cpp");
     std::fs::write(&file, src).unwrap();
 
     smol::block_on(async {
-        let client = LspClient::start("clangd", &[], dir.clone()).await.expect("start");
+        let client = LspClient::start("clangd", &[], dir.clone())
+            .await
+            .expect("start");
         let uri = Url::from_file_path(&file).unwrap();
         client.did_open(&uri, "cpp", 0, src).await.expect("didOpen");
         smol::Timer::after(Duration::from_secs(3)).await;

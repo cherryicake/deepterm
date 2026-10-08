@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui::{relative,
-    App, Context, CursorStyle, Element, Entity, FocusHandle,
-    GlobalElementId, InteractiveElement, IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Render, Style, Styled, Subscription, Window, div, px,
+use gpui::{
+    App, Context, CursorStyle, Element, Entity, FocusHandle, GlobalElementId, InteractiveElement,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
+    Styled, Subscription, Window, div, px, relative,
 };
 use gpui::{EventEmitter, KeyBinding, actions, prelude::*};
 
@@ -42,7 +42,18 @@ use crate::workspace::tab_bar::{
 // Define workspace actions
 actions!(
     workspace,
-    [NewLocalTerminal, CloseSelectedPanel, NewTerminalTab, ReopenClosedTab, NextTab, PreviousTab, FocusSplitLeft, FocusSplitRight, FocusSplitUp, FocusSplitDown]
+    [
+        NewLocalTerminal,
+        CloseSelectedPanel,
+        NewTerminalTab,
+        ReopenClosedTab,
+        NextTab,
+        PreviousTab,
+        FocusSplitLeft,
+        FocusSplitRight,
+        FocusSplitUp,
+        FocusSplitDown
+    ]
 );
 
 /// 跳转到第 N 个 tab（0 基）：cmd-1..9 为前 9 个，cmd-0 为第 10 个。
@@ -91,75 +102,78 @@ impl EventEmitter<WorkspaceEvent> for Workspace {}
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
     // 使用 None 作为 context，让这些快捷键全局有效
-    crate::keymap::bind(cx, [
-        #[cfg(target_os = "windows")]
-        KeyBinding::new("ctrl-l", NewLocalTerminal, None),
-        #[cfg(not(target_os = "windows"))]
-        KeyBinding::new("cmd-l", NewLocalTerminal, None),
-        KeyBinding::new("cmd-w", CloseSelectedPanel, None),
-        // 新 tab：cmd-t（win/linux 用 ctrl-shift-t，ctrl-t 是 shell 的输出重定向切换）
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-t", NewTerminalTab, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-t", NewTerminalTab, None),
-        // 重开最近关闭的 tab：cmd-shift-t（mac）/ ctrl-alt-t（其他）
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-alt-t", ReopenClosedTab, None),
-        // Tab 轮换：cmd-shift-] / cmd-shift-[（win/linux 用 ctrl-pageup/down）
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-]", NextTab, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-[", PreviousTab, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-pageup", PreviousTab, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-pagedown", NextTab, None),
-        // cmd+1..9 直接切到第 N 个 tab（0 = 第 10 个）
-        KeyBinding::new("cmd-1", GotoTab(0), None),
-        KeyBinding::new("cmd-2", GotoTab(1), None),
-        KeyBinding::new("cmd-3", GotoTab(2), None),
-        KeyBinding::new("cmd-4", GotoTab(3), None),
-        KeyBinding::new("cmd-5", GotoTab(4), None),
-        KeyBinding::new("cmd-6", GotoTab(5), None),
-        KeyBinding::new("cmd-7", GotoTab(6), None),
-        KeyBinding::new("cmd-8", GotoTab(7), None),
-        KeyBinding::new("cmd-9", GotoTab(8), None),
-        // cmd-0 是第 10 个 tab（与 cmd-1..9 同源），字号复位让位给 cmd-shift-0
-        KeyBinding::new("cmd-0", GotoTab(9), None),
-        // 分屏导航：cmd+alt+方向键（win/linux 用 ctrl+alt+方向键）
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-alt-left", FocusSplitLeft, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-alt-right", FocusSplitRight, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-alt-up", FocusSplitUp, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-alt-down", FocusSplitDown, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-alt-left", FocusSplitLeft, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-alt-right", FocusSplitRight, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-alt-up", FocusSplitUp, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-alt-down", FocusSplitDown, None),
-        // 字号：cmd +/-/0（win/linux 用 ctrl +/-/0）。
-        // 注意 win/linux 下 ctrl+0 / ctrl+plus 不会与浏览器风格冲突。
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-+", IncreaseFontSize, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-", DecreaseFontSize, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-0", ResetFontSize, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-+", IncreaseFontSize, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-", DecreaseFontSize, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-0", ResetFontSize, None),
-    ]);
+    crate::keymap::bind(
+        cx,
+        [
+            #[cfg(target_os = "windows")]
+            KeyBinding::new("ctrl-l", NewLocalTerminal, None),
+            #[cfg(not(target_os = "windows"))]
+            KeyBinding::new("cmd-l", NewLocalTerminal, None),
+            KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+            // 新 tab：cmd-t（win/linux 用 ctrl-shift-t，ctrl-t 是 shell 的输出重定向切换）
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-t", NewTerminalTab, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-t", NewTerminalTab, None),
+            // 重开最近关闭的 tab：cmd-shift-t（mac）/ ctrl-alt-t（其他）
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-alt-t", ReopenClosedTab, None),
+            // Tab 轮换：cmd-shift-] / cmd-shift-[（win/linux 用 ctrl-pageup/down）
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-]", NextTab, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-[", PreviousTab, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-pageup", PreviousTab, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-pagedown", NextTab, None),
+            // cmd+1..9 直接切到第 N 个 tab（0 = 第 10 个）
+            KeyBinding::new("cmd-1", GotoTab(0), None),
+            KeyBinding::new("cmd-2", GotoTab(1), None),
+            KeyBinding::new("cmd-3", GotoTab(2), None),
+            KeyBinding::new("cmd-4", GotoTab(3), None),
+            KeyBinding::new("cmd-5", GotoTab(4), None),
+            KeyBinding::new("cmd-6", GotoTab(5), None),
+            KeyBinding::new("cmd-7", GotoTab(6), None),
+            KeyBinding::new("cmd-8", GotoTab(7), None),
+            KeyBinding::new("cmd-9", GotoTab(8), None),
+            // cmd-0 是第 10 个 tab（与 cmd-1..9 同源），字号复位让位给 cmd-shift-0
+            KeyBinding::new("cmd-0", GotoTab(9), None),
+            // 分屏导航：cmd+alt+方向键（win/linux 用 ctrl+alt+方向键）
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-alt-left", FocusSplitLeft, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-alt-right", FocusSplitRight, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-alt-up", FocusSplitUp, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-alt-down", FocusSplitDown, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-alt-left", FocusSplitLeft, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-alt-right", FocusSplitRight, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-alt-up", FocusSplitUp, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-alt-down", FocusSplitDown, None),
+            // 字号：cmd +/-/0（win/linux 用 ctrl +/-/0）。
+            // 注意 win/linux 下 ctrl+0 / ctrl+plus 不会与浏览器风格冲突。
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-+", IncreaseFontSize, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-", DecreaseFontSize, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-0", ResetFontSize, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-+", IncreaseFontSize, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-", DecreaseFontSize, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-0", ResetFontSize, None),
+        ],
+    );
 }
 
 /// Tab类型
@@ -597,10 +611,7 @@ impl Workspace {
                     .next_tab_id
                     .max(state.tabs.len())
                     .max(max_restored_tab_seq),
-                next_panel_id: state
-                    .next_panel_id
-                    .max(1)
-                    .max(max_restored_panel_seq),
+                next_panel_id: state.next_panel_id.max(1).max(max_restored_panel_seq),
                 local_terminal_count: state.local_terminal_count.max(1),
                 focus_handle,
                 panel_subscriptions: HashMap::new(),
@@ -1049,7 +1060,8 @@ impl Workspace {
             PanelEvent::BellRang { panel_id } => {
                 // 后台铃 / 通知：点亮所属 tab 的红点。当前活动 tab 不点（用户正在看）。
                 if let Some((tab_id, _)) = self.tabs.iter().find(|(tab_id, tab_info)| {
-                    tab_info.container.contains_panel(panel_id, cx) && **tab_id != self.active_tab_id
+                    tab_info.container.contains_panel(panel_id, cx)
+                        && **tab_id != self.active_tab_id
                 }) {
                     let tab_id = tab_id.clone();
                     self.tab_bar.update(cx, |tab_bar, cx| {
@@ -1945,7 +1957,12 @@ impl Workspace {
     }
 
     /// 分屏导航：从当前选中 panel 向指定方向找相邻 panel 并聚焦其终端。
-    pub fn focus_split_direction(&mut self, nav: SplitNavDirection, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_split_direction(
+        &mut self,
+        nav: SplitNavDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.tabs.get(&self.active_tab_id) else {
             return;
         };
@@ -2186,17 +2203,13 @@ impl Workspace {
         let Some(tab_info) = self.tabs.get(tab_id) else {
             return false;
         };
-        tab_info
-            .container
-            .collect_panels_vec()
-            .iter()
-            .any(|panel| {
-                panel
-                    .read(cx)
-                    .content()
-                    .terminal_view()
-                    .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
-            })
+        tab_info.container.collect_panels_vec().iter().any(|panel| {
+            panel
+                .read(cx)
+                .content()
+                .terminal_view()
+                .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
+        })
     }
 
     /// tab 内是否存在仍在运行的终端。
@@ -2220,15 +2233,17 @@ impl Workspace {
 
     /// panel 是否需要关闭确认（其终端有存活前台进程）
     fn panel_needs_confirmation(&self, panel_id: &str, cx: &App) -> bool {
-        self.tabs
-            .values()
-            .any(|tab| tab.container.find_panel(panel_id, cx).is_some_and(|panel| {
+        self.tabs.values().any(|tab| {
+            tab.container.find_panel(panel_id, cx).is_some_and(|panel| {
                 panel
                     .read(cx)
                     .content()
                     .terminal_view()
-                    .is_some_and(|view| view.read(cx).terminal().read(cx).needs_close_confirmation())
-            }))
+                    .is_some_and(|view| {
+                        view.read(cx).terminal().read(cx).needs_close_confirmation()
+                    })
+            })
+        })
     }
 
     /// 压入 undo 栈；超过上限时逐出最旧的并 kill 其终端（释放进程与滚动区）。

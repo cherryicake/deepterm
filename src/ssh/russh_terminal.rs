@@ -78,12 +78,12 @@ impl client::Handler for SshClientHandler {
             .lookup(connected_address, connected_port as u16)
         else {
             // 认领不到就不是我们登记的转发：不桥接，直接丢弃（通道 drop 即关闭）。
-            log::warn!(
-                "russh: 收到未登记的转发连接 {connected_address}:{connected_port}，已忽略"
-            );
+            log::warn!("russh: 收到未登记的转发连接 {connected_address}:{connected_port}，已忽略");
             return Ok(());
         };
-        log::info!("russh: 转发连接 {connected_address}:{connected_port} → 本机 {target_host}:{target_port}");
+        log::info!(
+            "russh: 转发连接 {connected_address}:{connected_port} → 本机 {target_host}:{target_port}"
+        );
         tokio::spawn(async move {
             if let Err(e) = crate::ssh::port_forward::serve_forwarded_channel(
                 channel,
@@ -407,7 +407,6 @@ impl RusshTerminal {
         Ok((handle, channel))
     }
 
-
     /// SSH I/O 循环（在 tokio 任务中持续运行直到连接断开）
     ///
     /// 双向数据转发：
@@ -533,22 +532,19 @@ pub(crate) async fn connect_and_authenticate<H: client::Handler + Send + 'static
     log::info!("russh: 连接到 {}:{}", config.host, config.port);
     // config.timeout 生效：TCP+SSH 握手整体限时。此前该配置从未被使用，
     // 不可达主机要等 OS 级 SYN 重试（约 75-130s）UI 才能报错。
-    let mut handle = tokio::time::timeout(
-        Duration::from_secs(config.timeout.max(1)),
-        async {
-            // 经系统代理时先完成代理握手，再把已连通的流交给 russh；直连
-            // 交给 `client::connect`（它顺带处理 nodelay 等套接字选项）。
-            match crate::ssh::system_proxy::dial(config).await? {
-                Some(stream) => client::connect_stream(russh_config, stream, handler)
-                    .await
-                    // H::Error 只保证 Debug（russh 的约束），用 {:?} 而不是 {}。
-                    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
-                None => client::connect(russh_config, (config.host.as_str(), config.port), handler)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
-            }
-        },
-    )
+    let mut handle = tokio::time::timeout(Duration::from_secs(config.timeout.max(1)), async {
+        // 经系统代理时先完成代理握手，再把已连通的流交给 russh；直连
+        // 交给 `client::connect`（它顺带处理 nodelay 等套接字选项）。
+        match crate::ssh::system_proxy::dial(config).await? {
+            Some(stream) => client::connect_stream(russh_config, stream, handler)
+                .await
+                // H::Error 只保证 Debug（russh 的约束），用 {:?} 而不是 {}。
+                .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
+            None => client::connect(russh_config, (config.host.as_str(), config.port), handler)
+                .await
+                .map_err(|e| anyhow::anyhow!("TCP/SSH 握手失败: {e:?}")),
+        }
+    })
     .await
     .map_err(|_| {
         anyhow::anyhow!(

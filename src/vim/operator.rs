@@ -36,10 +36,13 @@ impl InputState {
     /// 待决栈里是否有对象前缀（`i`/`a`）。
     pub(crate) fn vim_object_prefix(&self) -> Option<bool> {
         let vim = self.vim.as_ref()?;
-        vim.operator_stack.iter().rev().find_map(|operator| match operator {
-            Operator::Object { around } => Some(*around),
-            _ => None,
-        })
+        vim.operator_stack
+            .iter()
+            .rev()
+            .find_map(|operator| match operator {
+                Operator::Object { around } => Some(*around),
+                _ => None,
+            })
     }
 
     /// 清空待决状态（操作符执行完或放弃时调用）。
@@ -131,7 +134,11 @@ impl InputState {
     /// - `Inclusive`：含目标字符。
     ///
     /// 正向与反向（目标在光标之前）都要处理，否则 `db` 与 `dw` 会不对称。
-    fn vim_operator_range(&self, target: usize, kind: MotionKind) -> Option<std::ops::Range<usize>> {
+    fn vim_operator_range(
+        &self,
+        target: usize,
+        kind: MotionKind,
+    ) -> Option<std::ops::Range<usize>> {
         let cursor = self.cursor();
         let (start, end) = if target >= cursor {
             (cursor, target)
@@ -200,7 +207,6 @@ impl InputState {
             }
         }
     }
-
 
     // ==================== 执行 ====================
 
@@ -292,12 +298,7 @@ impl InputState {
     /// `` `{a-z} `` / `'{a-z}`：跳到标记。
     ///
     /// `` ` `` 跳到精确位置，`'` 跳到该行首个非空白字符（vim 语义）。
-    pub(crate) fn vim_do_jump_mark(
-        &mut self,
-        name: char,
-        linewise: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_do_jump_mark(&mut self, name: char, linewise: bool, cx: &mut Context<Self>) {
         let Some(offset) = Marks::global(cx).get(name) else {
             return;
         };
@@ -379,11 +380,7 @@ impl InputState {
     /// 重放的是**修改本身**而不是按键：`dw` 之后把光标移到别处再按 `.`，
     /// 应按新位置重新计算范围（vim 的 `.` 语义）。范围长度取自记录值，
     /// 但起点用当前光标。
-    pub(crate) fn vim_do_repeat_change(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_do_repeat_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(change) = self.vim.as_ref().and_then(|vim| vim.last_change.clone()) else {
             return;
         };
@@ -624,7 +621,8 @@ impl InputState {
         // 这样 `vim_operator_range` 的 Linewise 分支会覆盖整段。
         let text = &self.text;
         let start_row = text.offset_to_point(cursor).row;
-        let last_row = (start_row + count.saturating_sub(1)).min(text.lines_len().saturating_sub(1));
+        let last_row =
+            (start_row + count.saturating_sub(1)).min(text.lines_len().saturating_sub(1));
         let target = text.line_start_offset(last_row);
         self.vim_apply_operator(operator, target, MotionKind::Linewise, window, cx);
     }
@@ -688,7 +686,11 @@ impl InputState {
             };
             self.vim_replace_range(insert_at..insert_at, content, window, cx);
             let target = insert_at + content.len().saturating_sub(1);
-            self.move_to(self.text.clip_offset(target, sum_tree::Bias::Left), None, cx);
+            self.move_to(
+                self.text.clip_offset(target, sum_tree::Bias::Left),
+                None,
+                cx,
+            );
         }
     }
 
@@ -963,7 +965,11 @@ impl InputState {
     }
 
     /// 可视模式下的 `~`：切换整个选区的大小写并退出可视。
-    pub(crate) fn vim_do_visual_toggle_case(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn vim_do_visual_toggle_case(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(range) = self.vim_visual_range() else {
             self.vim_do_leave_visual(cx);
             return;
@@ -1034,7 +1040,11 @@ impl InputState {
             return;
         }
         // 可见区第一行对应的 buffer 行。
-        let first_offset = last_layout.visible_line_byte_offsets.first().copied().unwrap_or(0);
+        let first_offset = last_layout
+            .visible_line_byte_offsets
+            .first()
+            .copied()
+            .unwrap_or(0);
         let first_row = self.text.offset_to_point(first_offset).row;
         let offset_rows = ((visible_rows.saturating_sub(1)) as f32 * fraction).round() as usize;
 
@@ -1060,12 +1070,21 @@ impl InputState {
     }
 
     /// `ctrl-d` / `ctrl-u`：半页滚动，光标随之移动。
-    pub(crate) fn vim_do_half_page(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn vim_do_half_page(
+        &mut self,
+        down: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(last_layout) = self.last_layout.as_ref() else {
             return;
         };
         let half = (last_layout.lines.len() / 2).max(1);
-        let delta = if down { half as isize } else { -(half as isize) };
+        let delta = if down {
+            half as isize
+        } else {
+            -(half as isize)
+        };
 
         // 可视模式下必须走可视感知的纵向移动，否则选区塌缩、visual_head 陈旧。
         if self.vim_mode_is_visual() {
@@ -1270,11 +1289,7 @@ impl InputState {
     /// 锚点记在 `VimState::visual_anchor`，选区由「锚点 + 光标」表达：
     /// 编辑器的 `selected_range` 每帧从这两个值重算，所以移动光标就能
     /// 自然扩展选区，不需要在每次移动时手动改 `selected_range`。
-    pub(crate) fn vim_do_enter_visual(
-        &mut self,
-        linewise: bool,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_do_enter_visual(&mut self, linewise: bool, cx: &mut Context<Self>) {
         let cursor = self.cursor();
         let mode = if linewise {
             VimMode::VisualLine
@@ -1305,11 +1320,7 @@ impl InputState {
     }
 
     /// `gv`：重选上次的可视区。
-    pub(crate) fn vim_do_reselect_visual(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_do_reselect_visual(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some((anchor, head, mode)) = self.vim.as_ref().and_then(|vim| vim.last_visual) else {
             return;
         };
@@ -1327,9 +1338,11 @@ impl InputState {
 
     /// `o`（Visual 下）：把光标移到选区另一端。
     pub(crate) fn vim_do_visual_swap_ends(&mut self, cx: &mut Context<Self>) {
-        let Some((anchor, head)) = self.vim.as_ref().and_then(|vim| {
-            Some((vim.visual_anchor?, vim.visual_head?))
-        }) else {
+        let Some((anchor, head)) = self
+            .vim
+            .as_ref()
+            .and_then(|vim| Some((vim.visual_anchor?, vim.visual_head?)))
+        else {
             return;
         };
         if let Some(vim) = self.vim.as_mut() {
@@ -1400,8 +1413,7 @@ impl InputState {
         // 直接用它会让光标落在最后选中字符的右侧一格。
         let head = self.vim_cursor();
         if let Some(vim) = self.vim.as_mut() {
-            if let (Some(anchor), Some(head)) = (vim.visual_anchor.take(), vim.visual_head.take())
-            {
+            if let (Some(anchor), Some(head)) = (vim.visual_anchor.take(), vim.visual_head.take()) {
                 let mode = vim.mode;
                 vim.last_visual = Some((anchor, head, mode));
             }
@@ -1477,10 +1489,9 @@ impl InputState {
         // 可视删除按**宽度**重放（`4l` 之后 `.` 再删同样多的字符），
         // 方向在退出可视前算好：退出后 `cursor()` 会被折叠成 head，
         // 那时再比较就分不出方向了。
-        let backward = self
-            .vim
-            .as_ref()
-            .is_some_and(|vim| matches!((vim.visual_anchor, vim.visual_head), (Some(a), Some(h)) if h < a));
+        let backward = self.vim.as_ref().is_some_and(
+            |vim| matches!((vim.visual_anchor, vim.visual_head), (Some(a), Some(h)) if h < a),
+        );
 
         // 先退出可视，再执行——`vim_execute` 会依据范围改文本并重设光标。
         self.vim_do_leave_visual(cx);

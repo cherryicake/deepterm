@@ -13,13 +13,14 @@ use anyhow::{Context as _, Result};
 use lsp_types::{
     ClientCapabilities, CodeActionClientCapabilities, CodeActionContext, CodeActionKind,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CodeActionParams, CodeActionResponse,
-    CompletionItem, CompletionParams, DocumentHighlight, DocumentHighlightParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, InlayHint, InlayHintParams, InitializeParams,
-    InitializeResult, Location, PartialResultParams, Position, PublishDiagnosticsParams, Range,
-    ReferenceContext, ReferenceParams, RenameParams, DocumentFormattingParams, SelectionRangeParams,
-    SemanticTokensParams, SignatureHelp, SignatureHelpParams, TextDocumentIdentifier,
-    TextDocumentPositionParams, TextEdit, Url, WorkDoneProgressParams, WorkspaceEdit,
+    CompletionItem, CompletionParams, DocumentFormattingParams, DocumentHighlight,
+    DocumentHighlightParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    InitializeParams, InitializeResult, InlayHint, InlayHintParams, Location, PartialResultParams,
+    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SelectionRangeParams, SemanticTokensParams, SignatureHelp, SignatureHelpParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, TextEdit, Url, WorkDoneProgressParams,
+    WorkspaceEdit,
 };
 
 use crate::lsp::jsonrpc::Connection;
@@ -89,9 +90,7 @@ impl LspClient {
                     if !is_transient_lsp_error(&e) || self.conn.is_closed() {
                         return Err(e);
                     }
-                    log::debug!(
-                        "lsp: `{method}` 瞬时态错误（第 {attempt} 次），重试: {e:#}"
-                    );
+                    log::debug!("lsp: `{method}` 瞬时态错误（第 {attempt} 次），重试: {e:#}");
                     last_err = Some(e);
                     smol::Timer::after(BACKOFF).await;
                 }
@@ -101,11 +100,7 @@ impl LspClient {
     }
 
     /// 启动服务器并完成 `initialize` / `initialized` 握手。
-    pub async fn start(
-        program: &str,
-        args: &[String],
-        root: PathBuf,
-    ) -> Result<Self> {
+    pub async fn start(program: &str, args: &[String], root: PathBuf) -> Result<Self> {
         let conn = Connection::spawn(program, args).await?;
         let conn = Arc::new(conn);
 
@@ -130,13 +125,13 @@ impl LspClient {
         };
         let params = serde_json::to_value(&params).context("serialize InitializeParams")?;
 
-        let result: InitializeResult = serde_json::from_value(
-            conn.request("initialize", Some(&params)).await?
-        )
-        .context("parse InitializeResult")?;
+        let result: InitializeResult =
+            serde_json::from_value(conn.request("initialize", Some(&params)).await?)
+                .context("parse InitializeResult")?;
 
         // `initialized` 之后服务器才会开始发诊断等通知。
-        conn.notify("initialized", Some(&serde_json::json!({}))).await?;
+        conn.notify("initialized", Some(&serde_json::json!({})))
+            .await?;
 
         let sync_kind = result
             .capabilities
@@ -144,9 +139,9 @@ impl LspClient {
             .as_ref()
             .map(|s| match s {
                 lsp_types::TextDocumentSyncCapability::Kind(k) => *k,
-                lsp_types::TextDocumentSyncCapability::Options(o) => o
-                    .change
-                    .unwrap_or(lsp_types::TextDocumentSyncKind::FULL),
+                lsp_types::TextDocumentSyncCapability::Options(o) => {
+                    o.change.unwrap_or(lsp_types::TextDocumentSyncKind::FULL)
+                }
             })
             .unwrap_or(lsp_types::TextDocumentSyncKind::FULL);
 
@@ -289,10 +284,7 @@ impl LspClient {
     /// 会把 `target/` 里每个中间产物都推给 rust-analyzer，它收到就重载工程，
     /// 而它自己的 `cargo check` 又在写 `target/`——自持循环，19 分钟实测
     /// reload 了 401 次，期间补全与 hover 全被回 `-32801` 而失效。
-    pub async fn did_change_watched_files(
-        &self,
-        changes: Vec<lsp_types::FileEvent>,
-    ) -> Result<()> {
+    pub async fn did_change_watched_files(&self, changes: Vec<lsp_types::FileEvent>) -> Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -317,7 +309,9 @@ impl LspClient {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
         };
         let value = serde_json::to_value(&params)?;
-        self.conn.notify("textDocument/didClose", Some(&value)).await
+        self.conn
+            .notify("textDocument/didClose", Some(&value))
+            .await
     }
 
     // ---------------------------------------------------------------- 查询请求
@@ -426,7 +420,8 @@ impl LspClient {
         uri: &Url,
         position: Position,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.goto("textDocument/typeDefinition", uri, position).await
+        self.goto("textDocument/typeDefinition", uri, position)
+            .await
     }
 
     /// `textDocument/implementation`：跳到**实现**（trait → 各实现类型）。
@@ -435,7 +430,8 @@ impl LspClient {
         uri: &Url,
         position: Position,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.goto("textDocument/implementation", uri, position).await
+        self.goto("textDocument/implementation", uri, position)
+            .await
     }
 
     /// 跳转族请求的公共实现。
@@ -541,7 +537,10 @@ impl LspClient {
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let value = serde_json::to_value(&params)?;
-        let result = self.conn.request("textDocument/rename", Some(&value)).await?;
+        let result = self
+            .conn
+            .request("textDocument/rename", Some(&value))
+            .await?;
         if result.is_null() {
             return Ok(None);
         }
@@ -584,11 +583,18 @@ impl LspClient {
         struct WithPlaceholder {
             range: lsp_types::Range,
         }
-        Ok(serde_json::from_value::<WithPlaceholder>(result).ok().map(|w| w.range))
+        Ok(serde_json::from_value::<WithPlaceholder>(result)
+            .ok()
+            .map(|w| w.range))
     }
 
     /// `textDocument/formatting`。
-    pub async fn formatting(&self, uri: &Url, tab_size: u32, insert_spaces: bool) -> Result<Vec<TextEdit>> {
+    pub async fn formatting(
+        &self,
+        uri: &Url,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<Vec<TextEdit>> {
         let params = DocumentFormattingParams {
             text_document: TextDocumentIdentifier { uri: uri.clone() },
             options: formatting_options(tab_size, insert_spaces),
@@ -733,8 +739,16 @@ impl LspClient {
     /// `workspace/symbol`：全项目符号搜索。
     ///
     /// `query` 为空串时按 LSP 规范返回「尽可能多的符号」。
-    pub async fn workspace_symbols(&self, query: &str) -> Result<Vec<lsp_types::SymbolInformation>> {
-        if self.capabilities.capabilities.workspace_symbol_provider.is_none() {
+    pub async fn workspace_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<lsp_types::SymbolInformation>> {
+        if self
+            .capabilities
+            .capabilities
+            .workspace_symbol_provider
+            .is_none()
+        {
             log::debug!("lsp: workspace/symbol not advertised, skipping");
             return Ok(Vec::new());
         }
@@ -750,7 +764,8 @@ impl LspClient {
         }
         // 规范允许 `SymbolInformation[]` 或 `WorkspaceSymbol[]`（后者多了
         // 位置信息，用于未打开的文件）。两种都接。
-        if let Ok(items) = serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result.clone())
+        if let Ok(items) =
+            serde_json::from_value::<Vec<lsp_types::SymbolInformation>>(result.clone())
         {
             return Ok(items);
         }
@@ -766,7 +781,12 @@ impl LspClient {
         command: &str,
         arguments: Vec<serde_json::Value>,
     ) -> Result<()> {
-        if self.capabilities.capabilities.execute_command_provider.is_none() {
+        if self
+            .capabilities
+            .capabilities
+            .execute_command_provider
+            .is_none()
+        {
             anyhow::bail!("server does not support workspace/executeCommand");
         }
         let params = lsp_types::ExecuteCommandParams {
@@ -973,14 +993,12 @@ fn client_capabilities() -> ClientCapabilities {
             // `cargo check` 的写入都会让 rust-analyzer 重载整个工程，
             // 形成自持循环（实测 19 分钟 401 次）。声明之后就能按 glob 精确
             // 过滤 —— 对照 Zed：它的过滤依据也正是这份注册。
-            did_change_watched_files: Some(
-                lsp_types::DidChangeWatchedFilesClientCapabilities {
-                    dynamic_registration: Some(true),
-                    // 3.17 的相对 glob 形状（`baseUri` + `pattern`）。
-                    // 声明支持才可能收到这种形式，两种都做了兼容解析。
-                    relative_pattern_support: Some(true),
-                },
-            ),
+            did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                // 3.17 的相对 glob 形状（`baseUri` + `pattern`）。
+                // 声明支持才可能收到这种形式，两种都做了兼容解析。
+                relative_pattern_support: Some(true),
+            }),
             ..Default::default()
         }),
         text_document: Some(lsp_types::TextDocumentClientCapabilities {
@@ -1055,9 +1073,7 @@ fn client_capabilities() -> ClientCapabilities {
                             CodeActionKind::REFACTOR_INLINE.as_str().to_string(),
                             CodeActionKind::REFACTOR_REWRITE.as_str().to_string(),
                             CodeActionKind::SOURCE.as_str().to_string(),
-                            CodeActionKind::SOURCE_ORGANIZE_IMPORTS
-                                .as_str()
-                                .to_string(),
+                            CodeActionKind::SOURCE_ORGANIZE_IMPORTS.as_str().to_string(),
                         ],
                     },
                 }),
@@ -1167,7 +1183,8 @@ pub fn path_to_uri(path: &Path) -> Result<Url> {
             .context("cannot resolve relative path without cwd")?
             .join(path)
     };
-    Url::from_file_path(&abs).map_err(|_| anyhow::anyhow!("invalid path for URI: {}", abs.display()))
+    Url::from_file_path(&abs)
+        .map_err(|_| anyhow::anyhow!("invalid path for URI: {}", abs.display()))
 }
 
 /// `file://` URI → 路径。
@@ -1265,7 +1282,10 @@ mod tests {
         .expect("InitializeResult parses");
 
         let chars = trigger_characters_of(&result);
-        assert_eq!(chars, vec![":".to_string(), ".".to_string(), "@".to_string()]);
+        assert_eq!(
+            chars,
+            vec![":".to_string(), ".".to_string(), "@".to_string()]
+        );
     }
 
     /// 服务器没声明触发字符时返回空（不能因此 panic 或瞎触发）。

@@ -4,8 +4,8 @@
 //! 完成收尾、任务列表操作。workspace.rs 保留 tab / 布局 / 事件分发。
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use gpui::prelude::*;
 use gpui::{AnyWindowHandle, Context};
@@ -379,5 +379,3 @@ impl Workspace {
         }
     }
 }
-
-

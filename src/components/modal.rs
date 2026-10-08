@@ -1,5 +1,5 @@
-use crate::components::callbacks::OptionalWindowCallback;
 use crate::components::animation::easing;
+use crate::components::callbacks::OptionalWindowCallback;
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{

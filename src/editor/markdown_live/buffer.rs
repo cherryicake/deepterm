@@ -22,7 +22,10 @@ pub enum LineEnding {
 impl LineEnding {
     /// Detect from the raw file bytes (first `\n` decides, like `editor.rs`).
     pub fn detect(raw: &str) -> Self {
-        if raw.find('\n').is_some_and(|i| i > 0 && raw.as_bytes()[i - 1] == b'\r') {
+        if raw
+            .find('\n')
+            .is_some_and(|i| i > 0 && raw.as_bytes()[i - 1] == b'\r')
+        {
             // Only checks the first newline; mixed files follow the majority
             // opener. Save normalizes through this ending.
             Self::Crlf
@@ -191,15 +194,12 @@ impl LiveBuffer {
     /// O(log lines).
     pub fn offset_of_pos(&self, pos: Pos) -> usize {
         let line = pos.line.min(self.model.lines().len().saturating_sub(1));
-        let start = self
-            .line_starts
-            .get(line)
-            .copied()
-            .unwrap_or(0);
-        start + crate::editor::markdown_live::layout::byte_for_col(
-            self.model.line(line).unwrap_or(""),
-            pos.col,
-        )
+        let start = self.line_starts.get(line).copied().unwrap_or(0);
+        start
+            + crate::editor::markdown_live::layout::byte_for_col(
+                self.model.line(line).unwrap_or(""),
+                pos.col,
+            )
     }
 
     /// [`Pos`] of a joined-document byte offset. O(log lines).

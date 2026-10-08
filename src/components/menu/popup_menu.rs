@@ -1,12 +1,12 @@
-use crate::components::callbacks::OptionalClickCallback;
 use crate::components::button::button_icon::Sizable;
 use crate::components::button::{Icon, Size};
+use crate::components::callbacks::OptionalClickCallback;
 use crate::components::menu::menu_item::MenuItemElement;
 use crate::theme::ActiveTheme;
 use gpui::{
     Action, App, AppContext as _, ClickEvent, Context, DismissEvent, Entity, EventEmitter,
-    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render,
-    SharedString, Styled, Window, actions, div, prelude::FluentBuilder, px, rems,
+    FocusHandle, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, SharedString,
+    Styled, Window, actions, div, prelude::FluentBuilder, px, rems,
 };
 use std::rc::Rc;
 
@@ -18,12 +18,15 @@ const CHECK_ICON_PATH: &str = "icons/check.svg";
 actions!(popup_menu, [Confirm, Cancel, SelectUp, SelectDown]);
 
 pub fn init(cx: &mut App) {
-    crate::keymap::bind(cx, [
-        KeyBinding::new("enter", Confirm, Some(CONTEXT)),
-        KeyBinding::new("escape", Cancel, Some(CONTEXT)),
-        KeyBinding::new("up", SelectUp, Some(CONTEXT)),
-        KeyBinding::new("down", SelectDown, Some(CONTEXT)),
-    ]);
+    crate::keymap::bind(
+        cx,
+        [
+            KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+            KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+            KeyBinding::new("up", SelectUp, Some(CONTEXT)),
+            KeyBinding::new("down", SelectDown, Some(CONTEXT)),
+        ],
+    );
 }
 
 /// An menu item in a popup menu.

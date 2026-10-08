@@ -6,8 +6,6 @@ use std::{
 
 use crate::editor::syntax::languages;
 
-
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanguageConfig {
     pub name: SharedString,
@@ -37,7 +35,6 @@ impl LanguageConfig {
         }
     }
 }
-
 
 /// Registry for code highlighter languages.
 pub struct LanguageRegistry {

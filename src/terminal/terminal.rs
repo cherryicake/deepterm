@@ -1174,7 +1174,9 @@ impl Terminal {
                 if let Ok(path) = std::env::join_paths(
                     std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
                 ) {
-                    pty_options.env.insert("PATH".into(), path.to_string_lossy().into_owned());
+                    pty_options
+                        .env
+                        .insert("PATH".into(), path.to_string_lossy().into_owned());
                 }
             }
         }
@@ -1706,10 +1708,11 @@ impl Terminal {
             crate::ssh::ssh_pty::ProxyCommandOutcome::NotRequested => None,
         };
         if let Some((message, ok)) = proxy_notice {
-            driver_tx.try_send(DriverEvent::PortForward { message, ok }).ok();
+            driver_tx
+                .try_send(DriverEvent::PortForward { message, ok })
+                .ok();
         }
-        let pending =
-            crate::ssh::tunnel::rules_for_openssh(ssh_config, &ssh_config.port_forwards);
+        let pending = crate::ssh::tunnel::rules_for_openssh(ssh_config, &ssh_config.port_forwards);
         if !pending.is_empty() {
             // 这条路径拿不到远端的确认（`-R` 的结果只体现在 ssh 的 stderr 上，
             // 直接落在终端里）。所以只陈述「请求了什么」，不谎称已绑定成功。
@@ -2950,10 +2953,8 @@ impl Terminal {
                 // 远程检测是**纯字符串比较、无 fork**，所以就地同步执行，不必
                 // 走 `TerminalView` 那套异步缓存（那套存在的理由是本地检测要
                 // sysctl / 读 /proc）。顺带也不用等 2 秒 TTL。
-                let agent = CLIAgent::detect_from_argv_with(
-                    std::slice::from_ref(&proc),
-                    &HashMap::new(),
-                );
+                let agent =
+                    CLIAgent::detect_from_argv_with(std::slice::from_ref(&proc), &HashMap::new());
                 self.remote_process_name = Some(proc);
                 self.set_foreground_agent(agent, cx);
             }
@@ -3269,7 +3270,9 @@ impl Terminal {
     fn rebuild_viewport_snapshot<'a>(
         cells: &mut Vec<IndexedCell>,
         row_ranges: &mut Vec<(usize, usize)>,
-        display_iter: impl Iterator<Item = alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>>,
+        display_iter: impl Iterator<
+            Item = alacritty_terminal::grid::Indexed<&'a alacritty_terminal::term::cell::Cell>,
+        >,
         num_rows: usize,
     ) {
         let estimated_size = display_iter.size_hint().0;
@@ -5480,10 +5483,7 @@ mod tests {
                 Some(2),
                 "锚点必须是提示符末尾，不能被后续回显推到行尾"
             );
-            assert!(
-                !t.input_line_blank(),
-                "行内已有 'abc'，不该被判定为空行"
-            );
+            assert!(!t.input_line_blank(), "行内已有 'abc'，不该被判定为空行");
         });
     }
 
@@ -5497,8 +5497,7 @@ mod tests {
     fn local_osc_notification_is_consumed(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
         terminal.update(cx, |t, cx| {
-            let consumed =
-                t.try_handle_osc_sequence(cx, b"777;notify;Build;done", true, None);
+            let consumed = t.try_handle_osc_sequence(cx, b"777;notify;Build;done", true, None);
             assert!(consumed, "本地 OSC 777 通知应由应用层消费");
         });
     }
@@ -5628,7 +5627,8 @@ mod tests {
             "sentinel 不得被当成桌面通知，实际事件 {seen:?}"
         );
         assert!(
-            seen.iter().any(|e| *e == crate::terminal::Event::AgentChanged),
+            seen.iter()
+                .any(|e| *e == crate::terminal::Event::AgentChanged),
             "应发出 AgentChanged，实际事件 {seen:?}"
         );
     }
@@ -5874,11 +5874,7 @@ mod tests {
                 cx,
             )
         });
-        assert_eq!(
-            emissions.lock().unwrap().len(),
-            2,
-            "状态真的变了要再发一次"
-        );
+        assert_eq!(emissions.lock().unwrap().len(), 2, "状态真的变了要再发一次");
     }
 
     /// **仅身份变化**（session 全等）也必须发 `AgentChanged`。
@@ -5890,7 +5886,7 @@ mod tests {
     /// 界面必须收到事件才显示得出图标，只判 session 的实现会静默丢掉。
     #[gpui::test]
     fn agent_changed_emitted_for_identity_only_change(cx: &mut TestAppContext) {
-        use crate::agent::{AgentSessionState, AgentStatus, AgentEvent, AgentEventKind, CLIAgent};
+        use crate::agent::{AgentEvent, AgentEventKind, AgentSessionState, AgentStatus, CLIAgent};
 
         let terminal = cx.new(|_| anchor_test_terminal());
         let emissions = Arc::new(Mutex::new(0usize));
@@ -5925,7 +5921,11 @@ mod tests {
             ..Default::default()
         };
         terminal.update(cx, |t, _cx| {
-            assert_eq!(t.agent_session(), Some(&expected), "起点 session 应为 Idle + 固定 id");
+            assert_eq!(
+                t.agent_session(),
+                Some(&expected),
+                "起点 session 应为 Idle + 固定 id"
+            );
         });
         let before = *emissions.lock().unwrap();
 
@@ -5995,7 +5995,9 @@ mod tests {
         };
 
         // 起手：一个回合开始（建立 session + 进 Working）。
-        terminal.update(cx, |t, cx| t.apply_agent_events(&[ev(AgentEventKind::PromptSubmit)], cx));
+        terminal.update(cx, |t, cx| {
+            t.apply_agent_events(&[ev(AgentEventKind::PromptSubmit)], cx)
+        });
         let after_prompt = *emissions.lock().unwrap();
         assert_eq!(after_prompt, 1, "建立 session 并进 Working 应发一次");
 
@@ -6012,7 +6014,9 @@ mod tests {
         );
 
         // 收尾仍然要发——别把真实变化一起静默掉。
-        terminal.update(cx, |t, cx| t.apply_agent_events(&[ev(AgentEventKind::Stop)], cx));
+        terminal.update(cx, |t, cx| {
+            t.apply_agent_events(&[ev(AgentEventKind::Stop)], cx)
+        });
         assert_eq!(
             *emissions.lock().unwrap(),
             after_prompt + 1,
@@ -6052,10 +6056,7 @@ mod tests {
                 "回到 shell 后身份应清空，实际 {:?}",
                 t.foreground_agent()
             );
-            assert!(
-                t.agent_session().is_none(),
-                "身份清空必须一并清掉 session"
-            );
+            assert!(t.agent_session().is_none(), "身份清空必须一并清掉 session");
         });
     }
 
@@ -6101,10 +6102,7 @@ mod tests {
 
             // 同一个值：不得清 session（否则周期检测会把状态洗掉）。
             t.set_foreground_agent(Some(CLIAgent::Claude), cx);
-            assert!(
-                t.agent_session().is_some(),
-                "值未变化时不应动 session"
-            );
+            assert!(t.agent_session().is_some(), "值未变化时不应动 session");
 
             t.set_foreground_agent(None, cx);
             assert!(t.foreground_agent().is_none());

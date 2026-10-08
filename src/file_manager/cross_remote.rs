@@ -1114,7 +1114,9 @@ impl DirTransferDriver for CrossSessionDirDriver<'_> {
     ) -> anyhow::Result<()> {
         self.destination_session.create_dir_all(destination_dir)?;
         if let Ok(Some(mode)) = self.source_session.permissions(remote_dir) {
-            let _ = self.destination_session.set_permissions(destination_dir, mode);
+            let _ = self
+                .destination_session
+                .set_permissions(destination_dir, mode);
         }
         Ok(())
     }

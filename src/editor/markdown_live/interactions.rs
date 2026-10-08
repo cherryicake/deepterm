@@ -5,9 +5,9 @@
 //! against [`crate::editor::markdown_live::model::EditorModel`]. The view
 //! layer (`view.rs`) wraps these in `buffer.edit(...)` transactions.
 
-use crate::editor::markdown_live::block::{classify, table_delimiter_cols, Block, DocState};
+use crate::editor::markdown_live::block::{Block, DocState, classify, table_delimiter_cols};
 
-use crate::editor::markdown_live::layout::{byte_for_col, col_for_byte, RowKind};
+use crate::editor::markdown_live::layout::{RowKind, byte_for_col, col_for_byte};
 use crate::editor::markdown_live::model::{EditorModel, Line, Pos};
 
 /// Ordered-list display numbering (preview parity).
@@ -167,11 +167,7 @@ pub fn on_tab(model: &mut EditorModel, line_text: &str, outdent: bool, tab_size:
     let line = model.cursor().line;
     let col = model.cursor().col;
     if outdent {
-        let lead = line_text
-            .chars()
-            .take_while(|c| *c == ' ')
-            .take(n)
-            .count();
+        let lead = line_text.chars().take_while(|c| *c == ' ').take(n).count();
         if lead > 0 {
             model.move_to(line, 0, false);
             model.move_to(line, lead, true);
@@ -249,8 +245,14 @@ pub fn toggle_wrap(model: &mut EditorModel, marker: &str) -> bool {
     let line = model.line(s.line).unwrap_or_default().to_string();
     let chars: Vec<char> = line.chars().collect();
     let starts_inside = s.col >= mlen
-        && chars.get(s.col - mlen..s.col).map(|w| w.iter().collect::<String>()) == Some(marker.to_string());
-    let ends_inside = chars.get(e.col..e.col + mlen).map(|w| w.iter().collect::<String>()) == Some(marker.to_string());
+        && chars
+            .get(s.col - mlen..s.col)
+            .map(|w| w.iter().collect::<String>())
+            == Some(marker.to_string());
+    let ends_inside = chars
+        .get(e.col..e.col + mlen)
+        .map(|w| w.iter().collect::<String>())
+        == Some(marker.to_string());
     let (mut s, mut e) = (s, e);
     if starts_inside && ends_inside {
         s = Pos::new(s.line, s.col - mlen);
@@ -309,7 +311,11 @@ pub fn insert_link(model: &mut EditorModel) -> bool {
 /// 空文档计 1 行；中英文统一按字符计（`共 N 字`）。
 pub fn word_stats(text: &str) -> (usize, usize) {
     let chars = text.chars().filter(|c| !c.is_whitespace()).count();
-    let lines = if text.is_empty() { 1 } else { text.lines().count() };
+    let lines = if text.is_empty() {
+        1
+    } else {
+        text.lines().count()
+    };
     (chars, lines)
 }
 
@@ -358,7 +364,10 @@ pub fn table_nav(model: &mut EditorModel, forward: bool, is_table: &dyn Fn(usize
         let next = cur.line + 1;
         if is_table(next) {
             let text = model.line(next).map(str::to_string).unwrap_or_default();
-            let (cs, _) = table_cell_contents(&text).first().copied().unwrap_or((0, 0));
+            let (cs, _) = table_cell_contents(&text)
+                .first()
+                .copied()
+                .unwrap_or((0, 0));
             model.move_to(next, cs, false);
             return true;
         }
@@ -400,8 +409,14 @@ pub fn table_insert_row_below(model: &mut EditorModel) -> bool {
     model.move_to(target, usize::MAX, false);
     model.newline();
     model.insert(&format!("|{}", "  |".repeat(cols)));
-    let fresh = model.line(target + 1).map(str::to_string).unwrap_or_default();
-    let (cs, _) = table_cell_contents(&fresh).first().copied().unwrap_or((0, 0));
+    let fresh = model
+        .line(target + 1)
+        .map(str::to_string)
+        .unwrap_or_default();
+    let (cs, _) = table_cell_contents(&fresh)
+        .first()
+        .copied()
+        .unwrap_or((0, 0));
     model.move_to(target + 1, cs, false);
     true
 }
@@ -552,58 +567,135 @@ pub fn pos_of_offset(lines: &[Line], mut off: usize) -> Pos {
 /// `insert` replaces the `/query`, `back` retreats the cursor afterwards,
 /// `middle` parks one line up (fenced code lands inside the block).
 pub struct SlashCommand {
-  pub title: &'static str,
-  pub hint: &'static str,
-  pub filter: &'static str,
-  pub insert: &'static str,
-  pub back: usize,
-  pub middle: bool,
+    pub title: &'static str,
+    pub hint: &'static str,
+    pub filter: &'static str,
+    pub insert: &'static str,
+    pub back: usize,
+    pub middle: bool,
 }
 
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
-  SlashCommand { title: "标题 1", hint: "#", filter: "标题 1 h1 biao ti heading", insert: "# ", back: 0, middle: false },
-  SlashCommand { title: "标题 2", hint: "##", filter: "标题 2 h2 biao ti heading", insert: "## ", back: 0, middle: false },
-  SlashCommand { title: "标题 3", hint: "###", filter: "标题 3 h3 biao ti heading", insert: "### ", back: 0, middle: false },
-  SlashCommand { title: "无序列表", hint: "-", filter: "无序列表 bullet list wu xu lie biao", insert: "- ", back: 0, middle: false },
-  SlashCommand { title: "有序列表", hint: "1.", filter: "有序列表 ordered numbered you xu lie biao", insert: "1. ", back: 0, middle: false },
-  SlashCommand { title: "任务列表", hint: "- [ ]", filter: "任务列表 task todo ren wu lie biao", insert: "- [ ] ", back: 0, middle: false },
-  SlashCommand { title: "引用", hint: ">", filter: "引用 quote yin yong", insert: "> ", back: 0, middle: false },
-  SlashCommand { title: "代码块", hint: "```", filter: "代码块 code fence dai ma kuai", insert: "```\n\n```", back: 0, middle: true },
-  SlashCommand { title: "表格", hint: "│ │", filter: "表格 table biao ge", insert: "|  |  |\n| --- | --- |\n|  |  |", back: 0, middle: false },
-  SlashCommand { title: "分隔线", hint: "---", filter: "分隔线 divider hr fen ge xian", insert: "---", back: 0, middle: false },
-  SlashCommand { title: "链接", hint: "[]()", filter: "链接 link lian jie", insert: "[]()", back: 3, middle: false },
+    SlashCommand {
+        title: "标题 1",
+        hint: "#",
+        filter: "标题 1 h1 biao ti heading",
+        insert: "# ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "标题 2",
+        hint: "##",
+        filter: "标题 2 h2 biao ti heading",
+        insert: "## ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "标题 3",
+        hint: "###",
+        filter: "标题 3 h3 biao ti heading",
+        insert: "### ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "无序列表",
+        hint: "-",
+        filter: "无序列表 bullet list wu xu lie biao",
+        insert: "- ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "有序列表",
+        hint: "1.",
+        filter: "有序列表 ordered numbered you xu lie biao",
+        insert: "1. ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "任务列表",
+        hint: "- [ ]",
+        filter: "任务列表 task todo ren wu lie biao",
+        insert: "- [ ] ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "引用",
+        hint: ">",
+        filter: "引用 quote yin yong",
+        insert: "> ",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "代码块",
+        hint: "```",
+        filter: "代码块 code fence dai ma kuai",
+        insert: "```\n\n```",
+        back: 0,
+        middle: true,
+    },
+    SlashCommand {
+        title: "表格",
+        hint: "│ │",
+        filter: "表格 table biao ge",
+        insert: "|  |  |\n| --- | --- |\n|  |  |",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "分隔线",
+        hint: "---",
+        filter: "分隔线 divider hr fen ge xian",
+        insert: "---",
+        back: 0,
+        middle: false,
+    },
+    SlashCommand {
+        title: "链接",
+        hint: "[]()",
+        filter: "链接 link lian jie",
+        insert: "[]()",
+        back: 3,
+        middle: false,
+    },
 ];
 
 /// The `/query` before `cursor_col` (chars) on `line`, when the line is
 /// `≤3 spaces + /query` with no whitespace in the query (menu trigger).
 /// `None` with a selection (typing state only).
 pub fn slash_query_for(line: &str, cursor_col: usize, selected: bool) -> Option<String> {
-  if selected {
-    return None;
-  }
-  let col = cursor_col.min(line.chars().count());
-  let bytes = byte_for_col(line, col);
-  let before = line.get(..bytes)?;
-  let indent = before.bytes().take_while(|&b| b == b' ').count();
-  if indent > 3 {
-    return None;
-  }
-  let query = before[indent..].strip_prefix('/')?;
-  if query.contains(char::is_whitespace) {
-    return None;
-  }
-  Some(query.to_string())
+    if selected {
+        return None;
+    }
+    let col = cursor_col.min(line.chars().count());
+    let bytes = byte_for_col(line, col);
+    let before = line.get(..bytes)?;
+    let indent = before.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return None;
+    }
+    let query = before[indent..].strip_prefix('/')?;
+    if query.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(query.to_string())
 }
 
 /// Indices into [`SLASH_COMMANDS`] matching `query` (empty shows all).
 pub fn slash_items(query: &str) -> Vec<usize> {
-  let q = query.to_ascii_lowercase();
-  SLASH_COMMANDS
-    .iter()
-    .enumerate()
-    .filter(|(_, c)| q.is_empty() || c.filter.contains(q.as_str()))
-    .map(|(i, _)| i)
-    .collect()
+    let q = query.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| q.is_empty() || c.filter.contains(q.as_str()))
+        .map(|(i, _)| i)
+        .collect()
 }
 pub fn line_selection(
     start: Pos,
@@ -666,24 +758,32 @@ mod tests {
         assert_eq!(pos_of_offset(&lines, 999), Pos::new(2, 0));
     }
 
-  #[test]
-  fn slash_query_triggers_at_line_start() {
-    assert_eq!(slash_query_for("/h", 2, false).as_deref(), Some("h"));
-    assert_eq!(slash_query_for("/", 1, false).as_deref(), Some(""));
-    assert_eq!(slash_query_for("  /tab", 6, false).as_deref(), Some("tab"));
-    assert!(slash_query_for("    /x", 6, false).is_none());
-    assert!(slash_query_for("/a b", 4, false).is_none());
-    assert!(slash_query_for("x/y", 3, false).is_none());
-    assert!(slash_query_for("/h", 2, true).is_none());
-  }
+    #[test]
+    fn slash_query_triggers_at_line_start() {
+        assert_eq!(slash_query_for("/h", 2, false).as_deref(), Some("h"));
+        assert_eq!(slash_query_for("/", 1, false).as_deref(), Some(""));
+        assert_eq!(slash_query_for("  /tab", 6, false).as_deref(), Some("tab"));
+        assert!(slash_query_for("    /x", 6, false).is_none());
+        assert!(slash_query_for("/a b", 4, false).is_none());
+        assert!(slash_query_for("x/y", 3, false).is_none());
+        assert!(slash_query_for("/h", 2, true).is_none());
+    }
 
-  #[test]
-  fn slash_items_filter() {
-    assert_eq!(slash_items("").len(), SLASH_COMMANDS.len());
-    assert!(slash_items("h1").iter().any(|&i| SLASH_COMMANDS[i].title == "标题 1"));
-    assert!(slash_items("table").iter().any(|&i| SLASH_COMMANDS[i].title == "表格"));
-    assert!(slash_items("zzz").is_empty());
-  }
+    #[test]
+    fn slash_items_filter() {
+        assert_eq!(slash_items("").len(), SLASH_COMMANDS.len());
+        assert!(
+            slash_items("h1")
+                .iter()
+                .any(|&i| SLASH_COMMANDS[i].title == "标题 1")
+        );
+        assert!(
+            slash_items("table")
+                .iter()
+                .any(|&i| SLASH_COMMANDS[i].title == "表格")
+        );
+        assert!(slash_items("zzz").is_empty());
+    }
 
     #[test]
     fn continuation_markers() {
@@ -821,7 +921,7 @@ mod tests {
 
     #[test]
     fn ordered_numbering_matches_preview() {
-        use crate::editor::markdown_live::block::{classify, DocState};
+        use crate::editor::markdown_live::block::{DocState, classify};
         use crate::editor::markdown_live::layout::plan;
 
         // Plan each doc line (preview-mode) and collect the ordered display
@@ -842,7 +942,10 @@ mod tests {
         // A blank line keeps a loose list going: sequential numbers.
         assert_eq!(numbers("1. a\n\n3. b"), vec!["1.", "2."]);
         // Nested lists restart at their own source number.
-        assert_eq!(numbers("1. a\n   1. b\n   2. c\n2. d"), vec!["1.", "1.", "2.", "2."]);
+        assert_eq!(
+            numbers("1. a\n   1. b\n   2. c\n2. d"),
+            vec!["1.", "1.", "2.", "2."]
+        );
         // A bullet item ends the ordered run: the next ordered list starts
         // from its own source number (CommonMark: a different marker type
         // begins a new list).
@@ -869,9 +972,15 @@ mod tests {
         let s = Pos::new(1, 2);
         let e = Pos::new(1, 5);
         assert_eq!(line_selection(s, e, 1, 9), Some((2, 5, false)));
-        assert_eq!(line_selection(Pos::new(0, 3), Pos::new(2, 2), 1, 9), Some((0, 9, true)));
+        assert_eq!(
+            line_selection(Pos::new(0, 3), Pos::new(2, 2), 1, 9),
+            Some((0, 9, true))
+        );
         assert_eq!(line_selection(s, e, 0, 9), None);
-        assert_eq!(line_selection(Pos::new(0, 0), Pos::new(2, 2), 1, 0), Some((0, 0, true)));
+        assert_eq!(
+            line_selection(Pos::new(0, 0), Pos::new(2, 2), 1, 0),
+            Some((0, 0, true))
+        );
     }
 
     #[test]

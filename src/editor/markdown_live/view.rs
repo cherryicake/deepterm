@@ -21,48 +21,48 @@ use gpui::{
 };
 
 use crate::assets::Icon;
-use crate::editor::markdown::{Copy, MarkdownStyle, SelectAll};
-use crate::editor::markdown_element::MarkdownElementBuilder;
-use crate::editor::markdown_live::block::{
-    split_table_row, table_cell_spans, table_delimiter_cols, Block,
-};
-use crate::editor::markdown_live::buffer::LiveBuffer;
-use crate::editor::markdown_live::element::{
-    apply_find_marks, apply_selection, apply_task_done, row_base_style, runs_for_row, LiveColors,
-    LiveLine,
-};
-use crate::editor::markdown_live::inline::collect_refdefs;
-use crate::editor::markdown_live::highlight::HighlightCache;
-use crate::editor::markdown_live::mermaid::{
-    MAX_DISPLAY_W, ZOOM_MAX, ZOOM_STEP, zoom_label, zoomed_size, MermaidBody, MermaidColors,
-    MermaidState,
-};
-use crate::editor::markdown_live::scrollbar::{
-    BAR_THICKNESS, ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
-};
-use crate::editor::markdown_live::images::{
-    MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
-};
-use crate::editor::markdown_live::interactions::{
-    backspace_marker, cell_content_cols, classify_alone, insert_link, line_selection, list_cols,
-    on_enter, on_tab, pos_of_offset, slash_items, slash_query_for, table_cell_at,
-    table_cell_bounds, table_goto_cell, table_insert_row_below, table_last_row_line, table_nav,
-    table_row_line, toggle_task, toggle_wrap, OrderedCounter, SLASH_COMMANDS,
-};
-use crate::editor::markdown_live::layout::{
-    byte_for_col, col_for_byte, plan_cell, src_for_vis, vis_for_src, RowKind,
-};
-use crate::editor::markdown_live::model::{Line, Pos};
-use crate::editor::markdown_live::reveal::{
-    plan_range, refdefs_for_lines, reveal_set, strip_callout_prefix,
-    CalloutKind, Classified, PlannedRow, Reveal,
-};
 use crate::components::input::{
     blink_cursor::{BlinkCursor, CURSOR_WIDTH},
     cursor::CursorShape,
     search::{SearchPanel, SearchTarget},
 };
 use crate::components::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use crate::editor::markdown::{Copy, MarkdownStyle, SelectAll};
+use crate::editor::markdown_element::MarkdownElementBuilder;
+use crate::editor::markdown_live::block::{
+    Block, split_table_row, table_cell_spans, table_delimiter_cols,
+};
+use crate::editor::markdown_live::buffer::LiveBuffer;
+use crate::editor::markdown_live::element::{
+    LiveColors, LiveLine, apply_find_marks, apply_selection, apply_task_done, row_base_style,
+    runs_for_row,
+};
+use crate::editor::markdown_live::highlight::HighlightCache;
+use crate::editor::markdown_live::images::{
+    MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
+};
+use crate::editor::markdown_live::inline::collect_refdefs;
+use crate::editor::markdown_live::interactions::{
+    OrderedCounter, SLASH_COMMANDS, backspace_marker, cell_content_cols, classify_alone,
+    insert_link, line_selection, list_cols, on_enter, on_tab, pos_of_offset, slash_items,
+    slash_query_for, table_cell_at, table_cell_bounds, table_goto_cell, table_insert_row_below,
+    table_last_row_line, table_nav, table_row_line, toggle_task, toggle_wrap,
+};
+use crate::editor::markdown_live::layout::{
+    RowKind, byte_for_col, col_for_byte, plan_cell, src_for_vis, vis_for_src,
+};
+use crate::editor::markdown_live::mermaid::{
+    MAX_DISPLAY_W, MermaidBody, MermaidColors, MermaidState, ZOOM_MAX, ZOOM_STEP, zoom_label,
+    zoomed_size,
+};
+use crate::editor::markdown_live::model::{Line, Pos};
+use crate::editor::markdown_live::reveal::{
+    CalloutKind, Classified, PlannedRow, Reveal, plan_range, refdefs_for_lines, reveal_set,
+    strip_callout_prefix,
+};
+use crate::editor::markdown_live::scrollbar::{
+    BAR_THICKNESS, ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
+};
 use crate::theme::ActiveTheme;
 use ropey::Rope;
 
@@ -73,7 +73,9 @@ pub enum LiveViewEvent {
     /// keystroke no longer pays a full-document `join` just to build an event
     /// nobody may consume. Subscribers that need the text (dirty check, save)
     /// read it explicitly; the shadow-`InputState` sync is debounced.
-    Change { version: u64 },
+    Change {
+        version: u64,
+    },
     LinkClick(String),
 }
 
@@ -483,7 +485,8 @@ impl LiveMarkdownView {
     pub fn set_cursor_blink(&mut self, blink: bool, cx: &mut Context<Self>) {
         if self.cursor_blink != blink {
             self.cursor_blink = blink;
-            self.blink.update(cx, |b, cx| b.set_blink_enabled(blink, cx));
+            self.blink
+                .update(cx, |b, cx| b.set_blink_enabled(blink, cx));
             cx.notify();
         }
     }
@@ -549,19 +552,13 @@ impl LiveMarkdownView {
         }
         let (dir, relative) = match self.doc_path.as_deref() {
             Some(doc) => (assets_dir(doc), true),
-            None => (
-                std::env::temp_dir().join("deepterm-md-images"),
-                false,
-            ),
+            None => (std::env::temp_dir().join("deepterm-md-images"), false),
         };
         std::fs::create_dir_all(&dir).ok()?;
         let name = unique_file_name(&dir, "image", ext);
         std::fs::write(dir.join(&name), bytes).ok()?;
         if relative {
-            Some(format!(
-                "{}/{name}",
-                dir.file_name()?.to_str()?
-            ))
+            Some(format!("{}/{name}", dir.file_name()?.to_str()?))
         } else {
             Some(dir.join(name).to_string_lossy().to_string())
         }
@@ -572,10 +569,7 @@ impl LiveMarkdownView {
         if !is_image_file(src) {
             return None;
         }
-        let ext = src
-            .extension()?
-            .to_str()?
-            .to_ascii_lowercase();
+        let ext = src.extension()?.to_str()?.to_ascii_lowercase();
         let bytes = std::fs::read(src).ok()?;
         self.save_image_bytes(&bytes, &ext)
     }
@@ -638,7 +632,10 @@ impl LiveMarkdownView {
 
     /// 图片文件拖拽投放（`on_drop::<ExternalPaths>`）：导入并插入。
     fn drop_image_files(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
-        let refs: Vec<String> = paths.iter().filter_map(|p| self.import_image_file(p)).collect();
+        let refs: Vec<String> = paths
+            .iter()
+            .filter_map(|p| self.import_image_file(p))
+            .collect();
         if refs.is_empty() {
             return false;
         }
@@ -927,8 +924,7 @@ impl LiveMarkdownView {
         // Stamped with the caret line and text version so an edit or a cursor
         // move invalidates it.
         if line == self.buffer.cursor().line {
-            self.caret_row_rect =
-                Some((line, self.buffer.text_version(), doc_top, doc_bottom));
+            self.caret_row_rect = Some((line, self.buffer.text_version(), doc_top, doc_bottom));
         }
         self.row_layouts.insert(
             line,
@@ -980,7 +976,11 @@ impl LiveMarkdownView {
     /// itself: every text mutation is followed by `after_edit`, which emits
     /// once per transaction (deduped by `emitted_version`). Emitting here
     /// as well doubled shadow-`InputState` sync + `buffer.text()` clones.
-    pub fn edit<R>(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> R) -> R {
+    pub fn edit<R>(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut crate::editor::markdown_live::model::EditorModel) -> R,
+    ) -> R {
         self.scroll_to_cursor = true;
         self.pause_caret(cx);
         let out = self.buffer.edit(f);
@@ -1197,10 +1197,7 @@ impl LiveMarkdownView {
             self.plan_revealed = revealed;
             self.plan_refs = (*self.planned_refs).clone();
             if self.planned_geometry_version != self.buffer.text_version() {
-                self.planned_geometry = Rc::new(PlanGeometry::build_owned(
-                    &self.planned,
-                    lines,
-                ));
+                self.planned_geometry = Rc::new(PlanGeometry::build_owned(&self.planned, lines));
                 self.planned_geometry_version = self.buffer.text_version();
             }
             self.planned_version = self.buffer.text_version();
@@ -1342,8 +1339,9 @@ impl LiveMarkdownView {
         // themselves, which made this test vacuously false and left the
         // geometry gate relying on `blocks_changed` alone.
         let replanned_kinds: Vec<RowKind> = replanned.iter().map(|r| r.plan.kind.clone()).collect();
-        let previous_kinds: Vec<Option<RowKind>> =
-            (lo..=hi).map(|i| self.planned.get(i).map(|r| r.plan.kind.clone())).collect();
+        let previous_kinds: Vec<Option<RowKind>> = (lo..=hi)
+            .map(|i| self.planned.get(i).map(|r| r.plan.kind.clone()))
+            .collect();
 
         // Splice in place. `make_mut` copies the pointer table only when the
         // previous frame still holds a clone; it never copies row contents.
@@ -1550,7 +1548,8 @@ impl LiveMarkdownView {
                 if panel_open {
                     let version = self.buffer.text_version();
                     if self.search_sync_version != Some(version) {
-                        self.search_sync_version = Some(version);                        let weak = cx.entity().downgrade();
+                        self.search_sync_version = Some(version);
+                        let weak = cx.entity().downgrade();
                         cx.spawn(async move |_this, cx| {
                             cx.background_executor()
                                 .timer(Duration::from_millis(Self::SEARCH_SYNC_DEBOUNCE_MS))
@@ -1600,15 +1599,16 @@ impl LiveMarkdownView {
                 return;
             };
             let is_table = |l: usize| l >= block.0 && l <= block.1;
-            let Some((_, ci, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col)
-            else {
+            let Some((_, ci, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
                 return;
             };
             let offset = cur.col.saturating_sub(cs);
             let Some(edits) = t::prettify_edits(&lines, block) else {
                 return;
             };
-            if edits.iter().all(|(i, text)| lines.get(*i).map(|l| l.as_str()) == Some(text.as_str()))
+            if edits
+                .iter()
+                .all(|(i, text)| lines.get(*i).map(|l| l.as_str()) == Some(text.as_str()))
             {
                 return; // 已是目标格式：不动文本、不入撤销栈。
             }
@@ -1909,7 +1909,11 @@ impl LiveMarkdownView {
     /// the caret refuse to follow the mouse and the selection snap back to the
     /// start of the row. So when the drag is already inside a table, defer to
     /// the cell path: extend within the pointer's own cell only.
-    pub(crate) fn on_fallback_drag(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+    pub(crate) fn on_fallback_drag(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         if !self.selecting {
             return;
         }
@@ -2155,12 +2159,7 @@ impl LiveMarkdownView {
     /// 单元格内拖拽：把选区终点扩到**指针所在格**的对应位置（spec #6：
     /// 端点由 `cell_div` 的元素级监听按命中格给出，不再夹回起点格 ——
     /// 跨格选区由此成形；跨块延伸由 [`Self::drag_cross_table`] 拦下）。
-    pub(crate) fn on_table_cell_drag(
-        &mut self,
-        line: usize,
-        col: usize,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn on_table_cell_drag(&mut self, line: usize, col: usize, cx: &mut Context<Self>) {
         if !self.selecting {
             return;
         }
@@ -2206,7 +2205,11 @@ impl LiveMarkdownView {
         if !self.line_is_table(cur.line) {
             return false;
         }
-        let len = self.buffer.line(cur.line).map(|l| l.chars().count()).unwrap_or(0);
+        let len = self
+            .buffer
+            .line(cur.line)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
         self.edit(cx, |m| m.select_range(0, len));
         cx.notify();
         true
@@ -2274,7 +2277,9 @@ impl LiveMarkdownView {
             prev_col
         };
         let moved = self.edit(cx, |m| {
-            table_goto_cell(m, &lines, &is_table, cur.line, prev_row, prev_col, true, false)
+            table_goto_cell(
+                m, &lines, &is_table, cur.line, prev_row, prev_col, true, false,
+            )
         });
         if moved {
             self.after_move(cx);
@@ -2430,7 +2435,9 @@ impl LiveMarkdownView {
         };
         // Typora: ↑ 落在目标格**末**，↓ 落在**首**。
         let moved = self.edit(cx, |m| {
-            table_goto_cell(m, &lines, &is_table, cur.line, target_row, col, !down, extend)
+            table_goto_cell(
+                m, &lines, &is_table, cur.line, target_row, col, !down, extend,
+            )
         });
         if moved {
             self.after_move(cx);
@@ -2459,7 +2466,11 @@ impl LiveMarkdownView {
         let Some((row, col, (cs, ce))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
             return false;
         };
-        let at_edge = if forward { cur.col >= ce } else { cur.col <= cs };
+        let at_edge = if forward {
+            cur.col >= ce
+        } else {
+            cur.col <= cs
+        };
         if !at_edge {
             return false;
         }
@@ -2476,7 +2487,9 @@ impl LiveMarkdownView {
             }
         };
         let moved = self.edit(cx, |m| {
-            table_goto_cell(m, &lines, &is_table, cur.line, target_row, col, !forward, extend)
+            table_goto_cell(
+                m, &lines, &is_table, cur.line, target_row, col, !forward, extend,
+            )
         });
         if !moved {
             // 末行格尾（或目标行列数不足）：无下一格，原地消费。
@@ -2629,7 +2642,9 @@ impl LiveMarkdownView {
     ) -> Option<(usize, usize, std::ops::Range<usize>)> {
         let cursor_line = cursor.line;
         // 光标行必须真的属于这个表格组（防御：调用点已保证，双保险）。
-        idxs.iter().copied().find(|pi| rows[*pi].line == cursor_line)?;
+        idxs.iter()
+            .copied()
+            .find(|pi| rows[*pi].line == cursor_line)?;
         let line = self.buffer.line(cursor_line)?;
         let col = cursor.col.min(line.chars().count());
         let byte = byte_for_col(line, col);
@@ -2664,12 +2679,7 @@ impl LiveMarkdownView {
     /// 夹光标必须在**切换的同一帧**做完：只改状态的话，光标会滞留在下一帧
     /// 就不可见的源码区里（真实点击路径实测复现，见 `live_mermaid_graph_mode`
     /// 第 4 步）。
-    fn set_mermaid_showing_code(
-        &mut self,
-        block_id: usize,
-        showing: bool,
-        cx: &mut Context<Self>,
-    ) {
+    fn set_mermaid_showing_code(&mut self, block_id: usize, showing: bool, cx: &mut Context<Self>) {
         if self.mermaid.set_showing_code(block_id, showing) && !showing {
             self.clamp_cursor_out_of_image_blocks(cx);
         }
@@ -2730,11 +2740,12 @@ impl LiveMarkdownView {
         if self.activation_observer.is_some() {
             return;
         }
-        self.activation_observer = Some(cx.observe_window_activation(window, |view, window, cx| {
-            if !window.is_window_active() {
-                view.end_scroll_drags(cx);
-            }
-        }));
+        self.activation_observer =
+            Some(cx.observe_window_activation(window, |view, window, cx| {
+                if !window.is_window_active() {
+                    view.end_scroll_drags(cx);
+                }
+            }));
     }
 
     /// 某块是否处于「全宽显示」。
@@ -2834,7 +2845,8 @@ impl LiveMarkdownView {
             return;
         }
         let anchors = &self.planned_geometry.wide_anchors;
-        self.wide_blocks.retain(|b| anchors.binary_search(b).is_ok());
+        self.wide_blocks
+            .retain(|b| anchors.binary_search(b).is_ok());
     }
 
     /// `line` 是否落在某个「正在画图」的 mermaid 块源码区间内。
@@ -2860,7 +2872,9 @@ impl LiveMarkdownView {
                 i += 1;
                 continue;
             };
-            let is_mermaid = lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
+            let is_mermaid = lang
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
             let open_pi = i;
             i += 1;
             let mut last_code = open_pi;
@@ -2868,15 +2882,14 @@ impl LiveMarkdownView {
                 last_code = i;
                 i += 1;
             }
-            let close_pi = if i < rows.len()
-                && matches!(rows[i].block, Block::Fence { open: false, .. })
-            {
-                let c = i;
-                i += 1;
-                Some(c)
-            } else {
-                None
-            };
+            let close_pi =
+                if i < rows.len() && matches!(rows[i].block, Block::Fence { open: false, .. }) {
+                    let c = i;
+                    i += 1;
+                    Some(c)
+                } else {
+                    None
+                };
             // 非 mermaid / 空块：与渲染分支一致（空块恒显源码）。
             if !is_mermaid || last_code == open_pi {
                 continue;
@@ -2884,8 +2897,8 @@ impl LiveMarkdownView {
             let block_id = rows[open_pi].line;
             // 与渲染分支同源：mermaid 块不吃「光标停在围栏行」的行级揭示
             //（严格 tab-only），只有全文档源码模式才回源码。
-            let fence_revealed = rows[open_pi].plan.revealed
-                || close_pi.is_some_and(|c| rows[c].plan.revealed);
+            let fence_revealed =
+                rows[open_pi].plan.revealed || close_pi.is_some_and(|c| rows[c].plan.revealed);
             let revealed = fence_revealed && self.show_source;
             if revealed || self.mermaid.is_showing_code(block_id) {
                 continue;
@@ -2986,17 +2999,12 @@ impl LiveMarkdownView {
         // semantics — guise's `Row::caret()` does the same with explicit
         // wrap boundaries.
         let pos_y = f32::from(pos.y);
-        let next_pos = info
-            .layout
-            .position_for_index((vis + 1).min(info.text_len));
+        let next_pos = info.layout.position_for_index((vis + 1).min(info.text_len));
         let (vrow_f, caret_x_rel) = match next_pos {
             Some(np) if vis < info.text_len && f32::from(np.y) > pos_y => {
                 // `vis` starts a new visual row: its row is the next one and
                 // its x is the row start.
-                (
-                    ((f32::from(np.y - origin.y)) / line_h).round(),
-                    0.0,
-                )
+                (((f32::from(np.y - origin.y)) / line_h).round(), 0.0)
             }
             _ => (
                 // Round, not floor: pixel snapping can put a row top at
@@ -3098,14 +3106,20 @@ impl LiveMarkdownView {
             Some(row) => {
                 let vis = raw.min(row.plan.visible.len());
                 let src = src_for_vis(&row.plan.segs, vis);
-                (row.plan.visible.len(), row.plan.segs.clone(), row.plan.link_at(src).map(str::to_string))
+                (
+                    row.plan.visible.len(),
+                    row.plan.segs.clone(),
+                    row.plan.link_at(src).map(str::to_string),
+                )
             }
             None => return,
         };
         let _ = vis_len;
         let vis = raw.min(vis_len);
         let src = src_for_vis(&segs, vis);
-        if (platform || self.read_only) && let Some(target) = link {
+        if (platform || self.read_only)
+            && let Some(target) = link
+        {
             cx.emit(LiveViewEvent::LinkClick(target));
             cx.notify();
             cx.stop_propagation();
@@ -3131,7 +3145,13 @@ impl LiveMarkdownView {
         cx.stop_propagation();
     }
 
-    pub fn on_line_drag(&mut self, line: usize, raw: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_line_drag(
+        &mut self,
+        line: usize,
+        raw: usize,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.selecting {
             return;
         }
@@ -3142,7 +3162,10 @@ impl LiveMarkdownView {
             Some(row) => (
                 row.plan.visible.len(),
                 row.plan.segs.clone(),
-                self.buffer.line(line).map(str::to_string).unwrap_or_default(),
+                self.buffer
+                    .line(line)
+                    .map(str::to_string)
+                    .unwrap_or_default(),
             ),
             None => return,
         };
@@ -3252,10 +3275,9 @@ impl LiveMarkdownView {
         let alt = ks.modifiers.alt;
         // 查找面板输入框聚焦时正文快捷键全部让行（`SearchPanel` 自带
         // Enter/Escape/Tab action），仅保留 Cmd+F / Cmd+G / Esc。
-        if self.search_panel_focused(window, cx) && !matches!(
-            (key, platform),
-            ("f", true) | ("g", true) | ("escape", _)
-        ) {
+        if self.search_panel_focused(window, cx)
+            && !matches!((key, platform), ("f", true) | ("g", true) | ("escape", _))
+        {
             return;
         }
 
@@ -3271,15 +3293,16 @@ impl LiveMarkdownView {
         // Slash `/` command menu (Typora/Notion parity): plain Up/Down
         // cycle, Enter/Tab apply, Esc suppresses until the query changes.
         // Anything else falls through so typing filters the menu live.
-        if !platform && !control && !alt
+        if !platform
+            && !control
+            && !alt
             && self.buffer.selection().is_none()
             && !self.search_panel_focused(window, cx)
             && let Some((query, items)) = self.slash_menu()
         {
             match key {
                 "up" => {
-                    self.slash_index =
-                        (self.slash_index + items.len() - 1) % items.len();
+                    self.slash_index = (self.slash_index + items.len() - 1) % items.len();
                     self.after_move(cx);
                     return;
                 }
@@ -3458,7 +3481,8 @@ impl LiveMarkdownView {
                 // spec #12：表格里 Cmd+退格删到**格内容首**（不是行首，避免
                 // 把管道和同排格子一起切掉）。
                 let cell_cs = if sel_none && platform && !shift && self.cursor_in_table() {
-                    self.table_cell_content_at(cur.line, cur.col).map(|(cs, _)| cs)
+                    self.table_cell_content_at(cur.line, cur.col)
+                        .map(|(cs, _)| cs)
                 } else {
                     None
                 };
@@ -3502,7 +3526,8 @@ impl LiveMarkdownView {
                 // spec #12：光标在格内容**末尾** → 命中零宽哨兵，Delete 无操作；
                 // 表格外（或格中间）不受影响。同时给 Cmd+Delete 提供格尾边界。
                 let cell_ce = if sel_none && self.cursor_in_table() {
-                    self.table_cell_content_at(cur.line, cur.col).map(|(_, ce)| ce)
+                    self.table_cell_content_at(cur.line, cur.col)
+                        .map(|(_, ce)| ce)
                 } else {
                     None
                 };
@@ -3586,7 +3611,11 @@ impl LiveMarkdownView {
                     return;
                 }
                 let cur = self.buffer.cursor();
-                let text = self.buffer.line(cur.line).map(str::to_string).unwrap_or_default();
+                let text = self
+                    .buffer
+                    .line(cur.line)
+                    .map(str::to_string)
+                    .unwrap_or_default();
                 let planned_block = self
                     .planned
                     .iter()
@@ -3607,7 +3636,11 @@ impl LiveMarkdownView {
                     return;
                 }
                 let cur = self.buffer.cursor();
-                let text = self.buffer.line(cur.line).map(str::to_string).unwrap_or_default();
+                let text = self
+                    .buffer
+                    .line(cur.line)
+                    .map(str::to_string)
+                    .unwrap_or_default();
                 let tab_size = self.tab_size;
                 // Typora Tab inside a table: grid navigation (no selection).
                 if self.buffer.selection().is_none() && self.line_is_table(cur.line) {
@@ -3692,18 +3725,15 @@ impl LiveMarkdownView {
                         } else {
                             let line = self.buffer.cursor().line;
                             let changed = self.edit(cx, |m| {
-                                let len =
-                                    m.line(line).map(|l| l.chars().count()).unwrap_or(0);
+                                let len = m.line(line).map(|l| l.chars().count()).unwrap_or(0);
                                 if line + 1 < m.line_count() {
                                     // 连同行尾换行一起删。
                                     m.move_to(line, 0, false);
                                     m.move_to(line + 1, 0, true);
                                 } else if line > 0 {
                                     // 末行：连同上一行末尾的换行一起删。
-                                    let prev_len = m
-                                        .line(line - 1)
-                                        .map(|l| l.chars().count())
-                                        .unwrap_or(0);
+                                    let prev_len =
+                                        m.line(line - 1).map(|l| l.chars().count()).unwrap_or(0);
                                     m.move_to(line - 1, prev_len, false);
                                     m.move_to(line, len, true);
                                 } else {
@@ -3842,13 +3872,7 @@ impl LiveMarkdownView {
                 }
                 // spec #13：撤销/重做恢复历史原样，跳过一次自动重排。
                 self.skip_reformat = true;
-                let changed = self.edit(cx, |m| {
-                    if shift {
-                        m.redo()
-                    } else {
-                        m.undo()
-                    }
-                });
+                let changed = self.edit(cx, |m| if shift { m.redo() } else { m.undo() });
                 if changed {
                     self.after_edit(cx);
                 } else {
@@ -3866,9 +3890,7 @@ impl LiveMarkdownView {
             "g" if platform => {
                 if self.search_panel.is_none() {
                     self.open_search(window, cx);
-                    if shift
-                        && let Some(panel) = self.search_panel.clone()
-                    {
+                    if shift && let Some(panel) = self.search_panel.clone() {
                         panel.update(cx, |p, cx| p.jump(-1, window, cx));
                     }
                 } else if let Some(panel) = self.search_panel.clone() {
@@ -4091,7 +4113,9 @@ fn style_fingerprint(style: &MarkdownStyle, is_dark: bool) -> u64 {
     b.font_family.hash(&mut h);
     b.font_weight.0.to_bits().hash(&mut h);
     b.font_style.hash(&mut h);
-    f32::from(b.font_size.to_pixels(px(16.))).to_bits().hash(&mut h);
+    f32::from(b.font_size.to_pixels(px(16.)))
+        .to_bits()
+        .hash(&mut h);
     // The code-block mono style feeds `row_base_style` for code runs.
     style.inline_code.font_family.hash(&mut h);
     if let Some(fs) = &style.inline_code.font_size {
@@ -4114,8 +4138,7 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
 
 /// Outline entries `(source line, level, title)` in document order.
 fn outline_entries(rows: &[&PlannedRow]) -> Vec<(usize, u8, String)> {
-    rows
-        .iter()
+    rows.iter()
         .filter_map(|r| match &r.block {
             Block::Heading { level, .. } => Some((r.line, *level, outline_title(&r.plan.visible))),
             _ => None,
@@ -4125,10 +4148,7 @@ fn outline_entries(rows: &[&PlannedRow]) -> Vec<(usize, u8, String)> {
 
 /// Outline display title: single line, max 42 chars.
 fn outline_title(visible: &str) -> String {
-    let one = visible
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let one = visible.split_whitespace().collect::<Vec<_>>().join(" ");
     if one.is_empty() {
         return "(空标题)".to_string();
     }
@@ -4303,7 +4323,11 @@ fn parse_image_line(line: &str) -> Option<(String, String)> {
     let alt = inner[..close].to_string();
     let rest = &inner[close + 2..];
     let end = rest.find(')')?;
-    let url = rest[..end].split_whitespace().next().unwrap_or("").to_string();
+    let url = rest[..end]
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string();
     if url.is_empty() || !rest[end + 1..].trim().is_empty() {
         return None;
     }
@@ -4357,7 +4381,12 @@ impl SearchTarget for LiveMarkdownView {
         Some(self.search_caret_offset())
     }
 
-    fn reveal_match(&mut self, range: std::ops::Range<usize>, _w: &mut Window, cx: &mut Context<Self>) {
+    fn reveal_match(
+        &mut self,
+        range: std::ops::Range<usize>,
+        _w: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // 防抖可能让面板的匹配落后于当前文本：跳转前先对齐。
         self.sync_search_now(cx);
         let lines = self.buffer.lines().to_vec();
@@ -4516,9 +4545,7 @@ impl EntityInputHandler for LiveMarkdownView {
     ) {
         // 只读/搜索面板聚焦/失焦：静默丢弃（**不**置 stop，避免平台仍在
         // 派发的 `on_key` 被吞）。
-        if self.read_only
-            || self.search_panel_focused(window, cx)
-            || !self.focus.is_focused(window)
+        if self.read_only || self.search_panel_focused(window, cx) || !self.focus.is_focused(window)
         {
             return;
         }
@@ -4555,9 +4582,7 @@ impl EntityInputHandler for LiveMarkdownView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.read_only
-            || self.search_panel_focused(window, cx)
-            || !self.focus.is_focused(window)
+        if self.read_only || self.search_panel_focused(window, cx) || !self.focus.is_focused(window)
         {
             return;
         }
@@ -4909,7 +4934,11 @@ impl PlanGeometry {
         let mut prev_base: u8 = 9;
         for (gi, gr) in groups.iter().enumerate() {
             let base = gr.cal_bucket(rows);
-            let b = if base == 9 { 10 + prev_base.min(9) } else { base };
+            let b = if base == 9 {
+                10 + prev_base.min(9)
+            } else {
+                base
+            };
             ginfo.push((gr.row_count(), b, gr.line_range(rows)));
             prev_base = base;
             let gi = gi as u32;
@@ -4957,7 +4986,10 @@ impl PlanGeometry {
         let mut mermaid_blocks: Vec<MermaidBlockRef> = Vec::new();
         for gr in &groups {
             let Group::Fence {
-                open, code, close: _, ..
+                open,
+                code,
+                close: _,
+                ..
             } = gr
             else {
                 continue;
@@ -5067,10 +5099,9 @@ impl PlanGeometry {
                     .unwrap_or(*open)
                     .max(*open),
             ),
-            Group::Para(v) | Group::Quote(v) | Group::Table(v) => (
-                *v.first().unwrap_or(&0),
-                *v.last().unwrap_or(&0),
-            ),
+            Group::Para(v) | Group::Quote(v) | Group::Table(v) => {
+                (*v.first().unwrap_or(&0), *v.last().unwrap_or(&0))
+            }
         })
     }
 
@@ -5368,10 +5399,7 @@ impl LiveMarkdownView {
             if i + 2 < g {
                 return false;
             }
-            matches!(
-                ginfo.get(i).map(|(_, b, _)| *b),
-                Some(10..=19)
-            )
+            matches!(ginfo.get(i).map(|(_, b, _)| *b), Some(10..=19))
         };
         // Reuse the previous prefix sum when nothing that feeds it changed
         // (an idle/blink frame, or a scroll that did not move the window).
@@ -5844,11 +5872,7 @@ impl Render for LiveMarkdownView {
                 runs_for_row(plan, &base, &colors, &style, &self.hl, &theme)
             };
             if matches!(row.plan.kind, RowKind::Task { checked: true, .. }) {
-                runs = apply_task_done(
-                    runs,
-                    ui.text_muted,
-                    ui.text_muted.opacity(0.6),
-                );
+                runs = apply_task_done(runs, ui.text_muted, ui.text_muted.opacity(0.6));
             }
             // Selection overlay: source cols → bytes → visible bytes.
             let vsel = selection.and_then(|(s, e)| {
@@ -5857,10 +5881,7 @@ impl Render for LiveMarkdownView {
                 let (cs, ce, _) = line_selection(s, e, row.line, line_len)?;
                 let bs = byte_for_col(src_line, cs);
                 let be = byte_for_col(src_line, ce);
-                Some((
-                    vis_for_src(&plan.segs, bs),
-                    vis_for_src(&plan.segs, be),
-                ))
+                Some((vis_for_src(&plan.segs, bs), vis_for_src(&plan.segs, be)))
             });
             runs = apply_selection(runs, plan.visible.len(), vsel, colors.selection);
             if let Some(marks) = find_marks.get(&row.line) {
@@ -5874,10 +5895,7 @@ impl Render for LiveMarkdownView {
             }
             let caret_vis = if show_caret && cursor.line == row.line {
                 let src_line = self.buffer.line(row.line).unwrap_or("");
-                Some(vis_for_src(
-                    &plan.segs,
-                    byte_for_col(src_line, cursor.col),
-                ))
+                Some(vis_for_src(&plan.segs, byte_for_col(src_line, cursor.col)))
             } else {
                 None
             };
@@ -5892,15 +5910,7 @@ impl Render for LiveMarkdownView {
             let (caret_block_width, caret_block_text) = if caret_vis.is_some() {
                 let src_line = self.buffer.line(row.line).unwrap_or("");
                 let ch = src_line.chars().nth(cursor.col);
-                Self::caret_block_for(
-                    self.cursor_shape,
-                    ch,
-                    &base,
-                    font_size,
-                    caret_h,
-                    window,
-                    cx,
-                )
+                Self::caret_block_for(self.cursor_shape, ch, &base, font_size, caret_h, window, cx)
             } else {
                 (CURSOR_WIDTH, None)
             };
@@ -6224,19 +6234,13 @@ impl Render for LiveMarkdownView {
                                         .w(px(22.))
                                         .flex_shrink_0()
                                         .mt(px(3.))
-                                        .child(
-                                            div()
-                                                .child(box_el)
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        move |this, _e, _w, cx| {
-                                                            this.toggle_task_at(line, cx);
-                                                            cx.stop_propagation();
-                                                        },
-                                                    ),
-                                                ),
-                                        )
+                                        .child(div().child(box_el).on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _e, _w, cx| {
+                                                this.toggle_task_at(line, cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        ))
                                         .into_any_element()
                                 }
                                 RowKind::Ordered { number, .. } => {
@@ -6278,7 +6282,11 @@ impl Render for LiveMarkdownView {
                             }
                             item.child(gutter)
                                 .child(
-                                    div().flex_1().w_0().min_w_0().child(live_line(pi, &paints, &entity, &colors)),
+                                    div()
+                                        .flex_1()
+                                        .w_0()
+                                        .min_w_0()
+                                        .child(live_line(pi, &paints, &entity, &colors)),
                                 )
                                 .into_any_element()
                         }
@@ -6406,10 +6414,11 @@ impl Render for LiveMarkdownView {
                     // 「只能点『源码』tab 才能编辑」。只保留全文档源码模式
                     //（`Cmd+/`，plan_document 会把所有行 revealed）这条用户显式
                     // 通道。
-                    let is_mermaid =
-                        lang.as_deref().is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
-                    let fence_revealed = rows[*open].plan.revealed
-                        || close.is_some_and(|c| rows[c].plan.revealed);
+                    let is_mermaid = lang
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case("mermaid"));
+                    let fence_revealed =
+                        rows[*open].plan.revealed || close.is_some_and(|c| rows[c].plan.revealed);
                     let revealed = fence_revealed && (!is_mermaid || self.show_source);
                     let block_id = rows[*open].line;
                     if revealed || code.is_empty() {
@@ -6431,7 +6440,8 @@ impl Render for LiveMarkdownView {
                             src = src.child(live_line(pi, &paints, &entity, &colors));
                         }
                         let last_idx = *idxs.last().unwrap();
-                        self.row_targets.push((rows[*open].line, rows[last_idx].line));
+                        self.row_targets
+                            .push((rows[*open].line, rows[last_idx].line));
                         row_els.push(src.into_any_element());
                         window_counts.push(row_els.len() - els_before);
                         continue;
@@ -6607,9 +6617,7 @@ impl Render for LiveMarkdownView {
                     }
                     // mermaid 卡片不渲染语言徽章（左上角让位给「预览 | 源码」
                     // tab）；其他语言保持原样。
-                    if !is_mermaid
-                        && let Some(lang) = lang
-                    {
+                    if !is_mermaid && let Some(lang) = lang {
                         card = card.child(
                             div()
                                 .absolute()
@@ -6815,19 +6823,20 @@ impl Render for LiveMarkdownView {
                                                 // 点百分比 = 还原（回到适配宽度 /
                                                 // 阅读尺寸）。
                                                 .hover(|s| {
-                                                    s.bg(ui.text.opacity(0.12))
-                                                        .text_color(ui.text)
+                                                    s.bg(ui.text.opacity(0.12)).text_color(ui.text)
                                                 })
                                                 .child(zoom_pct)
-                                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
-                                                    ent.update(cx, |v, cx| {
-                                                        v.mermaid_zoom_by(
-                                                            block_id,
-                                                            MermaidZoom::Reset,
-                                                            cx,
-                                                        )
-                                                    });
-                                                })
+                                                .on_click(
+                                                    move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                                        ent.update(cx, |v, cx| {
+                                                            v.mermaid_zoom_by(
+                                                                block_id,
+                                                                MermaidZoom::Reset,
+                                                                cx,
+                                                            )
+                                                        });
+                                                    },
+                                                )
                                         })
                                         .child(step("+", MermaidZoom::In, "live-mm-zoom-in"))
                                 })
@@ -6896,10 +6905,8 @@ impl Render for LiveMarkdownView {
                     }
                     // Fallback target: the first code line (lands the cursor
                     // inside the block without flipping the card).
-                    self.row_targets.push((
-                        rows[*code.first().unwrap()].line,
-                        group_last_line,
-                    ));
+                    self.row_targets
+                        .push((rows[*code.first().unwrap()].line, group_last_line));
                     if wide {
                         wide_rows.insert(row_els.len());
                     }
@@ -7026,17 +7033,17 @@ impl Render for LiveMarkdownView {
                     if idxs.iter().any(|pi| rows[*pi].line == cursor.line) {
                         caret_el_ix = Some(row_els.len());
                     }
-                    self.row_targets.push((
-                        rows[idxs[0]].line,
-                        rows[*idxs.last().unwrap()].line,
-                    ));
+                    self.row_targets
+                        .push((rows[idxs[0]].line, rows[*idxs.last().unwrap()].line));
                     row_els.push(card.into_any_element());
                 }
                 Group::Table(idxs) => {
                     let revealed = idxs.iter().any(|c| rows[*c].plan.revealed);
                     let src_lines: Vec<Line> = idxs
                         .iter()
-                        .map(|c| Arc::new(self.buffer.line(rows[*c].line).unwrap_or("").to_string()))
+                        .map(|c| {
+                            Arc::new(self.buffer.line(rows[*c].line).unwrap_or("").to_string())
+                        })
                         .collect();
                     let grid_rows: Vec<Vec<String>> =
                         src_lines.iter().map(|l| split_table_row(l)).collect();
@@ -7044,9 +7051,8 @@ impl Render for LiveMarkdownView {
                     // count, otherwise this is not a table at all (same rule
                     // pulldown-cmark applies in the read-only preview).
                     let has_delimiter = grid_rows.len() > 1
-                        && table_delimiter_cols(&src_lines[1]).is_some_and(|c| {
-                            c == grid_rows[0].len() && c > 0
-                        });
+                        && table_delimiter_cols(&src_lines[1])
+                            .is_some_and(|c| c == grid_rows[0].len() && c > 0);
                     if revealed || !has_delimiter {
                         // Whole-block source view (`Cmd+/`) or not really a
                         // table: mono rows.
@@ -7126,26 +7132,29 @@ impl Render for LiveMarkdownView {
                         )
                         .unwrap_or(0);
                         let cur_align = aligns.get(cur_col).copied().unwrap_or(CellAlign::None);
-                        let align_btn = |label: &'static str,
-                                         op: TableMenuOp,
-                                         want: CellAlign,
-                                         ent: Entity<Self>| {
-                            let on = cur_align == want;
-                            div()
-                                .id(SharedString::from(format!("live-table-tb-align-{start_line}-{label}")))
-                                .debug_selector(move || format!("live-table-toolbar-{label}"))
-                                .px(px(6.0))
-                                .py(px(2.0))
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .text_size(px(11.0))
-                                .text_color(if on { ui.accent } else { ui.text_muted })
-                                .hover(|s| s.bg(ui.text.opacity(0.08)))
-                                .child(label)
-                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
-                                    ent.update(cx, |v, cx| v.run_table_menu_op(op, cx));
-                                })
-                        };
+                        let align_btn =
+                            |label: &'static str,
+                             op: TableMenuOp,
+                             want: CellAlign,
+                             ent: Entity<Self>| {
+                                let on = cur_align == want;
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "live-table-tb-align-{start_line}-{label}"
+                                    )))
+                                    .debug_selector(move || format!("live-table-toolbar-{label}"))
+                                    .px(px(6.0))
+                                    .py(px(2.0))
+                                    .rounded(px(4.0))
+                                    .cursor_pointer()
+                                    .text_size(px(11.0))
+                                    .text_color(if on { ui.accent } else { ui.text_muted })
+                                    .hover(|s| s.bg(ui.text.opacity(0.08)))
+                                    .child(label)
+                                    .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                        ent.update(cx, |v, cx| v.run_table_menu_op(op, cx));
+                                    })
+                            };
                         // Typora 工具栏（spec #14）：左端「尺寸」按钮开 resize
                         // 弹层（行/列数步进器）、中间对齐 ×3、右端 More▾（= 右键
                         // 菜单同一套条目）。原 `+行/+列/重排/删除表` 平铺按钮
@@ -7346,9 +7355,7 @@ impl Render for LiveMarkdownView {
                             .cursor_pointer()
                             .hover(|s| s.bg(ui.text.opacity(0.15)));
                         if preview_idx > 0 {
-                            gutter = gutter
-                                .border_t(px(1.0))
-                                .border_color(colors.table_border);
+                            gutter = gutter.border_t(px(1.0)).border_color(colors.table_border);
                         }
                         if is_header {
                             gutter = gutter.bg(colors.elevated_bg);
@@ -7356,14 +7363,12 @@ impl Render for LiveMarkdownView {
                             gutter = gutter.bg(colors.panel_bg);
                         }
                         let g_line = row_line;
-                        gutter = gutter.on_click(cx.listener(
-                            move |this, _event, _window, cx| {
-                                if let Some((cs, _)) = this.table_cell_content_at(g_line, 0) {
-                                    this.edit_no_scroll(cx, |m| m.move_to(g_line, cs, false));
-                                    this.after_move(cx);
-                                }
-                            },
-                        ));
+                        gutter = gutter.on_click(cx.listener(move |this, _event, _window, cx| {
+                            if let Some((cs, _)) = this.table_cell_content_at(g_line, 0) {
+                                this.edit_no_scroll(cx, |m| m.move_to(g_line, cs, false));
+                                this.after_move(cx);
+                            }
+                        }));
                         if !is_header {
                             gutter = attach_table_drag(
                                 gutter,
@@ -7379,7 +7384,12 @@ impl Render for LiveMarkdownView {
                         }
                         let mut row_div = div().flex().w_full().child(gutter);
                         for (col, align) in aligns.iter().enumerate() {
-                            let mut cell_div = div().flex_1().min_w(px(0.)).px_3().py_2().text_size(px(14.));
+                            let mut cell_div = div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .px_3()
+                                .py_2()
+                                .text_size(px(14.));
                             if col > 0 || preview_idx > 0 {
                                 cell_div = cell_div.border_color(colors.table_border);
                                 if col > 0 {
@@ -7428,7 +7438,8 @@ impl Render for LiveMarkdownView {
                                     cursor.col,
                                     row_line == cursor.line,
                                 );
-                                let plan = plan_cell(src_line, content.clone(), expand, &table_refs);
+                                let plan =
+                                    plan_cell(src_line, content.clone(), expand, &table_refs);
                                 let base = row_base_style(&plan, &style);
                                 let mut runs =
                                     runs_for_row(&plan, &base, &colors, &style, &self.hl, &theme);
@@ -7440,10 +7451,8 @@ impl Render for LiveMarkdownView {
                                     if let Some((cs, ce, _)) =
                                         line_selection(s, e, row_line, line_len)
                                     {
-                                        let bs = byte_for_col(src_line, cs)
-                                            .max(content.start);
-                                        let be =
-                                            byte_for_col(src_line, ce).min(content.end);
+                                        let bs = byte_for_col(src_line, cs).max(content.start);
+                                        let be = byte_for_col(src_line, ce).min(content.end);
                                         if be > bs {
                                             let vsel = (
                                                 vis_for_src(&plan.segs, bs),
@@ -7459,10 +7468,7 @@ impl Render for LiveMarkdownView {
                                     }
                                 }
                                 let caret_vis = show_caret.then(|| {
-                                    vis_for_src(
-                                        &plan.segs,
-                                        byte_for_col(src_line, cursor.col),
-                                    )
+                                    vis_for_src(&plan.segs, byte_for_col(src_line, cursor.col))
                                 });
                                 // 单元格光标高度：与行渲染同一套度量（基础样式
                                 // 行高），不另造数字。
@@ -7510,8 +7516,7 @@ impl Render for LiveMarkdownView {
                                 let lead = raw.len() - raw.trim_start().len();
                                 let trail = raw.len() - raw.trim_end().len();
                                 let content = (s + lead)..(e - trail).max(s + lead);
-                                let plan =
-                                    plan_cell(src_line, content.clone(), None, &table_refs);
+                                let plan = plan_cell(src_line, content.clone(), None, &table_refs);
                                 let cell_base = row_base_style(&plan, &style);
                                 let mut runs = runs_for_row(
                                     &plan, &cell_base, &colors, &style, &self.hl, &theme,
@@ -7540,9 +7545,8 @@ impl Render for LiveMarkdownView {
                                     }
                                 }
                                 // 探针：非活动格（测试断言点击落在该格）。
-                                cell_div = cell_div.debug_selector(move || {
-                                    format!("live-table-cell-{di}-{col}")
-                                });
+                                cell_div = cell_div
+                                    .debug_selector(move || format!("live-table-cell-{di}-{col}"));
                                 cell_div = cell_div.child(
                                     LiveLine::new(
                                         ("live-table-cell", start_line + di * 64 + col),
@@ -7569,21 +7573,23 @@ impl Render for LiveMarkdownView {
                             let hit_key = (row_line, col);
                             cell_div = cell_div.on_mouse_down(
                                 gpui::MouseButton::Left,
-                                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
-                                    let Some(c) =
-                                        this.cell_col_at(hit_key.0, hit_key.1, event.position)
-                                    else {
-                                        return;
-                                    };
-                                    this.on_table_cell_mouse_down(
-                                        hit_key.0,
-                                        c,
-                                        event.click_count,
-                                        event.modifiers.shift,
-                                        window,
-                                        cx,
-                                    );
-                                }),
+                                cx.listener(
+                                    move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                        let Some(c) =
+                                            this.cell_col_at(hit_key.0, hit_key.1, event.position)
+                                        else {
+                                            return;
+                                        };
+                                        this.on_table_cell_mouse_down(
+                                            hit_key.0,
+                                            c,
+                                            event.click_count,
+                                            event.modifiers.shift,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ),
                             );
                             cell_div = cell_div.on_mouse_move(cx.listener(
                                 move |this, event: &gpui::MouseMoveEvent, _window, cx| {
@@ -7650,16 +7656,12 @@ impl Render for LiveMarkdownView {
                         )
                         .len();
                         // 一个步进按钮（−/+）：按当前光标块算目标值再走 op。
-                        let sb = |probe: &'static str,
-                                  glyph: &'static str,
-                                  ent: Entity<Self>| {
+                        let sb = |probe: &'static str, glyph: &'static str, ent: Entity<Self>| {
                             div()
                                 .id(SharedString::from(format!(
                                     "live-table-tb-step-{start_line}-{probe}"
                                 )))
-                                .debug_selector(move || {
-                                    format!("live-table-resize-{probe}")
-                                })
+                                .debug_selector(move || format!("live-table-resize-{probe}"))
                                 .px(px(7.0))
                                 .py(px(1.0))
                                 .rounded(px(4.0))
@@ -7679,19 +7681,13 @@ impl Render for LiveMarkdownView {
                                         };
                                         match probe {
                                             "row-plus" | "row-minus" => {
-                                                let n =
-                                                    t::table_data_rows(&lines, block).len();
+                                                let n = t::table_data_rows(&lines, block).len();
                                                 if n == 0 {
                                                     return;
                                                 }
-                                                let target = if probe == "row-plus" {
-                                                    n + 1
-                                                } else {
-                                                    n - 1
-                                                };
-                                                v.run_table_op(cx, |m| {
-                                                    t::set_row_count(m, target)
-                                                });
+                                                let target =
+                                                    if probe == "row-plus" { n + 1 } else { n - 1 };
+                                                v.run_table_op(cx, |m| t::set_row_count(m, target));
                                             }
                                             _ => {
                                                 let c = t::table_col_count(&lines, block);
@@ -7700,9 +7696,7 @@ impl Render for LiveMarkdownView {
                                                 } else {
                                                     c.saturating_sub(1)
                                                 };
-                                                v.run_table_op(cx, |m| {
-                                                    t::set_col_count(m, target)
-                                                });
+                                                v.run_table_op(cx, |m| t::set_col_count(m, target));
                                             }
                                         }
                                     });
@@ -7740,7 +7734,11 @@ impl Render for LiveMarkdownView {
                                                 .child(format!("{value}")),
                                         )
                                         .child(sb(
-                                            if base == "row" { "row-plus" } else { "col-plus" },
+                                            if base == "row" {
+                                                "row-plus"
+                                            } else {
+                                                "col-plus"
+                                            },
                                             "+",
                                             ent_row,
                                         )),
@@ -7775,10 +7773,8 @@ impl Render for LiveMarkdownView {
                     if idxs.iter().any(|pi| rows[*pi].line == cursor.line) {
                         caret_el_ix = Some(row_els.len());
                     }
-                    self.row_targets.push((
-                        rows[idxs[0]].line,
-                        rows[*idxs.last().unwrap()].line,
-                    ));
+                    self.row_targets
+                        .push((rows[idxs[0]].line, rows[*idxs.last().unwrap()].line));
                     // 右键菜单（Typora 的表格菜单）：与工具栏 More▾ 共用
                     // `table_menu_body` 一套条目，两处行为天然一致；`context_menu`
                     // 会改变元素类型，所以必须是 `outer` 的最后一步。
@@ -7830,8 +7826,7 @@ impl Render for LiveMarkdownView {
                 );
             } else if rows.is_empty() {
                 let ent = entity.clone();
-                if show_caret {
-                }
+                if show_caret {}
                 self.row_targets.push((0, 0));
                 row_els.push(
                     div()
@@ -8131,10 +8126,8 @@ impl Render for LiveMarkdownView {
         // Slash `/` menu (Typora/Notion parity): an in-flow bar above the
         // status strip listing the filtered block commands. It derives from
         // the buffer every frame, so no open/close state is stored.
-        let slash_bar: Option<gpui::AnyElement> = self
-            .slash_menu()
-            .filter(|_| focused)
-            .map(|(_, items)| {
+        let slash_bar: Option<gpui::AnyElement> =
+            self.slash_menu().filter(|_| focused).map(|(_, items)| {
                 let sel = self.slash_index.min(items.len() - 1);
                 let mut bar = div()
                     .flex_shrink_0()
@@ -8191,27 +8184,27 @@ impl Render for LiveMarkdownView {
 
         // 工具栏 More▾ 的手动表格菜单浮层（右键菜单由 ContextMenu 自带浮层，
         // 这里是 `open_table_menu` 手动模式的挂载点）。
-        let table_menu_overlay = self
-            .table_menu
-            .clone()
-            .zip(self.table_menu_position)
-            .map(|(menu, position)| {
-                // 与 ContextMenu 一致：菜单可见期间**在帧内**把焦点贴到菜单
-                // 上（派发期同步 focus 会被丢弃），Esc/↑↓/Enter 才走得到菜单。
-                let menu_focus = menu.focus_handle(cx);
-                if !menu_focus.contains_focused(window, cx) {
-                    menu_focus.focus(window, cx);
-                }
-                gpui::deferred(
-                    gpui::anchored()
-                        .position(position)
-                        .anchor(gpui::Anchor::TopLeft)
-                        .snap_to_window_with_margin(px(8.0))
-                        .child(menu),
-                )
-                .with_priority(100)
-                .into_any_element()
-            });
+        let table_menu_overlay =
+            self.table_menu
+                .clone()
+                .zip(self.table_menu_position)
+                .map(|(menu, position)| {
+                    // 与 ContextMenu 一致：菜单可见期间**在帧内**把焦点贴到菜单
+                    // 上（派发期同步 focus 会被丢弃），Esc/↑↓/Enter 才走得到菜单。
+                    let menu_focus = menu.focus_handle(cx);
+                    if !menu_focus.contains_focused(window, cx) {
+                        menu_focus.focus(window, cx);
+                    }
+                    gpui::deferred(
+                        gpui::anchored()
+                            .position(position)
+                            .anchor(gpui::Anchor::TopLeft)
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(menu),
+                    )
+                    .with_priority(100)
+                    .into_any_element()
+                });
 
         // 菜单刚关闭（Esc / 点菜单项 / 点别处）：焦点还悬在已卸载的菜单句柄
         // 上，这里把它还回编辑器，键盘输入才不会失联。
@@ -8424,9 +8417,8 @@ mod live_render_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         // 1. Build the exact LiveLines the view would build.
         struct Case {
@@ -8446,8 +8438,8 @@ mod live_render_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-            ..Default::default()
-        },
+                    ..Default::default()
+                },
             );
             rows.iter()
                 .enumerate()
@@ -8483,17 +8475,11 @@ mod live_render_tests {
         assert!(!cases.is_empty(), "sample must produce rows");
         // 2. Shape each line for real: full request_layout → prepaint → paint.
         for case in cases {
-            let (styled, _) = cx.draw(
-                point(px(0.), px(0.)),
-                size(px(700.), px(200.)),
-                |_, _| case.line,
-            );
+            let (styled, _) = cx.draw(point(px(0.), px(0.)), size(px(700.), px(200.)), |_, _| {
+                case.line
+            });
             let bounds = styled.layout().bounds();
-            assert!(
-                bounds.size.width > px(0.),
-                "zero width for {}",
-                case.label
-            );
+            assert!(bounds.size.width > px(0.), "zero width for {}", case.label);
             assert!(
                 bounds.size.height > px(0.),
                 "zero height for {}",
@@ -8512,9 +8498,8 @@ mod live_render_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         view.update(cx, |v, _| {
             // Simulate having measured every group of a very large doc as we
@@ -8535,9 +8520,15 @@ mod live_render_tests {
             }
             // Far-out entries were dropped.
             assert!(!v.group_heights.contains_key(&0));
-            assert!(!v.group_heights.contains_key(&(hi + GROUP_HEIGHT_KEEP_MARGIN + 1)));
+            assert!(
+                !v.group_heights
+                    .contains_key(&(hi + GROUP_HEIGHT_KEEP_MARGIN + 1))
+            );
             // Margin neighbors survive.
-            assert!(v.group_heights.contains_key(&lo.saturating_sub(GROUP_HEIGHT_KEEP_MARGIN)));
+            assert!(
+                v.group_heights
+                    .contains_key(&lo.saturating_sub(GROUP_HEIGHT_KEEP_MARGIN))
+            );
         });
     }
 
@@ -8549,9 +8540,8 @@ mod live_render_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(SHOWCASE, cx)))
-        });
+        let (host, cx) = cx
+            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(SHOWCASE, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         struct Case {
             label: String,
@@ -8570,8 +8560,8 @@ mod live_render_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-            ..Default::default()
-        },
+                    ..Default::default()
+                },
             );
             rows.iter()
                 .enumerate()
@@ -8579,7 +8569,12 @@ mod live_render_tests {
                 .map(|(pi, r)| {
                     let base = row_base_style(&r.plan, &style);
                     let runs = runs_for_row(&r.plan, &base, &colors, &style, &hl, &theme);
-                    let label = format!("L{} {:?} {:?}", r.line, r.plan.kind, r.plan.visible.chars().take(24).collect::<String>());
+                    let label = format!(
+                        "L{} {:?} {:?}",
+                        r.line,
+                        r.plan.kind,
+                        r.plan.visible.chars().take(24).collect::<String>()
+                    );
                     Case {
                         label,
                         line: LiveLine::new(
@@ -8602,11 +8597,9 @@ mod live_render_tests {
         let mut body_h = Vec::new();
         for case in cases {
             let label = case.label.clone();
-            let (styled, _) = cx.draw(
-                point(px(0.), px(0.)),
-                size(px(700.), px(200.)),
-                |_, _| case.line,
-            );
+            let (styled, _) = cx.draw(point(px(0.), px(0.)), size(px(700.), px(200.)), |_, _| {
+                case.line
+            });
             let b = styled.layout().bounds();
             if label.contains("Code {") {
                 code_h.push((label, b.size.height, b.size.width));
@@ -8694,9 +8687,8 @@ mod live_frame_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         cx.update(|window, cx| {
             window.focus(&view.read(cx).focus_handle(), cx);
@@ -8714,11 +8706,12 @@ mod live_frame_tests {
         });
         cx.simulate_input("x");
         cx.run_until_parked();
-        let painted: Vec<(usize, usize)> = crate::editor::markdown_live::element::LIVE_LINE_PAINT_LOG
-            .lock()
-            .unwrap()
-            .drain(..)
-            .collect();
+        let painted: Vec<(usize, usize)> =
+            crate::editor::markdown_live::element::LIVE_LINE_PAINT_LOG
+                .lock()
+                .unwrap()
+                .drain(..)
+                .collect();
         eprintln!("AFTER-TYPE painted: {painted:?}");
         // Card mode: the code lines render inside the card; the fence
         // lines themselves stay hidden.
@@ -8733,7 +8726,8 @@ mod live_frame_tests {
         // presence below is the semantic check — a flipped block would have
         // dropped `live-code-inner`.)
         assert!(
-            cx.debug_bounds("live-code-inner").is_some_and(|b| b.size.height > px(50.)),
+            cx.debug_bounds("live-code-inner")
+                .is_some_and(|b| b.size.height > px(50.)),
             "code card must stay while editing inside it"
         );
         // Move cursor far away (line 0): the card stays (it never left) and
@@ -8744,12 +8738,16 @@ mod live_frame_tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert!(
-            cx.debug_bounds("live-code-inner").is_some_and(|b| b.size.height > px(50.)),
+            cx.debug_bounds("live-code-inner")
+                .is_some_and(|b| b.size.height > px(50.)),
             "code card missing after leaving the block"
         );
         // The typed char must have stuck in the buffer.
         let text = view.read_with(cx, |v, _| v.text());
-        assert!(text.contains("fnx ") || text.contains("fn x"), "typed char lost: {text:?}");
+        assert!(
+            text.contains("fnx ") || text.contains("fn x"),
+            "typed char lost: {text:?}"
+        );
     }
 
     /// Repro: the real showcase doc, unfocused (full preview) — code cards
@@ -8766,9 +8764,8 @@ mod live_frame_tests {
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
         const DOC: &str = include_str!("../../../markdown-showcase.md");
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         let lines: Vec<Line> = DOC.split('\n').map(|l| Arc::new(l.to_string())).collect();
         let rows = plan_document(
@@ -8778,8 +8775,8 @@ mod live_frame_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         // Code lines (not fences: the cursor on a fence flips the card to
         // source mode) and table rows to jump onto.
@@ -9026,7 +9023,10 @@ mod live_frame_tests {
         let text = view.read_with(cx, |v, _| v.text());
         let line_after = view.read_with(cx, |v, _| v.buffer.line(2).unwrap_or("").to_string());
         assert_ne!(line_before, line_after, "打字必须改到被点的行：{text:?}");
-        assert!(line_after.contains('9'), "插入的字符应在该行：{line_after:?}");
+        assert!(
+            line_after.contains('9'),
+            "插入的字符应在该行：{line_after:?}"
+        );
         assert!(
             text.contains("| A    | B    |"),
             "表头结构不变，仅随 spec #13 自动重排列宽对齐：{text:?}"
@@ -9056,10 +9056,7 @@ mod live_frame_tests {
             (line_a, col_a) != (line_b, col_b),
             "Tab 必须把光标移到另一个格位（{line_b},{col_b} → {line_a},{col_a}）"
         );
-        assert!(
-            line_a <= 3,
-            "Tab 不得离开表格（line={line_a}）"
-        );
+        assert!(line_a <= 3, "Tab 不得离开表格（line={line_a}）");
 
         // 4) Esc：Typora 在表格里**不退出表格**（只关弹窗/清选区），光标
         // 留在格内、文本不变。
@@ -9069,7 +9066,11 @@ mod live_frame_tests {
         cx.run_until_parked();
         let line = view.read_with(cx, |v, _| v.buffer.cursor().line);
         assert_eq!(line, line_before, "Esc 不该把光标移出表格（Typora 语义）");
-        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "Esc 不得改动文本");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            before,
+            "Esc 不得改动文本"
+        );
 
         // 5) Enter：移到**下方同列**格（Typora），不是插入新行。
         view.update(cx, |v, cx| {
@@ -9088,10 +9089,7 @@ mod live_frame_tests {
             rows_before,
             "Enter 不该改变行数（Typora：移到下方同列格）"
         );
-        assert!(
-            line > 2,
-            "Enter 应移到下方单元格（line={line}, col={col}）"
-        );
+        assert!(line > 2, "Enter 应移到下方单元格（line={line}, col={col}）");
 
         // 6) Cmd/Ctrl+Enter：在当前行下方插入空行（Typora）。
         view.update(cx, |v, cx| {
@@ -9225,7 +9223,10 @@ mod live_frame_tests {
         let sel = view.read_with(cx, |v, _| v.buffer.selection());
         assert_eq!(
             sel,
-            Some((crate::editor::markdown_live::model::Pos::new(2, 7), crate::editor::markdown_live::model::Pos::new(3, 6))),
+            Some((
+                crate::editor::markdown_live::model::Pos::new(2, 7),
+                crate::editor::markdown_live::model::Pos::new(3, 6)
+            )),
             "Shift+右应把选区从格尾扩展到同列下一格首"
         );
 
@@ -9280,7 +9281,11 @@ mod live_frame_tests {
             c.line,
             c.col
         );
-        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "跳格不得改文本");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            before,
+            "跳格不得改文本"
+        );
 
         // 2) **非空**格首退格 → 原地消费。
         view.update(cx, |v, cx| {
@@ -9300,7 +9305,11 @@ mod live_frame_tests {
         });
         cx.simulate_keystrokes("delete");
         cx.run_until_parked();
-        assert_eq!(view.read_with(cx, |v, _| v.text()), before, "格尾 Delete 不得删字符");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            before,
+            "格尾 Delete 不得删字符"
+        );
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!((c.line, c.col), (2, 7), "格尾 Delete 原地消费");
 
@@ -9394,7 +9403,9 @@ mod live_frame_tests {
         cx.simulate_keystrokes("x");
         cx.run_until_parked();
         let lines: Vec<String> = view.read_with(cx, |v, _| {
-            (0..3).filter_map(|i| v.buffer.line(i).map(str::to_string)).collect()
+            (0..3)
+                .filter_map(|i| v.buffer.line(i).map(str::to_string))
+                .collect()
         });
         assert_eq!(lines[0], "| a    | bb   |", "表头列宽补齐");
         assert_eq!(lines[1], "| ---- | ---- |", "分隔行统一形态");
@@ -9423,7 +9434,11 @@ mod live_frame_tests {
         cx.simulate_keystrokes("cmd-shift-z");
         cx.run_until_parked();
         let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
-        assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"), "重做恢复重排后状态");
+        assert_eq!(
+            line2.as_deref(),
+            Some("| xy1  | 2    |"),
+            "重做恢复重排后状态"
+        );
     }
 
     /// spec #13 续：「源码」模式里裸编辑**不**自动重排（保护手写格式）；
@@ -9463,7 +9478,11 @@ mod live_frame_tests {
         cx.run_until_parked();
         let line0 = view.read_with(cx, |v, _| v.buffer.line(0).map(str::to_string));
         let line2 = view.read_with(cx, |v, _| v.buffer.line(2).map(str::to_string));
-        assert_eq!(line0.as_deref(), Some("| a    | bb   |"), "退出源码模式恢复重排");
+        assert_eq!(
+            line0.as_deref(),
+            Some("| a    | bb   |"),
+            "退出源码模式恢复重排"
+        );
         assert_eq!(line2.as_deref(), Some("| xy1  | 2    |"));
     }
 
@@ -9674,8 +9693,8 @@ mod live_frame_tests {
             (c.line, c.col)
         });
         assert_eq!(line, 2, "点击应落在被点的数据行");
-        let cs1 = view.read_with(cx, |v, _|cell_cs(v, 2, 1));
-        let ce1 = view.read_with(cx, |v, _|{
+        let cs1 = view.read_with(cx, |v, _| cell_cs(v, 2, 1));
+        let ce1 = view.read_with(cx, |v, _| {
             v.table_cell_content_at(2, 999).map(|(_, e)| e).unwrap()
         });
         assert!(
@@ -9685,8 +9704,8 @@ mod live_frame_tests {
 
         // 2) 覆盖输入：拖 (2, cs0+1) → (3, cell1 内容首)，输入 `z`
         //    = 合并首尾格 + typed 写进合并点。
-        let prefix_col = view.read_with(cx, |v, _|cell_cs(v, 2, 0) + 1); // 前缀 = "c"
-        let end_col = view.read_with(cx, |v, _|cell_cs(v, 3, 1)); // 后缀 = "ff"
+        let prefix_col = view.read_with(cx, |v, _| cell_cs(v, 2, 0) + 1); // 前缀 = "c"
+        let end_col = view.read_with(cx, |v, _| cell_cs(v, 3, 1)); // 后缀 = "ff"
         drag_range(&host, cx, 2, prefix_col, 3, end_col);
         let sel = view.read_with(cx, |v, _| v.buffer.selection());
         assert_eq!(
@@ -9698,61 +9717,85 @@ mod live_frame_tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert_eq!(
-            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            view.read_with(cx, |v, _| cell_text(v, 2, 0)),
             "czff",
             "覆盖输入：首格 ← 前缀 + typed + 尾格后缀"
         );
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 2, 1)), "", "同排后格应清空");
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 0)), "", "尾格前的格应清空");
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 1)), "", "尾格应清空");
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 2, 1)),
+            "",
+            "同排后格应清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 0)),
+            "",
+            "尾格前的格应清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 1)),
+            "",
+            "尾格应清空"
+        );
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!(
             (c.line, c.col),
-            (2, view.read_with(cx, |v, _|cell_cs(v, 2, 0)) + 2), // "c" + "z" 之后
+            (2, view.read_with(cx, |v, _| cell_cs(v, 2, 0)) + 2), // "c" + "z" 之后
             "光标应落在首格合并点"
         );
         assert!(view.read_with(cx, |v, _| v.buffer.selection()).is_none());
 
         // 3) 退格：表头里拖同排跨格选区 → 合并删除（首格保留前缀 +
         //    尾格后缀），数据行与结构不动。
-        let h0 = view.read_with(cx, |v, _|cell_cs(v, 0, 0) + 1); // 前缀 = "a"
-        let h1 = view.read_with(cx, |v, _|cell_cs(v, 0, 1)); // 后缀 = "bb"
+        let h0 = view.read_with(cx, |v, _| cell_cs(v, 0, 0) + 1); // 前缀 = "a"
+        let h1 = view.read_with(cx, |v, _| cell_cs(v, 0, 1)); // 后缀 = "bb"
         drag_range(&host, cx, 0, h0, 0, h1);
         cx.simulate_keystrokes("backspace");
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert_eq!(
-            view.read_with(cx, |v, _|cell_text(v, 0, 0)),
+            view.read_with(cx, |v, _| cell_text(v, 0, 0)),
             "abb",
             "退格合并：首格 ← 前缀 + 尾格后缀"
         );
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 0, 1)), "", "同排尾格应清空");
         assert_eq!(
-            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            view.read_with(cx, |v, _| cell_text(v, 0, 1)),
+            "",
+            "同排尾格应清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 2, 0)),
             "czff",
             "选区外的数据行不受影响"
         );
 
         // 4) 粘贴：跨格选区 + 含 `|` 的文本 = 先合并删除，再从首格分发。
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("P|Q".to_string()));
-        let p0 = view.read_with(cx, |v, _|cell_cs(v, 2, 0));
-        let p1 = view.read_with(cx, |v, _|cell_cs(v, 3, 1));
+        let p0 = view.read_with(cx, |v, _| cell_cs(v, 2, 0));
+        let p1 = view.read_with(cx, |v, _| cell_cs(v, 3, 1));
         drag_range(&host, cx, 2, p0, 3, p1);
         cx.simulate_keystrokes("cmd-v");
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert_eq!(
-            view.read_with(cx, |v, _|cell_text(v, 2, 0)),
+            view.read_with(cx, |v, _| cell_text(v, 2, 0)),
             "P",
             "粘贴分发：首格 ← 第一列"
         );
         assert_eq!(
-            view.read_with(cx, |v, _|cell_text(v, 2, 1)),
+            view.read_with(cx, |v, _| cell_text(v, 2, 1)),
             "Q",
             "粘贴分发：同排次格 ← 第二列"
         );
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 0)), "", "选区内尾行应已清空");
-        assert_eq!(view.read_with(cx, |v, _|cell_text(v, 3, 1)), "", "选区内尾行应已清空");
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 0)),
+            "",
+            "选区内尾行应已清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 1)),
+            "",
+            "选区内尾行应已清空"
+        );
 
         // 5) 结构始终完好：行数不变、表格块范围不变（分隔行仍是结构行）。
         assert_eq!(
@@ -9958,11 +10001,7 @@ mod live_frame_tests {
         cx.refresh().unwrap();
         cx.run_until_parked();
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
-        assert_eq!(
-            (c.line, c.col),
-            (2, 2),
-            "行把手点击 = 本行首格内容起点"
-        );
+        assert_eq!((c.line, c.col), (2, 2), "行把手点击 = 本行首格内容起点");
 
         // 7) More▾ → 手动打开表格菜单（与右键菜单共用条目），光标不动；
         //    Esc 关闭。
@@ -9987,10 +10026,7 @@ mod live_frame_tests {
         // 关闭后焦点还回编辑器（否则焦点悬空在菜单句柄上，键入失联）。
         let view_focus = view.read_with(cx, |v, _| v.focus_handle());
         cx.update(|window, _cx| {
-            assert!(
-                view_focus.is_focused(window),
-                "菜单关闭后焦点应还给编辑器"
-            );
+            assert!(view_focus.is_focused(window), "菜单关闭后焦点应还给编辑器");
         });
     }
 
@@ -10097,9 +10133,7 @@ mod live_frame_tests {
         std::fs::write(&src, b"fake-png-bytes").unwrap();
         let doc = dir.join("notes.md");
         let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| {
-                LiveMarkdownView::with_text("hello\n", cx).doc_path(doc.clone())
-            }))
+            Host(cx.new(|cx| LiveMarkdownView::with_text("hello\n", cx).doc_path(doc.clone())))
         });
         let view = host.read_with(cx, |h, _| h.0.clone());
         // 1. Drop an image file → copied into notes.assets, ref inserted.
@@ -10166,9 +10200,8 @@ mod live_frame_tests {
                 true,
             ),
         ] {
-            let (host, cx) = cx.add_window_view(|_, cx| {
-                Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx)))
-            });
+            let (host, cx) =
+                cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
             let view = host.read_with(cx, |h, _| h.0.clone());
             // Large docs virtualize rows: presence must be checked with the
             // block scrolled into the rendered window (jump the cursor onto
@@ -10182,8 +10215,8 @@ mod live_frame_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-            ..Default::default()
-        },
+                    ..Default::default()
+                },
             );
             let jump_to = |cx: &mut gpui::VisualTestContext, line: usize| {
                 cx.update(|_, cx| {
@@ -10243,21 +10276,17 @@ mod live_frame_tests {
         impl gpui::Render for EditorHost {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 // Mirrors the `md-live` branch in editor.rs.
-                div()
-                    .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .id("md-live")
-                            .w_full()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .px(px(6.0))
-                            .pb(px(12.0))
-                            .child(self.0.clone()),
-                    )
+                div().size_full().flex().flex_col().child(
+                    div()
+                        .id("md-live")
+                        .w_full()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .px(px(6.0))
+                        .pb(px(12.0))
+                        .child(self.0.clone()),
+                )
             }
         }
         cx.update(|cx| {
@@ -10285,9 +10314,8 @@ mod live_frame_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(SAMPLE, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         assert_frames(cx, &view);
     }
@@ -10471,8 +10499,8 @@ mod live_showcase_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         assert_eq!(rows.len(), lines.len());
         let mut empties = Vec::new();
@@ -10499,10 +10527,7 @@ mod live_showcase_tests {
             }
         }
         eprintln!("code rows: {code_count}, table rows: {table_count}");
-        assert!(
-            code_count > 10,
-            "showcase must contain plenty of code rows"
-        );
+        assert!(code_count > 10, "showcase must contain plenty of code rows");
         assert!(
             empties.is_empty(),
             "code/table rows with empty visible: {empties:?}"
@@ -10524,8 +10549,8 @@ mod live_showcase_tests {
                 selection: None,
                 focused: false,
                 read_only: false,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         );
         let row_refs: Vec<&PlannedRow> = rows.iter().collect();
         let outline = outline_entries(&row_refs);
@@ -10567,16 +10592,13 @@ mod live_showcase_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-            ..Default::default()
-        },
+                    ..Default::default()
+                },
             );
             for (kind, a, b) in preview_block_ranges(doc) {
                 for row in rows.iter().take(b + 1).skip(a) {
                     let ok = match kind {
-                        "code" => matches!(
-                            row.block,
-                            Block::Fence { .. } | Block::CodeLine
-                        ),
+                        "code" => matches!(row.block, Block::Fence { .. } | Block::CodeLine),
                         _ => matches!(row.block, Block::Table),
                     };
                     assert!(
@@ -10889,9 +10911,7 @@ mod scroll_to_caret_tests {
     /// and [`Group::Para`] (unbroken runs); [`Group::One`] is a single row and
     /// cannot. This covers all four.
     #[gpui::test]
-    fn clicking_visible_row_of_any_tall_container_does_not_scroll(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn clicking_visible_row_of_any_tall_container_does_not_scroll(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
@@ -11196,7 +11216,10 @@ mod scroll_to_caret_tests {
         // And the view must NOT have jumped to the table's first line: the
         // header (line 2) must be above the viewport top.
         let header_bottom = view.read_with(&vc, |v, _| {
-            v.row_layouts.get(&2).map(|i| i.doc_bottom).unwrap_or(f32::MAX)
+            v.row_layouts
+                .get(&2)
+                .map(|i| i.doc_bottom)
+                .unwrap_or(f32::MAX)
         });
         assert!(
             header_bottom <= vp_top + 1.0,
@@ -11300,10 +11323,7 @@ mod scroll_to_caret_tests {
         }
         para.push_str("\nafter\n");
 
-        for (label, doc, caret_line) in [
-            ("quote", quote, 2 + 39),
-            ("paragraph", para, 2 + 39),
-        ] {
+        for (label, doc, caret_line) in [("quote", quote, 2 + 39), ("paragraph", para, 2 + 39)] {
             let cell = std::cell::RefCell::new(None);
             let handle = cx.open_window(gpui::size(px(700.), px(300.)), |_, cx| {
                 let view = cx.new(|cx| LiveMarkdownView::with_text(&doc, cx));
@@ -11756,16 +11776,18 @@ mod scroll_stability_tests {
         let mut vc = gpui::VisualTestContext::from_window(handle.into(), cx);
         // Fixed probe groups: A near the bottom window, B far above it.
         let (ga, gb) = (1190usize, 600usize);
-        let snap = |view: &gpui::Entity<LiveMarkdownView>, vc: &mut gpui::VisualTestContext| -> Snap {
-            view.read_with(vc, |v, _| {
-                let off = f32::from(v.scroll.offset().y);
-                Snap {
-                    pos_a: v.virt_prefix.get(ga).copied().unwrap_or(-99999.0) + off,
-                    pos_b: v.virt_prefix.get(gb).copied().unwrap_or(-99999.0) + off,
-                }
-            })
-        };
-        let force_frame = |view: &gpui::Entity<LiveMarkdownView>, vc: &mut gpui::VisualTestContext| {
+        let snap =
+            |view: &gpui::Entity<LiveMarkdownView>, vc: &mut gpui::VisualTestContext| -> Snap {
+                view.read_with(vc, |v, _| {
+                    let off = f32::from(v.scroll.offset().y);
+                    Snap {
+                        pos_a: v.virt_prefix.get(ga).copied().unwrap_or(-99999.0) + off,
+                        pos_b: v.virt_prefix.get(gb).copied().unwrap_or(-99999.0) + off,
+                    }
+                })
+            };
+        let force_frame = |view: &gpui::Entity<LiveMarkdownView>,
+                           vc: &mut gpui::VisualTestContext| {
             view.update(vc, |_, cx| cx.notify());
             vc.refresh().unwrap();
             vc.run_until_parked();
@@ -11774,7 +11796,10 @@ mod scroll_stability_tests {
             assert!(
                 (s.pos_a - prev.pos_a).abs() <= 1.0 && (s.pos_b - prev.pos_b).abs() <= 1.0,
                 "content jumped with no input at {ctx}: posA {:.1}->{:.1} posB {:.1}->{:.1}",
-                prev.pos_a, s.pos_a, prev.pos_b, s.pos_b
+                prev.pos_a,
+                s.pos_a,
+                prev.pos_b,
+                s.pos_b
             );
         };
         // Settle onto the true bottom: `max_offset` lags layout by a
@@ -12060,9 +12085,7 @@ mod interaction_fallback_tests {
         let long = "word ".repeat(60); // wraps to 3+ visual rows at 700px
         let doc = format!("{long}\nsecond line\n");
         let (view, mut vc) = setup(cx, &doc);
-        let cursor = |vc: &gpui::VisualTestContext| {
-            view.read_with(vc, |v, _| v.buffer.cursor())
-        };
+        let cursor = |vc: &gpui::VisualTestContext| view.read_with(vc, |v, _| v.buffer.cursor());
         // Start at the beginning of the wrapped paragraph.
         view.update(&mut vc, |v, cx| {
             v.edit(cx, |m| m.move_to(0, 0, false));
@@ -12109,10 +12132,7 @@ mod interaction_fallback_tests {
             para.size.height < px(65.),
             "two joined paragraph lines must not carry inter-row margins: {para:?}"
         );
-        assert!(
-            para.size.height > px(45.),
-            "two lines of text: {para:?}"
-        );
+        assert!(para.size.height > px(45.), "two lines of text: {para:?}");
         let _ = view;
     }
 
@@ -12138,11 +12158,7 @@ mod interaction_fallback_tests {
             }
         }
         impl gpui::Render for RightPane {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
                     .size_full()
                     .track_focus(&self.focus)
@@ -12155,11 +12171,7 @@ mod interaction_fallback_tests {
             right: gpui::Entity<RightPane>,
         }
         impl gpui::Render for SplitHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
                     .size_full()
                     .flex()
@@ -12216,13 +12228,16 @@ mod live_ime_tests {
     fn setup<'a>(
         cx: &'a mut gpui::TestAppContext,
         doc: &str,
-    ) -> (gpui::Entity<LiveMarkdownView>, &'a mut gpui::VisualTestContext) {
+    ) -> (
+        gpui::Entity<LiveMarkdownView>,
+        &'a mut gpui::VisualTestContext,
+    ) {
         cx.update(|cx| {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx
-            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         cx.update(|window, cx| {
             window.focus(&view.read(cx).focus_handle(), cx);
@@ -12257,8 +12272,13 @@ mod live_ime_tests {
                 v.replace_and_mark_text_in_range(None, "n", Some(1..1), window, cx);
             });
         });
-        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllon\n", "组字文本应入 buffer");
-        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "héllon\n",
+            "组字文本应入 buffer"
+        );
+        let marked =
+            cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
         assert_eq!(marked, Some(5..6), "组字区间 = 刚插入的 n（UTF-16）");
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!((c.line, c.col), (0, 6), "光标应在组字文本末尾");
@@ -12270,7 +12290,8 @@ mod live_ime_tests {
             });
         });
         assert_eq!(view.read_with(cx, |v, _| v.text()), "héllonihao\n");
-        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        let marked =
+            cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
         assert_eq!(marked, Some(5..10), "组字区间跟随整段拼音");
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!((c.line, c.col), (0, 10), "光标在拼音末尾");
@@ -12281,8 +12302,13 @@ mod live_ime_tests {
                 v.replace_text_in_range(Some(5..10), "你好", window, cx);
             });
         });
-        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllo你好\n", "提交文本应替换拼音");
-        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "héllo你好\n",
+            "提交文本应替换拼音"
+        );
+        let marked =
+            cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
         assert_eq!(marked, None, "提交后无组字标记");
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!((c.line, c.col), (0, 7), "光标在提交文本之后");
@@ -12299,7 +12325,11 @@ mod live_ime_tests {
         });
         assert_eq!(view.read_with(cx, |v, _| v.text()), "中\n好文");
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
-        assert_eq!((c.line, c.col), (1, 1), "跨行 UTF-16 定位：换行后第 1 个字符");
+        assert_eq!(
+            (c.line, c.col),
+            (1, 1),
+            "跨行 UTF-16 定位：换行后第 1 个字符"
+        );
     }
 
     /// 未聚焦 / 只读：IME 写路径静默丢弃（不落文本、不动选区）。
@@ -12311,8 +12341,8 @@ mod live_ime_tests {
         });
         const DOC: &str = "abc\n";
         // 不聚焦：连处理器注册都不该认领。
-        let (host, cx) = cx
-            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         cx.refresh().unwrap();
         cx.run_until_parked();
@@ -12380,9 +12410,21 @@ mod live_ime_tests {
             "czff",
             "覆盖输入：首格 ← 前缀 + typed + 尾格后缀"
         );
-        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 2, 1)), "", "同排后格应清空");
-        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 3, 0)), "", "尾格前的格应清空");
-        assert_eq!(view.read_with(cx, |v, _| cell_text(v, 3, 1)), "", "尾格应清空");
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 2, 1)),
+            "",
+            "同排后格应清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 0)),
+            "",
+            "尾格前的格应清空"
+        );
+        assert_eq!(
+            view.read_with(cx, |v, _| cell_text(v, 3, 1)),
+            "",
+            "尾格应清空"
+        );
     }
 
     /// 代码块里 Tab / Shift+Tab：普通 Tab 缩进一次（不得经 handler 再插一遍
@@ -12452,8 +12494,13 @@ mod live_ime_tests {
                 v.replace_and_mark_text_in_range(Some(5..6), "", None, window, cx);
             });
         });
-        assert_eq!(view.read_with(cx, |v, _| v.text()), "héllo\n", "取消组字应删掉标记文本");
-        let marked = cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
+        assert_eq!(
+            view.read_with(cx, |v, _| v.text()),
+            "héllo\n",
+            "取消组字应删掉标记文本"
+        );
+        let marked =
+            cx.update(|window, cx| view.update(cx, |v, cx| v.marked_text_range(window, cx)));
         assert_eq!(marked, None, "取消后无组字标记");
         let c = view.read_with(cx, |v, _| v.buffer.cursor());
         assert_eq!((c.line, c.col), (0, 5), "光标塌缩回组字起点");
@@ -12535,10 +12582,7 @@ mod live_ime_tests {
     fn live_ime_bounds_and_point_mapping(cx: &mut gpui::TestAppContext) {
         const DOC: &str = "hello\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
         let (view, cx) = setup(cx, DOC);
-        let fallback = gpui::Bounds::new(
-            gpui::point(px(0.), px(0.)),
-            gpui::size(px(10.), px(10.)),
-        );
+        let fallback = gpui::Bounds::new(gpui::point(px(0.), px(0.)), gpui::size(px(10.), px(10.)));
         let b = cx
             .update(|window, cx| {
                 view.update(cx, |v, cx| v.bounds_for_range(0..0, fallback, window, cx))
@@ -12550,7 +12594,9 @@ mod live_ime_tests {
         let nb = cx.debug_bounds("live-table-cell-2-1").expect("第 2 格探针");
         let idx = cx
             .update(|window, cx| {
-                view.update(cx, |v, cx| v.character_index_for_point(nb.center(), window, cx))
+                view.update(cx, |v, cx| {
+                    v.character_index_for_point(nb.center(), window, cx)
+                })
             })
             .expect("格内点应可映射");
         let expect = view.read_with(cx, |v, _| {
@@ -12585,13 +12631,16 @@ mod live_table_regression_tests {
     fn setup<'a>(
         cx: &'a mut gpui::TestAppContext,
         doc: &str,
-    ) -> (gpui::Entity<LiveMarkdownView>, &'a mut gpui::VisualTestContext) {
+    ) -> (
+        gpui::Entity<LiveMarkdownView>,
+        &'a mut gpui::VisualTestContext,
+    ) {
         cx.update(|cx| {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        let (host, cx) = cx
-            .add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         cx.update(|window, cx| {
             window.focus(&view.read(cx).focus_handle(), cx);
@@ -12659,7 +12708,9 @@ mod live_table_regression_tests {
             v.edit(cx, |m| m.move_to(3, 4, false));
             v.after_move(cx);
         });
-        view.update(cx, |v, cx| v.run_table_menu_op(TableMenuOp::DeleteColumn, cx));
+        view.update(cx, |v, cx| {
+            v.run_table_menu_op(TableMenuOp::DeleteColumn, cx)
+        });
         cx.refresh().unwrap();
         cx.run_until_parked();
         assert_eq!(
@@ -12703,8 +12754,8 @@ mod live_table_regression_tests {
 #[cfg(test)]
 mod setext_parity_tests {
     use super::*;
-    use crate::editor::markdown_live::reveal::plan_document;
     use crate::editor::markdown_live::reveal::Reveal;
+    use crate::editor::markdown_live::reveal::plan_document;
 
     /// Live setext classification must match pulldown-cmark (the read-only
     /// preview's parser) on the constructs where setext, rules, and tables
@@ -12739,7 +12790,8 @@ mod setext_parity_tests {
                     Event::Start(Tag::Heading { .. }) => open = Some(range.start),
                     Event::End(pulldown_cmark::TagEnd::Heading(_)) => {
                         if let Some(s) = open.take() {
-                            pulldown_ranges.push((line_of(s), line_of(range.end.saturating_sub(1))));
+                            pulldown_ranges
+                                .push((line_of(s), line_of(range.end.saturating_sub(1))));
                         }
                     }
                     _ => {}
@@ -12753,8 +12805,8 @@ mod setext_parity_tests {
                     selection: None,
                     focused: false,
                     read_only: false,
-            ..Default::default()
-        },
+                    ..Default::default()
+                },
             );
             let mut live_ranges: Vec<(usize, usize)> = Vec::new();
             let mut open: Option<usize> = None;
@@ -12824,7 +12876,8 @@ mod e2e_smoke_tests {
 
         // Everything renders: code card, table-free, setext gap row.
         assert!(
-            vc.debug_bounds("live-code-inner").is_some_and(|b| b.size.height > px(20.)),
+            vc.debug_bounds("live-code-inner")
+                .is_some_and(|b| b.size.height > px(20.)),
             "code card renders"
         );
         // Focus + edit inside the code: card stays.
@@ -12859,7 +12912,10 @@ mod e2e_smoke_tests {
         );
         vc.run_until_parked();
         let line = view.read_with(&vc, |v, _| v.buffer.cursor().line);
-        assert!(line >= 10, "blank click lands near the end, got line {line}");
+        assert!(
+            line >= 10,
+            "blank click lands near the end, got line {line}"
+        );
     }
 }
 
@@ -13104,13 +13160,15 @@ mod incremental_plan_tests {
                 "row {i} line index diverged after round {round} edit {what:?}"
             );
             assert_eq!(
-                got.block, want.block,
+                got.block,
+                want.block,
                 "row {i} block diverged after round {round} edit {what:?}\n\
                  text: {:?}",
                 v.buffer.line(got.line).unwrap_or("")
             );
             assert_eq!(
-                got.plan, want.plan,
+                got.plan,
+                want.plan,
                 "row {i} plan diverged after round {round} edit {what:?}\n\
                  text: {:?}",
                 v.buffer.line(got.line).unwrap_or("")
@@ -13133,9 +13191,8 @@ mod incremental_plan_tests {
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
         let doc = "para\n\n```\nfn a() {}\nfn b() {}\n```\n\ntail\n";
-        let (host, cx) = cx.add_window_view(|_, cx| {
-            Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(doc, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
         // Warm the plan.
         view.update(cx, |v, _| {
@@ -13389,7 +13446,8 @@ mod hscroll_and_wide_tests {
             "条长应约为轨道一半，实际 {len:?}"
         );
         // 滚到底：条贴轨道右端。
-        let (start_bottom, _) = thumb_metrics(px(1000.), px(2000.), px(-1000.)).expect("溢出应有条");
+        let (start_bottom, _) =
+            thumb_metrics(px(1000.), px(2000.), px(-1000.)).expect("溢出应有条");
         assert!(
             f32::from(start_bottom) > f32::from(start),
             "滚到底后条应右移（{start:?} → {start_bottom:?}）"
@@ -13791,7 +13849,8 @@ mod hscroll_and_wide_tests {
             vc.run_until_parked();
         }
         assert!(
-            view.read_with(&vc, |v, _| v.is_wide_block(0) && v.mermaid_zoom(4).is_some()),
+            view.read_with(&vc, |v, _| v.is_wide_block(0)
+                && v.mermaid_zoom(4).is_some()),
             "setup：全宽与缩放状态应已置位"
         );
 
@@ -13892,9 +13951,7 @@ mod hscroll_and_wide_tests {
         let offscreen = vc.debug_bounds("live-table-scroll").is_none();
         assert!(offscreen, "setup：表格应已滚出虚拟化窗口");
         let kept = view.read_with(&vc, |v, _| {
-            v.h_scroll
-                .handle_for(0)
-                .map(|h| f32::from(h.offset().x))
+            v.h_scroll.handle_for(0).map(|h| f32::from(h.offset().x))
         });
         assert_eq!(
             kept.map(|x| (x - scrolled).abs() < 1.0),
@@ -14163,16 +14220,12 @@ mod hscroll_and_wide_tests {
             vc.refresh().unwrap();
             vc.run_until_parked();
             ready = view.read_with(&vc, |v, _cx| {
-                v.planned_geometry
-                    .mermaid_blocks
-                    .iter()
-                    .any(|b| {
-                        matches!(
-                            v.mermaid.body(&b.source),
-                            MermaidBody::Image { pending: false, .. }
-                        )
-                    })
-                    && v.planned_geometry.mermaid_blocks.len() == 1
+                v.planned_geometry.mermaid_blocks.iter().any(|b| {
+                    matches!(
+                        v.mermaid.body(&b.source),
+                        MermaidBody::Image { pending: false, .. }
+                    )
+                }) && v.planned_geometry.mermaid_blocks.len() == 1
             }) && vc.debug_bounds("live-mm-graph").is_some();
             if ready {
                 break;
@@ -14274,7 +14327,9 @@ mod hscroll_and_wide_tests {
                 vc.run_until_parked();
             }
         }
-        let z = view.read_with(&vc, |v, _| v.mermaid_zoom(0)).expect("放大后应有倍率");
+        let z = view
+            .read_with(&vc, |v, _| v.mermaid_zoom(0))
+            .expect("放大后应有倍率");
         let want = (base * 1.25 * 1.25).min(4.0);
         assert!(
             (z - want).abs() < 0.01,
@@ -14307,7 +14362,9 @@ mod hscroll_and_wide_tests {
             vc.refresh().unwrap();
             vc.run_until_parked();
         }
-        let z = view.read_with(&vc, |v, _| v.mermaid_zoom(0)).expect("缩小后应有倍率");
+        let z = view
+            .read_with(&vc, |v, _| v.mermaid_zoom(0))
+            .expect("缩小后应有倍率");
         let want = (base / 1.25).max(0.25);
         assert!(
             (z - want).abs() < 0.01,
@@ -14350,7 +14407,9 @@ mod hscroll_and_wide_tests {
             "点击后表格应明显变宽：{before:?} → {after:?}"
         );
         // 再点一次还原。
-        let btn = vc.debug_bounds("live-table-toolbar-wide").expect("按钮仍在");
+        let btn = vc
+            .debug_bounds("live-table-toolbar-wide")
+            .expect("按钮仍在");
         vc.simulate_click(btn.center(), gpui::Modifiers::none());
         for _ in 0..2 {
             vc.refresh().unwrap();

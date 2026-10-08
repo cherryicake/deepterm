@@ -17,8 +17,7 @@ use gpui::{AppContext as _, TestAppContext};
 fn feed(terminal: &mut Terminal, lines: usize, seq: usize, cx: &mut gpui::Context<Terminal>) {
     let mut bytes = Vec::with_capacity(lines * 96);
     for i in 0..lines {
-        let text =
-            format!("s{i}q{seq} The quick brown fox jumps over the lazy dog 0123456789\r\n");
+        let text = format!("s{i}q{seq} The quick brown fox jumps over the lazy dog 0123456789\r\n");
         bytes.extend_from_slice(text.as_bytes());
     }
     terminal.handle_remote_data(&bytes, cx);
@@ -176,7 +175,7 @@ fn terminal_view_prepaint_frame_allocations(cx: &mut TestAppContext) {
     use crate::sidebar_view::font_settings::FontState;
     use crate::terminal_view::TerminalElement;
     use crate::theme;
-    use gpui::{px, size, point};
+    use gpui::{point, px, size};
 
     struct Host {
         view: gpui::Entity<TerminalView>,
@@ -207,17 +206,28 @@ fn terminal_view_prepaint_frame_allocations(cx: &mut TestAppContext) {
     // 预热帧：建立行缓存（首次全量排版 + 缓存分配不计数）。
     let (view, terminal) = host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
     let focus_handle = view.read_with(cx, |v, _| v.focus_handle_for_test());
-    let make_element =
-        || TerminalElement::new(terminal.clone(), focus_handle.clone(), true, 1.0, view.clone());
-    cx.draw(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)), |_, _| {
-        make_element()
-    });
+    let make_element = || {
+        TerminalElement::new(
+            terminal.clone(),
+            focus_handle.clone(),
+            true,
+            1.0,
+            view.clone(),
+        )
+    };
+    cx.draw(
+        point(px(0.0), px(0.0)),
+        size(px(800.0), px(600.0)),
+        |_, _| make_element(),
+    );
 
     // 场景 A：稳态帧（无 damage、无选区变化、无悬停变化）。
     let (_, stats_clean) = AllocObserver::scope(|| {
-        cx.draw(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)), |_, _| {
-            make_element()
-        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(800.0), px(600.0)),
+            |_, _| make_element(),
+        );
     });
     println!("[alloc] 稳态 prepaint 分配: {} 次", stats_clean.allocations);
 
@@ -227,9 +237,11 @@ fn terminal_view_prepaint_frame_allocations(cx: &mut TestAppContext) {
         terminal.update(cx, |terminal, cx| {
             terminal.handle_remote_data(b"X\x1b[1D", cx);
         });
-        cx.draw(point(px(0.0), px(0.0)), size(px(800.0), px(600.0)), |_, _| {
-            make_element()
-        });
+        cx.draw(
+            point(px(0.0), px(0.0)),
+            size(px(800.0), px(600.0)),
+            |_, _| make_element(),
+        );
     });
     println!(
         "[alloc] 单行 dirty prepaint 分配: {} 次 / {}（O2 前基线：1932 次 / 8.1 MB）",
@@ -303,10 +315,8 @@ fn incremental_snapshot_matches_full_rebuild(cx: &mut TestAppContext) {
             3 => format!("line {step} 0123456789 abcdefghijklmnopqrstuvwxyz\r\n").into_bytes(),
             4 => format!("\x1b[{}K", next() % 3).into_bytes(),
             // OSC8 链接：开链接 → 写文本 → 关链接。
-            5 => format!(
-                "\x1b]8;;https://example.com/{step}\x1b\\link{step}\x1b]8;;\x1b\\"
-            )
-            .into_bytes(),
+            5 => format!("\x1b]8;;https://example.com/{step}\x1b\\link{step}\x1b]8;;\x1b\\")
+                .into_bytes(),
             // 组合变音符（U+0301）落在前一个基字符格上，产生非 None zerowidth。
             _ => format!("e\u{0301}{step}").into_bytes(),
         };
@@ -370,8 +380,8 @@ fn incremental_snapshot_matches_full_rebuild(cx: &mut TestAppContext) {
 /// 必然发生在锁被占住期间；同时它带 5 秒硬上限，任何实现下都不会把测试挂死。
 #[gpui::test]
 fn snapshot_refresh_yields_to_grid_lock_without_starving(cx: &mut TestAppContext) {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     // 阶段划分依赖「跳过上限至少为 2」：阶段 1 消耗第一次跳过，阶段 2 把它顶
@@ -482,8 +492,8 @@ fn snapshot_refresh_yields_to_grid_lock_without_starving(cx: &mut TestAppContext
 /// 任何推进，`content_dirty` 会一直为真，断言失败。
 #[gpui::test]
 fn skipped_snapshot_schedules_a_retry_frame(cx: &mut TestAppContext) {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     let terminal = cx.update(|cx| {
@@ -646,9 +656,7 @@ fn inconsistent_row_ranges_fall_back_to_full_rebuild(cx: &mut TestAppContext) {
 /// 每一步之后同样比对「生产路径（按真实 damage 决定增量/全量）」与
 /// 「强制整体重建」的逐格结果。
 #[gpui::test]
-fn incremental_snapshot_matches_full_rebuild_across_scroll_and_resize(
-    cx: &mut TestAppContext,
-) {
+fn incremental_snapshot_matches_full_rebuild_across_scroll_and_resize(cx: &mut TestAppContext) {
     let terminal = cx.update(|cx| {
         let t = Terminal::new_headless(cx, 500);
         t.update(cx, |t, cx| feed(t, 120, 0, cx));
@@ -675,10 +683,7 @@ fn incremental_snapshot_matches_full_rebuild_across_scroll_and_resize(
         );
         for (i, (a, b)) in incremental.iter().zip(full.iter()).enumerate() {
             // 整格比较，理由同上：不遗漏 zerowidth / hyperlink。
-            assert_eq!(
-                a, b,
-                "{label}: 第 {i} 格不一致（增量 {a:?} vs 全量 {b:?}）"
-            );
+            assert_eq!(a, b, "{label}: 第 {i} 格不一致（增量 {a:?} vs 全量 {b:?}）");
         }
     };
 
@@ -735,14 +740,18 @@ fn incremental_snapshot_matches_full_rebuild_across_scroll_and_resize(
                 let c = t.last_content();
                 (c.cols, c.rows)
             };
-            for (new_cols, new_rows) in [(cols + 10, rows), (cols, rows + 5), (cols - 7, rows + 3)] {
+            for (new_cols, new_rows) in [(cols + 10, rows), (cols, rows + 5), (cols - 7, rows + 3)]
+            {
                 t.resize(
                     crate::terminal::terminal::TerminalBounds::new(
                         gpui::px(16.0),
                         gpui::px(9.0),
                         gpui::Bounds::new(
                             gpui::point(gpui::px(0.0), gpui::px(0.0)),
-                            gpui::size(gpui::px(9.0 * new_cols as f32), gpui::px(16.0 * new_rows as f32)),
+                            gpui::size(
+                                gpui::px(9.0 * new_cols as f32),
+                                gpui::px(16.0 * new_rows as f32),
+                            ),
                         ),
                     ),
                     1.0,
@@ -812,10 +821,7 @@ fn incremental_snapshot_rebuilds_far_fewer_cells(cx: &mut TestAppContext) {
         (1.0 - incremental as f64 / full as f64) * 100.0
     );
 
-    assert!(
-        full > 0,
-        "全量参考路径没有重建任何格，度量口径失效"
-    );
+    assert!(full > 0, "全量参考路径没有重建任何格，度量口径失效");
     assert!(
         incremental * 2 <= full,
         "增量快照 {FRAMES} 帧重建 {incremental} 格，未达全量 {full} 格的一半，\

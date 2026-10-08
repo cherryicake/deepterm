@@ -17,7 +17,9 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px};
+use gpui::{
+    App, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Styled as _, div, px,
+};
 use lsp_types::{CompletionItem, Url};
 
 use crate::components::input::InputState;
@@ -164,7 +166,10 @@ impl CompletionState {
             log::warn!("lsp: completion 无 client（服务器未就绪？）");
             return;
         };
-        log::info!("lsp: completion 客户端就绪，is_closed={}", client.is_closed());
+        log::info!(
+            "lsp: completion 客户端就绪，is_closed={}",
+            client.is_closed()
+        );
         // `take()` 只是 detach（GPUPI 的 Task drop 不取消），真正作废靠代号。
         self.task.take();
         self.request_generation = self.request_generation.wrapping_add(1);
@@ -287,14 +292,18 @@ impl CompletionState {
         // `None`），所以这里的 `cursor` 就是**发请求时**那个偏移，可以放心
         // 拿它当菜单锚点、拿去算替换区间。
         let cursor = pending.cursor_offset;
-        let replace_range =
-            editor.update(cx, |state, _| state.completion_replace_range_at(cursor, &items));
+        let replace_range = editor.update(cx, |state, _| {
+            state.completion_replace_range_at(cursor, &items)
+        });
         let range_for_log = replace_range.clone();
         self.candidates = items
             .into_iter()
             .map(|item| Candidate {
                 label: features::completion_label(&item),
-                detail: item.detail.clone().or(item.label_details.as_ref().and_then(|d| d.detail.clone())),
+                detail: item
+                    .detail
+                    .clone()
+                    .or(item.label_details.as_ref().and_then(|d| d.detail.clone())),
                 item,
             })
             .collect();
@@ -350,8 +359,7 @@ impl CompletionState {
         let range = self.replace_range.clone();
         self.hide();
 
-        let needs_resolve =
-            candidate.item.additional_text_edits.is_none() && client.is_some();
+        let needs_resolve = candidate.item.additional_text_edits.is_none() && client.is_some();
         if !needs_resolve {
             apply_completion_item(&candidate.item, editor, range, cx);
             return None;
@@ -402,10 +410,7 @@ pub fn render_completion_menu_from_state(
 /// 渲染补全菜单**内容**（不含定位）。
 ///
 /// 条目数超过 [`MAX_VISIBLE`] 时按窗口滚动。
-pub fn render_completion_rows(
-    menu: &CompletionMenu,
-    cx: &App,
-) -> Option<gpui::AnyElement> {
+pub fn render_completion_rows(menu: &CompletionMenu, cx: &App) -> Option<gpui::AnyElement> {
     let theme = cx.theme().ui;
 
     // 窗口滚动：保证选中项始终可见。
@@ -446,7 +451,11 @@ pub fn render_completion_rows(
             .rounded(px(4.0))
             .child(
                 div()
-                    .text_color(if is_selected { theme.text } else { theme.text_muted })
+                    .text_color(if is_selected {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    })
                     .child(candidate.label.clone()),
             );
 

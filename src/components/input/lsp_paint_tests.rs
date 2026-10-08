@@ -15,7 +15,9 @@
 //! `Element`，而 `EditorInput` 是 `RenderOnce`，且 gpui 需要
 //! `rendered_entity_stack` 才能算 `current_view()`）。
 
-use gpui::{AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, px};
+use gpui::{
+    AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, px,
+};
 
 use crate::components::input::rope_ext::RopeExt as _;
 use crate::components::input::{EditorInput, InputState};
@@ -74,7 +76,7 @@ fn hover_popover_paints_without_panic(cx: &mut gpui::TestAppContext) {
         // 锚在第 2 行（`let x`），内容非空 → 绘制路径会走 defer_draw。
         state.set_hover_popover(
             16,
-crate::editor::hover::HoverInfo::from_plain_text("```rust\nlet x: i32\n```", _cx)
+            crate::editor::hover::HoverInfo::from_plain_text("```rust\nlet x: i32\n```", _cx),
         );
     });
     // 走到这里说明 prepaint + paint 都跑通了。
@@ -111,7 +113,7 @@ fn both_popovers_paint_together(cx: &mut gpui::TestAppContext) {
     let input = draw_with("fn main() {\n    let x = 1;\n}\n", cx, |state, _cx| {
         state.set_hover_popover(
             16,
-crate::editor::hover::HoverInfo::from_plain_text("hover text", _cx)
+            crate::editor::hover::HoverInfo::from_plain_text("hover text", _cx),
         );
         state.set_completion_anchor(16);
         state.set_completion_menu(
@@ -137,7 +139,7 @@ fn popover_with_out_of_range_anchor_is_safe(cx: &mut gpui::TestAppContext) {
         state.set_hover_popover(
             // 远超文本长度：`visible_row_for_offset` 返回 None → 跳过绘制。
             999_999,
-crate::editor::hover::HoverInfo::from_plain_text("unreachable", _cx)
+            crate::editor::hover::HoverInfo::from_plain_text("unreachable", _cx),
         );
     });
 }
@@ -148,7 +150,7 @@ fn empty_popover_content_is_skipped(cx: &mut gpui::TestAppContext) {
     let _ = draw_with("fn main() {}\n", cx, |state, _cx| {
         state.set_hover_popover(
             0,
-crate::editor::hover::HoverInfo::from_plain_text("   \n  ", _cx)
+            crate::editor::hover::HoverInfo::from_plain_text("   \n  ", _cx),
         );
     });
 }
@@ -188,7 +190,11 @@ fn stale_diagnostics_version_is_ignored(cx: &mut gpui::TestAppContext) {
             .diagnostics()
             .map(|d| d.items().iter().map(|x| x.message.clone()).collect())
             .unwrap_or_default();
-        assert_eq!(msgs, vec!["v7".to_string()], "newer diagnostics must survive");
+        assert_eq!(
+            msgs,
+            vec!["v7".to_string()],
+            "newer diagnostics must survive"
+        );
     });
 }
 
@@ -330,7 +336,7 @@ fn hover_placement(
         let offset = state.text().line_start_offset(anchor_line);
         state.set_hover_popover(
             offset,
-crate::editor::hover::HoverInfo::from_plain_text("hover", _cx)
+            crate::editor::hover::HoverInfo::from_plain_text("hover", _cx),
         );
     });
     let _ = cx.refresh();

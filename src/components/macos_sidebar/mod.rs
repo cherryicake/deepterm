@@ -185,10 +185,9 @@ impl std::fmt::Debug for SidebarEvent {
                 .field("from", from)
                 .field("to", to)
                 .finish(),
-            Self::PathRemoved { path, .. } => f
-                .debug_struct("PathRemoved")
-                .field("path", path)
-                .finish(),
+            Self::PathRemoved { path, .. } => {
+                f.debug_struct("PathRemoved").field("path", path).finish()
+            }
             Self::OpenDiffLoading { path, staged, .. } => f
                 .debug_struct("OpenDiffLoading")
                 .field("path", path)

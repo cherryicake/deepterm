@@ -169,8 +169,7 @@ impl SshPtyTerminal {
         // 但若该主机已有活着的**共享隧道**（另一个 russh 标签建的，见
         // `crate::ssh::tunnel`），这些规则已经装在上面了：再加 `-R` 只会让 ssh
         // 拿到「端口被占用」的警告——占住端口的正是本进程自己。此时省掉。
-        let pending_forwards =
-            crate::ssh::tunnel::rules_for_openssh(config, &config.port_forwards);
+        let pending_forwards = crate::ssh::tunnel::rules_for_openssh(config, &config.port_forwards);
         let forward_args = crate::ssh::port_forward::openssh_args(&pending_forwards);
         if !forward_args.is_empty() {
             log::info!("SSH: 端口转发参数 {:?}", forward_args);
@@ -357,7 +356,8 @@ mod tests {
     /// 调用方据此弹提示，这是这条路径唯一能告知用户的方式。
     #[test]
     fn missing_proxy_is_reported_as_unavailable() {
-        let mut config = SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
+        let mut config =
+            SshConnectionConfig::new("overseas.example.com", "root", AuthMethod::Agent);
         config.use_system_proxy = true;
         let mut args: Vec<String> = Vec::new();
         // 本机可能真配了代理：两种结果都可接受，但 Direct 式的静默不在此列。

@@ -14,7 +14,9 @@
 //! ```
 
 use gpui::prelude::*;
-use gpui::{AnyView, App, Context, IntoElement, Render, SharedString, Styled, Window, div, px, relative};
+use gpui::{
+    AnyView, App, Context, IntoElement, Render, SharedString, Styled, Window, div, px, relative,
+};
 
 use crate::theme::ActiveTheme;
 
@@ -34,9 +36,7 @@ impl Tooltip {
     ///
     /// 返回的闭包是 `'static` 的，每次弹出时创建新的气泡视图：
     /// `.tooltip(Tooltip::text("暂存全部更改"))`
-    pub fn text(
-        label: impl Into<SharedString>,
-    ) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    pub fn text(label: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
         let label = label.into();
         move |_window, cx| {
             cx.new(|_| Tooltip {

@@ -712,11 +712,12 @@ mod tests {
             assert!(
                 ratio >= 3.0,
                 "{agent:?} 的图形 #{:06X} 在底色 #{:06X} 上对比度只有 {:.2}:1，看不清",
-                glyph, disc, ratio
+                glyph,
+                disc,
+                ratio
             );
         }
     }
-
 
     #[test]
     fn detects_native_binaries() {
@@ -791,7 +792,10 @@ mod tests {
     fn module_style_invocations_are_not_guessed() {
         assert_eq!(detect(&["python3", "-m", "aider.main"]), None);
         // 直接跑二进制才是常规路径。
-        assert_eq!(detect(&["python3", "/usr/bin/aider"]), Some(CLIAgent::Aider));
+        assert_eq!(
+            detect(&["python3", "/usr/bin/aider"]),
+            Some(CLIAgent::Aider)
+        );
         assert_eq!(detect(&["aider"]), Some(CLIAgent::Aider));
     }
 
@@ -875,7 +879,12 @@ mod tests {
         }
 
         // 亮底：图形要够暗（Goose 的官方绿 #3ECC5F 白字仅 2.1:1）。
-        for agent in [CLIAgent::Goose, CLIAgent::Pi, CLIAgent::Aider, CLIAgent::Cursor] {
+        for agent in [
+            CLIAgent::Goose,
+            CLIAgent::Pi,
+            CLIAgent::Aider,
+            CLIAgent::Cursor,
+        ] {
             let glyph = agent.icon_rgb();
             assert_ne!(glyph, agent.accent_rgb(), "{agent:?} 的图形色没反相");
             assert!(
@@ -1029,7 +1038,11 @@ mod tests {
     fn command_argv_preserves_case_for_flag_replay() {
         assert_eq!(
             command_argv("claude --model Opus"),
-            vec!["claude".to_string(), "--model".to_string(), "Opus".to_string()]
+            vec![
+                "claude".to_string(),
+                "--model".to_string(),
+                "Opus".to_string()
+            ]
         );
         // shell 集成会把后台命令记成 `& cmd`，前导的 & 不是命令的一部分。
         assert_eq!(command_argv("& claude"), vec!["claude".to_string()]);
@@ -1074,7 +1087,10 @@ mod tests {
             None,
             "未知事件名要整条拒绝，不能猜"
         );
-        assert_eq!(parse_agent_event(b"777;notify;deepterm://cli-agent;not json"), None);
+        assert_eq!(
+            parse_agent_event(b"777;notify;deepterm://cli-agent;not json"),
+            None
+        );
     }
 
     #[test]
@@ -1294,14 +1310,8 @@ mod tests {
             assert!(status.dot_rgb().is_some(), "{status:?} 应有状态点颜色");
         }
         // Waiting 与 Done 是「要不要过去看一眼」的那一对，必须颜色可分辨。
-        assert_ne!(
-            AgentStatus::Waiting.dot_rgb(),
-            AgentStatus::Done.dot_rgb()
-        );
-        assert_ne!(
-            AgentStatus::Working.dot_rgb(),
-            AgentStatus::Done.dot_rgb()
-        );
+        assert_ne!(AgentStatus::Waiting.dot_rgb(), AgentStatus::Done.dot_rgb());
+        assert_ne!(AgentStatus::Working.dot_rgb(), AgentStatus::Done.dot_rgb());
     }
 
     #[test]

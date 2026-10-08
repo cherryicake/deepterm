@@ -178,12 +178,11 @@ while True:
         conn.shutdown_gracefully().await;
 
         // 进程必须退出：`kill(pid, 0)` 失败即不存在。
-        let gone = wait_for(
-            || !process_alive(pid),
-            Duration::from_secs(5),
-        )
-        .await;
-        assert!(gone, "language server child (pid {pid}) still alive after shutdown");
+        let gone = wait_for(|| !process_alive(pid), Duration::from_secs(5)).await;
+        assert!(
+            gone,
+            "language server child (pid {pid}) still alive after shutdown"
+        );
     });
 }
 
@@ -224,7 +223,10 @@ while True:
         );
         // 卡死的服务器会被强杀，不留孤儿。
         let gone = wait_for(|| !process_alive(pid), Duration::from_secs(5)).await;
-        assert!(gone, "unresponsive server must be killed, pid {pid} still alive");
+        assert!(
+            gone,
+            "unresponsive server must be killed, pid {pid} still alive"
+        );
     });
 }
 
@@ -264,14 +266,13 @@ while True:
         // 用一个很短的超时驱动真实代码路径（生产值是 30s，测试不宜等）。
         let started = std::time::Instant::now();
         let result = conn
-            .request_with_timeout(
-                "textDocument/hover",
-                None,
-                Duration::from_millis(400),
-            )
+            .request_with_timeout("textDocument/hover", None, Duration::from_millis(400))
             .await;
 
-        assert!(result.is_err(), "unanswered request must fail, got {result:?}");
+        assert!(
+            result.is_err(),
+            "unanswered request must fail, got {result:?}"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -362,7 +363,11 @@ time.sleep(1)
                 }
             }
         }
-        assert_eq!(seen, vec![0, 1, 2, 3, 4], "notifications must arrive in order");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3, 4],
+            "notifications must arrive in order"
+        );
     });
 }
 
@@ -468,13 +473,15 @@ while True:
                     .iter()
                     .filter_map(|f| f.get("method").and_then(|m| m.as_str()).map(String::from))
                     .collect();
-                methods.contains(&"shutdown".to_string())
-                    && methods.contains(&"exit".to_string())
+                methods.contains(&"shutdown".to_string()) && methods.contains(&"exit".to_string())
             },
             Duration::from_secs(10),
         )
         .await;
-        assert!(saw, "LspClient::shutdown must emit shutdown + exit handshake");
+        assert!(
+            saw,
+            "LspClient::shutdown must emit shutdown + exit handshake"
+        );
     });
 }
 

@@ -173,11 +173,10 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::vim_insert_before))
                     .on_action(window.listener_for(&self.state, InputState::vim_insert_after))
                     .on_action(
-                        window.listener_for(&self.state, InputState::vim_insert_first_non_whitespace),
+                        window
+                            .listener_for(&self.state, InputState::vim_insert_first_non_whitespace),
                     )
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_insert_end_of_line),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_insert_end_of_line))
                     .on_action(window.listener_for(&self.state, InputState::vim_left))
                     .on_action(window.listener_for(&self.state, InputState::vim_right))
                     .on_action(window.listener_for(&self.state, InputState::vim_down))
@@ -194,16 +193,10 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::vim_push_delete))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_yank))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_change))
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_push_object_inner),
-                    )
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_push_object_around),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_push_object_inner))
+                    .on_action(window.listener_for(&self.state, InputState::vim_push_object_around))
                     .on_action(window.listener_for(&self.state, InputState::vim_object_word))
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_object_key_action),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_object_key_action))
                     .on_action(window.listener_for(&self.state, InputState::vim_delete_char))
                     .on_action(window.listener_for(&self.state, InputState::vim_paste_after))
                     .on_action(window.listener_for(&self.state, InputState::vim_paste_before))
@@ -234,9 +227,7 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::vim_open_line_below))
                     .on_action(window.listener_for(&self.state, InputState::vim_open_line_above))
                     .on_action(window.listener_for(&self.state, InputState::vim_toggle_case))
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_matching_bracket),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_matching_bracket))
                     .on_action(
                         window.listener_for(&self.state, InputState::vim_first_non_whitespace),
                     )
@@ -259,13 +250,9 @@ impl RenderOnce for EditorInput {
                     .on_action(window.listener_for(&self.state, InputState::vim_search_next))
                     .on_action(window.listener_for(&self.state, InputState::vim_search_prev))
                     // 等待一个字符的命令与注释
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_push_find_forward),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_push_find_forward))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_find_before))
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_push_find_backward),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_push_find_backward))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_find_after))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_replace))
                     .on_action(window.listener_for(&self.state, InputState::vim_repeat_find))
@@ -276,15 +263,15 @@ impl RenderOnce for EditorInput {
                     // Visual 模式
                     .on_action(window.listener_for(&self.state, InputState::vim_visual_char))
                     .on_action(window.listener_for(&self.state, InputState::vim_visual_line))
-                    .on_action(
-                        window.listener_for(&self.state, InputState::vim_visual_swap_ends),
-                    )
+                    .on_action(window.listener_for(&self.state, InputState::vim_visual_swap_ends))
                     .on_action(window.listener_for(&self.state, InputState::vim_reselect_visual))
                     .on_action(window.listener_for(&self.state, InputState::vim_repeat_change))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_register))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_set_mark))
                     .on_action(window.listener_for(&self.state, InputState::vim_push_jump_mark))
-                    .on_action(window.listener_for(&self.state, InputState::vim_push_jump_mark_line))
+                    .on_action(
+                        window.listener_for(&self.state, InputState::vim_push_jump_mark_line),
+                    )
                     .on_action(window.listener_for(&self.state, InputState::vim_visual_delete))
                     .on_action(window.listener_for(&self.state, InputState::vim_visual_yank))
                     .on_action(window.listener_for(&self.state, InputState::vim_visual_change))
@@ -310,7 +297,9 @@ impl RenderOnce for EditorInput {
                             .on_action(window.listener_for(&self.state, InputState::indent))
                             .on_action(window.listener_for(&self.state, InputState::outdent))
                             .on_action(window.listener_for(&self.state, InputState::toggle_comment))
-                            .on_action(window.listener_for(&self.state, InputState::toggle_soft_wrap))
+                            .on_action(
+                                window.listener_for(&self.state, InputState::toggle_soft_wrap),
+                            )
                             .on_action(window.listener_for(&self.state, InputState::move_line_up))
                             .on_action(window.listener_for(&self.state, InputState::move_line_down))
                             .on_action(window.listener_for(&self.state, InputState::duplicate_line))

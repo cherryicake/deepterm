@@ -41,7 +41,11 @@ fn offset_mapping_is_empty_safe() {
 }
 
 /// 累计前 `row_index + 1` 行的高度（与绘制路径同构）。
-fn sum_heights_to(heights: &[gpui::Pixels], row_index: usize, visible_top: gpui::Pixels) -> gpui::Pixels {
+fn sum_heights_to(
+    heights: &[gpui::Pixels],
+    row_index: usize,
+    visible_top: gpui::Pixels,
+) -> gpui::Pixels {
     let mut y = visible_top;
     for h in heights.iter().take(row_index + 1) {
         y += *h;
@@ -114,7 +118,10 @@ fn expected_row_top(
 #[test]
 fn row_top_matches_paint_formula_for_first_row() {
     // 第一行：行顶就是 visible_top（无前置行）。
-    assert_eq!(expected_row_top(100.0, 0.0, &[20.0, 20.0], &[0.0, 0.0], 0), 100.0);
+    assert_eq!(
+        expected_row_top(100.0, 0.0, &[20.0, 20.0], &[0.0, 0.0], 0),
+        100.0
+    );
 }
 
 #[test]
@@ -324,7 +331,10 @@ fn anchor_at_very_top_goes_below() {
         y > 0.0,
         "anchor at the very top has no room above; popover must go below, got y={y}"
     );
-    assert_eq!(y, 20.0, "should sit just below the anchor row (0 + row height 20)");
+    assert_eq!(
+        y, 20.0,
+        "should sit just below the anchor row (0 + row height 20)"
+    );
 }
 
 /// 底部锚点：下方放不下时必须翻到上方（另一侧的场景）。

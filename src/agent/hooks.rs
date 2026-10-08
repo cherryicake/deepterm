@@ -133,10 +133,21 @@ pub const CLAUDE_HOOK_EVENTS: &[HookEventSpec] = &[
 ///
 /// 与 tty7 的 15 个 hook 适配器一致；识别支持不代表存在状态事件源。
 pub const INSTALLABLE_AGENTS: &[CLIAgent] = &[
-    CLIAgent::Claude, CLIAgent::Codex, CLIAgent::TraeCode, CLIAgent::Copilot,
-    CLIAgent::OpenCode, CLIAgent::Pi, CLIAgent::Grok, CLIAgent::OhMyPi,
-    CLIAgent::Gemini, CLIAgent::Droid, CLIAgent::Qwen, CLIAgent::Goose,
-    CLIAgent::Kimi, CLIAgent::QoderCLI, CLIAgent::Crush,
+    CLIAgent::Claude,
+    CLIAgent::Codex,
+    CLIAgent::TraeCode,
+    CLIAgent::Copilot,
+    CLIAgent::OpenCode,
+    CLIAgent::Pi,
+    CLIAgent::Grok,
+    CLIAgent::OhMyPi,
+    CLIAgent::Gemini,
+    CLIAgent::Droid,
+    CLIAgent::Qwen,
+    CLIAgent::Goose,
+    CLIAgent::Kimi,
+    CLIAgent::QoderCLI,
+    CLIAgent::Crush,
 ];
 
 /// 该不该弹「装 hook」的窗。
@@ -204,15 +215,70 @@ pub fn hook_install_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
 fn adapter_events(agent: CLIAgent) -> &'static [(&'static str, &'static str)] {
     use CLIAgent::*;
     match agent {
-        Codex => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("Stop", "stop")],
-        TraeCode | Qwen => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("PermissionRequest", "permission-request"), ("PostToolUse", "tool-complete"), ("Stop", "stop"), ("SessionEnd", "session-end")],
-        Gemini => &[("SessionStart", "session-start"), ("BeforeAgent", "prompt-submit"), ("Notification", "notification"), ("AfterTool", "tool-complete"), ("AfterAgent", "stop"), ("SessionEnd", "session-end")],
-        Droid | Grok => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("Notification", "notification"), ("PostToolUse", "tool-complete"), ("Stop", "stop"), ("SessionEnd", "session-end")],
-        Goose => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("PostToolUse", "tool-complete"), ("Stop", "stop"), ("SessionEnd", "session-end")],
-        Kimi => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("PermissionRequest", "permission-request"), ("PostToolUse", "tool-complete"), ("Stop", "stop"), ("Interrupt", "stop"), ("StopFailure", "stop"), ("SessionEnd", "session-end")],
-        QoderCLI => &[("SessionStart", "session-start"), ("UserPromptSubmit", "prompt-submit"), ("PermissionRequest", "permission-request"), ("Elicitation", "question-asked"), ("PostToolUse", "tool-complete"), ("Stop", "stop"), ("StopFailure", "stop"), ("SessionEnd", "session-end")],
+        Codex => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("Stop", "stop"),
+        ],
+        TraeCode | Qwen => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PermissionRequest", "permission-request"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        Gemini => &[
+            ("SessionStart", "session-start"),
+            ("BeforeAgent", "prompt-submit"),
+            ("Notification", "notification"),
+            ("AfterTool", "tool-complete"),
+            ("AfterAgent", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        Droid | Grok => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("Notification", "notification"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        Goose => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        Kimi => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PermissionRequest", "permission-request"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("Interrupt", "stop"),
+            ("StopFailure", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        QoderCLI => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PermissionRequest", "permission-request"),
+            ("Elicitation", "question-asked"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("StopFailure", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
         Crush => &[("PreToolUse", "tool-complete")],
-        Copilot => &[("sessionStart", "session-start"), ("userPromptSubmitted", "prompt-submit"), ("agentStop", "stop"), ("sessionEnd", "session-end"), ("notification", "notification")],
+        Copilot => &[
+            ("sessionStart", "session-start"),
+            ("userPromptSubmitted", "prompt-submit"),
+            ("agentStop", "stop"),
+            ("sessionEnd", "session-end"),
+            ("notification", "notification"),
+        ],
         _ => &[],
     }
 }
@@ -249,24 +315,43 @@ fn adapter_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
             } else if agent == Crush {
                 serde_json::json!({"command": command})
             } else {
-                let mut group = serde_json::json!({"hooks": [{"type": "command", "command": command}]});
+                let mut group =
+                    serde_json::json!({"hooks": [{"type": "command", "command": command}]});
                 if agent == Grok {
                     group["hooks"][0]["timeout"] = 10.into();
-                    if event == "Notification" { group["matcher"] = "elicitation_dialog".into(); }
+                    if event == "Notification" {
+                        group["matcher"] = "elicitation_dialog".into();
+                    }
                 }
                 group
             };
             hooks.insert(event.into(), serde_json::json!([entry]));
         }
         let mut root = serde_json::json!({"hooks": hooks});
-        if agent == Copilot { root["version"] = 1.into(); }
+        if agent == Copilot {
+            root["version"] = 1.into();
+        }
         serde_json::to_string_pretty(&root).expect("hook JSON serializes")
     };
-    Some(HookInstallPlan { rel_path, installed_marker: REPORTER_MARKER, content, executable: false })
+    Some(HookInstallPlan {
+        rel_path,
+        installed_marker: REPORTER_MARKER,
+        content,
+        executable: false,
+    })
 }
 
 fn uses_shared_json(agent: CLIAgent) -> bool {
-    matches!(agent, CLIAgent::Codex | CLIAgent::TraeCode | CLIAgent::Gemini | CLIAgent::Droid | CLIAgent::Qwen | CLIAgent::QoderCLI | CLIAgent::Crush)
+    matches!(
+        agent,
+        CLIAgent::Codex
+            | CLIAgent::TraeCode
+            | CLIAgent::Gemini
+            | CLIAgent::Droid
+            | CLIAgent::Qwen
+            | CLIAgent::QoderCLI
+            | CLIAgent::Crush
+    )
 }
 
 /// 只替换 deepterm 自己的 handler，保留同一 matcher 下第三方 handler。
@@ -274,44 +359,96 @@ fn uses_shared_json(agent: CLIAgent) -> bool {
 /// 清理时同时匹配**新版**标记（上报脚本）与**旧版**标记（`deepterm
 /// agent-hook` 命令）：升级安装的用户配置里可能还留着旧条目，不清掉会
 /// 新旧两套同时上报，事件翻倍。
-pub fn merge_bridge_config(agent: CLIAgent, plan: &HookInstallPlan, existing: &[u8]) -> Result<String, String> {
+pub fn merge_bridge_config(
+    agent: CLIAgent,
+    plan: &HookInstallPlan,
+    existing: &[u8],
+) -> Result<String, String> {
     let legacy = format!("{} {}", LEGACY_CLI_PREFIX, agent.slug());
     let is_ours = |s: &str| s.contains(plan.installed_marker) || s.contains(&legacy);
     if agent == CLIAgent::Kimi {
-        return merge_kimi_hooks(std::str::from_utf8(existing).map_err(|e| e.to_string())?, &legacy);
+        return merge_kimi_hooks(
+            std::str::from_utf8(existing).map_err(|e| e.to_string())?,
+            &legacy,
+        );
     }
-    if !uses_shared_json(agent) { return Ok(plan.content.clone()); }
-    let mut root: serde_json::Value = if existing.is_empty() { serde_json::json!({}) } else {
+    if !uses_shared_json(agent) {
+        return Ok(plan.content.clone());
+    }
+    let mut root: serde_json::Value = if existing.is_empty() {
+        serde_json::json!({})
+    } else {
         serde_json::from_slice(existing).map_err(|e| format!("配置不是合法 JSON：{e}"))?
     };
-    let hooks = root.as_object_mut().ok_or("配置顶层不是对象")?
-        .entry("hooks").or_insert_with(|| serde_json::json!({}))
-        .as_object_mut().ok_or("hooks 不是对象")?;
+    let hooks = root
+        .as_object_mut()
+        .ok_or("配置顶层不是对象")?
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("hooks 不是对象")?;
     for entries in hooks.values_mut() {
         let entries = entries.as_array_mut().ok_or("hook 事件不是数组")?;
         entries.retain_mut(|entry| {
-            if entry.get("command").and_then(|v| v.as_str()).is_some_and(&is_ours) { return false; }
+            if entry
+                .get("command")
+                .and_then(|v| v.as_str())
+                .is_some_and(&is_ours)
+            {
+                return false;
+            }
             if let Some(handlers) = entry.get_mut("hooks").and_then(|v| v.as_array_mut()) {
                 let before = handlers.len();
-                handlers.retain(|h| !h.get("command").and_then(|v| v.as_str()).is_some_and(&is_ours));
+                handlers.retain(|h| {
+                    !h.get("command")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(&is_ours)
+                });
                 return before == handlers.len() || !handlers.is_empty();
             }
             true
         });
     }
-    let generated: serde_json::Value = serde_json::from_str(&plan.content).map_err(|e| e.to_string())?;
-    for (event, entries) in generated["hooks"].as_object().ok_or("生成的 hooks 不是对象")? {
-        hooks.entry(event).or_insert_with(|| serde_json::json!([])).as_array_mut().ok_or("hook 事件不是数组")?
-            .extend(entries.as_array().ok_or("生成的 hook 事件不是数组")?.iter().cloned());
+    let generated: serde_json::Value =
+        serde_json::from_str(&plan.content).map_err(|e| e.to_string())?;
+    for (event, entries) in generated["hooks"]
+        .as_object()
+        .ok_or("生成的 hooks 不是对象")?
+    {
+        hooks
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut()
+            .ok_or("hook 事件不是数组")?
+            .extend(
+                entries
+                    .as_array()
+                    .ok_or("生成的 hook 事件不是数组")?
+                    .iter()
+                    .cloned(),
+            );
     }
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
 fn merge_kimi_hooks(existing: &str, legacy: &str) -> Result<String, String> {
-    let mut doc = existing.parse::<toml_edit::DocumentMut>().map_err(|e| format!("配置不是合法 TOML：{e}"))?;
-    if doc.get("hooks").and_then(|v| v.as_array()).is_some_and(|v| v.is_empty()) { doc.remove("hooks"); }
-    let list = doc.entry("hooks").or_insert(toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
-        .as_array_of_tables_mut().ok_or("hooks 不是 TOML 表数组")?;
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("配置不是合法 TOML：{e}"))?;
+    if doc
+        .get("hooks")
+        .and_then(|v| v.as_array())
+        .is_some_and(|v| v.is_empty())
+    {
+        doc.remove("hooks");
+    }
+    let list = doc
+        .entry("hooks")
+        .or_insert(toml_edit::Item::ArrayOfTables(
+            toml_edit::ArrayOfTables::new(),
+        ))
+        .as_array_of_tables_mut()
+        .ok_or("hooks 不是 TOML 表数组")?;
     list.retain(|entry| {
         let cmd = entry.get("command").and_then(|v| v.as_str());
         cmd.is_none_or(|s| !(s.contains(REPORTER_MARKER) || s.contains(legacy)))
@@ -327,32 +464,57 @@ fn merge_kimi_hooks(existing: &str, legacy: &str) -> Result<String, String> {
 
 /// 与 tty7 相同的本地配置目录覆盖；远端不使用本机环境变量。
 pub fn local_bridge_path(agent: CLIAgent, home: &std::path::Path, rel: &str) -> std::path::PathBuf {
-    let value = |key| std::env::var_os(key).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    let value = |key| {
+        std::env::var_os(key)
+            .filter(|v| !v.is_empty())
+            .map(std::path::PathBuf::from)
+    };
     let xdg = || value("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
     match agent {
         CLIAgent::Claude => value("CLAUDE_CONFIG_DIR").map(|p| p.join("settings.json")),
         CLIAgent::OpenCode => Some(xdg().join("opencode/plugins/deepterm.js")),
-        CLIAgent::TraeCode => value("TRAECLI_HOME").map(|p| p.join("hooks.json")).or_else(|| value("TRAE_HOME").map(|p| p.join("cli/hooks.json"))),
+        CLIAgent::TraeCode => value("TRAECLI_HOME")
+            .map(|p| p.join("hooks.json"))
+            .or_else(|| value("TRAE_HOME").map(|p| p.join("cli/hooks.json"))),
         CLIAgent::Kimi => value("KIMI_CODE_HOME").map(|p| p.join("config.toml")),
         CLIAgent::QoderCLI => value("QODER_CONFIG_DIR").map(|p| p.join("settings.json")),
-        CLIAgent::Crush => Some(value("CRUSH_GLOBAL_CONFIG").unwrap_or_else(|| xdg().join("crush")).join("crush.json")),
+        CLIAgent::Crush => Some(
+            value("CRUSH_GLOBAL_CONFIG")
+                .unwrap_or_else(|| xdg().join("crush"))
+                .join("crush.json"),
+        ),
         _ => None,
-    }.unwrap_or_else(|| home.join(rel))
+    }
+    .unwrap_or_else(|| home.join(rel))
 }
 
 /// 完整性检测：共享配置允许第三方条目，缺少任一必需事件则需要重装。
 pub fn bridge_installed(agent: CLIAgent, plan: &HookInstallPlan, existing: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(existing) else { return false; };
+    let Ok(text) = std::str::from_utf8(existing) else {
+        return false;
+    };
     if agent == CLIAgent::Kimi {
         return merge_kimi_hooks(text, &format!("{} kimi", LEGACY_CLI_PREFIX))
             .is_ok_and(|merged| merged == text);
     }
-    if !uses_shared_json(agent) { return text == plan.content; }
-    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else { return false; };
-    let Ok(expected) = serde_json::from_str::<serde_json::Value>(&plan.content) else { return false; };
-    expected["hooks"].as_object().is_some_and(|hooks| hooks.iter().all(|(event, entries)| {
-        root["hooks"][event].as_array().is_some_and(|actual| entries.as_array().is_some_and(|wanted| wanted.iter().all(|entry| actual.contains(entry))))
-    }))
+    if !uses_shared_json(agent) {
+        return text == plan.content;
+    }
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return false;
+    };
+    let Ok(expected) = serde_json::from_str::<serde_json::Value>(&plan.content) else {
+        return false;
+    };
+    expected["hooks"].as_object().is_some_and(|hooks| {
+        hooks.iter().all(|(event, entries)| {
+            root["hooks"][event].as_array().is_some_and(|actual| {
+                entries
+                    .as_array()
+                    .is_some_and(|wanted| wanted.iter().all(|entry| actual.contains(entry)))
+            })
+        })
+    })
 }
 
 /// 「装 hook」系统弹窗里显示的**精简文案**。
@@ -407,9 +569,15 @@ pub fn hook_install_copy(agent: CLIAgent) -> Option<HookInstallCopy> {
             Some(HookInstallCopy {
                 title: format!("为 {name} 启用状态指示？"),
                 blurb: match other {
-                    CLIAgent::Crush => "Crush 目前只有工具活动事件，不报告完整回合或等待状态。".into(),
-                    CLIAgent::Codex | CLIAgent::Goose => format!("安装后显示 {name} 的工作中 / 已完成状态；上游适配不提供权限等待事件。"),
-                    _ => format!("安装后按 {name} 提供的事件同步回合状态；部分版本不提供权限等待事件。"),
+                    CLIAgent::Crush => {
+                        "Crush 目前只有工具活动事件，不报告完整回合或等待状态。".into()
+                    }
+                    CLIAgent::Codex | CLIAgent::Goose => format!(
+                        "安装后显示 {name} 的工作中 / 已完成状态；上游适配不提供权限等待事件。"
+                    ),
+                    _ => format!(
+                        "安装后按 {name} 提供的事件同步回合状态；部分版本不提供权限等待事件。"
+                    ),
                 },
                 // Codex 的 `hooks` 特性由安装流程自己开（见
                 // `codex_enable_hooks_command`），不需要用户再跑命令。
@@ -673,9 +841,7 @@ case "$event" in
     ;;
 esac
 "#,
-        stop_payload = esc_for_shell_single_quoted(&claude_terminal_sequence(
-            AgentEventKind::Stop
-        )),
+        stop_payload = esc_for_shell_single_quoted(&claude_terminal_sequence(AgentEventKind::Stop)),
         cases = cases,
     )
 }
@@ -1117,7 +1283,6 @@ export default function (pi: ExtensionAPI) {{
     )
 }
 
-
 ///
 /// 产出的是**纯文本**序列，其中 ESC/BEL 写成 shell 的 `\033` / `\007`
 /// 转义而不是裸控制字节（裸字节会让脚本正文难以编辑与传输）。
@@ -1221,10 +1386,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn codex_enable_hooks_command_finds_codex_without_inherited_path() {
-        let home = std::env::temp_dir().join(format!(
-            "deepterm-codex-path-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("deepterm-codex-path-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -1269,13 +1432,27 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(parsed["permissions"]["allow"][0], "Read");
         assert_eq!(parsed["hooks"]["Stop"][0]["matcher"], "*");
-        assert_eq!(parsed["hooks"]["Stop"][0]["hooks"], serde_json::json!([{"type":"command","command":"third-party-notify"}]));
-        assert_eq!(merge_bridge_config(CLIAgent::Codex, &plan, merged.as_bytes()).unwrap(), merged);
+        assert_eq!(
+            parsed["hooks"]["Stop"][0]["hooks"],
+            serde_json::json!([{"type":"command","command":"third-party-notify"}])
+        );
+        assert_eq!(
+            merge_bridge_config(CLIAgent::Codex, &plan, merged.as_bytes()).unwrap(),
+            merged
+        );
         assert!(bridge_installed(CLIAgent::Codex, &plan, merged.as_bytes()));
         let mut partial = parsed;
         partial["hooks"].as_object_mut().unwrap().remove("Stop");
-        assert!(!bridge_installed(CLIAgent::Codex, &plan, &serde_json::to_vec(&partial).unwrap()));
-        for invalid in [b"{broken".as_slice(), br#"{"hooks":[]}"#, br#"{"hooks":{"Stop":{}}}"#] {
+        assert!(!bridge_installed(
+            CLIAgent::Codex,
+            &plan,
+            &serde_json::to_vec(&partial).unwrap()
+        ));
+        for invalid in [
+            b"{broken".as_slice(),
+            br#"{"hooks":[]}"#,
+            br#"{"hooks":{"Stop":{}}}"#,
+        ] {
             assert!(merge_bridge_config(CLIAgent::Codex, &plan, invalid).is_err());
         }
     }
@@ -1288,8 +1465,17 @@ mod tests {
         assert!(merged.contains("# provider comment"));
         let doc = merged.parse::<toml_edit::DocumentMut>().unwrap();
         assert_eq!(doc["model"].as_str(), Some("fixture"));
-        assert!(doc["hooks"].as_array_of_tables().unwrap().iter().any(|h| h["command"].as_str() == Some("third-party-notify")));
-        assert_eq!(merge_bridge_config(CLIAgent::Kimi, &plan, merged.as_bytes()).unwrap(), merged);
+        assert!(
+            doc["hooks"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .any(|h| h["command"].as_str() == Some("third-party-notify"))
+        );
+        assert_eq!(
+            merge_bridge_config(CLIAgent::Kimi, &plan, merged.as_bytes()).unwrap(),
+            merged
+        );
         assert!(merge_bridge_config(CLIAgent::Kimi, &plan, b"hooks = []").is_ok());
         assert!(merge_bridge_config(CLIAgent::Kimi, &plan, b"hooks = 'invalid'").is_err());
     }
@@ -1355,9 +1541,7 @@ mod tests {
             .expect("脚本的 Stop 分支里应当有 emit '...' 调用");
 
         // 脚本里的载荷是纯文本，控制字符写成 shell 转义 `\033` / `\007`。
-        let expanded = payload
-            .replace("\\033", "\u{1b}")
-            .replace("\\007", "\u{7}");
+        let expanded = payload.replace("\\033", "\u{1b}").replace("\\007", "\u{7}");
         let inner = expanded
             .strip_prefix("\u{1b}]")
             .unwrap_or_else(|| panic!("必须由 OSC 引导：{expanded:?}"))
@@ -1424,7 +1608,11 @@ mod tests {
     /// 静默不工作——所以这里把脚本调用契约钉死在测试里。
     #[test]
     fn bridges_invoke_the_reporter_script() {
-        for src in [opencode_plugin_js(), pi_extension_ts(), pi_extension_for("omp", "@oh-my-pi/pi-coding-agent")] {
+        for src in [
+            opencode_plugin_js(),
+            pi_extension_ts(),
+            pi_extension_for("omp", "@oh-my-pi/pi-coding-agent"),
+        ] {
             assert!(
                 src.contains(REPORTER_REL_PATH),
                 "桥接必须引用上报脚本 {REPORTER_REL_PATH}"
@@ -1460,7 +1648,10 @@ mod tests {
         };
         let slugs = case_items("case \"$agent\" in");
         let events = case_items("case \"$event\" in");
-        for agent in INSTALLABLE_AGENTS.iter().filter(|a| **a != CLIAgent::Claude) {
+        for agent in INSTALLABLE_AGENTS
+            .iter()
+            .filter(|a| **a != CLIAgent::Claude)
+        {
             assert!(
                 slugs.iter().any(|s| s == agent.slug()),
                 "上报脚本必须认得 agent `{}`（当前白名单：{slugs:?}）",
@@ -1483,14 +1674,20 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reporter_script_run_by_real_sh_produces_parsable_bytes() {
-        let dir = std::env::temp_dir().join(format!("deepterm-reporter-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("deepterm-reporter-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("agent-report.sh");
         let target = dir.join("osc.out");
         std::fs::write(&script, agent_report_script()).unwrap();
 
         for (agent, event, stdin_json, expected_kind) in [
-            ("opencode", "prompt-submit", r#"{"sessionID":"ses_1","cwd":"/tmp/x"}"#, AgentEventKind::PromptSubmit),
+            (
+                "opencode",
+                "prompt-submit",
+                r#"{"sessionID":"ses_1","cwd":"/tmp/x"}"#,
+                AgentEventKind::PromptSubmit,
+            ),
             ("codex", "stop", "", AgentEventKind::Stop),
         ] {
             let _ = std::fs::remove_file(&target);
@@ -1505,17 +1702,29 @@ mod tests {
                 .spawn()
                 .and_then(|mut child| {
                     use std::io::Write as _;
-                    child.stdin.take().unwrap().write_all(stdin_json.as_bytes())?;
+                    child
+                        .stdin
+                        .take()
+                        .unwrap()
+                        .write_all(stdin_json.as_bytes())?;
                     child.wait_with_output()
                 })
                 .expect("上报脚本必须能被 /bin/sh 执行");
-            assert!(output.status.success(), "脚本必须以 0 退出：{:?}", output.stderr);
+            assert!(
+                output.status.success(),
+                "脚本必须以 0 退出：{:?}",
+                output.stderr
+            );
             let bytes = std::fs::read(&target).expect("OSC 必须写到目标文件");
             let parsed = crate::agent::parse_agent_event(osc_content(&bytes))
                 .expect("脚本产出的序列必须能被解析器读回");
             assert_eq!(parsed.kind, expected_kind);
             if agent == "opencode" {
-                assert_eq!(parsed.session_id.as_deref(), Some("ses_1"), "session_id 别名必须覆盖 opencode 拼法");
+                assert_eq!(
+                    parsed.session_id.as_deref(),
+                    Some("ses_1"),
+                    "session_id 别名必须覆盖 opencode 拼法"
+                );
                 assert_eq!(parsed.cwd.as_deref(), Some(std::path::Path::new("/tmp/x")));
             }
         }
@@ -1571,10 +1780,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn reporter_script_routes_events_like_the_old_cli() {
-        let dir = std::env::temp_dir().join(format!(
-            "deepterm-reporter-routing-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("deepterm-reporter-routing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("agent-report.sh");
         std::fs::write(&script, agent_report_script()).unwrap();
@@ -1598,7 +1805,11 @@ mod tests {
                     child.wait_with_output()
                 })
                 .expect("上报脚本必须能被 /bin/sh 执行");
-            assert!(output.status.success(), "脚本必须以 0 退出：{:?}", output.stderr);
+            assert!(
+                output.status.success(),
+                "脚本必须以 0 退出：{:?}",
+                output.stderr
+            );
             let bytes = std::fs::read(&target).ok()?;
             let parsed = crate::agent::parse_agent_event(osc_content(&bytes))
                 .expect("脚本产出的序列必须能被解析器读回");
@@ -1609,7 +1820,10 @@ mod tests {
         use AgentEventKind::*;
 
         // qodercli：compact 触发的 SessionStart 不是新会话，必须静默。
-        assert_eq!(run("qodercli", "session-start", r#"{"source":"compact"}"#), None);
+        assert_eq!(
+            run("qodercli", "session-start", r#"{"source":"compact"}"#),
+            None
+        );
         assert_eq!(
             run("qodercli", "session-start", r#"{"source":"startup"}"#),
             Some(SessionStart),
@@ -1655,7 +1869,11 @@ mod tests {
 
         // 白名单：未知事件 / 未知 agent / 无 DEEPTERM 一律静默。
         assert_eq!(run("opencode", "some-future-event", "{}"), None);
-        assert_eq!(run("claude", "stop", "{}"), None, "claude 不在脚本白名单里（走 terminalSequence）");
+        assert_eq!(
+            run("claude", "stop", "{}"),
+            None,
+            "claude 不在脚本白名单里（走 terminalSequence）"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1724,7 +1942,10 @@ mod tests {
             js.contains("export default {"),
             "V2 只认 default 导出的定义"
         );
-        assert!(js.contains(r#"id: "deepterm""#), "每个 V2 插件都需要一个稳定 id");
+        assert!(
+            js.contains(r#"id: "deepterm""#),
+            "每个 V2 插件都需要一个稳定 id"
+        );
         assert!(js.contains("async setup(ctx) {"), "必须有 setup 函数");
         assert!(
             !js.contains("export const DeeptermPresence"),
@@ -1959,7 +2180,6 @@ mod tests {
         }
     }
 
-
     /// `StopFailure` 必须映射到 `Stop` 而不是 `Notification`。
     ///
     /// 这是本模块最容易「看起来对、实则错」的一处：`Notification` 只在当前是
@@ -1982,11 +2202,12 @@ mod tests {
     #[test]
     fn pre_tool_use_is_deliberately_not_installed() {
         assert!(
-            !CLAUDE_HOOK_EVENTS.iter().any(|s| s.claude_event == "PreToolUse"),
+            !CLAUDE_HOOK_EVENTS
+                .iter()
+                .any(|s| s.claude_event == "PreToolUse"),
             "PreToolUse 会让状态点在 Waiting/Working 之间抖"
         );
     }
-
 
     /// **端到端**：把生成的脚本喂给真实的 `sh` 执行，确认它输出的字节能被
     /// 真实的解析器认出来。
@@ -2045,7 +2266,10 @@ mod tests {
             // 真实场景里 Claude Code 解析的是这行 JSON。
             let wrapper: serde_json::Value =
                 serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-                    panic!("{} 的输出不是合法 JSON（{e}）：{stdout:?}", spec.claude_event)
+                    panic!(
+                        "{} 的输出不是合法 JSON（{e}）：{stdout:?}",
+                        spec.claude_event
+                    )
                 });
             let seq = wrapper["terminalSequence"]
                 .as_str()
@@ -2068,7 +2292,11 @@ mod tests {
                 spec.claude_event
             );
             // 终止符必须是 BEL 或 ST——这里用 BEL。
-            assert!(seq.ends_with('\u{7}'), "{} 没有 BEL 终止", spec.claude_event);
+            assert!(
+                seq.ends_with('\u{7}'),
+                "{} 没有 BEL 终止",
+                spec.claude_event
+            );
             // 序列里不能出现第二处 ESC：混入 CSI 等白名单外内容会让整段被丢弃。
             assert_eq!(
                 seq.matches('\u{1b}').count(),
@@ -2081,9 +2309,8 @@ mod tests {
                 .strip_prefix("\u{1b}]")
                 .and_then(|s| s.strip_suffix('\u{7}'))
                 .expect("剥 OSC 引导符与终止符");
-            let event = parse_agent_event(inner.as_bytes()).unwrap_or_else(|| {
-                panic!("{} 的字节解析失败：{inner:?}", spec.claude_event)
-            });
+            let event = parse_agent_event(inner.as_bytes())
+                .unwrap_or_else(|| panic!("{} 的字节解析失败：{inner:?}", spec.claude_event));
             assert_eq!(event.kind, spec.kind, "{}", spec.claude_event);
             assert_eq!(event.agent, Some(CLIAgent::Claude));
             // 脚本**刻意不转发** session_id / cwd：那需要 sed 从 stdin 抽字段，
@@ -2106,9 +2333,7 @@ mod tests {
             .stdin
             .as_mut()
             .expect("stdin")
-            .write_all(
-                br#"{"background_tasks":[{"type":"subagent","status":"running"}]}"#,
-            )
+            .write_all(br#"{"background_tasks":[{"type":"subagent","status":"running"}]}"#)
             .expect("写 stdin");
         let out = child.wait_with_output().expect("等 sh");
         assert!(
@@ -2166,16 +2391,16 @@ mod tests {
         assert_eq!(esc_for_shell_single_quoted("it's"), "it'\\''s");
         // 引号与反斜杠原样保留：它们属于 OSC 载荷，不该被 JSON 转义。
         assert_eq!(esc_for_shell_single_quoted("\"x\""), "\"x\"");
-        assert_eq!(
-            esc_for_shell_single_quoted("\u{1b}x\u{7}"),
-            "\\033x\\007"
-        );
+        assert_eq!(esc_for_shell_single_quoted("\u{1b}x\u{7}"), "\\033x\\007");
         // 真实载荷：ESC 与 BEL 都转义，无裸控制字节；内层引号保持原样。
         let seq = claude_terminal_sequence(AgentEventKind::Stop);
         let escaped = esc_for_shell_single_quoted(&seq);
         assert!(escaped.starts_with("\\033]777;"), "{escaped}");
         assert!(escaped.ends_with("\\007"), "{escaped}");
-        assert!(escaped.contains("{\"v\":1"), "内层引号不该被转义：{escaped}");
+        assert!(
+            escaped.contains("{\"v\":1"),
+            "内层引号不该被转义：{escaped}"
+        );
         assert!(!escaped.contains('\u{1b}'), "不该有裸 ESC");
         assert!(!escaped.contains('\u{7}'), "不该有裸 BEL");
     }

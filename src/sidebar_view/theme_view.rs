@@ -104,10 +104,7 @@ where
     for (index, theme_item) in themes.iter().enumerate() {
         if !query_lower.is_empty() {
             let name_hit = theme_item.name.to_lowercase().contains(&query_lower);
-            let display_hit = theme_item
-                .description
-                .to_lowercase()
-                .contains(&query_lower);
+            let display_hit = theme_item.description.to_lowercase().contains(&query_lower);
             if !name_hit && !display_hit {
                 continue;
             }

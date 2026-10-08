@@ -248,7 +248,9 @@ mod tests {
 
     #[test]
     fn 构建产物目录被排除() {
-        assert!(is_build_artifact(Path::new("/ws/target/debug/deps/lib.rmeta")));
+        assert!(is_build_artifact(Path::new(
+            "/ws/target/debug/deps/lib.rmeta"
+        )));
         assert!(is_build_artifact(Path::new("/ws/.git/index")));
         assert!(is_build_artifact(Path::new("/ws/node_modules/x/i.js")));
     }
@@ -262,7 +264,9 @@ mod tests {
     #[test]
     #[cfg(windows)]
     fn windows_盘符路径的构建产物也被排除() {
-        assert!(is_build_artifact(Path::new(r"C:\ws\target\.rustc_info.json")));
+        assert!(is_build_artifact(Path::new(
+            r"C:\ws\target\.rustc_info.json"
+        )));
     }
 
     #[test]

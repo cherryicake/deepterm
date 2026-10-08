@@ -72,7 +72,9 @@ pub enum Operator {
     Yank,
     Change,
     /// `i` / `a` 对象前缀。
-    Object { around: bool },
+    Object {
+        around: bool,
+    },
 }
 
 /// 一次可重复的修改（供 `.` 重放）。
@@ -322,7 +324,10 @@ mod tests {
 
         assert_eq!(state.mode, VimMode::Insert);
         assert_eq!(state.last_mode, VimMode::Normal);
-        assert!(state.operator_stack.is_empty(), "切换模式必须丢弃待决操作符");
+        assert!(
+            state.operator_stack.is_empty(),
+            "切换模式必须丢弃待决操作符"
+        );
         assert_eq!(state.pre_count, None);
         assert_eq!(state.selected_register, None);
     }
@@ -335,7 +340,10 @@ mod tests {
         state.push_count_digit(2);
         state.switch_mode(VimMode::Normal);
 
-        assert!(state.operator_stack.is_empty(), "同模式切换应清空待决操作符");
+        assert!(
+            state.operator_stack.is_empty(),
+            "同模式切换应清空待决操作符"
+        );
         assert_eq!(state.pre_count, None);
         assert_eq!(state.last_mode, VimMode::Normal, "last_mode 不应被覆盖");
     }

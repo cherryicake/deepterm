@@ -1,12 +1,11 @@
-use crate::components::callbacks::{OptionalClickCallback, OptionalHoverCallback};
 use crate::components::button::button_icon::{ButtonIcon, Disableable, Selectable, Sizable, Size};
+use crate::components::callbacks::{OptionalClickCallback, OptionalHoverCallback};
 use crate::theme::ActiveTheme;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla,
-    InteractiveElement, Interactivity, IntoElement, MouseButton, ParentElement, Pixels,
-    RenderOnce, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div, px,
-    transparent_black,
+    AnyElement, App, ClickEvent, Corners, Div, Edges, ElementId, Hsla, InteractiveElement,
+    Interactivity, IntoElement, MouseButton, ParentElement, Pixels, RenderOnce, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Window, div, px, transparent_black,
 };
 use std::rc::Rc;
 

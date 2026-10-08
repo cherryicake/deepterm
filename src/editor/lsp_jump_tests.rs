@@ -79,10 +79,7 @@ fn same_file_location_jumps_in_place() {
 #[test]
 fn non_file_uri_is_ignored() {
     let location = loc("untitled:Untitled-1", 0, 0);
-    assert_eq!(
-        lsp_location_action(&location, false),
-        LspJumpAction::Ignore
-    );
+    assert_eq!(lsp_location_action(&location, false), LspJumpAction::Ignore);
 }
 
 /// 同文件判定优先于 uri 形态：即便 uri 不是 file://，同文件也原地跳。
@@ -171,7 +168,10 @@ fn nav_history_is_lifo() {
 #[test]
 fn nav_history_is_bounded() {
     let limit = super::NAV_HISTORY_LIMIT;
-    assert!(limit > 0 && limit <= 1000, "limit should be sane, got {limit}");
+    assert!(
+        limit > 0 && limit <= 1000,
+        "limit should be sane, got {limit}"
+    );
 
     let mut history: Vec<super::NavLocation> = Vec::new();
     for i in 0..(limit * 2) {
@@ -203,14 +203,22 @@ fn consecutive_identical_jumps_are_deduplicated() {
         }
         history.push(entry.clone());
     }
-    assert_eq!(history.len(), 1, "identical consecutive entries must collapse");
+    assert_eq!(
+        history.len(),
+        1,
+        "identical consecutive entries must collapse"
+    );
 }
 
 // ------------------------------------------------ 端到端：跳到目标函数上
 
 struct Host(gpui::Entity<super::Editor>);
 impl gpui::Render for Host {
-    fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+    fn render(
+        &mut self,
+        _: &mut gpui::Window,
+        _: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
         gpui::div()
     }
 }
@@ -227,7 +235,8 @@ fn editor_ctx<'a>(
         // 也会走这条路径），缺这个全局会 panic。
         crate::lsp::init(cx);
     });
-    let (host, cx) = cx.add_window_view(|window, cx| Host(cx.new(|cx| super::Editor::new(window, cx))));
+    let (host, cx) =
+        cx.add_window_view(|window, cx| Host(cx.new(|cx| super::Editor::new(window, cx))));
     (host.read_with(cx, |h, _| h.0.clone()), cx)
 }
 
@@ -241,46 +250,48 @@ fn jump_lands_cursor_on_target_function(cx: &mut gpui::TestAppContext) {
     // 关掉 LSP 接入：打开文件会尝试连服务器（`smol::spawn` 到全局执行器），
     // 会被 gpui 的 TestScheduler 判为非确定性并 abort 整个测试二进制。
     super::with_lsp_disabled(|| {
-    let (editor, cx) = editor_ctx(cx);
-    let dir = std::env::temp_dir().join("deepterm-lsp-jump-cursor");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let target = dir.join("defs.rs");
-    // 目标函数在第 20 行（0 基 19），前面填足够多的行以证明真的跳了。
-    let mut body = String::new();
-    for i in 1..=19 {
-        body.push_str(&format!("// filler line {i}\n"));
-    }
-    body.push_str("fn target_function() {}\n");
-    body.push_str("// trailing\n");
-    std::fs::write(&target, &body).unwrap();
+        let (editor, cx) = editor_ctx(cx);
+        let dir = std::env::temp_dir().join("deepterm-lsp-jump-cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("defs.rs");
+        // 目标函数在第 20 行（0 基 19），前面填足够多的行以证明真的跳了。
+        let mut body = String::new();
+        for i in 1..=19 {
+            body.push_str(&format!("// filler line {i}\n"));
+        }
+        body.push_str("fn target_function() {}\n");
+        body.push_str("// trailing\n");
+        std::fs::write(&target, &body).unwrap();
 
-    let uri = Url::from_file_path(&target).unwrap();
-    // LSP 行号 0 基：第 20 行 → 19。列 3（`fn ` 之后，`target_function` 起点）。
-    let location = Location {
-        uri,
-        range: Range::new(Position::new(19, 3), Position::new(19, 18)),
-    };
+        let uri = Url::from_file_path(&target).unwrap();
+        // LSP 行号 0 基：第 20 行 → 19。列 3（`fn ` 之后，`target_function` 起点）。
+        let location = Location {
+            uri,
+            range: Range::new(Position::new(19, 3), Position::new(19, 18)),
+        };
 
-    editor.update_in(cx, |editor, window, cx| {
-        editor.open_lsp_location_for_test(&location, window, cx);
-    });
-    // 文件加载是异步的：跑到空闲让 pending jump 落地。
-    cx.run_until_parked();
+        editor.update_in(cx, |editor, window, cx| {
+            editor.open_lsp_location_for_test(&location, window, cx);
+        });
+        // 文件加载是异步的：跑到空闲让 pending jump 落地。
+        cx.run_until_parked();
 
-    let pos = editor
-        .read_with(cx, |editor, cx| editor.cursor_position_of_open_path(&target, cx))
-        .expect("target file must be open");
-    assert_eq!(
-        pos.0, 19,
-        "cursor must land on the definition line (0-based 19), got line {} (col {})",
-        pos.0, pos.1
-    );
-    assert_eq!(
-        pos.1, 3,
-        "cursor must land on the definition column (0-based 3), got {}",
-        pos.1
-    );
+        let pos = editor
+            .read_with(cx, |editor, cx| {
+                editor.cursor_position_of_open_path(&target, cx)
+            })
+            .expect("target file must be open");
+        assert_eq!(
+            pos.0, 19,
+            "cursor must land on the definition line (0-based 19), got line {} (col {})",
+            pos.0, pos.1
+        );
+        assert_eq!(
+            pos.1, 3,
+            "cursor must land on the definition column (0-based 3), got {}",
+            pos.1
+        );
     });
 }
 
@@ -288,42 +299,44 @@ fn jump_lands_cursor_on_target_function(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn same_file_jump_moves_cursor(cx: &mut gpui::TestAppContext) {
     super::with_lsp_disabled(|| {
-    let (editor, cx) = editor_ctx(cx);
-    let dir = std::env::temp_dir().join("deepterm-lsp-jump-same-cursor");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("one.rs");
-    let mut body = String::new();
-    for i in 1..=30 {
-        body.push_str(&format!("// line {i}\n"));
-    }
-    body.push_str("fn here() {}\n");
-    std::fs::write(&file, &body).unwrap();
+        let (editor, cx) = editor_ctx(cx);
+        let dir = std::env::temp_dir().join("deepterm-lsp-jump-same-cursor");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.rs");
+        let mut body = String::new();
+        for i in 1..=30 {
+            body.push_str(&format!("// line {i}\n"));
+        }
+        body.push_str("fn here() {}\n");
+        std::fs::write(&file, &body).unwrap();
 
-    // 先把文件打开。
-    editor.update_in(cx, |editor, window, cx| {
-        editor.open_file(file.clone(), window, cx);
-    });
-    cx.run_until_parked();
+        // 先把文件打开。
+        editor.update_in(cx, |editor, window, cx| {
+            editor.open_file(file.clone(), window, cx);
+        });
+        cx.run_until_parked();
 
-    // 让 `open_lsp_location` 认为目标是「当前文件」。
-    editor.update_in(cx, |editor, _window, _cx| {
-        editor.set_session_uri_for_test(Url::from_file_path(&file).unwrap());
-    });
+        // 让 `open_lsp_location` 认为目标是「当前文件」。
+        editor.update_in(cx, |editor, _window, _cx| {
+            editor.set_session_uri_for_test(Url::from_file_path(&file).unwrap());
+        });
 
-    let uri = Url::from_file_path(&file).unwrap();
-    let location = Location {
-        uri,
-        range: Range::new(Position::new(30, 3), Position::new(30, 7)),
-    };
-    editor.update_in(cx, |editor, window, cx| {
-        editor.open_lsp_location_for_test(&location, window, cx);
-    });
-    cx.run_until_parked();
+        let uri = Url::from_file_path(&file).unwrap();
+        let location = Location {
+            uri,
+            range: Range::new(Position::new(30, 3), Position::new(30, 7)),
+        };
+        editor.update_in(cx, |editor, window, cx| {
+            editor.open_lsp_location_for_test(&location, window, cx);
+        });
+        cx.run_until_parked();
 
-    let pos = editor
-        .read_with(cx, |editor, cx| editor.cursor_position_of_open_path(&file, cx))
-        .expect("file must be open");
-    assert_eq!(pos.0, 30, "same-file jump must move the cursor to line 30");
+        let pos = editor
+            .read_with(cx, |editor, cx| {
+                editor.cursor_position_of_open_path(&file, cx)
+            })
+            .expect("file must be open");
+        assert_eq!(pos.0, 30, "same-file jump must move the cursor to line 30");
     });
 }

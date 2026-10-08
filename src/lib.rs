@@ -10,7 +10,6 @@ pub mod editor;
 pub mod file_manager;
 pub mod keymap;
 pub mod lsp;
-pub mod vim;
 pub mod settings;
 pub mod sidebar_view;
 pub mod ssh;
@@ -19,12 +18,13 @@ pub mod terminal;
 pub mod terminal_view;
 pub mod theme;
 pub mod utils;
+pub mod vim;
 pub mod workspace;
 
 use gpui::prelude::*;
 use gpui::{
-    AnimationExt, App, Context, Entity, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, Styled, Subscription, WeakEntity, Window, actions, div, px, svg,
+    AnimationExt, App, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, Styled, Subscription, WeakEntity, Window, actions, div, px, svg,
 };
 
 use crate::assets::Icon;
@@ -119,7 +119,7 @@ pub struct AppWindow {
     last_fullscreen: bool,
 }
 
-    /// AppWindow::new 构建的全部实体（从 300 行内联构造拆出，便于阅读）。
+/// AppWindow::new 构建的全部实体（从 300 行内联构造拆出，便于阅读）。
 struct BuiltEntities {
     workspace: Entity<Workspace>,
     transfer_bell: Entity<TransferBellPanel>,
@@ -202,7 +202,6 @@ impl AppWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> BuiltEntities {
-
         let tab_bar = workspace.read(cx).tab_bar.clone();
         let workspace_weak = workspace.downgrade();
         // 传输铃铛面板：独立的业务组件，通过 TitleBar 的 trailing 插槽挂载，
@@ -1720,7 +1719,10 @@ mod init_tests {
             crate::init(cx);
         });
         cx.update(|cx| {
-            assert!(cx.has_global::<crate::settings::SettingsStore>(), "SettingsStore");
+            assert!(
+                cx.has_global::<crate::settings::SettingsStore>(),
+                "SettingsStore"
+            );
             assert!(cx.has_global::<crate::theme::ThemeState>(), "ThemeState");
             assert!(
                 cx.has_global::<crate::sidebar_view::font_settings::FontState>(),

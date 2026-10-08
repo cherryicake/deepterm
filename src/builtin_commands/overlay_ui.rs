@@ -12,9 +12,9 @@ use gpui::{
     StatefulInteractiveElement, Styled, Transformation, div, ease_in_out, percentage, px, svg,
 };
 
-use crate::builtin_commands::registry::BuiltinCommand;
 use crate::builtin_commands::history::HistoryEntry;
 use crate::builtin_commands::path_completion::{CompletionKind, PathCompletionItem};
+use crate::builtin_commands::registry::BuiltinCommand;
 use crate::theme::UiTheme;
 
 fn render_key_hint(key: &str, label: Option<&str>, theme: UiTheme) -> impl IntoElement {

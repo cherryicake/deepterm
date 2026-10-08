@@ -10,20 +10,20 @@ pub mod argument;
 pub mod command_model;
 pub mod executor;
 pub mod history;
+pub mod overlay_ui;
 pub mod path_completion;
 pub mod path_resolver;
 pub mod registry;
 pub mod scp_completion;
-pub mod overlay_ui;
 pub mod suggestion_engine;
 
 // 浮层 UI 已拆至 overlay_ui.rs；re-export 保持
 // `builtin_commands::render_overlay` 等旧路径（terminal_view）不变。
-pub use overlay_ui::{OverlayAnchor, render_overlay, render_path_overlay};
 pub use argument::{ArgumentError, ArgumentParser, ParsedArgument};
 pub use command_model::{BuiltinCommandModel, CommandEntryState, DetectedCommand};
 pub use executor::{CommandContext, CommandExecutor, CommandHandler, CommandResult};
 pub use history::{CommandHistory, HistoryEntry};
+pub use overlay_ui::{OverlayAnchor, render_overlay, render_path_overlay};
 pub use path_completion::{CompletionKind, PathCompletionEngine, PathCompletionItem};
 pub use path_resolver::{LocalPathContext, PathResolver, RemotePathContext};
 pub use registry::{
@@ -1331,7 +1331,6 @@ fn remote_dir_failed_item(err: String) -> PathCompletionItem {
         replacement: None,
     }
 }
-
 
 /// `HostOrLocal` 阶段：合并"匹配的主机"与"本地路径补全"为一份列表。
 fn build_host_or_local_completions(

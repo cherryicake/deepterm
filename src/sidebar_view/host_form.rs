@@ -1,12 +1,10 @@
 use std::path::PathBuf;
 
 use gpui::prelude::*;
-use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, Render, SharedString, Window, div, px,
-};
+use gpui::{App, Context, Entity, FocusHandle, IntoElement, Render, SharedString, Window, div, px};
 
-use crate::components::callbacks::OptionalAppCallback;
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
+use crate::components::callbacks::OptionalAppCallback;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::macos_select::MacosSelect;
 use crate::ssh::config::{AuthMethod, SshConnectionConfig, SshGlobalConfig};
@@ -853,10 +851,30 @@ impl NewHostForm {
     /// 四个框分别读远端 地址/端口 与本机 地址/端口；解析不出来就在表单上
     /// 给出原因，而不是静默丢弃（用户会以为加上了）。
     fn add_forward_draft(&mut self, cx: &mut Context<Self>) {
-        let bind_host_raw = self.forward_bind_host_input.read(cx).value().trim().to_string();
-        let bind_port_raw = self.forward_bind_port_input.read(cx).value().trim().to_string();
-        let target_host_raw = self.forward_target_host_input.read(cx).value().trim().to_string();
-        let target_port_raw = self.forward_target_port_input.read(cx).value().trim().to_string();
+        let bind_host_raw = self
+            .forward_bind_host_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let bind_port_raw = self
+            .forward_bind_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let target_host_raw = self
+            .forward_target_host_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let target_port_raw = self
+            .forward_target_port_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
 
         // 远端地址留空 = 默认绑回环（对外暴露必须显式填 0.0.0.0）
         let bind_host = if bind_host_raw.is_empty() {
@@ -885,8 +903,7 @@ impl NewHostForm {
             return;
         };
         let Some(target_port) = parse_port(&target_port_raw).filter(|p| *p > 0) else {
-            self.error_message =
-                Some(format!("本机端口 `{target_port_raw}` 不合法：写 1-65535"));
+            self.error_message = Some(format!("本机端口 `{target_port_raw}` 不合法：写 1-65535"));
             cx.notify();
             return;
         };
@@ -899,8 +916,7 @@ impl NewHostForm {
                 .iter()
                 .any(|r| r.bind_host == bind_host && r.bind_port == bind_port)
         {
-            self.error_message =
-                Some(format!("远端绑定 {bind_host}:{bind_port} 已经在列表里了"));
+            self.error_message = Some(format!("远端绑定 {bind_host}:{bind_port} 已经在列表里了"));
             cx.notify();
             return;
         }
@@ -1274,7 +1290,10 @@ mod view_tests {
                 form.add_forward_draft(cx);
                 assert_eq!(form.port_forwards.len(), 1, "重复的远端绑定不该加进去");
                 assert!(
-                    form.error_message.as_deref().unwrap_or("").contains("已经在列表里"),
+                    form.error_message
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("已经在列表里"),
                     "重复添加必须说明原因：{:?}",
                     form.error_message
                 );

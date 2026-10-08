@@ -595,8 +595,7 @@ impl MermaidState {
 
     /// 设为显式倍率（`+` / `-` 的落点，已夹在 [`ZOOM_MIN`]/[`ZOOM_MAX`] 内）。
     pub(crate) fn set_zoom(&mut self, block_id: usize, zoom: f32) {
-        self.zoom
-            .insert(block_id, zoom.clamp(ZOOM_MIN, ZOOM_MAX));
+        self.zoom.insert(block_id, zoom.clamp(ZOOM_MIN, ZOOM_MAX));
     }
 
     /// 清除显式倍率：回到「适配宽度 / 阅读尺寸」的默认展示。

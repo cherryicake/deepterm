@@ -54,7 +54,9 @@ fn make_doc(lines: usize) -> String {
             4 => doc.push_str(&format!("```rust\nfn f{i}() -> u32 {{ {i} }}\n```\n\n")),
             5 => doc.push_str(&format!("| a | b |\n|---|---|\n| {i} | {i} |\n\n")),
             6 => doc.push_str(&format!("> quote {i} with a [link](https://x.dev/{i})\n\n")),
-            _ => doc.push_str(&format!("Plain line {i} with filler text to be realistic.\n\n")),
+            _ => doc.push_str(&format!(
+                "Plain line {i} with filler text to be realistic.\n\n"
+            )),
         }
         i += 3;
     }

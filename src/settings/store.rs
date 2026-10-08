@@ -41,7 +41,12 @@ pub trait Settings: 'static + Sized {
     fn get_global(cx: &App) -> &Self {
         cx.global::<SettingsStore>()
             .get::<Self>()
-            .unwrap_or_else(|| panic!("settings type {} is not registered", std::any::type_name::<Self>()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "settings type {} is not registered",
+                    std::any::type_name::<Self>()
+                )
+            })
     }
 }
 
@@ -524,7 +529,9 @@ mod tests {
         }
 
         assert!(
-            raw.get("font").and_then(|f| f.get("editor_font_size")).is_none(),
+            raw.get("font")
+                .and_then(|f| f.get("editor_font_size"))
+                .is_none(),
             "改回默认值后不应保留该键：{raw}"
         );
     }
@@ -568,9 +575,13 @@ mod tests {
 
     #[test]
     fn broken_json_keeps_previous_settings() {
-        let mut store = SettingsStore::new(json!({ "font": { "editor_font_size": 19.0 } }), None, false);
+        let mut store =
+            SettingsStore::new(json!({ "font": { "editor_font_size": 19.0 } }), None, false);
         assert_eq!(
-            store.get::<super::super::content::FontContent>().unwrap().editor_font_size,
+            store
+                .get::<super::super::content::FontContent>()
+                .unwrap()
+                .editor_font_size,
             19.0
         );
 
@@ -580,7 +591,10 @@ mod tests {
 
         assert!(store.error().is_some(), "解析失败必须被记录");
         assert_eq!(
-            store.get::<super::super::content::FontContent>().unwrap().editor_font_size,
+            store
+                .get::<super::super::content::FontContent>()
+                .unwrap()
+                .editor_font_size,
             19.0,
             "失败后应保留上一份可用设置"
         );
@@ -592,12 +606,22 @@ mod tests {
         let app = gpui::TestAppContext::single();
         let text = r#"{ "vim": { "enabled": true } }"#;
         app.update(|cx| store.set_user_document(text, cx));
-        assert!(store.get::<super::super::content::VimContent>().unwrap().enabled);
+        assert!(
+            store
+                .get::<super::super::content::VimContent>()
+                .unwrap()
+                .enabled
+        );
 
         // 再喂一次同样内容：不应重算（此处以「未报错且值不变」为可观测判据）。
         app.update(|cx| store.set_user_document(text, cx));
         assert!(store.error().is_none());
-        assert!(store.get::<super::super::content::VimContent>().unwrap().enabled);
+        assert!(
+            store
+                .get::<super::super::content::VimContent>()
+                .unwrap()
+                .enabled
+        );
     }
 
     /// 未改动任何设置时，`update_user` 不得改写文件内容。
@@ -656,7 +680,12 @@ mod tests {
         let app = gpui::TestAppContext::single();
         app.update(|cx| store.set_user_document(r#"{ "vim": { "enabled": true } }"#, cx));
 
-        assert!(store.get::<super::super::content::VimContent>().unwrap().enabled);
+        assert!(
+            store
+                .get::<super::super::content::VimContent>()
+                .unwrap()
+                .enabled
+        );
         assert_eq!(
             store.get::<super::super::content::FontContent>().unwrap(),
             &super::super::content::FontContent::default()

@@ -27,9 +27,7 @@ fn make_terminal_view(cx: &mut BenchAppContext) -> gpui::Entity<TerminalView> {
     let mut window = cx.add_empty_window();
     let terminal = cx.update(|cx| Terminal::new_headless(cx, 10_000));
     window.update(|window, cx| {
-        window.replace_root(cx, |_window, cx| {
-            TerminalView::build_headless(cx, terminal)
-        })
+        window.replace_root(cx, |_window, cx| TerminalView::build_headless(cx, terminal))
     })
 }
 

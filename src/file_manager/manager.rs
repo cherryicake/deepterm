@@ -85,7 +85,9 @@ impl<'a> TransferRun<'a> {
     }
 
     fn cancelled(&self) -> Arc<AtomicBool> {
-        self.cancelled.clone().unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
+        self.cancelled
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)))
     }
 
     fn progress(&self) -> Option<&Arc<AtomicU64>> {

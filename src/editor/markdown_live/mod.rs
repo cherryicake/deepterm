@@ -26,13 +26,13 @@ pub mod scrollbar;
 pub mod table_ops;
 pub mod view;
 
-pub use block::{classify, indent_cols, Block, DocState};
+pub use block::{Block, DocState, classify, indent_cols};
 pub use buffer::LiveBuffer;
 pub use inline::{Inline, InlineSpan, InlineStyle};
 pub use layout::{
-    byte_for_col, col_for_byte, metrics, plan, src_for_vis, vis_for_src, RowKind, RowMetrics,
-    RowPlan, RunAttrs, Seg,
+    RowKind, RowMetrics, RowPlan, RunAttrs, Seg, byte_for_col, col_for_byte, metrics, plan,
+    src_for_vis, vis_for_src,
 };
 pub use model::{EditorModel, Pos};
-pub use reveal::{plan_document, strip_plan_prefix, Callout, CalloutKind, PlannedRow, Reveal};
+pub use reveal::{Callout, CalloutKind, PlannedRow, Reveal, plan_document, strip_plan_prefix};
 pub use view::{LiveMarkdownView, LiveViewEvent};

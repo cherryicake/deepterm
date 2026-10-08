@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, ClipboardItem, Context, Entity, FocusHandle, Hsla, IntoElement, KeyBinding,
-    ListAlignment, ListState, Render, SharedString, StyleRefinement, TextRun, TextStyleRefinement,
-    WhiteSpace, Window, actions, div, list, px, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, Hsla, IntoElement, KeyBinding, ListAlignment,
+    ListState, Render, SharedString, StyleRefinement, TextRun, TextStyleRefinement, WhiteSpace,
+    Window, actions, div, list, px, rems,
 };
 
 use crate::editor::syntax::SyntaxHighlighter;
@@ -188,10 +188,18 @@ impl MarkdownStyle {
         // `background_color` / `border_width` 这些名字。
         let code_block = StyleRefinement {
             padding: gpui::EdgesRefinement {
-                top: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(6.)))),
-                left: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                right: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                bottom: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(6.)))),
+                top: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(6.)),
+                )),
+                left: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                right: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                bottom: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(6.)),
+                )),
             },
             margin: gpui::EdgesRefinement {
                 top: Some(gpui::Length::Definite(px(4.).into())),
@@ -337,12 +345,15 @@ pub struct Markdown {
 
 impl Markdown {
     pub fn init(cx: &mut gpui::App) {
-        crate::keymap::bind(cx, [
-            KeyBinding::new("cmd-c", Copy, Some("Markdown")),
-            KeyBinding::new("ctrl-c", Copy, Some("Markdown")),
-            KeyBinding::new("cmd-a", SelectAll, Some("Markdown")),
-            KeyBinding::new("ctrl-a", SelectAll, Some("Markdown")),
-        ]);
+        crate::keymap::bind(
+            cx,
+            [
+                KeyBinding::new("cmd-c", Copy, Some("Markdown")),
+                KeyBinding::new("ctrl-c", Copy, Some("Markdown")),
+                KeyBinding::new("cmd-a", SelectAll, Some("Markdown")),
+                KeyBinding::new("ctrl-a", SelectAll, Some("Markdown")),
+            ],
+        );
     }
 
     pub fn new(source: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
@@ -633,14 +644,9 @@ impl Markdown {
             )
         });
 
-        let elements = MarkdownElementBuilder::new_with_item(
-            style,
-            copied,
-            markdown,
-            highlight_cache,
-            ix,
-        )
-        .build(&events, cx);
+        let elements =
+            MarkdownElementBuilder::new_with_item(style, copied, markdown, highlight_cache, ix)
+                .build(&events, cx);
 
         div().w_full().children(elements).into_any_element()
     }

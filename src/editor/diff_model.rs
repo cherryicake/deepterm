@@ -59,7 +59,9 @@ pub fn build_hunk_patch(
         patch.push_str(&format!("--- a/{path}\n"));
     }
     patch.push_str(&format!("+++ b/{path}\n"));
-    patch.push_str(&format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"));
+    patch.push_str(&format!(
+        "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+    ));
 
     let old_no_nl = !old_text.is_empty() && !old_text.ends_with('\n');
     let new_no_nl = !new_text.is_empty() && !new_text.ends_with('\n');
@@ -397,11 +399,8 @@ pub fn worktree_from_merged<'a>(
             true,
         );
         // 变更块：旧侧干净（全是 Context/Add）→ 新区全收；否则区内二次对齐。
-        let touched_hidden = (os..oe).any(|i| {
-            old_lines
-                .get(i)
-                .is_some_and(|l| !l.kind.is_worktree_line())
-        });
+        let touched_hidden =
+            (os..oe).any(|i| old_lines.get(i).is_some_and(|l| !l.kind.is_worktree_line()));
         if !touched_hidden {
             for line in new_lines.get(ns..ne).unwrap_or(&[]) {
                 out.push(line);
@@ -419,10 +418,9 @@ pub fn worktree_from_merged<'a>(
             }
             // 再对齐新区：只保留与旧 Context/Add 行对齐的新行
             //（Separator 已预回填，此处跳过，避免重复）。
-            let sub_old: Vec<&str> = snap_rows.get(os..oe.min(snap_rows.len())).map_or_else(
-                Vec::new,
-                |s| s.to_vec(),
-            );
+            let sub_old: Vec<&str> = snap_rows
+                .get(os..oe.min(snap_rows.len()))
+                .map_or_else(Vec::new, |s| s.to_vec());
             let sub_old_text = sub_old.join("\n");
             let sub_new: Vec<&str> = new_lines.get(ns..ne).unwrap_or(&[]).to_vec();
             let sub_new_text = sub_new.join("\n");
@@ -728,11 +726,7 @@ pub(crate) fn build_unified_collapsed(
                 old_cursor..old_cursor + collapsible,
             );
             let last_start = new_line_count - reserve_last;
-            b.context(
-                last_start,
-                new_line_count,
-                old_cursor + collapsible,
-            );
+            b.context(last_start, new_line_count, old_cursor + collapsible);
         }
     }
 
@@ -757,7 +751,6 @@ pub(crate) fn build_unified_collapsed(
         b.separators,
     )
 }
-
 
 /// Byte offsets of every line start in a text, plus a sentinel past the end
 /// so `line_range` works for the last line.
@@ -1035,7 +1028,10 @@ mod tests {
     fn test_writeback_identity() {
         for (old, new) in [
             ("a\nb\nc\n", "a\nX\nc\n"),
-            ("fn main() {\n    let x = 1;\n}\n", "fn main() {\n    let x = 2;\n    dbg!(x);\n}\n"),
+            (
+                "fn main() {\n    let x = 1;\n}\n",
+                "fn main() {\n    let x = 2;\n    dbg!(x);\n}\n",
+            ),
             ("", "a\nb\n"),
             ("a\nb\n", ""),
             ("a", "a\nb"),
@@ -1144,7 +1140,10 @@ mod tests {
         let old = "a\nb\n";
         let new = "a\nB\n";
         let unified = build_unified(old, new);
-        assert_eq!(worktree_from_merged(&unified.lines, &unified.text, "", old), "");
+        assert_eq!(
+            worktree_from_merged(&unified.lines, &unified.text, "", old),
+            ""
+        );
     }
 
     /// 尾换行往返：删尾换行不再凭空补回；加尾换行正常落盘。
@@ -1221,7 +1220,10 @@ mod tests {
             let w1 = worktree_from_merged(&u1.lines, &u1.text, edited, old);
             let u2 = build_unified(old, &w1);
             let w2 = worktree_from_merged(&u2.lines, &u2.text, &u2.text, old);
-            assert_eq!(w1, w2, "fixpoint failed for {old:?}->{new:?} edit {edited:?}");
+            assert_eq!(
+                w1, w2,
+                "fixpoint failed for {old:?}->{new:?} edit {edited:?}"
+            );
             let u3 = build_unified(old, &w2);
             assert_eq!(u2.text, u3.text, "merged not stable for {old:?}->{new:?}");
         }
@@ -1391,7 +1393,9 @@ mod collapsed_ui_tests {
     fn collapsed_writeback_fixpoint() {
         let (old, new) = sample_texts();
         let (out, _) = collapsed(&old, &new);
-        let edited = out.text.replacen("new line B\n", "new line B2\nnew line B3\n", 1);
+        let edited = out
+            .text
+            .replacen("new line B\n", "new line B2\nnew line B3\n", 1);
         let w1 = worktree_from_merged(&out.lines, &out.text, &edited, &old);
         assert!(w1.contains("new line B2\nnew line B3\n"));
         assert!(w1.contains("ctx0\n"), "隐藏头部必须保留");

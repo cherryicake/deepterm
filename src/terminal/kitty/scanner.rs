@@ -1113,7 +1113,11 @@ mod tests {
         scanner.scan(
             b"$ \x1b]133;B\x07abc\r\n",
             &mut pending,
-            &mut |bytes| processor.borrow_mut().advance(&mut *term.borrow_mut(), bytes),
+            &mut |bytes| {
+                processor
+                    .borrow_mut()
+                    .advance(&mut *term.borrow_mut(), bytes)
+            },
             &mut || {
                 let t = term.borrow();
                 let point = t.grid().cursor.point;

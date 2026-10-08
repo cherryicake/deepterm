@@ -51,11 +51,7 @@ pub struct HighlightCache {
 impl HighlightCache {
     /// Insert into the map, evicting the oldest entry (FIFO) on overflow.
     /// Returns `true` if the key was inserted (not already present).
-    fn insert_bounded(
-        &self,
-        key: CacheKey,
-        value: CacheValue,
-    ) -> bool {
+    fn insert_bounded(&self, key: CacheKey, value: CacheValue) -> bool {
         let mut map = self.inner.borrow_mut();
         if map.contains_key(&key) {
             return false;

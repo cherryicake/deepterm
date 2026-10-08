@@ -65,7 +65,11 @@ mod tests {
                 .settings
                 .editor_font_size
         });
-        let before_theme = cx.update(|cx| crate::theme::ThemeState::global(cx).active_theme_id().to_string());
+        let before_theme = cx.update(|cx| {
+            crate::theme::ThemeState::global(cx)
+                .active_theme_id()
+                .to_string()
+        });
 
         // 模拟用户在 settings.json 里改了字号与主题。
         let other_theme = cx.update(|cx| {
@@ -96,9 +100,16 @@ mod tests {
                 .settings
                 .editor_font_size
         });
-        let after_theme = cx.update(|cx| crate::theme::ThemeState::global(cx).active_theme_id().to_string());
+        let after_theme = cx.update(|cx| {
+            crate::theme::ThemeState::global(cx)
+                .active_theme_id()
+                .to_string()
+        });
 
-        assert_eq!(before_font, 16.0, "默认字号来自 assets/default_settings.json");
+        assert_eq!(
+            before_font, 16.0,
+            "默认字号来自 assets/default_settings.json"
+        );
         assert_eq!(after_font, 33.0, "字号变更必须传到 FontState");
         assert_eq!(after_theme, other_theme, "主题变更必须传到 ThemeState");
     }

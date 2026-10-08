@@ -11,6 +11,8 @@ use gpui::{
 };
 
 use crate::assets::Icon;
+use crate::assets::file_icon_or_default;
+use crate::components::input::RopeExt as _;
 use crate::components::input::{EditorInput, InputState};
 use crate::components::notification::NotificationKind;
 use crate::editor::completion;
@@ -19,12 +21,10 @@ use crate::editor::git_marks::compute_git_diff_summary;
 use crate::editor::git_repository::GitRepository;
 use crate::editor::goto_line;
 use crate::editor::hover;
+use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
 use crate::editor::rename;
 use crate::editor::symbols;
-use crate::editor::image_viewer::{ActualSize, FitToView, ResetZoom, ZoomIn, ZoomOut};
-use crate::components::input::RopeExt as _;
 use crate::editor::syntax::languages::Language;
-use crate::assets::file_icon_or_default;
 use crate::file_manager::filesystem::RemoteFileSystem;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind, WatcherContext};
 use crate::ssh::SshConnectionConfig;
@@ -107,59 +107,77 @@ pub fn init(cx: &mut App) {
     // 详情见 `hover::init_keystroke_interceptor`。
     crate::editor::hover::init_keystroke_interceptor(cx);
     // 实时 markdown 与只读预览共用复制/全选语义，仅上下文不同。
-    crate::keymap::bind(cx, [
-        KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
-        KeyBinding::new("ctrl-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
-        KeyBinding::new("cmd-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
-        KeyBinding::new("ctrl-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
-    ]);
-    crate::keymap::bind(cx, [
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
-        // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
-        KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
-        KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
-        KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
-        KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
-        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-        // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
-        KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
-        KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
-        KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
-        KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
-        // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
-        KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
-        KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
-        KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
-        KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
-        KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
-        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
-        KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
-        // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
-        // 焦点移进浮层，此后 hjkl 滚动内容。
-        //
-        // 放在 Rust 侧而不是 `default.json`：与上面这批 LSP 快捷键一致，且
-        // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
-        // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
-        KeyBinding::new("K", Hover, Some("EditorPanel")),
-        // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
-        // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
-        KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
-        KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
-        KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
-        KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
-        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-    ]);
+    crate::keymap::bind(
+        cx,
+        [
+            KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+            KeyBinding::new(
+                "ctrl-c",
+                crate::editor::markdown::Copy,
+                Some("LiveMarkdown"),
+            ),
+            KeyBinding::new(
+                "cmd-a",
+                crate::editor::markdown::SelectAll,
+                Some("LiveMarkdown"),
+            ),
+            KeyBinding::new(
+                "ctrl-a",
+                crate::editor::markdown::SelectAll,
+                Some("LiveMarkdown"),
+            ),
+        ],
+    );
+    crate::keymap::bind(
+        cx,
+        [
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
+            // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
+            KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
+            KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
+            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+            // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
+            KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
+            KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
+            KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
+            KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
+            // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
+            KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
+            KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
+            KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
+            KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
+            KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
+            KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
+            KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
+            // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
+            // 焦点移进浮层，此后 hjkl 滚动内容。
+            //
+            // 放在 Rust 侧而不是 `default.json`：与上面这批 LSP 快捷键一致，且
+            // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
+            // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
+            KeyBinding::new("K", Hover, Some("EditorPanel")),
+            // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
+            // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
+            KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
+            KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
+            KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
+            KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
+            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+        ],
+    );
 }
 
 /// 路径前缀替换：`from` 自身 → `to`，`from` 的后代 → `to` 下的同层级路径。
@@ -787,13 +805,22 @@ impl Editor {
                 continue;
             }
             if let Some(ref diff_repo) = file_info.diff_repo {
-                self.open_diff_file_loading(file_info.path.clone(), diff_repo.clone(), false, window, cx);
+                self.open_diff_file_loading(
+                    file_info.path.clone(),
+                    diff_repo.clone(),
+                    false,
+                    window,
+                    cx,
+                );
                 continue;
             }
             // 兼容旧缓存：id 是 `diff-` 前缀但没有仓库快照时跳过建空白 tab，
             // 避免切组回来留下一个空白的只读编辑器。
             if file_info.id.as_ref().starts_with("diff-") {
-                log::warn!("skip restoring diff tab without repo snapshot: {}", file_info.id.as_ref());
+                log::warn!(
+                    "skip restoring diff tab without repo snapshot: {}",
+                    file_info.id.as_ref()
+                );
                 continue;
             }
             let is_image = crate::editor::image_viewer::is_image_file(Path::new(&file_info.path));
@@ -912,7 +939,10 @@ impl Editor {
                 restored_tab_id.clone(),
                 cx.subscribe(
                     &live,
-                    move |this, _live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                    move |this,
+                          _live_entity,
+                          event: &crate::editor::markdown_live::LiveViewEvent,
+                          cx| {
                         if !matches!(
                             event,
                             crate::editor::markdown_live::LiveViewEvent::Change { .. }
@@ -931,22 +961,22 @@ impl Editor {
             self.editor_state_subscriptions.insert(
                 restored_tab_id.clone(),
                 cx.observe(&editor_state, move |this, state_entity, cx| {
-                // 与 open_file_with_content 相同的脏检查逻辑，恢复后同样需要维护未保存标记。
-                let text_version = state_entity.read(cx).text_version;
-                let idx = this.open_files.iter().position(|f| f.id == restored_tab_id);
-                if let Some(idx) = idx
-                    && this.open_files[idx].last_checked_text_version != text_version
-                {
-                    let dirty = this.file_is_dirty(&this.open_files[idx], cx);
-                    this.open_files[idx].last_checked_text_version = text_version;
-                    if this.open_files[idx].dirty != dirty {
-                        this.open_files[idx].dirty = dirty;
-                        this.sync_tab_modified(&restored_tab_id, dirty, cx);
+                    // 与 open_file_with_content 相同的脏检查逻辑，恢复后同样需要维护未保存标记。
+                    let text_version = state_entity.read(cx).text_version;
+                    let idx = this.open_files.iter().position(|f| f.id == restored_tab_id);
+                    if let Some(idx) = idx
+                        && this.open_files[idx].last_checked_text_version != text_version
+                    {
+                        let dirty = this.file_is_dirty(&this.open_files[idx], cx);
+                        this.open_files[idx].last_checked_text_version = text_version;
+                        if this.open_files[idx].dirty != dirty {
+                            this.open_files[idx].dirty = dirty;
+                            this.sync_tab_modified(&restored_tab_id, dirty, cx);
+                        }
                     }
-                }
-                cx.notify();
-            }),
-        );
+                    cx.notify();
+                }),
+            );
         }
 
         let file = EditorFile {
@@ -1420,10 +1450,9 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         // unwatch 需要与 watch 同一台服务器的 fs 才能定位到引用计数
-        let fs: Arc<dyn crate::file_manager::FileSystem> =
-            Arc::new(crate::file_manager::filesystem::RemoteFileSystem::new(
-                ssh_config.clone(),
-            ));
+        let fs: Arc<dyn crate::file_manager::FileSystem> = Arc::new(
+            crate::file_manager::filesystem::RemoteFileSystem::new(ssh_config.clone()),
+        );
         cx.unwatch_remote_path(path, &fs);
     }
 
@@ -1500,8 +1529,8 @@ impl Editor {
             let dw = win_w - self.last_window_width;
             if dw.abs() > 0.5 {
                 let max_w = self.window_follow_limit.max(EDITOR_MIN_WIDTH);
-                self.width = (self.width + dw * EDITOR_WINDOW_FOLLOW_RATIO)
-                    .clamp(EDITOR_MIN_WIDTH, max_w);
+                self.width =
+                    (self.width + dw * EDITOR_WINDOW_FOLLOW_RATIO).clamp(EDITOR_MIN_WIDTH, max_w);
             }
         }
         self.last_window_width = win_w;
@@ -1587,7 +1616,14 @@ impl Editor {
     }
 
     /// LSP 请求的三件套：编辑器实体、客户端、文件 URI。缺任一即无 LSP。
-    fn lsp_context(&self, cx: &App) -> Option<(Entity<InputState>, std::sync::Arc<crate::lsp::client::LspClient>, lsp_types::Url)> {
+    fn lsp_context(
+        &self,
+        cx: &App,
+    ) -> Option<(
+        Entity<InputState>,
+        std::sync::Arc<crate::lsp::client::LspClient>,
+        lsp_types::Url,
+    )> {
         let editor = self.active_text_editor(cx)?;
         let uri = self.active_lsp_session()?.uri().clone();
         let client = self.active_lsp_client(cx)?;
@@ -1800,7 +1836,12 @@ impl Editor {
     }
 
     /// 格式化文档：应用服务器返回的 `TextEdit[]`。
-    fn format_document(&mut self, _: &FormatDocument, _window: &mut Window, cx: &mut Context<Self>) {
+    fn format_document(
+        &mut self,
+        _: &FormatDocument,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some((editor, client, uri)) = self.lsp_context(cx) else {
             return;
         };
@@ -1827,7 +1868,12 @@ impl Editor {
             let edits = match selection {
                 Some(range) => {
                     client
-                        .range_formatting(&uri, range, tab_size.tab_size as u32, !tab_size.hard_tabs)
+                        .range_formatting(
+                            &uri,
+                            range,
+                            tab_size.tab_size as u32,
+                            !tab_size.hard_tabs,
+                        )
                         .await
                 }
                 None => {
@@ -1847,7 +1893,12 @@ impl Editor {
     }
 
     /// 手动触发补全。
-    fn trigger_completion(&mut self, _: &TriggerCompletion, _window: &mut Window, cx: &mut Context<Self>) {
+    fn trigger_completion(
+        &mut self,
+        _: &TriggerCompletion,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
@@ -1908,12 +1959,18 @@ impl Editor {
         };
         let client = self.active_lsp_client(cx);
         let cursor = editor.read(cx).cursor();
-        self.hover.on_keyboard_triggered(cursor, &editor, client, uri, cx);
+        self.hover
+            .on_keyboard_triggered(cursor, &editor, client, uri, cx);
         cx.notify();
     }
 
     /// 补全菜单：下一项。
-    fn completion_next(&mut self, _: &CompletionNext, _window: &mut Window, cx: &mut Context<Self>) {
+    fn completion_next(
+        &mut self,
+        _: &CompletionNext,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.completion.is_visible() {
             return;
         }
@@ -1926,7 +1983,12 @@ impl Editor {
     }
 
     /// 补全菜单：上一项。
-    fn completion_prev(&mut self, _: &CompletionPrev, _window: &mut Window, cx: &mut Context<Self>) {
+    fn completion_prev(
+        &mut self,
+        _: &CompletionPrev,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.completion.is_visible() {
             return;
         }
@@ -1978,7 +2040,12 @@ impl Editor {
     }
 
     /// 补全菜单：取消（Esc）。
-    fn completion_cancel(&mut self, _: &CompletionCancel, _window: &mut Window, cx: &mut Context<Self>) {
+    fn completion_cancel(
+        &mut self,
+        _: &CompletionCancel,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.completion.is_visible() {
             return;
         }
@@ -2031,11 +2098,7 @@ impl Editor {
                     // 服务器明确拒绝：不开面板，给用户一句反馈。
                     Ok(None) => {
                         this.update_in(cx, |this, _window, cx| {
-                            this.show_notification(
-                                "此处不可重命名",
-                                NotificationKind::Warning,
-                                cx,
-                            );
+                            this.show_notification("此处不可重命名", NotificationKind::Warning, cx);
                         })
                         .ok();
                     }
@@ -2045,11 +2108,7 @@ impl Editor {
                     Err(e) if is_rename_rejection(&e) => {
                         log::debug!("lsp: prepareRename rejected: {e}");
                         this.update_in(cx, |this, _window, cx| {
-                            this.show_notification(
-                                "此处不可重命名",
-                                NotificationKind::Warning,
-                                cx,
-                            );
+                            this.show_notification("此处不可重命名", NotificationKind::Warning, cx);
                         })
                         .ok();
                     }
@@ -2129,10 +2188,7 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
-        let Some(client) = self
-            .active_lsp_session()
-            .and_then(|s| s.client().cloned())
-        else {
+        let Some(client) = self.active_lsp_session().and_then(|s| s.client().cloned()) else {
             return;
         };
         // 每次光标移动都请求会打挂服务器：只在光标真的换了位置时才发。
@@ -2171,10 +2227,7 @@ impl Editor {
         if editor.read(cx).hover_popover().is_some() {
             return;
         }
-        let Some(client) = self
-            .active_lsp_session()
-            .and_then(|s| s.client().cloned())
-        else {
+        let Some(client) = self.active_lsp_session().and_then(|s| s.client().cloned()) else {
             return;
         };
         let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
@@ -2264,7 +2317,10 @@ impl Editor {
             // `Command` 形态：动作本体是服务器命令，必须让它执行。
             // 此前直接跳过，用户看到的是「点了没反应」。
             if let lsp_types::CodeActionOrCommand::Command(cmd) = &chosen {
-                if let Err(e) = client.execute_command(&cmd.command, cmd.arguments.clone().unwrap_or_default()).await {
+                if let Err(e) = client
+                    .execute_command(&cmd.command, cmd.arguments.clone().unwrap_or_default())
+                    .await
+                {
                     log::warn!("lsp: executeCommand `{}` failed: {e}", cmd.command);
                 }
                 return;
@@ -2319,10 +2375,7 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
-        let Some(client) = self
-            .active_lsp_session()
-            .and_then(|s| s.client().cloned())
-        else {
+        let Some(client) = self.active_lsp_session().and_then(|s| s.client().cloned()) else {
             return;
         };
         let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
@@ -2419,7 +2472,8 @@ impl Editor {
         if let Some(panel) = self.symbols_panel.clone() {
             let response = editor.update(cx, |state, _| state.take_pending_symbols());
             if let Some(response) = response {
-                let symbols = crate::lsp::features::flatten_symbols(editor.read(cx).text(), &response);
+                let symbols =
+                    crate::lsp::features::flatten_symbols(editor.read(cx).text(), &response);
                 panel.update(cx, |p, _| p.set_symbols(symbols));
             }
         }
@@ -2550,7 +2604,10 @@ impl Editor {
     }
 
     /// 当前活动 tab 的 LSP 客户端（无 LSP 时 None）。
-    fn active_lsp_client(&self, _cx: &App) -> Option<std::sync::Arc<crate::lsp::client::LspClient>> {
+    fn active_lsp_client(
+        &self,
+        _cx: &App,
+    ) -> Option<std::sync::Arc<crate::lsp::client::LspClient>> {
         let id = self.active_file_id.clone()?;
         let file = self.open_files.iter().find(|f| f.id == id)?;
         file.lsp.as_ref()?.client().cloned()
@@ -2789,8 +2846,7 @@ impl Editor {
             return;
         }
         if file.is_loading {
-            self.pending_jumps
-                .insert(tab_id.to_string(), (line, col));
+            self.pending_jumps.insert(tab_id.to_string(), (line, col));
             self.switch_to_file(tab_id, cx);
             return;
         }
@@ -2826,13 +2882,13 @@ impl Editor {
     /// 本地仓库用 root，远程用 SSH 目标（同一路径在两台服务器上是不同仓库）。
     /// 两种形态都以 `/{rel_path}` 结尾，`refresh_diff_for_path` 的后缀匹配
     /// 依赖这一性质。
-    fn diff_tab_id(
-        rel_path: &str,
-        repo: &crate::editor::git_repository::GitRepository,
-    ) -> String {
+    fn diff_tab_id(rel_path: &str, repo: &crate::editor::git_repository::GitRepository) -> String {
         match repo.ssh_config() {
             Some(config) => {
-                format!("diff-{}@{}:{}/{}", config.username, config.host, config.port, rel_path)
+                format!(
+                    "diff-{}@{}:{}/{}",
+                    config.username, config.host, config.port, rel_path
+                )
             }
             None => format!("diff-{}/{}", repo.root(), rel_path),
         }
@@ -3345,8 +3401,7 @@ impl Editor {
         line: Option<u32>,
         col: Option<u32>,
     ) {
-        let live_mode =
-            Self::default_live_mode(std::path::Path::new(&path), false, false);
+        let live_mode = Self::default_live_mode(std::path::Path::new(&path), false, false);
         let tab_id = if live_mode {
             format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
         } else {
@@ -3366,16 +3421,19 @@ impl Editor {
             return;
         }
         // 图片走 ImageViewer，没有行列概念：不记录 pending，避免泄漏后误跳。
-        if line.is_some()
-            && crate::editor::image_viewer::is_image_file(std::path::Path::new(&path))
+        if line.is_some() && crate::editor::image_viewer::is_image_file(std::path::Path::new(&path))
         {
-            self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false, false);
+            self.open_remote_file_inner(
+                path, ssh_config, window, cx, notify_app, false, false, false,
+            );
             return;
         }
         if let Some(line) = line {
             self.pending_jumps.insert(tab_id.clone(), (line, col));
         }
-        self.open_remote_file_inner(path, ssh_config, window, cx, notify_app, false, false, false);
+        self.open_remote_file_inner(
+            path, ssh_config, window, cx, notify_app, false, false, false,
+        );
         // Cached remote files open synchronously (`is_loading=false`):
         // apply the pending jump immediately instead of waiting for a load.
         if let Some((line, col)) = self.take_pending_jump(&tab_id) {
@@ -3428,8 +3486,7 @@ impl Editor {
         live_mode: bool,
         silent: bool,
     ) {
-        let live_mode =
-            Self::default_live_mode(std::path::Path::new(&path), edit_mode, live_mode);
+        let live_mode = Self::default_live_mode(std::path::Path::new(&path), edit_mode, live_mode);
         let tab_id = if live_mode {
             format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
         } else if edit_mode {
@@ -3805,9 +3862,8 @@ impl Editor {
             state
         });
 
-        let is_live_file = live_mode
-            && !is_image
-            && path.extension().and_then(|e| e.to_str()) == Some("md");
+        let is_live_file =
+            live_mode && !is_image && path.extension().and_then(|e| e.to_str()) == Some("md");
         let live = if is_live_file {
             let content_clone = content.clone();
             let live_doc_path = path.clone();
@@ -3832,7 +3888,10 @@ impl Editor {
                 sync_tab_id.clone().into(),
                 cx.subscribe(
                     &live,
-                    move |this, _live_entity, event: &crate::editor::markdown_live::LiveViewEvent, cx| {
+                    move |this,
+                          _live_entity,
+                          event: &crate::editor::markdown_live::LiveViewEvent,
+                          cx| {
                         if !matches!(
                             event,
                             crate::editor::markdown_live::LiveViewEvent::Change { .. }
@@ -3848,7 +3907,7 @@ impl Editor {
                 ),
             );
         } else {
-        self.editor_state_subscriptions.insert(
+            self.editor_state_subscriptions.insert(
             sync_tab_id.clone().into(),
             cx.observe(&editor_state, move |this, state_entity, cx| {
                 // 未保存标记：仅在文本版本变化时重新比较（O(1) 闸门，
@@ -4117,9 +4176,9 @@ impl Editor {
         }
         let path = PathBuf::from(&self.open_files[idx].path);
         // 记下路径：跨文件跳转时用它判断「是不是同一个文件」。
-        self.open_files[idx]
-            .editor_state
-            .update(cx, |state, _| state.set_lsp_file_path(path.display().to_string()));
+        self.open_files[idx].editor_state.update(cx, |state, _| {
+            state.set_lsp_file_path(path.display().to_string())
+        });
         let editor = self.open_files[idx].editor_state.downgrade();
 
         let Some(mut session) = crate::lsp::session::LspSession::new(&path, &language, editor)
@@ -4153,16 +4212,16 @@ impl Editor {
                     // 缺的是哪个二进制。**不断言原因**——这条分支同时覆盖
                     // 「二进制不存在」与「握手失败/服务器立刻退出」，写成
                     // 「找不到 X」在后者上是错的。精确原因在日志里。
-                    let reason =
-                        match crate::lsp::LspManager::configured_command(cx, &language_for_status)
-                        {
-                            Some(command) => format!("{command} 启动失败"),
-                            None => format!("{language_for_status} 服务器启动失败"),
-                        };
+                    let reason = match crate::lsp::LspManager::configured_command(
+                        cx,
+                        &language_for_status,
+                    ) {
+                        Some(command) => format!("{command} 启动失败"),
+                        None => format!("{language_for_status} 服务器启动失败"),
+                    };
                     this.open_files[idx].editor_state.update(cx, |state, _| {
-                        state.set_lsp_status(Some(crate::lsp::status::LspStatus::Failed {
-                            reason,
-                        }));
+                        state
+                            .set_lsp_status(Some(crate::lsp::status::LspStatus::Failed { reason }));
                     });
                     cx.notify();
                 });
@@ -4366,17 +4425,8 @@ impl Editor {
     /// [`Self::pending_live_sync`] + 起一个防抖任务。真正的全文同步在
     /// [`Self::flush_live_shadow`] 里做 —— 影子 `InputState` 只服务于
     /// 保存/切标签页组/关闭确认，live tab 渲染时完全不读它，因此不必跟手。
-    fn on_live_change(
-        &mut self,
-        live_tab_id: &SharedString,
-        version: u64,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(idx) = self
-            .open_files
-            .iter()
-            .position(|f| f.id == *live_tab_id)
-        else {
+    fn on_live_change(&mut self, live_tab_id: &SharedString, version: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.open_files.iter().position(|f| f.id == *live_tab_id) else {
             return;
         };
         // O(1)：版本号对比，绝不 join 全文。
@@ -4406,7 +4456,9 @@ impl Editor {
         let tab_id = tab_id.clone();
         cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(std::time::Duration::from_millis(Self::LIVE_SHADOW_SYNC_DEBOUNCE_MS))
+                .timer(std::time::Duration::from_millis(
+                    Self::LIVE_SHADOW_SYNC_DEBOUNCE_MS,
+                ))
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.flush_live_shadow(&tab_id, cx);
@@ -4949,11 +5001,7 @@ impl Render for Editor {
                 .child(inner)
                 .into_any_element()
         } else {
-            let base = div()
-                .h(px(30.0))
-                .w_full()
-                .px(px(6.0))
-                .child(inner);
+            let base = div().h(px(30.0)).w_full().px(px(6.0)).child(inner);
             let epoch = self.tab_bar_pad_epoch;
             let start = self.tab_bar_pad_start;
             let end = self.tab_bar_pad_end;
@@ -5115,7 +5163,10 @@ impl Render for Editor {
                                             // 在那儿发一次 hover 请求，拿到「无内容」后
                                             // `clear_hover_popover` 把卡片擦掉 —— 表现为
                                             // **指针一移到卡片上，卡片立即消失**。
-                                            if editor.read(cx).hover_popover_contains(event.position) {
+                                            if editor
+                                                .read(cx)
+                                                .hover_popover_contains(event.position)
+                                            {
                                                 return;
                                             }
                                             // 指针回到编辑区 = 离开了浮层。复位这个标记，
@@ -5134,18 +5185,16 @@ impl Render for Editor {
                                             let offset = editor
                                                 .read(cx)
                                                 .index_for_mouse_position(event.position);
-                                            let uri = this
-                                                .active_lsp_session()
-                                                .map(|s| s.uri().clone());
+                                            let uri =
+                                                this.active_lsp_session().map(|s| s.uri().clone());
                                             let Some(uri) = uri else {
                                                 // 没有 LSP 会话：把可能还挂着的浮层收掉。
                                                 this.schedule_hover_hide(cx);
                                                 return;
                                             };
                                             let client = this.active_lsp_client(cx);
-                                            this.hover.on_mouse_moved(
-                                                offset, &editor, client, uri, cx,
-                                            );
+                                            this.hover
+                                                .on_mouse_moved(offset, &editor, client, uri, cx);
                                             cx.notify();
                                         },
                                     ))
@@ -5249,8 +5298,11 @@ impl Render for Editor {
         // epoch == 0（从未播放过动画，如启动/恢复）或动画目标与当前宽度不匹配
         // （clear()/外部改写宽度等状态突变）时直接应用目标宽度，避免残留旧动画终值。
         let anim_epoch = self.panel_anim_epoch;
-        let (anim_start, anim_end, anim_ms) =
-            (self.panel_anim_start, self.panel_anim_end, self.panel_anim_ms);
+        let (anim_start, anim_end, anim_ms) = (
+            self.panel_anim_start,
+            self.panel_anim_end,
+            self.panel_anim_ms,
+        );
         let target_width = if is_empty { 0.0 } else { self.width };
         let animating = anim_epoch > 0
             && (anim_end - target_width).abs() <= 0.5
@@ -5682,13 +5734,7 @@ fn render_lsp_status_chip(
         && (*errors > 0 || *warnings > 0)
     {
         // 有诊断：画一个小圆点，颜色与数字一致。
-        chip = chip.child(
-            div()
-                .w(px(6.0))
-                .h(px(6.0))
-                .rounded_full()
-                .bg(color),
-        );
+        chip = chip.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(color));
     }
 
     chip.child(label).into_any_element()
@@ -5764,11 +5810,7 @@ pub(crate) enum LspJumpAction {
     /// 目标就是当前文件：原地跳。
     JumpInPlace { line: u32, col: u32 },
     /// 目标在别的文件（或尚未打开）：打开它并定位。
-    OpenFile {
-        path: PathBuf,
-        line: u32,
-        col: u32,
-    },
+    OpenFile { path: PathBuf, line: u32, col: u32 },
     /// 无法处理（非 `file://` uri）。
     Ignore,
 }
@@ -5971,17 +6013,12 @@ mod tests {
         });
         struct EditorHost(gpui::Entity<Editor>);
         impl gpui::Render for EditorHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
-        let (host, cx) = cx.add_window_view(|window, cx| {
-            EditorHost(cx.new(|cx| Editor::new(window, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
         let editor = host.read_with(cx, |h, _| h.0.clone());
         let info = EditorOpenFileInfo {
             id: "notes.md#live".into(),
@@ -6006,11 +6043,14 @@ mod tests {
             let live_ok = editor.read(cx).open_files.iter().any(|f| {
                 f.id.as_ref() == "notes.md#live"
                     && f.live.is_some()
-                    && f.live.as_ref().is_some_and(|live| {
-                        live.read(cx).text() == "# hi\n"
-                    })
+                    && f.live
+                        .as_ref()
+                        .is_some_and(|live| live.read(cx).text() == "# hi\n")
             });
-            assert!(live_ok, "live tab must keep its LiveMarkdownView after restore");
+            assert!(
+                live_ok,
+                "live tab must keep its LiveMarkdownView after restore"
+            );
         });
     }
 
@@ -6036,9 +6076,8 @@ mod tests {
                 gpui::div()
             }
         }
-        let (host, cx) = cx.add_window_view(|window, cx| {
-            EditorHost(cx.new(|cx| Editor::new(window, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
         let editor = host.read_with(cx, |h, _| h.0.clone());
 
         // 指向一个保证不存在的路径，模拟「文件在挂起期间被删掉」。
@@ -6060,7 +6099,14 @@ mod tests {
 
         cx.update(|window, cx| {
             editor.update(cx, |editor, cx| {
-                editor.restore_from_info(vec![info], None, &HashMap::new(), &HashMap::new(), window, cx);
+                editor.restore_from_info(
+                    vec![info],
+                    None,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    window,
+                    cx,
+                );
             });
         });
         // 让后台加载跑完并回到 UI 线程处理失败。
@@ -6085,21 +6131,17 @@ mod tests {
         });
         struct EditorHost(gpui::Entity<Editor>);
         impl gpui::Render for EditorHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
-        let (host, cx) = cx.add_window_view(|window, cx| {
-            EditorHost(cx.new(|cx| Editor::new(window, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
         let editor = host.read_with(cx, |h, _| h.0.clone());
         // 用临时 git 仓库构造可恢复的 diff 上下文：DiffView 后台加载即可，
         // 断言只关心 tab 重建后 `diff.is_some()`（非空白纯文本）。
-        let tmp = std::env::temp_dir().join(format!("deepterm-diff-restore-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("deepterm-diff-restore-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         let _ = crate::editor::git_repository::git_command()
             .args(["init", "--quiet"])
@@ -6176,22 +6218,19 @@ mod tests {
         });
         struct EditorHost(gpui::Entity<Editor>);
         impl gpui::Render for EditorHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
             }
         }
-        let (host, cx) = cx.add_window_view(|window, cx| {
-            EditorHost(cx.new(|cx| Editor::new(window, cx)))
-        });
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
         let editor = host.read_with(cx, |h, _| h.0.clone());
 
         let mk_repo = |tag: &str| {
-            let dir = std::env::temp_dir()
-                .join(format!("deepterm-diff-collide-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "deepterm-diff-collide-{tag}-{}",
+                std::process::id()
+            ));
             let _ = std::fs::create_dir_all(&dir);
             let _ = crate::editor::git_repository::git_command()
                 .args(["init", "--quiet"])
@@ -6233,7 +6272,11 @@ mod tests {
                 .filter(|f| f.diff.is_some())
                 .map(|f| &f.id)
                 .collect();
-            assert_eq!(ids.len(), 2, "两个仓库的同名路径必须是两个独立 tab: {ids:?}");
+            assert_eq!(
+                ids.len(),
+                2,
+                "两个仓库的同名路径必须是两个独立 tab: {ids:?}"
+            );
             assert_ne!(ids[0], ids[1]);
             // 每个仓库各有一个可解析到自身的 repo。
             let repos: Vec<&crate::editor::git_repository::GitRepository> = editor
@@ -6262,11 +6305,7 @@ mod tests {
             editor: gpui::Entity<Editor>,
         }
         impl gpui::Render for WidthHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
                     .size_full()
                     .flex()
@@ -6323,7 +6362,11 @@ mod tests {
             );
             // 同一宽度重复调不漂移。
             e.apply_window_follow(w0 + 400.0);
-            assert!((e.width - 880.0).abs() <= 0.5, "no drift, width={:.1}", e.width);
+            assert!(
+                (e.width - 880.0).abs() <= 0.5,
+                "no drift, width={:.1}",
+                e.width
+            );
             // 窗口骤窄：按比例收缩，钳在最小宽度。
             e.apply_window_follow(200.0);
             assert!(
@@ -6385,11 +6428,7 @@ mod tests {
             editor: gpui::Entity<Editor>,
         }
         impl gpui::Render for WidthHost {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
                     .size_full()
                     .flex()
@@ -6526,11 +6565,7 @@ mod tests {
             editor: gpui::Entity<Editor>,
         }
         impl gpui::Render for Host {
-            fn render(
-                &mut self,
-                _: &mut Window,
-                _: &mut Context<Self>,
-            ) -> impl gpui::IntoElement {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
                 gpui::div()
                     .size_full()
                     .flex()
@@ -6819,7 +6854,10 @@ mod lsp_signature_tests {
     #[test]
     fn open_paren_puts_cursor_in_params() {
         let t = Rope::from("foo(1, 2");
-        assert!(signature_trigger_for(&t, t.len()), "cursor inside `(` should trigger");
+        assert!(
+            signature_trigger_for(&t, t.len()),
+            "cursor inside `(` should trigger"
+        );
     }
 
     #[test]

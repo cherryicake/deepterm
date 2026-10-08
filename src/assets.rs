@@ -68,8 +68,8 @@ pub enum Icon {
     // elsewhere and keep their original look).
     ChevronDownThick,
     ChevronRightThick,
-    ChevronUpThick,      // Diff collapse band (expand up)
-    ChevronUpDownThick,  // Diff collapse band (expand both ways)
+    ChevronUpThick,     // Diff collapse band (expand up)
+    ChevronUpDownThick, // Diff collapse band (expand both ways)
     Eye,
     EyeOff,
     Loader,
@@ -99,19 +99,19 @@ pub enum Icon {
     FolderBadgePlus,
     XmarkCircleFill,
     // Git status icons
-    SquareDot,   // Modified
-    SquarePlus,  // Added
-    SquareMinus, // Deleted
-    Warning,     // Conflicted
-    Trash,       // Discard changes
-    Refresh,     // Refresh git status / diff
-    Minus,       // Unstage (VSCode style plain minus)
-    MinusThick,  // Git panel unstage (stroke-weight minus, pairs with PlusThick)
-    PlusThick,   // Git panel stage (stroke-weight plus; plain Plus is shared elsewhere)
-    Discard,     // VSCode SCM discard (curved left arrow, NOT trash)
-    DiscardThick,   // Git panel discard (stroke-outlined, bolder)
-    RefreshThick,   // Git panel refresh (bolder stroke; plain Refresh shared)
-    GoToFile,    // VSCode SCM "Open File" (file with arrow)
+    SquareDot,    // Modified
+    SquarePlus,   // Added
+    SquareMinus,  // Deleted
+    Warning,      // Conflicted
+    Trash,        // Discard changes
+    Refresh,      // Refresh git status / diff
+    Minus,        // Unstage (VSCode style plain minus)
+    MinusThick,   // Git panel unstage (stroke-weight minus, pairs with PlusThick)
+    PlusThick,    // Git panel stage (stroke-weight plus; plain Plus is shared elsewhere)
+    Discard,      // VSCode SCM discard (curved left arrow, NOT trash)
+    DiscardThick, // Git panel discard (stroke-outlined, bolder)
+    RefreshThick, // Git panel refresh (bolder stroke; plain Refresh shared)
+    GoToFile,     // VSCode SCM "Open File" (file with arrow)
     /// Dynamic file icon loaded by extension/name (e.g., language icons from Seti UI).
     FileIcon(&'static str),
     /// CLI agent 图标（Claude / Codex / …）。
@@ -123,7 +123,11 @@ pub enum Icon {
     ///
     /// 图形色和圆盘底色分别来自 `icon_rgb()` / `accent_rgb()`。
     /// SVG 只提供 alpha mask，不从文件填充色推断品牌色。
-    AgentIcon { path: &'static str, rgb: u32, accent_rgb: u32 },
+    AgentIcon {
+        path: &'static str,
+        rgb: u32,
+        accent_rgb: u32,
+    },
 }
 
 impl Icon {

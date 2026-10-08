@@ -306,12 +306,7 @@ pub async fn establish<H: client::Handler>(
     // 这个窗口无法消除（服务器分配了什么端口只有回复才知道）。
     let pre_registered = rule.bind_port != 0;
     if pre_registered
-        && !forwards.register(
-            wire,
-            rule.bind_port,
-            &rule.target_host,
-            rule.target_port,
-        )
+        && !forwards.register(wire, rule.bind_port, &rule.target_host, rule.target_port)
     {
         return Err(anyhow::anyhow!(
             "远端 {}:{} 在本次连接里已登记过",

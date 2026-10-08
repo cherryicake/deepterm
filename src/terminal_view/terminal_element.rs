@@ -1,10 +1,10 @@
 //! Terminal element for rendering
 
+use crate::components::cursor_animation::{CursorQuad, CursorShape, CursorTarget};
 use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
-use crate::components::cursor_animation::{CursorQuad, CursorShape, CursorTarget};
 use crate::terminal_view::terminal_view::TerminalView;
 use crate::theme::{ActiveTheme, TerminalTheme};
 #[cfg(test)]
@@ -1946,10 +1946,7 @@ impl Element for TerminalElement {
                 // beam / underline 的粗细取「单格」比例，与 cell 是否加宽无关。
                 shape_span: (cell_width.as_f32(), line_height.as_f32()),
                 // 终端只有纵向滚动；换算成像素偏移交给动画器做平移。
-                scroll_offset: Point::new(
-                    0.0,
-                    line_height.as_f32() * display_offset as f32,
-                ),
+                scroll_offset: Point::new(0.0, line_height.as_f32() * display_offset as f32),
                 shape: overlay_cursor_shape,
                 cell_percentage: overlay_cell_percentage,
                 metrics: (cell_width, line_height),
@@ -1968,10 +1965,7 @@ impl Element for TerminalElement {
                 cell: (cell_width.as_f32(), line_height.as_f32()),
                 shape_span: (cell_width.as_f32(), line_height.as_f32()),
                 // 终端只有纵向滚动；换算成像素偏移交给动画器做平移。
-                scroll_offset: Point::new(
-                    0.0,
-                    line_height.as_f32() * display_offset as f32,
-                ),
+                scroll_offset: Point::new(0.0, line_height.as_f32() * display_offset as f32),
                 shape: overlay.cursor_shape,
                 cell_percentage: overlay_cell_percentage,
                 metrics: (cell_width, line_height),

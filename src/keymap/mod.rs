@@ -170,10 +170,7 @@ mod tests {
             file::sections_of(source).unwrap_or_else(|err| panic!("{label} 解析失败：{err}"));
         }
         assert!(binding_count(DEFAULT_KEYMAP) > 0, "default.json 不应为空");
-        assert!(
-            binding_count(PLATFORM_KEYMAP) > 0,
-            "平台键位表不应为空"
-        );
+        assert!(binding_count(PLATFORM_KEYMAP) > 0, "平台键位表不应为空");
     }
 
     /// 迁移后键位数必须与迁移前 `state.rs` 的有效键位一致。
@@ -187,7 +184,10 @@ mod tests {
     fn default_keymaps_cover_all_migrated_bindings() {
         let total = binding_count(DEFAULT_KEYMAP) + binding_count(PLATFORM_KEYMAP);
         let expected = if cfg!(target_os = "macos") { 75 } else { 59 };
-        assert_eq!(total, expected, "迁移后键位数应与原 state.rs 的有效键位一致");
+        assert_eq!(
+            total, expected,
+            "迁移后键位数应与原 state.rs 的有效键位一致"
+        );
     }
 
     /// 每个 action 名都必须能在 gpui 的注册表里查到——否则该绑定是死键。
@@ -199,10 +199,9 @@ mod tests {
                 let sections = file::sections_of(source).unwrap();
                 for section in sections {
                     for (keystroke, action) in section.bindings.iter() {
-                        let (name, params) =
-                            file::split_action(action).unwrap_or_else(|err| {
-                                panic!("{label}: 键位 `{keystroke}` 的 action 非法：{err}")
-                            });
+                        let (name, params) = file::split_action(action).unwrap_or_else(|err| {
+                            panic!("{label}: 键位 `{keystroke}` 的 action 非法：{err}")
+                        });
                         assert!(
                             cx.build_action(&name, params).is_ok(),
                             "{label}: 键位 `{keystroke}` 引用了未注册的 action `{name}`"
@@ -222,10 +221,7 @@ mod tests {
             let mut total = 0;
             for (label, source) in builtin_documents() {
                 let (bindings, errors) = file::parse(source, cx);
-                assert!(
-                    errors.is_empty(),
-                    "{label} 有绑定未能构造：{errors:?}"
-                );
+                assert!(errors.is_empty(), "{label} 有绑定未能构造：{errors:?}");
                 assert_eq!(
                     bindings.len(),
                     binding_count(source),
@@ -257,7 +253,9 @@ mod tests {
                     .map(|key| gpui::Keystroke::parse(key).unwrap())
                     .collect();
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 迁移前由 `state.rs` 的 `cx.bind_keys` 提供；迁移后由 JSON 提供。
@@ -270,7 +268,10 @@ mod tests {
                 Some("editor::SearchPrevious"),
                 "迁移前的后写覆盖语义必须保持"
             );
-            assert_eq!(resolve(cx, "alt-z").as_deref(), Some("editor::ToggleSoftWrap"));
+            assert_eq!(
+                resolve(cx, "alt-z").as_deref(),
+                Some("editor::ToggleSoftWrap")
+            );
             assert_eq!(
                 resolve(cx, "alt-shift-up").as_deref(),
                 Some("editor::DuplicateLine")
@@ -320,7 +321,9 @@ mod tests {
                 let stack = [context];
                 let keys = vec![gpui::Keystroke::parse("h").unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 默认关闭：`h` 不应解析到 vim 命令。
@@ -460,7 +463,9 @@ mod tests {
                 let stack = [app_window, panel, input];
                 let keys = vec![gpui::Keystroke::parse(key).unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 无操作符时 `d` 开启操作符。
@@ -560,7 +565,9 @@ mod tests {
             let resolve = |cx: &mut gpui::App| -> Option<String> {
                 let keys = vec![gpui::Keystroke::parse("left").unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             assert_eq!(resolve(cx).as_deref(), Some("editor::MoveLeft"));
@@ -612,8 +619,10 @@ mod tests {
                     .split_whitespace()
                     .map(|k| gpui::Keystroke::parse(k).unwrap())
                     .collect();
-                let (matched, _pending) =
-                    cx.key_bindings().borrow().bindings_for_input(&strokes, &stack);
+                let (matched, _pending) = cx
+                    .key_bindings()
+                    .borrow()
+                    .bindings_for_input(&strokes, &stack);
                 matched
                     .first()
                     .map(|binding| binding.action().name().to_string())

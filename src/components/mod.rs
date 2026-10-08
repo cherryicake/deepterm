@@ -1,7 +1,7 @@
 use gpui::App;
 pub mod animation;
-pub mod callbacks;
 pub mod button;
+pub mod callbacks;
 /// 光标弹簧动画（四角独立弹簧 + 形状 morph），终端与编辑器共用。
 pub mod cursor_animation;
 pub mod input;

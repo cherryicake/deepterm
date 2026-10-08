@@ -562,9 +562,9 @@ impl ImageCache {
     fn retain_live(&mut self, storage: &Storage) -> Vec<Arc<gpui::RenderImage>> {
         let mut removed = Vec::new();
         self.textures.retain(|(id, generation), texture| {
-            let live = storage.get(*id).is_some_and(|stored| {
-                stored.generation == *generation && stored.is_placed()
-            });
+            let live = storage
+                .get(*id)
+                .is_some_and(|stored| stored.generation == *generation && stored.is_placed());
             if !live {
                 removed.push(texture.clone());
             }

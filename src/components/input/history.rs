@@ -159,10 +159,7 @@ where
 
     /// 从 `from` 弹出一个版本组（同 version 的连续变更），整体克隆一份压回 `to`，
     /// 返回弹出的变更列表。undo / redo 的共享实现。
-    fn pop_group(
-        from: &mut VecDeque<I>,
-        to: &mut VecDeque<I>,
-    ) -> Option<Vec<I>> {
+    fn pop_group(from: &mut VecDeque<I>, to: &mut VecDeque<I>) -> Option<Vec<I>> {
         let first_change = from.pop_back()?;
         let target_version = first_change.version();
         let mut changes = vec![first_change];

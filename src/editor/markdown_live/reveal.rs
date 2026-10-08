@@ -14,9 +14,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::editor::markdown_live::block::{classify_with_next, Block, DocState};
+use crate::editor::markdown_live::block::{Block, DocState, classify_with_next};
 use crate::editor::markdown_live::inline::collect_refdefs;
-use crate::editor::markdown_live::layout::{plan_with_refs, RowPlan, RunAttrs, Seg};
+use crate::editor::markdown_live::layout::{RowPlan, RunAttrs, Seg, plan_with_refs};
 use crate::editor::markdown_live::model::{Line, Pos};
 
 /// Five callout kinds (matches the existing read-only preview).
@@ -373,10 +373,7 @@ pub fn classify_incremental(
                     || matches!(blocks[j - 1], Block::Heading { content: 0, .. }))
             {
                 j -= 1;
-                blocks[j] = Block::Heading {
-                    level,
-                    content: 0,
-                };
+                blocks[j] = Block::Heading { level, content: 0 };
             }
             changed_lo = changed_lo.min(j);
         }
@@ -592,7 +589,16 @@ pub fn plan_rows_with_refs(
     let revealed = reveal_set(blocks, lines.len(), reveal);
 
     // 3. Plan each line + track callout cards across quote runs.
-    plan_range(lines, classified, refdefs, &revealed, 0, lines.len(), false, None)
+    plan_range(
+        lines,
+        classified,
+        refdefs,
+        &revealed,
+        0,
+        lines.len(),
+        false,
+        None,
+    )
 }
 
 /// Plan the whole document: classify then plan rows. Pure function of
@@ -669,15 +675,18 @@ mod tests {
         let rows = plan_document(&ls, reveal_at(5));
         assert!(matches!(
             rows[0].block,
-            Block::Heading { level: 1, content: 0 }
+            Block::Heading {
+                level: 1,
+                content: 0
+            }
         ));
-        assert!(matches!(
-            rows[1].block,
-            Block::SetextUnderline { level: 1 }
-        ));
+        assert!(matches!(rows[1].block, Block::SetextUnderline { level: 1 }));
         assert!(matches!(
             rows[3].block,
-            Block::Heading { level: 2, content: 0 }
+            Block::Heading {
+                level: 2,
+                content: 0
+            }
         ));
         assert_eq!(rows[0].plan.kind, RowKind::Heading(1));
         // Preview mode hides the underline (visible is empty) and styles
@@ -692,10 +701,11 @@ mod tests {
         // Multi-line runs restyle every paragraph line of the run.
         let ls = lines("a\nb\n===");
         let rows = plan_document(&ls, reveal_at(3));
-        assert!(rows.iter().take(2).all(|r| matches!(
-            r.block,
-            Block::Heading { level: 1, .. }
-        )));
+        assert!(
+            rows.iter()
+                .take(2)
+                .all(|r| matches!(r.block, Block::Heading { level: 1, .. }))
+        );
         // A mid-document `---` without a paragraph above stays a rule.
         let ls = lines("# h\n\n---\n");
         let rows = plan_document(&ls, reveal_at(3));
@@ -857,7 +867,7 @@ pub fn strip_plan_prefix(plan: &RowPlan, n_vis: usize, n_src: usize) -> RowPlan 
 
 #[cfg(test)]
 mod strip_tests {
-    use super::super::block::{classify, DocState};
+    use super::super::block::{DocState, classify};
     use super::*;
 
     fn plan_quote(line: &str, reveal: bool) -> RowPlan {
@@ -924,15 +934,15 @@ mod showcase_tests {
                 selection: None,
                 focused: true,
                 read_only: false,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
             Reveal {
                 cursor: Pos::new(0, 0),
                 selection: Some((Pos::new(0, 0), Pos::new(lines.len().saturating_sub(1), 0))),
                 focused: true,
                 read_only: false,
-            ..Default::default()
-        },
+                ..Default::default()
+            },
         ];
         for reveal in configs {
             let rows = plan_document(&lines, reveal);
@@ -965,8 +975,7 @@ mod showcase_tests {
             let merged = plan_document(&ls, reveal);
             let split = plan_rows(&ls, &classified, reveal);
             // P1 cached path: reuse the precomputed classification + refs.
-            let split_cached =
-                plan_rows_with_refs(&ls, &classified, &refs, reveal);
+            let split_cached = plan_rows_with_refs(&ls, &classified, &refs, reveal);
             assert_eq!(merged.len(), split.len());
             assert_eq!(merged.len(), split_cached.len());
             for (a, b) in merged.iter().zip(split.iter()) {

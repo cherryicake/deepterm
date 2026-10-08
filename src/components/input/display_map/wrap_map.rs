@@ -255,8 +255,7 @@ mod tests {
             // Force a full rebuild on the second instance.
             full.rebuild_cache();
             assert_eq!(
-                incr.buffer_line_starts,
-                full.buffer_line_starts,
+                incr.buffer_line_starts, full.buffer_line_starts,
                 "buffer_line_starts diverged after edit at {:?}",
                 range
             );

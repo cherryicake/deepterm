@@ -12,8 +12,7 @@ use smallvec::SmallVec;
 
 use crate::{
     components::input::{
-        DiffLineKind,
-        RopeExt as _,
+        DiffLineKind, RopeExt as _,
         blink_cursor::CURSOR_WIDTH,
         cursor::{CursorLayout, CursorShape},
         display_map::LineLayout,
@@ -1353,7 +1352,8 @@ impl TextElement {
 
         let dark = cx.theme().appearance.is_dark();
         let error_color = cx.theme().error;
-        let rainbow = Self::rainbow_overrides_in_range(spans.iter().as_slice(), visible, dark, error_color);
+        let rainbow =
+            Self::rainbow_overrides_in_range(spans.iter().as_slice(), visible, dark, error_color);
         if rainbow.is_empty() {
             return Some(styles);
         }
@@ -2536,23 +2536,20 @@ impl TextElement {
         };
 
         // git 展开区行数前缀表：所有遍历可见行的 y 累计点统一查表。
-        let (git_insert_shift, git_insert_baseline) = if state
-            .display_map
-            .git_insertions()
-            .is_empty()
-        {
-            (Rc::new(Vec::new()), 0)
-        } else {
-            let shift: Vec<u32> = visible_buffer_lines
-                .iter()
-                .map(|&line| state.display_map.git_insertion_rows_before(line + 1) as u32)
-                .collect();
-            let baseline = visible_buffer_lines
-                .first()
-                .map(|&first| state.display_map.git_insertion_rows_before(first))
-                .unwrap_or(0);
-            (Rc::new(shift), baseline)
-        };
+        let (git_insert_shift, git_insert_baseline) =
+            if state.display_map.git_insertions().is_empty() {
+                (Rc::new(Vec::new()), 0)
+            } else {
+                let shift: Vec<u32> = visible_buffer_lines
+                    .iter()
+                    .map(|&line| state.display_map.git_insertion_rows_before(line + 1) as u32)
+                    .collect();
+                let baseline = visible_buffer_lines
+                    .first()
+                    .map(|&first| state.display_map.git_insertion_rows_before(first))
+                    .unwrap_or(0);
+                (Rc::new(shift), baseline)
+            };
 
         let mut last_layout = LastLayout {
             visible_range,
@@ -2804,8 +2801,7 @@ impl TextElement {
         // 滚动不算移动：这里把滚动偏移单独传给动画器，它会把四角与目标一起
         // 平移，光标钉在内容上、不产生动画。
         let cursor_bounds = cursor_bounds.map(|layout| {
-            let shape: crate::components::cursor_animation::CursorShape =
-                layout.shape().into();
+            let shape: crate::components::cursor_animation::CursorShape = layout.shape().into();
             // 形状基准尺寸：Bar 用固定宽度、Underline 用固定高度（编辑器两者
             // 都与字号无关），Block/Hollow 用整块宽高。`cell` 决定 Block 宽度，
             // `shape_span` 决定 beam/underline 的粗细比例，两者在编辑器里相同。
@@ -2865,13 +2861,7 @@ impl TextElement {
 
         // 闪烁淡入淡出窗口内需要连续帧：与光标动画同一套「按需续帧」约定。
         // 相位中间 `needs_repaint()` 为 false，静止即停，不会让渲染循环空转。
-        if self
-            .state
-            .read(cx)
-            .blink_cursor
-            .read(cx)
-            .needs_repaint()
-        {
+        if self.state.read(cx).blink_cursor.read(cx).needs_repaint() {
             let state_id = self.state.entity_id();
             window.on_next_frame(move |_, cx| cx.notify(state_id));
         }
@@ -3018,7 +3008,10 @@ impl TextElement {
         // 只平移文字本身，命中区不动（与 Zed 的 `text_hitbox` 一致）。
         let text_hitbox = window.insert_hitbox(
             Bounds {
-                origin: point(input_bounds.origin.x + line_number_width, input_bounds.origin.y),
+                origin: point(
+                    input_bounds.origin.x + line_number_width,
+                    input_bounds.origin.y,
+                ),
                 size: size(
                     (input_bounds.size.width - line_number_width).max(px(0.)),
                     input_bounds.size.height,
@@ -3069,10 +3062,7 @@ impl TextElement {
         .then(|| {
             window.insert_hitbox(
                 Bounds {
-                    origin: point(
-                        input_bounds.origin.x,
-                        input_bounds.bottom() - BAR_THICKNESS,
-                    ),
+                    origin: point(input_bounds.origin.x, input_bounds.bottom() - BAR_THICKNESS),
                     size: size(input_bounds.size.width - BAR_THICKNESS, BAR_THICKNESS),
                 },
                 HitboxBehavior::Normal,
@@ -3220,17 +3210,15 @@ impl TextElement {
         } else {
             (Hsla::default(), Hsla::default())
         };
-        let selected_byte_range = if window.is_window_active()
-            && !state.masked
-            && !selected_range.is_empty()
-        {
-            Some(
-                selected_range.start.min(selected_range.end)
-                    ..selected_range.start.max(selected_range.end),
-            )
-        } else {
-            None
-        };
+        let selected_byte_range =
+            if window.is_window_active() && !state.masked && !selected_range.is_empty() {
+                Some(
+                    selected_range.start.min(selected_range.end)
+                        ..selected_range.start.max(selected_range.end),
+                )
+            } else {
+                None
+            };
 
         // Paint the current line background.
         //
@@ -3301,15 +3289,15 @@ impl TextElement {
                     } else {
                         *bg_color
                     };
-                    window.paint_quad(fill(
-                        Bounds::new(p, size(bounds.size.width, height)),
-                        bg,
-                    ));
+                    window.paint_quad(fill(Bounds::new(p, size(bounds.size.width, height)), bg));
                 }
                 // 已展开 hunk 的新行：整行绿底（与 diff view 新增行同色）。
                 // 行首色条在下方「Paint line numbers」段里绘制 —— 行号区背景
                 // 全高后涂，画在它之前的色条会被盖住。
-                let expanded_tinted = self.state.read(cx).line_in_expanded_hunk(buffer_line as u32);
+                let expanded_tinted = self
+                    .state
+                    .read(cx)
+                    .line_in_expanded_hunk(buffer_line as u32);
                 if expanded_tinted && !diff_line_colors.contains_key(&(buffer_line as u32)) {
                     window.paint_quad(fill(
                         Bounds::new(p, size(bounds.size.width, height)),
@@ -3702,8 +3690,7 @@ impl TextElement {
             .zip(prepaint.last_layout.visible_buffer_lines.iter())
             .enumerate()
         {
-            offset_y +=
-                line_height * prepaint.last_layout.git_insert_delta(i) as f32;
+            offset_y += line_height * prepaint.last_layout.git_insert_delta(i) as f32;
             let line_y = origin.y + offset_y;
             let p = point(
                 origin.x + prepaint.last_layout.line_number_width + (scroll_offset),
@@ -3741,7 +3728,14 @@ impl TextElement {
                         }],
                         None,
                     );
-                    _ = run.paint(point(hint_x, line_y), line_height, TextAlign::Left, None, window, cx);
+                    _ = run.paint(
+                        point(hint_x, line_y),
+                        line_height,
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
                     hint_x += run.width;
                 }
             }
@@ -3842,8 +3836,7 @@ impl TextElement {
                 .enumerate()
             {
                 // git 展开区：与正文累计保持一致（查表）。
-                offset_y +=
-                    line_height * prepaint.last_layout.git_insert_delta(i) as f32;
+                offset_y += line_height * prepaint.last_layout.git_insert_delta(i) as f32;
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
@@ -3862,8 +3855,8 @@ impl TextElement {
                 // （不含换行符）：否则行尾诊断会把下一行的换行符也算进来。
                 let diagnostic_severity_for_line = diagnostics_for_gutter.as_ref().and_then(|d| {
                     let state = self.state.read(cx);
-                    let line_range =
-                        state.text.line_start_offset(buffer_line)..state.text.line_content_end_offset(buffer_line);
+                    let line_range = state.text.line_start_offset(buffer_line)
+                        ..state.text.line_content_end_offset(buffer_line);
                     d.max_severity_for_range(&line_range)
                 });
                 let row_selected = selected_byte_range.as_ref().is_some_and(|sel| {
@@ -3889,7 +3882,11 @@ impl TextElement {
                         Some(bg)
                     }
                     None => {
-                        if self.state.read(cx).line_in_expanded_hunk(buffer_line as u32) {
+                        if self
+                            .state
+                            .read(cx)
+                            .line_in_expanded_hunk(buffer_line as u32)
+                        {
                             // 已展开 hunk 的新行：行号区同绿底，与正文一致。
                             Some(cx.theme().status_added.opacity(0.14))
                         } else {
@@ -3911,10 +3908,8 @@ impl TextElement {
                     };
                     match line_kind {
                         crate::components::input::DiffLineKind::Added => {
-                            window.paint_quad(fill(
-                                Bounds::new(p, size(px(3.), height)),
-                                edge_color,
-                            ));
+                            window
+                                .paint_quad(fill(Bounds::new(p, size(px(3.), height)), edge_color));
                         }
                         crate::components::input::DiffLineKind::Deleted => {
                             // 条纹短划（2px 划 + 2px 空）铺满行高，参考 diff UI
@@ -3941,17 +3936,15 @@ impl TextElement {
                         prepaint.last_layout.line_number_width - LINE_NUMBER_RIGHT_MARGIN;
                     let mark_w = px(2.);
                     window.paint_quad(fill(
-                        Bounds::new(
-                            point(p.x + gutter_w - mark_w, p.y),
-                            size(mark_w, height),
-                        ),
+                        Bounds::new(point(p.x + gutter_w - mark_w, p.y), size(mark_w, height)),
                         severity.color(cx),
                     ));
                 }
 
                 for line in lines {
                     _ = line.paint(p, line_height, TextAlign::Left, None, window, cx);
-                    offset_y += line_height;                }
+                    offset_y += line_height;
+                }
 
                 // Paint git 行首色条：新增绿 / 修改蓝 / 删除红（行顶小短条）。
                 // 必须画在行号区背景之后（背景全高后涂会盖住先画的色条），
@@ -3962,13 +3955,15 @@ impl TextElement {
                         let state = self.state.read(cx);
                         let line_u32 = buffer_line as u32;
                         let deletion_expanded = state.expanded_git_hunks.iter().any(|&ix| {
-                            state.git_hunks.get(ix).is_some_and(|h| {
-                                h.new_rows.is_empty() && h.before_line == line_u32
-                            })
+                            state
+                                .git_hunks
+                                .get(ix)
+                                .is_some_and(|h| h.new_rows.is_empty() && h.before_line == line_u32)
                         });
                         (
                             state.git_line_marks.get(&line_u32).copied(),
-                            state.git_expandable
+                            state
+                                .git_expandable
                                 .then(|| state.git_hunk_index_for_line(line_u32))
                                 .flatten()
                                 .is_some(),
@@ -3993,7 +3988,10 @@ impl TextElement {
                         };
                         if mark != GitLineMark::Deleted {
                             window.paint_quad(fill(
-                                Bounds::new(point(input_bounds.origin.x, p.y), size(px(3.), height)),
+                                Bounds::new(
+                                    point(input_bounds.origin.x, p.y),
+                                    size(px(3.), height),
+                                ),
                                 bar_color,
                             ));
                         } else {
@@ -4312,10 +4310,7 @@ impl TextElement {
         // 滚过的内容原点：把「未滚动视口」平移滚动量得到，与正文绘制
         // （`paint_inner` 用 `prepaint.bounds`）一致。
         // 这样调用方只需给一个矩形，不会再出现「传错矩形」的错误。
-        let bounds = Bounds::new(
-            viewport.origin + scroll_offset,
-            viewport.size,
-        );
+        let bounds = Bounds::new(viewport.origin + scroll_offset, viewport.size);
         // 可见区的**结束字节**：最后一条可见行的下一行行首（钳到文本长度）。
         // 用它界定最后一条可见行——用 `text_len` 不行：那会把视口之后的
         // 所有偏移都算到最后一行上，滚动后浮层就粘在底部不消失。
@@ -4331,8 +4326,7 @@ impl TextElement {
         // 补全菜单优先：它在打字时出现，比 hover 更需要即时可见。
         if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
             let offset = state.completion_anchor()?;
-            let content =
-                crate::editor::completion::render_completion_menu_from_state(state, cx)?;
+            let content = crate::editor::completion::render_completion_menu_from_state(state, cx)?;
             Some((offset, content))
         }) && let Some((origin, anchor_y, size)) = self.place_at_anchor(
             anchor,
@@ -4356,8 +4350,9 @@ impl TextElement {
             // 阶段调用会入队一个从未 prepaint 的元素，触发
             // "must call prepaint before paint"。
             window.defer_draw(content, origin, 2, None);
-            self.state
-                .update(cx, |state, _cx| state.record_popover_placement(origin, anchor_y));
+            self.state.update(cx, |state, _cx| {
+                state.record_popover_placement(origin, anchor_y)
+            });
         }
 
         // hover 浮层：优先画在锚点行上方（不遮住正在看的词）。
@@ -4399,10 +4394,7 @@ impl TextElement {
                 state.record_popover_placement(origin, anchor_y);
                 // 记下卡片实际占的矩形：滚轮事件冒泡到 `on_scroll_wheel` 时
                 // 靠它判断是否该放行给浮层自己滚。
-                state.record_hover_popover_bounds(Bounds {
-                    origin,
-                    size,
-                });
+                state.record_hover_popover_bounds(Bounds { origin, size });
             });
         }
     }
@@ -4749,10 +4741,7 @@ mod tests {
         let s = px(8.);
         let t = px(32.);
         // 两个 Tab：列 0 → 0，列 4 → 第一个 Tab 的推进量，列 8 → 两个 Tab
-        assert_eq!(
-            measure_guide_xs("\t\tx", 4, s, t),
-            vec![px(0.), t, t * 2.]
-        );
+        assert_eq!(measure_guide_xs("\t\tx", 4, s, t), vec![px(0.), t, t * 2.]);
         // Tab + 2 空格（6 列）：层数 2，列 4 落在 Tab 终点
         assert_eq!(measure_guide_xs("\t  x", 4, s, t), vec![px(0.), t]);
         // Tab + 4 空格（8 列）：层数 2，列 4 = Tab 终点；列 8 为余量
@@ -4822,7 +4811,8 @@ mod tests {
 
         // 关键断言：块状光标宽度就是一格。
         assert_eq!(
-            block_width, cell,
+            block_width,
+            cell,
             "块状光标宽度应等于一个字符格（旧实现是 line_height*0.6 = {:?}）",
             line_height * 0.6
         );
@@ -5067,9 +5057,7 @@ mod tests {
                     .multi_line(true)
                     .code_editor("text".to_string());
                 // 内容要足够长，否则滚动会被钳制到 0（测不到滚动通道）。
-                let long: String = (0..60)
-                    .map(|i| format!("line {i}\n"))
-                    .collect();
+                let long: String = (0..60).map(|i| format!("line {i}\n")).collect();
                 s.set_text(&long, cx);
                 s
             });
@@ -5136,9 +5124,7 @@ mod tests {
     #[gpui::test]
     fn gutter_click_selects_line_while_horizontally_scrolled(cx: &mut gpui::TestAppContext) {
         use crate::components::input::InputState;
-        use gpui::{
-            AppContext as _, Modifiers, MouseButton, MouseDownEvent, VisualTestContext,
-        };
+        use gpui::{AppContext as _, Modifiers, MouseButton, MouseDownEvent, VisualTestContext};
 
         struct Host {
             state: gpui::Entity<InputState>,
@@ -5202,11 +5188,13 @@ mod tests {
                 .map(|l| l.line_height)
                 .unwrap_or(px(20.));
             assert!(
-                point(input.origin.x + px(4.), input.origin.y)
-                    .x < s.content_left_x(),
+                point(input.origin.x + px(4.), input.origin.y).x < s.content_left_x(),
                 "点击点必须落在 gutter 内"
             );
-            point(input.origin.x + px(4.), input.origin.y + line_height + px(4.))
+            point(
+                input.origin.x + px(4.),
+                input.origin.y + line_height + px(4.),
+            )
         });
         state.update_in(cx, |state, window, cx| {
             state.on_mouse_down(
@@ -5226,7 +5214,8 @@ mod tests {
                 .line_range(second_line_start)
                 .expect("第 2 行存在");
             assert_eq!(
-                state.selected_range, expected.into(),
+                state.selected_range,
+                expected.into(),
                 "点行号应选中整行（Zed: click_count = 3），\
                  而不是把光标放到 gutter 底下的某一列"
             );
@@ -5472,12 +5461,13 @@ mod tests {
             state
         };
 
-        let check = |state: &gpui::Entity<InputState>,
-                     cx: &gpui::TestAppContext,
-                     label: &str| {
+        let check = |state: &gpui::Entity<InputState>, cx: &gpui::TestAppContext, label: &str| {
             let requests = take_cursor_requests();
             let (painted_v, painted_h) = state.read_with(cx, |s, _| {
-                (s.scrollbar_geometry.is_some(), s.scrollbar_geometry_h.is_some())
+                (
+                    s.scrollbar_geometry.is_some(),
+                    s.scrollbar_geometry_h.is_some(),
+                )
             });
             // 条带请求排在文本请求之后，所以指针停在条带上时箭头胜出。
             // 按精确厚度区分：纵向条宽 = BAR_THICKNESS、高 = 视口高；
@@ -5617,9 +5607,7 @@ mod tests {
 
         let gutter = requests
             .iter()
-            .find(|r| {
-                r.style == CursorStyle::Arrow && r.bounds.right() <= text.bounds.left()
-            })
+            .find(|r| r.style == CursorStyle::Arrow && r.bounds.right() <= text.bounds.left())
             .expect("应有行号栏的 Arrow 请求（位于文本区左侧）");
         assert_eq!(
             resolve(gutter.bounds.center()),
@@ -5631,7 +5619,10 @@ mod tests {
         let bars: Vec<_> = requests
             .iter()
             .filter(|r| r.style == CursorStyle::Arrow)
-            .filter(|r| r.bounds.size.height > BAR_THICKNESS && r.bounds.size.width <= BAR_THICKNESS + px(0.5))
+            .filter(|r| {
+                r.bounds.size.height > BAR_THICKNESS
+                    && r.bounds.size.width <= BAR_THICKNESS + px(0.5)
+            })
             .collect();
         let v_bar = bars.first().expect("内容溢出时应有纵向条带的箭头请求");
         assert!(
@@ -5876,13 +5867,9 @@ mod tests_runs_for_range {
         // 场景：表头 `{` 在 offset 10，tail `}` 在 offset 40，二者同 depth。
         let dark = true;
         let error = gpui::red();
-        let spans: Vec<BracketSpan> = vec![
-            (10..11, 2, true, true),
-            (40..41, 2, false, true),
-        ];
+        let spans: Vec<BracketSpan> = vec![(10..11, 2, true, true), (40..41, 2, false, true)];
         // tail range 40..41 → 只有闭括号 span 命中
-        let overrides =
-            TextElement::rainbow_overrides_in_range(&spans, &(40..41), dark, error);
+        let overrides = TextElement::rainbow_overrides_in_range(&spans, &(40..41), dark, error);
         assert_eq!(overrides.len(), 1);
         assert_eq!(overrides[0].0, 40..41);
         // tail 闭括号的颜色 = 同层级开括号的颜色（即表头 `{` 实际渲染色）
@@ -5891,12 +5878,10 @@ mod tests_runs_for_range {
         assert_eq!(overrides[0].1.color, header_overrides[0].1.color);
         // 游离闭括号（未配对）标错误色
         let unmatched: Vec<BracketSpan> = vec![(40..41, 2, false, false)];
-        let overrides =
-            TextElement::rainbow_overrides_in_range(&unmatched, &(40..41), dark, error);
+        let overrides = TextElement::rainbow_overrides_in_range(&unmatched, &(40..41), dark, error);
         assert_eq!(overrides[0].1.color, Some(error));
         // 与 tail 不相交的 span 不产生覆盖
-        let overrides =
-            TextElement::rainbow_overrides_in_range(&spans, &(50..60), dark, error);
+        let overrides = TextElement::rainbow_overrides_in_range(&spans, &(50..60), dark, error);
         assert!(overrides.is_empty());
     }
 }

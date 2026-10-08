@@ -33,10 +33,7 @@ const TRAILING_PUNCT: &[char] = &[
 /// that prefix filenames. Private-use area + common symbol blocks.
 fn is_icon_noise(ch: char) -> bool {
     matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
-        || matches!(
-            ch,
-            '📁' | '📄' | '📦' | '🦀' | '' | '├' | '└' | '│' | '─'
-        )
+        || matches!(ch, '📁' | '📄' | '📦' | '🦀' | '' | '├' | '└' | '│' | '─')
         || ('\u{2500}'..='\u{257F}').contains(&ch)
 }
 
@@ -294,19 +291,12 @@ fn map_candidates(text: &str, byte_to_col: &[usize]) -> Vec<FileHit> {
     hits
 }
 
-fn to_file_hit(
-    tok: &str,
-    bstart: usize,
-    bend: usize,
-    byte_to_col: &[usize],
-) -> Option<FileHit> {
+fn to_file_hit(tok: &str, bstart: usize, bend: usize, byte_to_col: &[usize]) -> Option<FileHit> {
     // Strip surrounding quotes first (`"my file.ts"`), keep inner content.
     let mut cleaned = tok.trim();
     if cleaned.len() >= 2 {
         let b = cleaned.as_bytes();
-        if (b[0] == b'"' && b[b.len() - 1] == b'"')
-            || (b[0] == b'\'' && b[b.len() - 1] == b'\'')
-        {
+        if (b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\'') {
             cleaned = &cleaned[1..cleaned.len() - 1];
         }
     }
@@ -356,9 +346,7 @@ fn to_file_hit(
 
 /// Find the candidate under a grid column.
 pub fn file_hit_at_col<'a>(hits: &'a [FileHit], col: usize) -> Option<&'a FileHit> {
-    hits
-        .iter()
-        .find(|h| col >= h.start_col && col < h.end_col)
+    hits.iter().find(|h| col >= h.start_col && col < h.end_col)
 }
 
 #[cfg(test)]
@@ -375,14 +363,8 @@ mod tests {
             split_line_column("a.rs:10"),
             ("a.rs".to_string(), Some(10), None)
         );
-        assert_eq!(
-            split_line_column("a:b"),
-            ("a:b".to_string(), None, None)
-        );
-        assert_eq!(
-            split_line_column("foo:"),
-            ("foo:".to_string(), None, None)
-        );
+        assert_eq!(split_line_column("a:b"), ("a:b".to_string(), None, None));
+        assert_eq!(split_line_column("foo:"), ("foo:".to_string(), None, None));
     }
 
     #[test]

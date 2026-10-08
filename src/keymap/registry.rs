@@ -43,7 +43,10 @@ pub fn watch_user_keymap(cx: &mut App) {
         return;
     };
     if let Err(err) = std::fs::create_dir_all(&parent) {
-        log::warn!("failed to create config directory {}: {err}", parent.display());
+        log::warn!(
+            "failed to create config directory {}: {err}",
+            parent.display()
+        );
         return;
     }
 

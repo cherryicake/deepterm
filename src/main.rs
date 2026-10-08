@@ -96,14 +96,17 @@ fn main() {
             // 从未注册、按 `yy` 直接 panic。
             deepterm::init(cx);
             init_global_executor();
-            deepterm::keymap::bind(cx, [
-                KeyBinding::new("cmd-q", Quit, None),
-                #[cfg(target_os = "windows")]
-                KeyBinding::new("ctrl-k", ShowSshPicker, None),
-                #[cfg(not(target_os = "windows"))]
-                KeyBinding::new("cmd-k", ShowSshPicker, None),
-                KeyBinding::new("cmd-n", NewWindow, None),
-            ]);
+            deepterm::keymap::bind(
+                cx,
+                [
+                    KeyBinding::new("cmd-q", Quit, None),
+                    #[cfg(target_os = "windows")]
+                    KeyBinding::new("ctrl-k", ShowSshPicker, None),
+                    #[cfg(not(target_os = "windows"))]
+                    KeyBinding::new("cmd-k", ShowSshPicker, None),
+                    KeyBinding::new("cmd-n", NewWindow, None),
+                ],
+            );
             cx.on_action(|_: &Quit, cx| {
                 // 退出前同步落盘所有窗口的待保存会话：
                 // defer_save_session 是 300ms 防抖任务，若刚变更完立刻退出，

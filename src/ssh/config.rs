@@ -905,8 +905,7 @@ mod tests {
         assert!(matches!(back, AuthMethod::Auto));
 
         // 整个连接配置（save() 的实际形态）也要能往返。
-        let config =
-            SshConnectionConfig::new("example.com", "admin", AuthMethod::Auto);
+        let config = SshConnectionConfig::new("example.com", "admin", AuthMethod::Auto);
         let json = serde_json::to_string(&config).expect("含 Auto 的配置必须可序列化");
         let back: SshConnectionConfig =
             serde_json::from_str(&json).expect("含 Auto 的配置必须可反序列化");

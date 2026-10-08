@@ -257,17 +257,14 @@ impl GitPanel {
                 .auto_grow(3, 6)
                 .placeholder("消息")
         });
-        let sub = cx.subscribe(
-            &input,
-            |this, _, event: &InputEvent, cx| match event {
-                InputEvent::Change => cx.notify(),
-                // Ctrl/Cmd+Enter 提交（与 VSCode 一致）。
-                InputEvent::PressEnter { secondary } if *secondary => {
-                    this.do_commit(CommitScope::Smart, cx);
-                }
-                _ => {}
-            },
-        );
+        let sub = cx.subscribe(&input, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => cx.notify(),
+            // Ctrl/Cmd+Enter 提交（与 VSCode 一致）。
+            InputEvent::PressEnter { secondary } if *secondary => {
+                this.do_commit(CommitScope::Smart, cx);
+            }
+            _ => {}
+        });
         self.commit_editor = Some(input);
         self.commit_subscription = Some(sub);
         cx.notify();
@@ -460,9 +457,7 @@ impl GitPanel {
                             if let (Some(fs), Some(root)) =
                                 (this.filesystem.clone(), this.workspace_path.clone())
                             {
-                                for git_path in
-                                    [root.join(".git/index"), root.join(".git/HEAD")]
-                                {
+                                for git_path in [root.join(".git/index"), root.join(".git/HEAD")] {
                                     cx.watch_remote_path(&git_path, fs.clone());
                                     this.remote_git_watched.push(git_path);
                                 }
@@ -710,7 +705,8 @@ impl GitPanel {
     }
 
     /// Schedule a refresh with a debounce to avoid refreshing too frequently
-    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {        self.refresh_pending = true;
+    fn schedule_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_pending = true;
         if self.refresh_debounce_task.is_some() {
             return;
         }
@@ -924,7 +920,9 @@ impl GitPanel {
             .file_entries
             .iter()
             .filter(|e| {
-                e.section == section && !e.status.is_conflicted() && !e.status.is_untracked()
+                e.section == section
+                    && !e.status.is_conflicted()
+                    && !e.status.is_untracked()
                     && (e.status.has_unstaged_changes() || e.status.has_staged_changes())
             })
             .cloned()
@@ -974,8 +972,7 @@ impl GitPanel {
                 .background_executor()
                 .spawn(async move {
                     if !tracked_paths.is_empty() {
-                        let refs: Vec<&str> =
-                            tracked_paths.iter().map(|s| s.as_str()).collect();
+                        let refs: Vec<&str> = tracked_paths.iter().map(|s| s.as_str()).collect();
                         repo.discard(&refs)?;
                     }
                     for rel in &untracked_for_task {
@@ -1020,12 +1017,7 @@ impl GitPanel {
     }
 
     /// 未跟踪文件没有 HEAD 可回退：放弃 = 删除文件（Warning 二次确认，不可撤销）。
-    fn delete_untracked_files(
-        &self,
-        rels: &[String],
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn delete_untracked_files(&self, rels: &[String], window: &mut Window, cx: &mut Context<Self>) {
         let Some(root) = self.workspace_path.clone() else {
             return;
         };
@@ -1099,7 +1091,11 @@ impl GitPanel {
         }
         let message = self.commit_message(cx);
         let message = (!message.trim().is_empty()).then_some(message);
-        self.run_repo_op(cx, async move { repo.stash_push(message.as_deref()) }, "贮藏失败");
+        self.run_repo_op(
+            cx,
+            async move { repo.stash_push(message.as_deref()) },
+            "贮藏失败",
+        );
     }
 
     /// 弹出最近贮藏（有冲突时 git 保留贮藏并报错，用户可重试）。
@@ -1320,14 +1316,12 @@ impl GitPanel {
             let mut menu = menu;
             {
                 let this = this.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("提交").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.do_commit(CommitScope::Smart, cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("提交").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_context_menu(cx);
+                        this.do_commit(CommitScope::Smart, cx);
+                    });
+                }));
             }
             {
                 let this = this.clone();
@@ -1355,14 +1349,12 @@ impl GitPanel {
             menu = menu.separator();
             {
                 let this = this.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("贮藏更改").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.stash_push(cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("贮藏更改").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_context_menu(cx);
+                        this.stash_push(cx);
+                    });
+                }));
             }
             {
                 let this = this.clone();
@@ -1464,26 +1456,22 @@ impl GitPanel {
             {
                 let this = this.clone();
                 let entry = entry.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("打开更改").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.open_diff(&entry, cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("打开更改").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_context_menu(cx);
+                        this.open_diff(&entry, cx);
+                    });
+                }));
             }
             {
                 let this = this.clone();
                 let entry = entry.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("打开文件").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.open_file(&entry, cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("打开文件").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_context_menu(cx);
+                        this.open_file(&entry, cx);
+                    });
+                }));
             }
             menu = menu.separator();
             // 冲突文件：三选一解决（VSCode 合并更改组的右键菜单同款）。
@@ -1495,28 +1483,24 @@ impl GitPanel {
                 ] {
                     let this = this.clone();
                     let entry = entry.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label).on_click(move |_, window, cx| {
-                            this.update(cx, |this, cx| {
-                                this.close_context_menu(cx);
-                                this.resolve_conflict(&entry.path, side, window, cx);
-                            });
-                        }),
-                    );
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.close_context_menu(cx);
+                            this.resolve_conflict(&entry.path, side, window, cx);
+                        });
+                    }));
                 }
                 menu = menu.separator();
             }
             if can_stage {
                 let this = this.clone();
                 let path = entry.path.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("暂存更改").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.stage_file(&path, cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("暂存更改").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_context_menu(cx);
+                        this.stage_file(&path, cx);
+                    });
+                }));
             }
             if can_unstage {
                 let this = this.clone();
@@ -1545,11 +1529,9 @@ impl GitPanel {
             menu = menu.separator();
             {
                 let path = entry.path.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("复制路径").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("复制路径").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(path.clone()));
+                }));
             }
             menu
         });
@@ -1585,9 +1567,7 @@ impl GitPanel {
                         .bg(theme.elevated_background)
                         .px(px(8.0))
                         .py(px(6.0))
-                        .child(
-                            EditorInput::new(&editor),
-                        )
+                        .child(EditorInput::new(&editor))
                         .into_any_element()
                 } else {
                     div()
@@ -1762,18 +1742,13 @@ impl GitPanel {
                                         )
                                     }),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.text_muted)
-                                    .child("修正"),
-                            ),
+                            .child(div().text_sm().text_color(theme.text_muted).child("修正")),
                     )
                     // ahead/behind 徽标（仅任一非零时显示；上游名在 tooltip）。
                     .when_some(
-                        self.branch_status.clone().and_then(|(a, b, up)| {
-                            (a > 0 || b > 0).then_some((a, b, up))
-                        }),
+                        self.branch_status
+                            .clone()
+                            .and_then(|(a, b, up)| (a > 0 || b > 0).then_some((a, b, up))),
                         |this, (ahead, behind, upstream)| {
                             let label = match (ahead > 0, behind > 0) {
                                 (true, true) => format!("↑{ahead} ↓{behind}"),
@@ -1781,7 +1756,9 @@ impl GitPanel {
                                 _ => format!("↓{behind}"),
                             };
                             let tooltip = match upstream {
-                                Some(up) => format!("领先上游 {ahead} 个提交，落后 {behind} 个（{up}）"),
+                                Some(up) => {
+                                    format!("领先上游 {ahead} 个提交，落后 {behind} 个（{up}）")
+                                }
                                 None => format!("领先上游 {ahead} 个提交，落后 {behind} 个"),
                             };
                             this.child(
@@ -1865,7 +1842,10 @@ impl GitPanel {
         // VSCode 组头操作：更改 → 暂存全部(+) + 放弃全部(垃圾桶)；
         // 已暂存的更改 → 全部取消暂存(−)；合并更改 → 无。
         let show_stage_all = section == Section::Changes
-            && self.file_entries.iter().any(|e| e.section == section && e.can_stage());
+            && self
+                .file_entries
+                .iter()
+                .any(|e| e.section == section && e.can_stage());
         let show_discard_all = section == Section::Changes
             && self.file_entries.iter().any(|e| {
                 e.section == section
@@ -1873,7 +1853,10 @@ impl GitPanel {
                     && (e.status.has_unstaged_changes() || e.status.has_staged_changes())
             });
         let show_unstage_all = matches!(section, Section::Staged)
-            && self.file_entries.iter().any(|e| e.section == section && e.can_unstage());
+            && self
+                .file_entries
+                .iter()
+                .any(|e| e.section == section && e.can_unstage());
 
         div()
             .id(format!("git-header-{section:?}"))
@@ -2300,12 +2283,7 @@ impl Render for GitPanel {
                 .text_color(theme.text_subtle)
                 .child(message)
                 .when_some(op_error, |this, err| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.error)
-                            .child(err),
-                    )
+                    this.child(div().text_xs().text_color(theme.error).child(err))
                 })
                 .child(
                     div()
@@ -2522,17 +2500,16 @@ mod tests {
     /// 只断言同步行为（set 返回后立即检查），不依赖后台 find 任务的时序；
     /// find 指向本机关闭端口，会快速失败，不影响断言。
     #[gpui::test]
-    fn git_panel_defers_git_file_watches_until_repo_confirmed(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn git_panel_defers_git_file_watches_until_repo_confirmed(cx: &mut gpui::TestAppContext) {
         // set_workspace_path 内部经 WatcherContext 取全局 watcher，先初始化。
         cx.update(|cx| crate::file_manager::watcher::init(cx));
         let panel = cx.new(GitPanel::new);
         let mut config = SshConnectionConfig::local();
         config.host = "127.0.0.1".to_string();
         config.port = 9;
-        let fs: Arc<dyn FileSystem> =
-            Arc::new(crate::file_manager::filesystem::RemoteFileSystem::new(config.clone()));
+        let fs: Arc<dyn FileSystem> = Arc::new(
+            crate::file_manager::filesystem::RemoteFileSystem::new(config.clone()),
+        );
         panel.update(cx, |p, cx| {
             p.set_workspace_path(
                 std::path::PathBuf::from("/root/sn105_workspace/docs"),
@@ -2606,22 +2583,16 @@ mod tests {
     }
 
     impl Render for WrapProbeHost {
-        fn render(
-            &mut self,
-            _window: &mut Window,
-            _cx: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             use crate::components::input::EditorInput;
-            div()
-                .w(px(300.))
-                .child(
-                    div()
-                        .w_full()
-                        .min_h(px(64.0))
-                        .max_h(px(160.0))
-                        .overflow_hidden()
-                        .child(EditorInput::new(&self.input)),
-                )
+            div().w(px(300.)).child(
+                div()
+                    .w_full()
+                    .min_h(px(64.0))
+                    .max_h(px(160.0))
+                    .overflow_hidden()
+                    .child(EditorInput::new(&self.input)),
+            )
         }
     }
 
@@ -2630,7 +2601,8 @@ mod tests {
         use crate::components::input::InputState;
 
         cx.update(|cx| crate::theme::init(cx));
-        let long = "这是一段很长的提交信息应该在到达盒子右缘时自动折行而不是横向滚出视野 ".repeat(6);
+        let long =
+            "这是一段很长的提交信息应该在到达盒子右缘时自动折行而不是横向滚出视野 ".repeat(6);
         let window = cx.open_window(gpui::size(px(400.), px(200.)), |window, cx| {
             let input = cx.new(|cx| {
                 // 与生产提交框同配置：auto_grow(3, 6)。
@@ -2755,7 +2727,9 @@ mod tests {
         cx.run_until_parked();
         let grown_rows = cx.cx.update(|cx| {
             window
-                .read_with(cx, |host: &WrapProbeHost, cx| host.input.read(cx).mode.rows())
+                .read_with(cx, |host: &WrapProbeHost, cx| {
+                    host.input.read(cx).mode.rows()
+                })
                 .unwrap_or(0)
         });
         assert_eq!(grown_rows, 5, "5 行内容盒子应长到 5 行，实际={grown_rows}");
@@ -2766,7 +2740,9 @@ mod tests {
         cx.run_until_parked();
         let capped_rows = cx.cx.update(|cx| {
             window
-                .read_with(cx, |host: &WrapProbeHost, cx| host.input.read(cx).mode.rows())
+                .read_with(cx, |host: &WrapProbeHost, cx| {
+                    host.input.read(cx).mode.rows()
+                })
                 .unwrap_or(0)
         });
         assert_eq!(capped_rows, 6, "8 行内容应钳制在 6 行，实际={capped_rows}");

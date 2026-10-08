@@ -272,7 +272,10 @@ impl SidebarFileTree {
     /// 接收 GitPanel 推送的状态快照（仓库根 + 相对路径 → 状态）。
     pub fn set_git_status(
         &mut self,
-        snapshot: Option<(String, Arc<HashMap<String, crate::editor::git_status::FileStatus>>)>,
+        snapshot: Option<(
+            String,
+            Arc<HashMap<String, crate::editor::git_status::FileStatus>>,
+        )>,
         cx: &mut Context<Self>,
     ) {
         self.git_status = match snapshot {
@@ -287,11 +290,7 @@ impl SidebarFileTree {
 
     /// 文件名按 git 状态着色：新增=绿、修改/改名=主题蓝、冲突=橙红。
     /// 非 git 仓库内、快照未就绪或文件无变更时返回 None（用默认色）。
-    pub(crate) fn git_name_color(
-        &self,
-        path: &Path,
-        theme: &UiTheme,
-    ) -> Option<gpui::Hsla> {
+    pub(crate) fn git_name_color(&self, path: &Path, theme: &UiTheme) -> Option<gpui::Hsla> {
         let root = self.git_status.repo_root.as_ref()?;
         let rel = path.strip_prefix(root).ok()?;
         let key = rel.to_string_lossy();

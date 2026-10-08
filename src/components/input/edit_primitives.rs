@@ -72,9 +72,7 @@ pub(crate) fn word_range_at(text: &Rope, offset: usize) -> Option<Range<usize>> 
     // 单个非 ASCII 字符：视为噪音，不高亮。
     let mut chars = text.slice(start..end).chars();
     let first = chars.next();
-    if chars.next().is_none()
-        && first.is_some_and(|c| !c.is_ascii())
-    {
+    if chars.next().is_none() && first.is_some_and(|c| !c.is_ascii()) {
         return None;
     }
     Some(start..end)

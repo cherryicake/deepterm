@@ -13,11 +13,11 @@
 
 pub mod actions;
 pub mod input;
-pub mod motion;
 pub mod marks;
+pub mod motion;
 pub mod object;
-pub mod registers;
 pub mod operator;
+pub mod registers;
 pub mod state;
 
 #[cfg(test)]
@@ -64,7 +64,10 @@ impl VimState {
         let operator = self.active_operator_id();
 
         // Normal 与 Visual 下 vim 接管普通按键；Insert 下放行给文本输入。
-        if matches!(self.mode, VimMode::Normal | VimMode::Visual | VimMode::VisualLine) {
+        if matches!(
+            self.mode,
+            VimMode::Normal | VimMode::Visual | VimMode::VisualLine
+        ) {
             context.add("VimControl");
         }
 
@@ -215,7 +218,10 @@ mod tests {
         let context = context_of(&state);
         assert!(context.contains("VimControl"));
         assert_eq!(context.get("vim_mode").map(|v| v.as_ref()), Some("normal"));
-        assert_eq!(context.get("vim_operator").map(|v| v.as_ref()), Some("none"));
+        assert_eq!(
+            context.get("vim_operator").map(|v| v.as_ref()),
+            Some("none")
+        );
     }
 
     #[test]
@@ -242,7 +248,11 @@ mod tests {
                 ..VimState::default()
             };
             let context = context_of(&state);
-            assert_eq!(context.get("vim_mode").map(|v| v.as_ref()), Some("visual"), "{mode:?}");
+            assert_eq!(
+                context.get("vim_mode").map(|v| v.as_ref()),
+                Some("visual"),
+                "{mode:?}"
+            );
             assert!(context.contains("VimControl"), "{mode:?}");
         }
     }
@@ -254,9 +264,14 @@ mod tests {
 
         state.operator_stack.push(Operator::Delete);
         assert_eq!(state.active_operator_id(), "d");
-        assert_eq!(context_of(&state).get("vim_operator").map(|v| v.as_ref()), Some("d"));
+        assert_eq!(
+            context_of(&state).get("vim_operator").map(|v| v.as_ref()),
+            Some("d")
+        );
 
-        state.operator_stack.push(Operator::Object { around: false });
+        state
+            .operator_stack
+            .push(Operator::Object { around: false });
         assert_eq!(state.active_operator_id(), "i", "内层对象前缀优先");
 
         state.operator_stack.push(Operator::Object { around: true });
@@ -277,7 +292,10 @@ mod tests {
         settings.normal_cursor_shape = "hollow".to_string();
         let state = VimState::from_settings(&settings);
         assert_eq!(state.mode, VimMode::Normal);
-        assert_eq!(state.normal_cursor_shape, crate::components::input::CursorShape::Hollow);
+        assert_eq!(
+            state.normal_cursor_shape,
+            crate::components::input::CursorShape::Hollow
+        );
     }
 
     #[test]
@@ -288,6 +306,9 @@ mod tests {
             ..Default::default()
         };
         let state = VimState::from_settings(&settings);
-        assert_eq!(state.normal_cursor_shape, crate::components::input::CursorShape::Block);
+        assert_eq!(
+            state.normal_cursor_shape,
+            crate::components::input::CursorShape::Block
+        );
     }
 }

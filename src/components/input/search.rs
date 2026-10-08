@@ -154,9 +154,7 @@ impl SearchMatcher {
                                 continue;
                             };
                             let range = query_match.range();
-                            if whole
-                                && !Self::literal_word_boundary(&text, &range)
-                            {
+                            if whole && !Self::literal_word_boundary(&text, &range) {
                                 continue;
                             }
                             new_ranges.push(range);
@@ -194,9 +192,12 @@ impl SearchMatcher {
     fn literal_word_boundary(text: &str, range: &Range<usize>) -> bool {
         use super::state::is_word_char;
         let left_ok = range.start == 0
-            || !text[..range.start].chars().next_back().is_some_and(is_word_char);
-        let right_ok = range.end >= text.len()
-            || !text[range.end..].chars().next().is_some_and(is_word_char);
+            || !text[..range.start]
+                .chars()
+                .next_back()
+                .is_some_and(is_word_char);
+        let right_ok =
+            range.end >= text.len() || !text[range.end..].chars().next().is_some_and(is_word_char);
         left_ok && right_ok
     }
 
@@ -690,7 +691,12 @@ impl<T: SearchTarget> SearchPanel<T> {
         cx.notify();
     }
 
-    pub(crate) fn on_action_enter(&mut self, _action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_action_enter(
+        &mut self,
+        _action: &Enter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.jump(1, window, cx);
     }
 
