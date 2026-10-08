@@ -1079,6 +1079,288 @@ fn enabling_vim_installs_state_on_existing_editors(cx: &mut TestAppContext) {
     });
 }
 
+/// 起一个 vim 已启用的环境，再按 `builder` 造一个输入框，返回它。
+///
+/// 造法交给调用方（`new_code_editor` / 普通单行框 / …），这样「同一个环境、
+/// 不同造法」的 A/B 用例能复用同一段初始化。
+fn input_host_with(
+    cx: &mut TestAppContext,
+    builder: impl Fn(&mut Window, &mut gpui::Context<VimHost>) -> Entity<InputState>,
+) -> (Entity<InputState>, &mut VisualTestContext) {
+    cx.update(|cx| {
+        crate::settings::SettingsStore::init_for_test(cx);
+        crate::theme::init(cx);
+        crate::sidebar_view::font_settings::FontState::init(cx);
+        crate::settings::SettingsStore::update_user(cx, |content| {
+            content.vim.enabled = true;
+        });
+        crate::keymap::reload(cx);
+        crate::vim::init(cx);
+        crate::components::input::state::init(cx);
+    });
+
+    let cell = std::cell::RefCell::new(None);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let state = builder(window, cx);
+        state.update(cx, |state, cx| state.focus(window, cx));
+        *cell.borrow_mut() = Some(state.clone());
+        VimHost { state }
+    });
+    (cell.into_inner().unwrap(), cx)
+}
+
+/// 起一个 vim 已启用、但输入框是普通单行框的环境，返回该输入框。
+///
+/// 与 `vim_editor` 的区别只在输入框类型：那条路径建的是代码编辑器。
+fn plain_input_host(
+    cx: &mut TestAppContext,
+) -> (Entity<InputState>, &mut VisualTestContext) {
+    input_host_with(cx, |window, cx| {
+        // 单行普通输入框：与搜索框、表单字段、提交框同一条构造路径。
+        cx.new(|cx| InputState::new(window, cx).placeholder("搜索"))
+    })
+}
+
+/// 代码编辑器必须**当场**装上 vim 状态，不能等设置变化后再补。
+///
+/// 这是漂移的护栏：`settings::observe` 在**任何**设置变化（字号、主题……）时
+/// 都会调 `vim::disable_all`，而它遍历的是全部已注册 `InputState`。于是
+/// 「创建时不装、之后被补上」的用户可见后果是：同一个 diff 编辑器，开出来时
+/// 没 vim，用户改一次字号后 vim 突然出现——diff 视图当初正是这样漏掉了
+/// `sync_vim_state`。
+///
+/// 断言的是 [`InputState::new_code_editor`] 而不是 `DiffView::new_editor`：
+/// 后者要构造整个 `DiffView` 实体，而两个生产调用点（编辑器 tab、diff 视图）
+/// 现在共用同一个构造器，守住它等于同时守住两处。
+#[gpui::test]
+fn code_editors_get_vim_at_creation(cx: &mut TestAppContext) {
+    let (state, cx) = input_host_with(cx, |window, cx| {
+        cx.new(|cx| InputState::new_code_editor("rust", window, cx))
+    });
+
+    state.read_with(cx, |state, _| {
+        assert!(
+            state.vim.is_some(),
+            "开着 vim 开关时，代码编辑器创建的那一刻就必须有 vim 状态"
+        );
+        assert!(state.vim_capable(), "代码编辑器必须是 vim 的适用面");
+    });
+}
+
+/// 关掉开关后新建的代码编辑器不得带 vim 状态。
+///
+/// 与上一条同一构造器的反向判据：只测「开」不测「关」的话，`sync_vim_state`
+/// 里那个 `else` 分支（清掉残留状态）就没有护栏。
+#[gpui::test]
+fn code_editors_skip_vim_when_the_setting_is_off(cx: &mut TestAppContext) {
+    // 先开着开关建环境，再关掉——`SettingsStore` 必须已注册，否则
+    // `enabled()` 与 `initial_state()` 会同时拿不到设置而给出「关」的假象。
+    let (state, cx) = input_host_with(cx, |window, cx| {
+        cx.new(|cx| InputState::new_code_editor("rust", window, cx))
+    });
+    cx.update(|_window, cx| {
+        crate::settings::SettingsStore::update_user(cx, |content| {
+            content.vim.enabled = false;
+        });
+    });
+
+    let cell = std::cell::RefCell::new(None);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let fresh = cx.new(|cx| InputState::new_code_editor("rust", window, cx));
+        *cell.borrow_mut() = Some(fresh.clone());
+        VimHost { state: fresh }
+    });
+    let fresh = cell.into_inner().unwrap();
+
+    fresh.read_with(cx, |state, _| {
+        assert!(
+            state.vim.is_none(),
+            "开关关闭时新建的代码编辑器不得带 vim 状态"
+        );
+    });
+    // 顺带确认「关」是真的生效，而不是设置压根没读到。
+    let setting_off = cx.update(|_window, cx| !crate::vim::enabled(cx));
+    assert!(
+        setting_off,
+        "前置：vim 开关此刻必须是关的，否则这条测的是别的东西"
+    );
+    state.read_with(cx, |state, _| {
+        assert!(state.vim.is_some(), "前置：先前创建的那个仍应有 vim");
+    });
+}
+
+#[gpui::test]
+fn vim_is_not_installed_on_plain_inputs(cx: &mut TestAppContext) {
+    // vim 只属于代码/文本编辑器。普通输入框装上它之后，Normal 模式会吞掉
+    // `h`/`j`/`k`/`l`，搜索框与表单会变成「打不了字」。
+    let (state, cx) = plain_input_host(cx);
+
+    cx.update(|_window, cx| {
+        crate::vim::disable_all(cx);
+    });
+
+    state.read_with(cx, |state, _| {
+        assert!(
+            state.vim.is_none(),
+            "普通单行输入框不得装上 vim 状态"
+        );
+        assert!(!state.vim_capable(), "普通单行输入框不是 vim 的适用面");
+    });
+}
+
+#[gpui::test]
+fn plain_inputs_keep_typing_with_vim_enabled(cx: &mut TestAppContext) {
+    // 回归的**用户可见**判据：开着 vim 在搜索框里打字，字符必须落进去。
+    let (state, cx) = plain_input_host(cx);
+
+    cx.update(|_window, cx| {
+        crate::vim::disable_all(cx);
+    });
+
+    // `hjkl` 是 vim 的移动键，在普通输入框里必须是字符。
+    type_text(cx, "hjkl");
+    assert_eq!(
+        text_of(&state, cx),
+        "hjkl",
+        "普通输入框里 `hjkl` 应作为文本插入，而不是被当作移动命令吞掉"
+    );
+}
+
+#[gpui::test]
+fn vim_applies_to_code_editors_but_not_plain_inputs(cx: &mut TestAppContext) {
+    // 同一环境、同一开关下的 A/B：收紧适用面不能把代码编辑器一起挡掉，
+    // 也不能放过普通输入框。
+    //
+    // `plain` 覆盖三种非代码编辑器模式——搜索框/表单字段（单行 PlainText）、
+    // 多行文本框（多行 PlainText）、git 提交框（AutoGrow）。
+    struct AbHost {
+        code: Entity<InputState>,
+        plain: Entity<InputState>,
+        multiline: Entity<InputState>,
+        commit: Entity<InputState>,
+    }
+    impl Render for AbHost {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(crate::components::input::EditorInput::new(&self.code))
+                .child(crate::components::input::EditorInput::new(&self.plain))
+                .child(crate::components::input::EditorInput::new(&self.multiline))
+                .child(crate::components::input::EditorInput::new(&self.commit))
+        }
+    }
+
+    cx.update(|cx| {
+        crate::settings::SettingsStore::init_for_test(cx);
+        crate::theme::init(cx);
+        crate::sidebar_view::font_settings::FontState::init(cx);
+        crate::settings::SettingsStore::update_user(cx, |content| {
+            content.vim.enabled = true;
+        });
+        crate::keymap::reload(cx);
+        crate::vim::init(cx);
+        crate::components::input::state::init(cx);
+    });
+
+    let cells = std::cell::RefCell::new(None);
+    let (_, cx) = cx.add_window_view(|window, cx| {
+        let code = cx.new(|cx| {
+            InputState::new(window, cx).code_editor("rust").multi_line(true)
+        });
+        let plain = cx.new(|cx| InputState::new(window, cx).placeholder("搜索"));
+        let multiline = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        // git 提交框的真实构造参数（`git_panel::ensure_commit_editor`）。
+        let commit = cx.new(|cx| InputState::new(window, cx).auto_grow(3, 6));
+        *cells.borrow_mut() = Some((
+            code.clone(),
+            plain.clone(),
+            multiline.clone(),
+            commit.clone(),
+        ));
+        AbHost {
+            code,
+            plain,
+            multiline,
+            commit,
+        }
+    });
+    let (code, plain, multiline, commit) = cells.into_inner().unwrap();
+
+    // 走设置变更那条路径（`vim::disable_all` 是唯一入口）。
+    cx.update(|_window, cx| {
+        crate::vim::disable_all(cx);
+    });
+
+    code.read_with(cx, |state, _| {
+        assert!(state.vim.is_some(), "代码编辑器必须装上 vim 状态");
+    });
+    for (state, what) in [
+        (&plain, "单行普通输入框"),
+        (&multiline, "多行普通输入框"),
+        (&commit, "git 提交框（auto_grow）"),
+    ] {
+        state.read_with(cx, |state, _| {
+            assert!(state.vim.is_none(), "{what}不得装上 vim 状态");
+        });
+    }
+
+    // 关掉开关：代码编辑器的状态必须清干净（否则残留 Normal 会继续吞按键）。
+    cx.update(|_window, cx| {
+        crate::settings::SettingsStore::update_user(cx, |content| {
+            content.vim.enabled = false;
+        });
+        crate::vim::disable_all(cx);
+    });
+    code.read_with(cx, |state, _| {
+        assert!(state.vim.is_none(), "关闭 vim 后代码编辑器必须清掉状态");
+    });
+}
+
+/// 编辑器内的查找框是**普通输入框**，渲染上嵌在编辑器 `key_context` 内部。
+///
+/// 用户的可见后果：编辑器处于 Normal 模式时打开查找（Cmd+F），在查找框里
+/// 按 `h`/`j`/`k`/`l` 会命中祖先上下文的 vim 移动键——字符进不了查找框，
+/// 编辑器光标反而在动。
+#[gpui::test]
+fn nested_find_input_keeps_typing_in_normal_mode(cx: &mut TestAppContext) {
+    let (state, cx) = vim_editor(cx, "hello world\n");
+
+    // 打开查找面板：走真实入口 `InputState::on_action_search`。
+    cx.update(|window, cx| {
+        state.update(cx, |state, cx| {
+            state.on_action_search(&crate::components::input::Search, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 查找框应拿到焦点（`SearchPanel::show` 的行为）。
+    let find_input = state.read_with(cx, |state, cx| {
+        state
+            .search_panel
+            .as_ref()
+            .map(|panel| panel.read(cx).search_input_for_test())
+    });
+    let find_input = find_input.expect("打开查找后应有搜索面板");
+
+    // 前置：编辑器处于 Normal 模式——这正是 vim 键位生效的条件。
+    assert_eq!(mode_of(&state, cx), VimMode::Normal, "前置：编辑器应在 Normal");
+
+    // 前置：焦点确实在查找框里，否则这条测的就成了别的东西。
+    let focused = cx.update(|window, cx| {
+        let handle = find_input.read_with(cx, |state, _| state.focus_handle.clone());
+        handle.is_focused(window)
+    });
+    assert!(focused, "前置：打开查找后焦点应在查找框里");
+
+    // 在查找框里打字。`hjkl` 全是 vim 的移动键，但对查找框来说必须是字符。
+    type_text(cx, "hjkl");
+    assert_eq!(
+        find_input.read_with(cx, |state, _| state.value().to_string()),
+        "hjkl",
+        "查找框里 `hjkl` 应作为查询文本输入，而不是被祖先编辑器的 vim 键位吃掉"
+    );
+}
+
 #[gpui::test]
 fn escape_cancels_pending_char(cx: &mut TestAppContext) {
     // `f` 之后按 `Esc`：vim 会放弃这次查找。若不清 pending_char，

@@ -136,6 +136,14 @@ impl RenderOnce for EditorInput {
         key_context.add(super::CONTEXT);
         if let Some(vim) = state.vim.as_ref() {
             vim.extend_key_context(&mut key_context);
+        } else {
+            // 不接受 vim 的输入框：显式标记，让 vim 键位整体退出。
+            //
+            // 只靠「不追加 vim 状态」不够：gpui 的谓词从最深一层往上找，
+            // 嵌套在编辑器里的查找框会命中**祖先**的 `VimControl`。带上
+            // 这个标记后，`vim.json` 里每段谓词的 `!NoVim` 在整条栈上求值，
+            // 于是祖先再深也匹配不上。
+            key_context.add(crate::vim::NO_VIM_CONTEXT);
         }
 
         let actions = div()

@@ -925,6 +925,24 @@ impl InputState {
         self
     }
 
+    /// 构造一个**代码编辑器**输入框（编辑器 tab 与 diff 视图共用）。
+    ///
+    /// 「同一条路径」不只是 [`InputMode`]：vim 状态也在这里装上
+    /// （`crate::vim` 的 `InputState::sync_vim_state`）。两处各写一遍 builder
+    /// 链时已经漂移过一次——diff 视图当初只在设置变化时被
+    /// `vim::disable_all` 补上 vim，于是「新开的 diff 编辑器没有 vim，
+    /// 改一次任意设置（字号、主题…）后 vim 突然出现」。构造函数让漂移在
+    /// 结构上不可能发生：新增代码编辑器请一律走这里。
+    pub fn new_code_editor(
+        language: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut state = Self::new(window, cx).code_editor(language).multi_line(true);
+        state.sync_vim_state(cx);
+        state
+    }
+
     /// Set Input to use [`InputMode::CodeEditor`] mode.
     ///
     /// Default options:
@@ -4935,9 +4953,22 @@ impl InputState {
     pub(crate) fn on_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 只处理「焦点真在自己身上」的击键。
+        //
+        // `on_key_down` 挂在编辑器的 div 上，而 gpui 的事件冒泡从焦点节点
+        // 往上走——焦点在**子输入框**（查找框、替换框）里时，这个监听器
+        // 照样会被调用。若不加这道判断，编辑器在 Normal 模式下会把子输入框
+        // 的字符一并吞掉：查找框里按 `h` 什么都不发生。
+        //
+        // `is_focused` 是精确判定（`window.focus == self`），不含后代，
+        // 正是这里需要的语义。
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+
         self.pause_blink_cursor(cx);
 
         if !self.should_intercept_key(event) {

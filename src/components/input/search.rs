@@ -722,6 +722,15 @@ impl<T: SearchTarget> SearchPanel<T> {
         Some(&self.matcher)
     }
 
+    /// 查找输入框本身。
+    ///
+    /// 供测试断言「在查找框里打字，字符真的落进了这个框」——焦点与键位
+    /// 归属是两件事，只有读它的文本才能证明按键没有被祖先编辑器截走。
+    #[cfg(test)]
+    pub(crate) fn search_input_for_test(&self) -> Entity<InputState> {
+        self.search_input.clone()
+    }
+
     fn replace_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.replaceable(cx) {
             self.replace_mode = false;

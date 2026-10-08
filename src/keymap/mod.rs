@@ -355,6 +355,77 @@ mod tests {
         });
     }
 
+    /// 嵌套的普通输入框不得继承祖先编辑器的 vim 键位。
+    ///
+    /// 编辑器的查找框是**普通输入框**，但渲染上位于编辑器 `key_context`
+    /// 内部（`EditorInput` 把搜索面板作为绝对定位子元素挂进去）。
+    /// gpui 的谓词匹配从最深上下文往上找，于是「编辑器处于 Normal 模式」
+    /// 这个**祖先**上下文会替查找框命中 `vim::Left`：用户在查找框里按 `h`，
+    /// 编辑器光标左移，字符进不去输入框。
+    #[gpui::test]
+    fn vim_bindings_do_not_leak_into_nested_plain_inputs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            reload(cx);
+
+            let resolve = |stack: &[gpui::KeyContext]| -> Option<String> {
+                let keys = vec![gpui::Keystroke::parse("h").unwrap()];
+                let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, stack);
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+
+            let app_window = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("AppWindow");
+                context
+            };
+            // 编辑器（Normal 模式）自己的上下文，与 `EditorInput` 产出的形状一致。
+            let editor = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("Input");
+                context.add("VimControl");
+                context.set("vim_mode", "normal");
+                context.set("vim_operator", "none");
+                context
+            };
+            // 编辑器内的查找框：普通输入框的上下文。
+            //
+            // `NoVim` 是 `EditorInput` 对「不接受 vim 的输入框」注入的标记，
+            // 与生产渲染路径一致（见 `components/input/input.rs`）。
+            let find_input = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("Input");
+                context.add(crate::vim::NO_VIM_CONTEXT);
+                context
+            };
+
+            // 正控制：焦点在编辑器自己身上时，`h` 必须是 vim 的移动。
+            assert_eq!(
+                resolve(&[app_window(), editor()]).as_deref(),
+                Some("vim::Left"),
+                "前置：焦点在编辑器里时 `h` 应命中 vim::Left"
+            );
+
+            // 焦点落进嵌套的查找框。
+            let mut search_panel = gpui::KeyContext::new_with_defaults();
+            search_panel.add("SearchPanel");
+            let nested = [app_window(), editor(), search_panel, find_input()];
+            // 按**前缀**排除而不是只排除 `vim::Left` 这一个动作名：后者在
+            // 某个 `vim::*` 改名或新增时仍会通过，起不到护栏的作用。
+            let resolved = resolve(&nested).unwrap_or_default();
+            assert!(
+                !resolved.starts_with("vim::"),
+                "焦点在嵌套的普通输入框里时，`h` 不得命中祖先编辑器的任何 vim 键位，\
+                 实际命中 {resolved}"
+            );
+        });
+    }
+
     /// 操作符待决时，第二个 `d` 必须仍解析到 `vim::PushDelete`。
     ///
     /// 这是 `dd` 的关键：第一次 `d` 在 `vim_operator == none` 段命中，

@@ -7,12 +7,18 @@
 //   VimControl        —— Normal / Visual 下存在
 //   vim_mode          —— normal | insert | replace | visual
 //   vim_operator      —— none | d | y | c | i | a
+//   NoVim             —— 不接受 vim 的输入框（普通输入框）带此标记
+//
+// 每段都带 `!NoVim`：gpui 的谓词从最深一层往上找，嵌套在编辑器里的查找框
+// 会命中祖先的 `VimControl`。`Not` 会在整条上下文栈上求值，所以只要栈里
+// 任何一层带 `NoVim`，整条 vim 绑定就不再匹配——普通输入框因此彻底退出
+// vim 的管辖，`h`/`j`/`k`/`l` 照常作为字符输入。
 //
 // 未绑定的按键在 Normal 模式下会被 `on_key_down` 吞掉（不插入字符），
 // 与 vim 的「无操作」一致。
 [
   {
-    "context": "Input && VimControl && vim_mode == normal && vim_operator == none",
+    "context": "Input && !NoVim && VimControl && vim_mode == normal && vim_operator == none",
     "bindings": {
       // 模式切换
       "escape": "vim::NormalMode",
@@ -138,7 +144,7 @@
     // 与上面的 normal 段分开，是为了让 `vim_operator` 参与匹配——
     // 这样 `d` 之后的 `w` 走同一条 `vim::NextWordStart`，
     // 而 `i`/`a` 变成对象前缀而非插入命令。
-    "context": "Input && VimControl && vim_mode == normal && vim_operator != none",
+    "context": "Input && !NoVim && VimControl && vim_mode == normal && vim_operator != none",
     "bindings": {
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode",
@@ -181,7 +187,7 @@
   {
     // 对象前缀待决（`di` / `da` / `ci` / `ya` …）：`w` 在这里是对象名
     // 而非移动，所以必须单独一段——否则 `diw` 会被当成 `di` + 移动。
-    "context": "Input && VimControl && vim_mode == normal && (vim_operator == i || vim_operator == a)",
+    "context": "Input && !NoVim && VimControl && vim_mode == normal && (vim_operator == i || vim_operator == a)",
     "bindings": {
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode",
@@ -209,7 +215,7 @@
     // Visual 模式：`v` / `V` 进入，操作符直接作用于选区。
     // 上下文里没有 `vim_operator == none` 限制——可视模式下操作符立即执行，
     // 不像 Normal 那样需要后续的移动或对象。
-    "context": "Input && VimControl && vim_mode == visual",
+    "context": "Input && !NoVim && VimControl && vim_mode == visual",
     "bindings": {
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode",
@@ -256,7 +262,7 @@
   },
   {
     // Insert 模式：只保留 `Esc` 与 `ctrl-[`。其余按键交给文本输入。
-    "context": "Input && vim_mode == insert",
+    "context": "Input && !NoVim && vim_mode == insert",
     "bindings": {
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode"

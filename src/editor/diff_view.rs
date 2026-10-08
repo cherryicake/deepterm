@@ -621,9 +621,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor(language)
-                .multi_line(true);
+            let mut state = InputState::new_code_editor(language, window, cx);
             state.set_value(text, window, cx);
             state.disabled = readonly;
             // No soft wrap in diff views: hunk-anchored scroll sync assumes a

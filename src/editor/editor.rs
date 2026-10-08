@@ -3793,16 +3793,15 @@ impl Editor {
         let language = guess_language_from_extension(&path);
 
         let editor_state = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor(language.clone())
-                .multi_line(true);
+            let mut state = InputState::new_code_editor(language.clone(), window, cx);
             state.set_value(&content, window, cx);
             state.disabled = is_image || is_loading || read_only;
             // 普通文件标签：行首 git 色条可点击展开 hunk
             // （diff 视图自己的编辑器已是展开态，保持默认 false）。
             state.set_git_expandable(true);
-            // vim 状态随 tab 创建：每个 tab 一个 InputState，模式因此天然隔离。
-            state.vim = crate::vim::initial_state(cx);
+            // vim 状态随 tab 创建（`new_code_editor` 内）：每个 tab 一个
+            // InputState，模式因此天然隔离。只有代码编辑器接受 vim，且开关
+            // 关闭时不装——普通输入框永远不该拿到 vim 状态。
             state
         });
 
