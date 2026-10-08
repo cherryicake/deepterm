@@ -393,16 +393,21 @@ mod tests {
     /// 非 WSL 的本地终端不受翻译影响。
     #[test]
     fn plain_local_tree_target_is_unchanged() {
+        // 路径取**本平台**的形状：写死 `C:\...` 的话，unix 上反斜杠不是分隔符，
+        // `file_name()` 取不到末段，label 会退化成整条路径——这条测的就不再是
+        // 「非 WSL 的本地终端不受翻译影响」了。
+        let cwd = if cfg!(windows) {
+            r"C:\Users\you\project"
+        } else {
+            "/Users/you/project"
+        };
         let state = TerminalSessionState::Local {
-            cwd: Some(r"C:\Users\you\project".to_string()),
+            cwd: Some(cwd.to_string()),
             command: Some("powershell.exe".to_string()),
             args: vec![],
         };
         let (path, label) = state.file_tree_target();
-        assert_eq!(
-            path.as_deref(),
-            Some(std::path::Path::new(r"C:\Users\you\project"))
-        );
+        assert_eq!(path.as_deref(), Some(std::path::Path::new(cwd)));
         assert_eq!(label, "project");
     }
 }

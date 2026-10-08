@@ -249,9 +249,20 @@ mod tests {
     #[test]
     fn 构建产物目录被排除() {
         assert!(is_build_artifact(Path::new("/ws/target/debug/deps/lib.rmeta")));
-        assert!(is_build_artifact(Path::new(r"C:\ws\target\.rustc_info.json")));
         assert!(is_build_artifact(Path::new("/ws/.git/index")));
         assert!(is_build_artifact(Path::new("/ws/node_modules/x/i.js")));
+    }
+
+    /// Windows 盘符路径里的 `target` 同样要认出来。
+    ///
+    /// `is_build_artifact` 按 `Path::components()` 逐段比对，而 components 的
+    /// 切分是平台相关的：反斜杠只在 windows 上是分隔符。整条断言因此只能在
+    /// windows 上成立——但**代码**两边都对，所以不能塞进上面的用例里假装
+    /// 跨平台。
+    #[test]
+    #[cfg(windows)]
+    fn windows_盘符路径的构建产物也被排除() {
+        assert!(is_build_artifact(Path::new(r"C:\ws\target\.rustc_info.json")));
     }
 
     #[test]

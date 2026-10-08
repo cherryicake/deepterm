@@ -1288,9 +1288,19 @@ mod tests {
     fn uri_eq_tolerates_windows_drive_letter_case() {
         let lower = Url::parse("file:///c:/dir/f.rs").unwrap();
         let upper = Url::parse("file:///C:/dir/f.rs").unwrap();
+        // 两边都断言，因为「哪个才对」本身就是平台相关的：windows 上盘符
+        // 之外的字母大小写无意义，unix 上路径区分大小写。
+        #[cfg(windows)]
         assert!(
             uri_eq(&lower, &upper),
             "同一文件的盘符大小写差异必须判为相等"
+        );
+        // unix 上判成相等才是 bug：会把「跳转到当前文件」误判成跨文件，
+        // 表现就是每次跳转都新开一个标签、光标留在原地（windows 那条的镜像）。
+        #[cfg(not(windows))]
+        assert!(
+            !uri_eq(&lower, &upper),
+            "unix 路径区分大小写，盘符差异是两个不同路径，不得判为相等"
         );
         assert!(uri_eq(&lower, &lower.clone()));
     }
