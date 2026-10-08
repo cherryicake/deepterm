@@ -205,8 +205,14 @@ impl LspManager {
                     }
                     Err(e) => {
                         // 降级：只记日志。服务器缺失是常态，不能弹窗打断编辑。
+                        //
+                        // `{e:#}` 而不是 `{e}`：后者只打最外层的上下文
+                        // （`failed to spawn language server \`rust-analyzer\``），
+                        // 把真正的原因（`No such file or directory`——即命令不在
+                        // `PATH` 里）藏在 source chain 里，排查时看不出是缺二进制
+                        // 还是别的问题。
                         log::error!(
-                            "lsp: failed to start `{program}` for {}: {e}",
+                            "lsp: failed to start `{program}` for {}: {e:#}",
                             key2.language
                         );
                         None
@@ -218,6 +224,18 @@ impl LspManager {
         }
 
         Some(rx)
+    }
+
+    /// 某语言最终生效的启动命令（无可用服务器时为 `None`）。
+    ///
+    /// 供失败提示「指名道姓」用：只说「rust 服务器启动失败」，用户不知道
+    /// 缺的是哪个二进制、该装什么。给出 `rust-analyzer` 就能直接对照。
+    pub fn configured_command(cx: &App, language: &str) -> Option<String> {
+        let settings: LspContent = cx
+            .try_global::<crate::settings::SettingsStore>()
+            .map(|s| s.content().lsp.clone())
+            .unwrap_or_else(LspContent::default_enabled);
+        server_for_language(language, Some(&settings)).map(|c| c.command)
     }
 
     /// 同步查询已就绪的服务器（无则 `None`）。

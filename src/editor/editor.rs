@@ -4149,9 +4149,19 @@ impl Editor {
                     else {
                         return;
                     };
+                    // 指名具体命令：只说「rust 服务器启动失败」，用户不知道
+                    // 缺的是哪个二进制。**不断言原因**——这条分支同时覆盖
+                    // 「二进制不存在」与「握手失败/服务器立刻退出」，写成
+                    // 「找不到 X」在后者上是错的。精确原因在日志里。
+                    let reason =
+                        match crate::lsp::LspManager::configured_command(cx, &language_for_status)
+                        {
+                            Some(command) => format!("{command} 启动失败"),
+                            None => format!("{language_for_status} 服务器启动失败"),
+                        };
                     this.open_files[idx].editor_state.update(cx, |state, _| {
                         state.set_lsp_status(Some(crate::lsp::status::LspStatus::Failed {
-                            reason: format!("{language_for_status} 服务器启动失败"),
+                            reason,
                         }));
                     });
                     cx.notify();

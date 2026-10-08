@@ -336,22 +336,55 @@ pub struct Connection {
     watched_globs: Arc<Mutex<Vec<String>>>,
 }
 
+/// 构造启动语言服务器的命令（不真正 spawn）。
+///
+/// 抽出来是为了让「子进程拿到了什么环境」可断言：`PATH` 拼错时
+/// `Connection::spawn` 只会返回一个泛泛的 `NotFound`，看不出是缺二进制还是
+/// 环境没给对（见 [`spawn_command_environment`] 的说明）。
+pub fn spawn_command(program: &str, args: &[String]) -> Command {
+    let mut command = Command::new(program);
+    // 语言服务器是**常驻**子进程（不是跑一下就退的那种），所以 windows 上
+    // 若不抑制控制台，用户会看到编辑器旁边长期挂着一个跑 rust-analyzer 的
+    // 黑框。`CREATE_NO_WINDOW` 只影响是否分配可见控制台，管道照常。
+    crate::utils::console::hide_console_window_async(&mut command);
+    spawn_command_environment(&mut command);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command
+}
+
+/// 给语言服务器子进程设上自拼的 `PATH`。
+///
+/// # 为什么必须自己拼
+///
+/// 从 Finder / Dock 启动时，本进程继承的是 launchd 的最小 `PATH`
+/// （`/usr/bin:/bin:/usr/sbin:/sbin`），`~/.cargo/bin` 与 Homebrew 都不在其中。
+/// rustup 装的 `rust-analyzer` 只在 `~/.cargo/bin`，于是按名字
+/// `Command::new("rust-analyzer")` 直接 `NotFound`——现场就是状态栏的
+/// 「LSP 失败: rust 服务器启动失败」，而同一台机器上用户在终端里敲
+/// `rust-analyzer --version` 一切正常。差别只在启动方式。
+///
+/// 这份 `PATH` 也会被服务器自己的子进程继承：rust-analyzer 要调 `cargo`，
+/// 拿不到 `~/.cargo/bin` 的话索引会失败（表现为「有诊断但补全不来」这类
+/// 半残状态，比启动失败更难排查）。
+///
+/// 取不到主目录时保持继承行为：设一个残缺的 `PATH` 比不设更糟。
+fn spawn_command_environment(command: &mut Command) {
+    if let Some(path) = crate::utils::path::local_spawn_path() {
+        command.env("PATH", path);
+    }
+}
+
 impl Connection {
     /// 启动一个语言服务器进程并完成握手。
     ///
     /// `spawn` 失败（命令不存在）会以 `Err` 返回，调用方降级为「无 LSP」，
     /// 不阻塞编辑器。
     pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
-        let mut command = Command::new(program);
-        // 语言服务器是**常驻**子进程（不是跑一下就退的那种），所以 windows 上
-        // 若不抑制控制台，用户会看到编辑器旁边长期挂着一个跑 rust-analyzer 的
-        // 黑框。`CREATE_NO_WINDOW` 只影响是否分配可见控制台，管道照常。
-        crate::utils::console::hide_console_window_async(&mut command);
-        command
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        let mut command = spawn_command(program, args);
 
         let mut child = command
             .spawn()

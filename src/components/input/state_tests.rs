@@ -1287,7 +1287,12 @@ fn apply_completion_rejects_bad_ranges(cx: &mut gpui::TestAppContext) {
             state.replace_text_in_range_silent(None, "abc", window, cx);
             // 越界、反向区间都必须被拒绝，且**不能改动文本**。
             assert!(!state.apply_completion(0..99, "x", cx));
-            assert!(!state.apply_completion(2..1, "x", cx));
+            // 用变量构造反向区间：字面量 `2..1` 会撞上 clippy 的
+            // `reversed_empty_ranges`（deny 级，整个 lib test target 编译不过），
+            // 而 clippy 建议的 `(1..2).rev()` 传不进来——`apply_completion` 收的
+            // 是 `Range<usize>`。`2..1` 正是这里要测的输入，别把它换成合法区间。
+            let (reversed_start, reversed_end) = (2usize, 1usize);
+            assert!(!state.apply_completion(reversed_start..reversed_end, "x", cx));
             assert_eq!(state.value().as_ref(), "abc");
         })
         .unwrap();
