@@ -29,8 +29,19 @@ const STATUS_NUMSTAT_MARKER: &[u8] = b"\0__DEEPTERM_NUMSTAT__\n";
 /// 我们的控制台，Windows 就会新分配一个并显示出来。git 调用点很多
 /// （`rev-parse` 找仓、status 轮询、`merge-file`…），逐个加标志迟早会漏，
 /// 所以统一走这里——新增调用点默认就是对的。
+///
+/// 也统一补上 `PATH`：git 与语言服务器一样是**按名字**启动的，从 Finder /
+/// Dock 启动时本进程只有 launchd 那份最小 `PATH`。`/usr/bin/git` 通常在，
+/// 但用户若只装了 Homebrew 版 git（或 git 只在 `~/.local/bin`），不补就会
+/// 静默 `NotFound`——git 面板表现为「仓库列表空着」，没有任何报错。
+/// 见 [`crate::utils::path`]。
 pub(crate) fn git_command() -> Command {
-    crate::utils::console::hidden_command("git")
+    let mut command = crate::utils::console::hidden_command("git");
+    // 取不到主目录时保持继承行为：设一份残缺的 `PATH` 比不设更糟。
+    if let Some(path) = crate::utils::path::local_spawn_path() {
+        command.env("PATH", path);
+    }
+    command
 }
 
 /// 在字节序列中查找子序列（`[u8]::windows` 对 1 字节 needle 的特化不通用，
@@ -1566,6 +1577,40 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
+
+    /// git 子进程必须带着拼好的 `PATH` 启动，且该 `PATH` 含用户级目录。
+    ///
+    /// git 与语言服务器一样是**按名字**启动的，从 Finder / Dock 启动时本进程
+    /// 只有 launchd 那份最小 `PATH`。`/usr/bin/git` 通常在，所以这不是必现
+    /// bug；但用户只装了 Homebrew 版 git（或 git 只在 `~/.local/bin`）时不补
+    /// 就是静默 `NotFound`——git 面板表现为「仓库列表空着」，没有任何报错，
+    /// 排查成本极高。
+    ///
+    /// 断言的是**真的进了子进程环境**（`get_envs`）：漏掉 `env("PATH", …)`
+    /// 这一步时，`utils::path` 的单测仍会全绿。
+    #[test]
+    #[cfg(unix)]
+    fn git_command_carries_a_path_with_user_bin_dirs() {
+        let command = git_command();
+
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .expect("git 子进程必须显式设置 PATH，否则非系统目录里的 git 找不到")
+            .to_string_lossy()
+            .into_owned();
+        let dirs: Vec<&str> = path.split(':').collect();
+
+        let home = dirs::home_dir().expect("测试环境必须有主目录");
+        for dir in crate::utils::path::USER_BIN_DIRS {
+            let expected = home.join(dir);
+            assert!(
+                dirs.contains(&expected.to_string_lossy().as_ref()),
+                "PATH 缺 ~/{dir}：只装在那里的 git 会静默找不到，仓库列表直接空掉：{path}"
+            );
+        }
+    }
 
     fn temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4()))

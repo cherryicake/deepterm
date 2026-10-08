@@ -2561,31 +2561,30 @@ impl TerminalView {
     ///
     /// # 为什么要自己拼 `PATH`
     ///
-    /// `default_terminal_env` 给出的 `PATH` 是「系统目录 + Homebrew」，
-    /// 不含用户级可执行目录。Codex 的 standalone 安装器把二进制装在
-    /// `~/.local/bin`（`~/.codex/packages/standalone/current/bin/codex` 的
-    /// 软链），那种装法下 `Command::new("codex")` 直接 `NotFound`，安装
-    /// 在写 `hooks.json` 之前就失败。远端同因（见
-    /// [`crate::agent::hooks::USER_BIN_DIRS`]），所以两边共用同一份目录表。
+    /// `Command::new("codex")` 不走 shell。`default_terminal_env` 给出的
+    /// `PATH` 是「系统目录 + Homebrew」，不含用户级可执行目录；Codex 的
+    /// standalone 安装器把二进制装在 `~/.local/bin`（`~/.codex/packages/
+    /// standalone/current/bin/codex` 的软链），那种装法下直接 `NotFound`，
+    /// 安装在写 `hooks.json` 之前就失败。远端同因（见
+    /// [`crate::agent::hooks::codex_enable_hooks_command`]），所以两边共用
+    /// 同一份目录表。
     ///
     /// 找不到 `codex` 时报错而不是静默跳过：跳过会留下「hook 装好了但
     /// 特性没开」的半装状态，用户看到的是状态点永远不亮。
     fn enable_codex_hooks_local(&self, home: &std::path::Path) -> Result<(), String> {
         let mut env = crate::terminal::mappings::default_terminal_env();
-        // 三段都要：用户目录（standalone / cargo / npm 装法）、
-        // `default_terminal_env` 的系统 + Homebrew 表（Finder 启动时本进程
-        // 的 PATH 只有 launchd 那几个目录，Homebrew 的 codex 全靠它），
-        // 以及本进程自己的 PATH（从终端启动时带着用户的真实环境）。
-        let mut base: Vec<std::path::PathBuf> = env
-            .get("PATH")
-            .map(|system| std::env::split_paths(system).collect())
-            .unwrap_or_default();
-        base.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        let path = crate::agent::hooks::path_with_user_bins(home, &base)
-            .ok_or_else(|| "拼装 PATH 失败".to_string())?;
-        env.insert("PATH".to_string(), path);
+        // 与语言服务器、git 走同一条拼装（`local_spawn_path_for`）：用户级
+        // 目录（standalone / cargo / npm 装法）+ 系统与 Homebrew 表
+        // （Finder 启动时本进程的 PATH 只有 launchd 那几个目录，Homebrew 的
+        // codex 全靠它）。本进程自己的 PATH 已在 `system_search_path()` 的
+        // 第一段里，不重复拼。
+        env.insert(
+            "PATH".to_string(),
+            crate::utils::path::local_spawn_path_for(
+                home,
+                crate::utils::path::system_search_path(),
+            ),
+        );
 
         let output = crate::utils::console::hidden_command("codex")
             .args(["features", "enable", "hooks"])
