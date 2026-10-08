@@ -6,6 +6,7 @@
 
 pub mod console;
 pub mod fs_atomic;
+pub mod path;
 pub mod safe_open;
 pub mod shell;
 

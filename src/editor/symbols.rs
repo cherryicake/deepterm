@@ -131,7 +131,11 @@ impl gpui::Render for SymbolsPanel {
                 )
                 .child(
                     div()
-                        .text_color(if is_selected { theme.text } else { theme.text_muted })
+                        .text_color(if is_selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
                         .child(symbol.name.clone()),
                 )
                 .when(is_selected, |this| this.bg(theme.accent.opacity(0.18)))

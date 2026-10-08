@@ -1,5 +1,5 @@
-use crate::components::callbacks::{OptionalBoxedClickCallback, OptionalBoxedHoverCallback};
 use crate::components::button::Disableable;
+use crate::components::callbacks::{OptionalBoxedClickCallback, OptionalBoxedHoverCallback};
 use crate::theme::ActiveTheme;
 use gpui::{
     AnyElement, App, ClickEvent, ElementId, InteractiveElement, IntoElement, MouseButton,

@@ -27,9 +27,9 @@ pub fn format_extension(format: gpui::ImageFormat) -> &'static str {
 
 /// True when `path` names a locally loadable image (render allowlist).
 pub fn is_image_file(path: &Path) -> bool {
-    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
-        IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str())
-    })
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
 }
 
 /// Typora-style assets dir for a document: `<doc_dir>/<stem>.assets`.

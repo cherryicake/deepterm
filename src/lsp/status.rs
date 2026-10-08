@@ -120,14 +120,11 @@ impl ProgressTracker {
             WorkDoneProgress::Report(report) => {
                 // 服务器可能只发 report 不发 begin（少见但合法）：此时按
                 // 空标题建一个，总比丢掉进度好。
-                let entry = self
-                    .active
-                    .entry(key)
-                    .or_insert_with(|| ActiveProgress {
-                        title: String::new(),
-                        message: None,
-                        percentage: None,
-                    });
+                let entry = self.active.entry(key).or_insert_with(|| ActiveProgress {
+                    title: String::new(),
+                    message: None,
+                    percentage: None,
+                });
                 // `message` 缺省表示「沿用上一次」，不能覆盖成 None。
                 if report.message.is_some() {
                     entry.message = report.message.clone();
@@ -336,15 +333,19 @@ mod tests {
             .label(),
             "3 个警告"
         );
-        assert!(!LspStatus::Ready {
-            errors: 0,
-            warnings: 0
-        }
-        .is_busy());
-        assert!(LspStatus::Failed {
-            reason: "not found".into()
-        }
-        .label()
-        .contains("not found"));
+        assert!(
+            !LspStatus::Ready {
+                errors: 0,
+                warnings: 0
+            }
+            .is_busy()
+        );
+        assert!(
+            LspStatus::Failed {
+                reason: "not found".into()
+            }
+            .label()
+            .contains("not found")
+        );
     }
 }

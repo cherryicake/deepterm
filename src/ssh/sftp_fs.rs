@@ -14,8 +14,8 @@ use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::ssh::TRANSFER_CANCELLED_MSG;
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
+use crate::ssh::TRANSFER_CANCELLED_MSG;
 use crate::ssh::auth::try_agent_auth;
 use crate::ssh::config::SshConnectionConfig;
 use crate::ssh::keychain::{
@@ -626,9 +626,7 @@ impl BlockingSftpSession {
             if self.rename(&tmp, path).is_ok() {
                 return Ok(());
             }
-            anyhow::bail!(
-                "写入 {path} 失败: {first_err}；新内容已保留在临时文件 {tmp}"
-            );
+            anyhow::bail!("写入 {path} 失败: {first_err}；新内容已保留在临时文件 {tmp}");
         }
 
         // 目标已存在（覆盖保存）。先把原文件复制为同目录备份，再删目标、重命名；
@@ -652,9 +650,7 @@ impl BlockingSftpSession {
         let remove_result = self.remove_file(path);
         if let Err(e) = remove_result {
             let _ = self.remove_file(&bak);
-            anyhow::bail!(
-                "写入 {path} 失败: {first_err}；删除旧文件失败: {e}；新内容保留在 {tmp}"
-            );
+            anyhow::bail!("写入 {path} 失败: {first_err}；删除旧文件失败: {e}；新内容保留在 {tmp}");
         }
         match self.rename(&tmp, path) {
             Ok(()) => {
@@ -1190,9 +1186,7 @@ pub fn with_cached_session<T>(
             // 返回的业务错误等），直接返回，避免非幂等操作（rm/scp/覆盖写）
             // 被执行两次，也避免取消传输触发一次无意义的重连。
             if session.lock().ping().is_ok() {
-                log::debug!(
-                    "with_cached_session: 会话存活，按应用错误返回（不重试）: {err:#}"
-                );
+                log::debug!("with_cached_session: 会话存活，按应用错误返回（不重试）: {err:#}");
                 checkin_session(&key, session);
                 return Err(err);
             }

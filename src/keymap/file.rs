@@ -100,7 +100,9 @@ pub fn split_action(action: &Value) -> Result<(String, Option<Value>), String> {
                 .to_string();
             Ok((name, items.get(1).cloned()))
         }
-        other => Err(format!("action 必须是字符串或 [名称, 参数]，实际是 {other}")),
+        other => Err(format!(
+            "action 必须是字符串或 [名称, 参数]，实际是 {other}"
+        )),
     }
 }
 

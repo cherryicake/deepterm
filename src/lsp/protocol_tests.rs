@@ -178,12 +178,11 @@ while True:
         conn.shutdown_gracefully().await;
 
         // 进程必须退出：`kill(pid, 0)` 失败即不存在。
-        let gone = wait_for(
-            || !process_alive(pid),
-            Duration::from_secs(5),
-        )
-        .await;
-        assert!(gone, "language server child (pid {pid}) still alive after shutdown");
+        let gone = wait_for(|| !process_alive(pid), Duration::from_secs(5)).await;
+        assert!(
+            gone,
+            "language server child (pid {pid}) still alive after shutdown"
+        );
     });
 }
 
@@ -224,7 +223,10 @@ while True:
         );
         // 卡死的服务器会被强杀，不留孤儿。
         let gone = wait_for(|| !process_alive(pid), Duration::from_secs(5)).await;
-        assert!(gone, "unresponsive server must be killed, pid {pid} still alive");
+        assert!(
+            gone,
+            "unresponsive server must be killed, pid {pid} still alive"
+        );
     });
 }
 
@@ -264,14 +266,13 @@ while True:
         // 用一个很短的超时驱动真实代码路径（生产值是 30s，测试不宜等）。
         let started = std::time::Instant::now();
         let result = conn
-            .request_with_timeout(
-                "textDocument/hover",
-                None,
-                Duration::from_millis(400),
-            )
+            .request_with_timeout("textDocument/hover", None, Duration::from_millis(400))
             .await;
 
-        assert!(result.is_err(), "unanswered request must fail, got {result:?}");
+        assert!(
+            result.is_err(),
+            "unanswered request must fail, got {result:?}"
+        );
         let elapsed = started.elapsed();
         assert!(
             elapsed < Duration::from_secs(5),
@@ -348,9 +349,11 @@ time.sleep(1)
 
     smol::block_on(async {
         let conn = start_stub(&script, &dir).await;
+        // 订阅必须在服务器开始发通知**之前**：通知走广播，只投给订阅那一刻
+        // 已在册的订阅者，晚订阅的收不到之前发的（见 `Connection::subscribe`）。
+        let rx = conn.subscribe();
         let _ = conn.request("initialize", None).await;
 
-        let rx = conn.notifications.clone();
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while seen.len() < 5 && std::time::Instant::now() < deadline {
@@ -360,7 +363,11 @@ time.sleep(1)
                 }
             }
         }
-        assert_eq!(seen, vec![0, 1, 2, 3, 4], "notifications must arrive in order");
+        assert_eq!(
+            seen,
+            vec![0, 1, 2, 3, 4],
+            "notifications must arrive in order"
+        );
     });
 }
 
@@ -466,13 +473,15 @@ while True:
                     .iter()
                     .filter_map(|f| f.get("method").and_then(|m| m.as_str()).map(String::from))
                     .collect();
-                methods.contains(&"shutdown".to_string())
-                    && methods.contains(&"exit".to_string())
+                methods.contains(&"shutdown".to_string()) && methods.contains(&"exit".to_string())
             },
             Duration::from_secs(10),
         )
         .await;
-        assert!(saw, "LspClient::shutdown must emit shutdown + exit handshake");
+        assert!(
+            saw,
+            "LspClient::shutdown must emit shutdown + exit handshake"
+        );
     });
 }
 
@@ -513,4 +522,87 @@ while True:
         let gone = wait_for(|| !process_alive(pid), Duration::from_secs(10)).await;
         assert!(gone, "server pid {pid} still alive after client shutdown");
     });
+}
+
+// ---------------------------------------------------------------- 启动环境
+
+/// 语言服务器子进程必须带着自拼的 `PATH` 启动，且该 `PATH` 含用户级目录。
+///
+/// 这是「LSP 失败: rust 服务器启动失败」那条 bug 的护栏。从 Finder / Dock
+/// 启动时本进程继承的是 launchd 的最小 `PATH`
+/// （`/usr/bin:/bin:/usr/sbin:/sbin`），`~/.cargo/bin` 不在其中；而 rustup 装的
+/// `rust-analyzer` 只在那里。若启动时不自己拼 `PATH`，按名字
+/// `Command::new("rust-analyzer")` 直接 `NotFound`——用户在终端里敲同一命令
+/// 却一切正常，差别只在启动方式。
+///
+/// 断言的是**真的进了子进程环境**（`get_envs`），而不是「我们算过一个字符串」：
+/// 漏掉 `command.env(...)` 这一步时，`utils::path` 的单测仍会全绿。
+#[test]
+#[cfg(unix)]
+fn spawn_command_carries_a_path_with_user_bin_dirs() {
+    let command = crate::lsp::jsonrpc::spawn_command("rust-analyzer", &[]);
+
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value)
+        .expect("语言服务器子进程必须显式设置 PATH，否则 Finder 启动时找不到它")
+        .to_string_lossy()
+        .into_owned();
+    let dirs: Vec<&str> = path.split(':').collect();
+
+    let home = dirs::home_dir().expect("测试环境必须有主目录");
+    for dir in crate::utils::path::USER_BIN_DIRS {
+        let expected = home.join(dir);
+        assert!(
+            dirs.contains(&expected.to_string_lossy().as_ref()),
+            "PATH 缺 ~/{dir}：rustup / standalone 装的语言服务器只在这里，\
+             找不到就是「LSP 失败: 服务器启动失败」：{path}"
+        );
+    }
+    // 系统目录只在 macOS 上断言：`system_search_path` 读 `/etc/paths`，
+    // `/usr/bin` 是白纸黑字写在那里的；其它平台没有这层兜底，继承来的
+    // `PATH` 里有什么就是什么，拿它当断言等于依赖 CI runner 的环境。
+    #[cfg(target_os = "macos")]
+    assert!(dirs.contains(&"/usr/bin"), "系统目录不能丢：{path}");
+}
+
+/// 用户级目录里按**名字**启动的语言服务器必须真的能跑起来并完成握手。
+///
+/// 与上一条的分工：那条验证「`PATH` 进了子进程环境」，这条验证「这样拼出来的
+/// `PATH` 真的能解析到可执行文件」——`Command::env` 生效与查找成功是两件事，
+/// 中间还隔着 `PATH` 内容本身对不对。
+#[test]
+#[cfg(unix)]
+fn command_with_composed_path_resolves_a_bare_name() {
+    let dir = scratch_dir("spawn-path");
+    let home = dir.join("home");
+    let bin = home.join(".cargo/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let marker = dir.join("invoked.txt");
+
+    let fake = bin.join("fake-language-server");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nprintf 'ran' > {}\n",
+            crate::utils::shell::shell_quote_single(&marker.to_string_lossy())
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // 与 `local_spawn_path` 同一套拼装，只把 home 换成临时目录。
+    let path = crate::utils::path::local_spawn_path_for(&home, "/usr/bin:/bin");
+    let output = std::process::Command::new("fake-language-server")
+        .env("PATH", &path)
+        .output()
+        .expect("必须能在自拼的 PATH 里按裸名字找到可执行文件");
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "ran");
+    let _ = std::fs::remove_dir_all(&dir);
 }

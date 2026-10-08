@@ -29,8 +29,19 @@ const STATUS_NUMSTAT_MARKER: &[u8] = b"\0__DEEPTERM_NUMSTAT__\n";
 /// 我们的控制台，Windows 就会新分配一个并显示出来。git 调用点很多
 /// （`rev-parse` 找仓、status 轮询、`merge-file`…），逐个加标志迟早会漏，
 /// 所以统一走这里——新增调用点默认就是对的。
+///
+/// 也统一补上 `PATH`：git 与语言服务器一样是**按名字**启动的，从 Finder /
+/// Dock 启动时本进程只有 launchd 那份最小 `PATH`。`/usr/bin/git` 通常在，
+/// 但用户若只装了 Homebrew 版 git（或 git 只在 `~/.local/bin`），不补就会
+/// 静默 `NotFound`——git 面板表现为「仓库列表空着」，没有任何报错。
+/// 见 [`crate::utils::path`]。
 pub(crate) fn git_command() -> Command {
-    crate::utils::console::hidden_command("git")
+    let mut command = crate::utils::console::hidden_command("git");
+    // 取不到主目录时保持继承行为：设一份残缺的 `PATH` 比不设更糟。
+    if let Some(path) = crate::utils::path::local_spawn_path() {
+        command.env("PATH", path);
+    }
+    command
 }
 
 /// 在字节序列中查找子序列（`[u8]::windows` 对 1 字节 needle 的特化不通用，
@@ -76,7 +87,10 @@ fn find_cache() -> &'static Mutex<FindCache> {
 const FIND_CACHE_CAP: usize = 128;
 
 fn remote_repo_cache_key(config: &SshConnectionConfig, from: &str) -> String {
-    format!("{}:{}:{}@{}", config.username, config.host, config.port, from)
+    format!(
+        "{}:{}:{}@{}",
+        config.username, config.host, config.port, from
+    )
 }
 
 /// 使远端 find 缓存失效（初始化仓库后调用，保证 find 重新探测）。
@@ -85,9 +99,7 @@ pub fn invalidate_find_cache(ssh_config: Option<&SshConnectionConfig>) {
         return;
     };
     let prefix = format!("{}:{}:{}@", config.username, config.host, config.port);
-    find_cache()
-        .lock()
-        .retain(|k, _| !k.starts_with(&prefix));
+    find_cache().lock().retain(|k, _| !k.starts_with(&prefix));
 }
 
 /// 远程 diff 内容缓存条目。
@@ -461,10 +473,7 @@ impl GitRepository {
         })
         .map_err(|e| format!("Failed to run remote git: {e}"))?;
         if !raw.success() {
-            return Err(format!(
-                "git status failed: {}",
-                raw.stderr.trim()
-            ));
+            return Err(format!("git status failed: {}", raw.stderr.trim()));
         }
         let bytes = raw.stdout;
         let Some(pos) = find_subslice(&bytes, STATUS_NUMSTAT_MARKER) else {
@@ -472,8 +481,11 @@ impl GitRepository {
         };
         let status_text = decode_bytes_to_string(&bytes[..pos]);
         let numstat_text = decode_bytes_to_string(&bytes[pos + STATUS_NUMSTAT_MARKER.len()..]);
-        let entries: Vec<StatusEntry> =
-            GitStatus::parse(&status_text).entries.iter().cloned().collect();
+        let entries: Vec<StatusEntry> = GitStatus::parse(&status_text)
+            .entries
+            .iter()
+            .cloned()
+            .collect();
         let numstat = parse_numstat(&numstat_text);
         status_cache()
             .lock()
@@ -964,9 +976,7 @@ impl GitRepository {
     /// 上次提交的完整信息（amend 预填：用户只想改个错字时不该被迫重写全文）。
     /// 无 HEAD 时返回 None。
     pub fn last_commit_message(&self) -> Option<String> {
-        let raw = self
-            .run_git(&["log", "-1", "--pretty=%B"])
-            .ok()?;
+        let raw = self.run_git(&["log", "-1", "--pretty=%B"]).ok()?;
         let text = raw.trim_end_matches('\n').to_string();
         (!text.trim().is_empty()).then_some(text)
     }
@@ -988,12 +998,7 @@ impl GitRepository {
         };
 
         let counts = self
-            .run_git(&[
-                "rev-list",
-                "--left-right",
-                "--count",
-                "HEAD...@{upstream}",
-            ])
+            .run_git(&["rev-list", "--left-right", "--count", "HEAD...@{upstream}"])
             .map_err(|e| format!("Failed to get ahead/behind: {e}"))?;
         let mut parts = counts.split_whitespace();
         let ahead = parts
@@ -1048,9 +1053,7 @@ impl GitRepository {
         if side == ConflictSide::Both {
             return match &self.backend {
                 GitBackend::Local => self.resolve_conflict_union_local(path),
-                GitBackend::Remote { config } => {
-                    self.resolve_conflict_union_remote(config, path)
-                }
+                GitBackend::Remote { config } => self.resolve_conflict_union_remote(config, path),
             };
         }
         let side_flag = match side {
@@ -1073,7 +1076,11 @@ impl GitRepository {
         let theirs = execute_local_git_bytes(&["show", &format!(":3:{path}")], &self.root)
             .map_err(|e| format!("无法合并两侧：{e}（可能是删除/修改冲突）"))?;
 
-        let tag = format!("deepterm-conflict-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let tag = format!(
+            "deepterm-conflict-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         let dir = std::env::temp_dir();
         let t_base = dir.join(format!("{tag}-base"));
         let t_ours = dir.join(format!("{tag}-ours"));
@@ -1116,7 +1123,11 @@ impl GitRepository {
         config: &SshConnectionConfig,
         path: &str,
     ) -> Result<(), String> {
-        let tag = format!("deepterm-conflict-{}-{}", std::process::id(), uuid::Uuid::new_v4());
+        let tag = format!(
+            "deepterm-conflict-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        );
         let t_base = format!("/tmp/{tag}-base");
         let t_ours = format!("/tmp/{tag}-ours");
         let t_theirs = format!("/tmp/{tag}-theirs");
@@ -1164,10 +1175,7 @@ impl GitRepository {
                 if result.success() {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "初始化仓库失败：{}",
-                        result.stderr.trim()
-                    ))
+                    Err(format!("初始化仓库失败：{}", result.stderr.trim()))
                 }
             }
         }
@@ -1204,7 +1212,10 @@ impl GitRepository {
     /// 返回 `(text, unsupported)`。
     fn staged_content(&self, path: &str) -> (String, bool) {
         let staged_ref = format!(":{path}");
-        let Ok(bytes) = self.backend.execute_bytes(&["show", &staged_ref], &self.root) else {
+        let Ok(bytes) = self
+            .backend
+            .execute_bytes(&["show", &staged_ref], &self.root)
+        else {
             return (String::new(), false);
         };
         if bytes.is_empty() {
@@ -1243,9 +1254,7 @@ impl GitRepository {
                 let (worktree, worktree_unsupported) =
                     worktree_string(self.read_file_content(path)?, path);
                 Ok(DiffBaseContents {
-                    has_staged: status
-                        .map(|s| s.has_staged_changes())
-                        .unwrap_or(false),
+                    has_staged: status.map(|s| s.has_staged_changes()).unwrap_or(false),
                     is_new: status.map(|s| s.is_untracked()).unwrap_or(false),
                     is_binary: staged_unsupported || worktree_unsupported,
                     head,
@@ -1330,8 +1339,7 @@ impl GitRepository {
                 }
 
                 // (head, worktree) 命中：只补拉暂存区与单路径状态。
-                let pair_hit =
-                    remote_diff_cache_get_pair(&cache_key, &head_commit, size, mtime);
+                let pair_hit = remote_diff_cache_get_pair(&cache_key, &head_commit, size, mtime);
 
                 let head_ref = format!("HEAD:{path}");
                 // 第二批并行：暂存区 + 状态始终要拉；(head, worktree) 未命中
@@ -1363,14 +1371,15 @@ impl GitRepository {
                                 worktree_string(content, path)
                             });
                             let old = h_old.join().unwrap_or_default();
-                            let (new, unsupported) =
-                                h_new.join().unwrap_or((String::new(), false));
+                            let (new, unsupported) = h_new.join().unwrap_or((String::new(), false));
                             (old, new, unsupported)
                         });
                         let (staged_text, staged_unsupported) =
                             h_staged.join().unwrap_or((String::new(), false));
                         let (head, worktree, worktree_unsupported) =
-                            h_pair.join().unwrap_or((String::new(), String::new(), false));
+                            h_pair
+                                .join()
+                                .unwrap_or((String::new(), String::new(), false));
                         (
                             staged_text,
                             staged_unsupported,
@@ -1385,9 +1394,7 @@ impl GitRepository {
                     unsupported: staged_unsupported,
                     status,
                 };
-                let has_staged = status
-                    .map(|s| s.has_staged_changes())
-                    .unwrap_or(false);
+                let has_staged = status.map(|s| s.has_staged_changes()).unwrap_or(false);
                 let is_new = status.map(|s| s.is_untracked()).unwrap_or(false);
                 let staged_text = staged_side.text.clone();
                 let staged_unsupported = staged_side.unsupported;
@@ -1478,20 +1485,17 @@ impl GitRepository {
                 });
                 // 失败也尽力清理临时文件。
                 if result.is_err() {
-                    let _ = sftp_fs::with_cached_session(config, |session| {
-                        session.remove_file(&tmp)
-                    });
+                    let _ =
+                        sftp_fs::with_cached_session(config, |session| session.remove_file(&tmp));
                 }
-                result
-                    .map_err(|e| format!("暂存失败：{e}"))
-                    .and_then(|r| {
-                        if r.success() {
-                            self.invalidate_status_cache();
-                            Ok(())
-                        } else {
-                            Err(format!("暂存该块失败：{}", r.stderr.trim()))
-                        }
-                    })
+                result.map_err(|e| format!("暂存失败：{e}")).and_then(|r| {
+                    if r.success() {
+                        self.invalidate_status_cache();
+                        Ok(())
+                    } else {
+                        Err(format!("暂存该块失败：{}", r.stderr.trim()))
+                    }
+                })
             }
         }
     }
@@ -1567,6 +1571,40 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
 
+    /// git 子进程必须带着拼好的 `PATH` 启动，且该 `PATH` 含用户级目录。
+    ///
+    /// git 与语言服务器一样是**按名字**启动的，从 Finder / Dock 启动时本进程
+    /// 只有 launchd 那份最小 `PATH`。`/usr/bin/git` 通常在，所以这不是必现
+    /// bug；但用户只装了 Homebrew 版 git（或 git 只在 `~/.local/bin`）时不补
+    /// 就是静默 `NotFound`——git 面板表现为「仓库列表空着」，没有任何报错，
+    /// 排查成本极高。
+    ///
+    /// 断言的是**真的进了子进程环境**（`get_envs`）：漏掉 `env("PATH", …)`
+    /// 这一步时，`utils::path` 的单测仍会全绿。
+    #[test]
+    #[cfg(unix)]
+    fn git_command_carries_a_path_with_user_bin_dirs() {
+        let command = git_command();
+
+        let path = command
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value)
+            .expect("git 子进程必须显式设置 PATH，否则非系统目录里的 git 找不到")
+            .to_string_lossy()
+            .into_owned();
+        let dirs: Vec<&str> = path.split(':').collect();
+
+        let home = dirs::home_dir().expect("测试环境必须有主目录");
+        for dir in crate::utils::path::USER_BIN_DIRS {
+            let expected = home.join(dir);
+            assert!(
+                dirs.contains(&expected.to_string_lossy().as_ref()),
+                "PATH 缺 ~/{dir}：只装在那里的 git 会静默找不到，仓库列表直接空掉：{path}"
+            );
+        }
+    }
+
     fn temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4()))
     }
@@ -1622,7 +1660,10 @@ mod tests {
             sftp_fs::join_remote_path("/home/user/project", "/src/main.rs"),
             "/home/user/project/src/main.rs"
         );
-        assert_eq!(sftp_fs::join_remote_path("/", "src/main.rs"), "/src/main.rs");
+        assert_eq!(
+            sftp_fs::join_remote_path("/", "src/main.rs"),
+            "/src/main.rs"
+        );
     }
 
     #[test]
@@ -1825,13 +1866,19 @@ mod tests {
 
         // 暂存区只有第一块，工作区两块都在。
         let staged = repo.staged_text("a.txt");
-        assert!(staged.contains("ONE\n"), "staged should contain first hunk: {staged:?}");
+        assert!(
+            staged.contains("ONE\n"),
+            "staged should contain first hunk: {staged:?}"
+        );
         assert!(
             staged.contains("five\nsix\n"),
             "staged should keep old tail: {staged:?}"
         );
         let status = repo.status().unwrap();
-        let entry = status.iter().find(|e| e.path == "a.txt").expect("a.txt in status");
+        let entry = status
+            .iter()
+            .find(|e| e.path == "a.txt")
+            .expect("a.txt in status");
         // 部分暂存：既有已暂存也有未暂存。
         assert!(entry.status.has_staged_changes());
         assert!(entry.status.has_unstaged_changes());
@@ -1872,7 +1919,10 @@ mod tests {
         let staged = repo.staged_text("new.txt");
         assert_eq!(staged, "alpha\nBETA\ngamma\n");
         let status = repo.status().unwrap();
-        let entry = status.iter().find(|e| e.path == "new.txt").expect("in status");
+        let entry = status
+            .iter()
+            .find(|e| e.path == "new.txt")
+            .expect("in status");
         assert!(entry.status.has_staged_changes());
         assert!(!entry.status.has_unstaged_changes());
 
@@ -1944,9 +1994,7 @@ mod tests {
         repo.stage_all().unwrap();
         let status = repo.status().unwrap();
         assert!(
-            status
-                .iter()
-                .all(|e| e.status.has_staged_changes()),
+            status.iter().all(|e| e.status.has_staged_changes()),
             "stage_all 后所有条目都应有已暂存改动"
         );
 
@@ -2050,10 +2098,7 @@ mod tests {
         assert_eq!(base.worktree_base(), "ONE\ntwo\nthree\nfour\nfive\n");
 
         // 以基线计算的补丁应用到 index（暂存区）必须成功，且只并入 FIVE。
-        let hunks = crate::editor::diff_model::compute_hunks(
-            base.worktree_base(),
-            &base.worktree,
-        );
+        let hunks = crate::editor::diff_model::compute_hunks(base.worktree_base(), &base.worktree);
         assert_eq!(hunks.len(), 1);
         let patch = crate::editor::diff_model::build_hunk_patch(
             "a.txt",
@@ -2231,7 +2276,12 @@ mod tests {
 
         // 上游领先 1：另一份 clone 推进后 fetch 回来。
         let _ = Command::new("git")
-            .args(["clone", "--quiet", upstream.to_str().unwrap(), up_clone.to_str().unwrap()])
+            .args([
+                "clone",
+                "--quiet",
+                upstream.to_str().unwrap(),
+                up_clone.to_str().unwrap(),
+            ])
             .output();
         std::fs::write(up_clone.join("up.txt"), "up\n").unwrap();
         let _ = Command::new("git")

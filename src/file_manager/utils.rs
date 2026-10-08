@@ -368,17 +368,22 @@ pub fn resolve_remote_conflict(
         ConflictPolicy::Ask => {
             let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
             let file_name = remote_file_name(desired_path).unwrap_or_else(|_| "file".to_string());
-            let resolution = prompt_conflict(file_name, desired_path.to_string(), resolver, cancelled)?;
+            let resolution =
+                prompt_conflict(file_name, desired_path.to_string(), resolver, cancelled)?;
             match resolution {
                 ConflictResolution::Skip => Ok(None),
                 ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
-                ConflictResolution::AutoRename => {
-                    Ok(first_available_remote_rename(session, desired_path, cancelled)?)
-                }
+                ConflictResolution::AutoRename => Ok(first_available_remote_rename(
+                    session,
+                    desired_path,
+                    cancelled,
+                )?),
                 ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
             }
         }
-        ConflictPolicy::AutoRename => first_available_remote_rename(session, desired_path, cancelled),
+        ConflictPolicy::AutoRename => {
+            first_available_remote_rename(session, desired_path, cancelled)
+        }
     }
 }
 
@@ -438,8 +443,11 @@ pub trait DirTransferDriver {
     fn read_entries(&mut self, remote_dir: &str) -> anyhow::Result<Vec<sftp_fs::RemoteFileEntry>>;
 
     /// 源目录 entry 名 → 目标目录下的完整路径。
-    fn child_destination(&self, destination_dir: &Self::Destination, name: &str)
-        -> Self::Destination;
+    fn child_destination(
+        &self,
+        destination_dir: &Self::Destination,
+        name: &str,
+    ) -> Self::Destination;
 
     /// 冲突解决：`None` 表示跳过。
     fn resolve_conflict(
@@ -493,14 +501,24 @@ pub fn walk_remote_dir<D>(
         let destination_path = driver.child_destination(destination_dir, &entry.name);
 
         if entry.kind == RemoteFileKind::File {
-            match driver.resolve_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
-                Some(path) => summary.merge(
-                    driver.transfer_file(&entry.path, &path, cancelled, progress)?,
-                ),
+            match driver.resolve_conflict(
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
+                Some(path) => {
+                    summary.merge(driver.transfer_file(&entry.path, &path, cancelled, progress)?)
+                }
                 None => summary.merge(TransferSummary::one_skipped()),
             }
         } else if entry.kind == RemoteFileKind::Directory {
-            match driver.resolve_conflict(&destination_path, conflict_policy, resolver, cancelled)? {
+            match driver.resolve_conflict(
+                &destination_path,
+                conflict_policy,
+                resolver,
+                cancelled,
+            )? {
                 Some(path) => {
                     // prepare_destination_dir 在递归的 walk_remote_dir 里执行，
                     // 这里无需再建目录。
@@ -609,7 +627,10 @@ mod tests {
         assert_eq!(renamed_file_name("file.txt", 3), "file_副本2.txt");
         assert_eq!(renamed_file_name("plain", 1), "plain_副本");
         // 多级扩展名只在最后一段后插入后缀（与 Path::file_stem/extension 语义一致）
-        assert_eq!(renamed_file_name("archive.tar.gz", 1), "archive.tar_副本.gz");
+        assert_eq!(
+            renamed_file_name("archive.tar.gz", 1),
+            "archive.tar_副本.gz"
+        );
         // 隐藏文件不把首点当扩展名分隔
         assert_eq!(renamed_file_name(".bashrc", 1), ".bashrc_副本");
     }

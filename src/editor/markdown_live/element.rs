@@ -7,10 +7,10 @@
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, StyledText,
-    TextRun, TextStyle, TextStyleRefinement, Window,
+    App, Bounds, DispatchPhase, Element, ElementId, ElementInputHandler, Entity, GlobalElementId,
+    Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement, LayoutId, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, ShapedLine, SharedString, StyledText, TextRun, TextStyle,
+    TextStyleRefinement, Window,
 };
 
 use crate::components::input::cursor::{CursorLayout, CursorShape};
@@ -448,11 +448,7 @@ impl LiveLine {
 
     /// Render one table cell's content (see [`LiveLine::cell`]): mouse
     /// mapping is confined to `content` and resolved through `segs`.
-    pub fn with_cell_segs(
-        mut self,
-        segs: Vec<Seg>,
-        content: std::ops::Range<usize>,
-    ) -> Self {
+    pub fn with_cell_segs(mut self, segs: Vec<Seg>, content: std::ops::Range<usize>) -> Self {
         self.cell = Some((segs, content));
         self
     }
@@ -475,11 +471,7 @@ impl LiveLine {
         self
     }
 
-    pub fn with_caret_block(
-        mut self,
-        block_width: Pixels,
-        block_text: Option<ShapedLine>,
-    ) -> Self {
+    pub fn with_caret_block(mut self, block_width: Pixels, block_text: Option<ShapedLine>) -> Self {
         self.caret_block_width = block_width;
         self.caret_block_text = block_text;
         self
@@ -609,10 +601,9 @@ impl Element for LiveLine {
 
         // 平台文本输入（中文 IME）注册：光标行每帧注册（候选框贴光标行），
         // 其余行仅在本帧尚未注册时兜底一次。`render` 每帧复位认领标志。
-        if let Some(focus) = self
-            .view
-            .update(cx, |v, _| v.claim_input_registration(self.caret_vis.is_some(), window))
-        {
+        if let Some(focus) = self.view.update(cx, |v, _| {
+            v.claim_input_registration(self.caret_vis.is_some(), window)
+        }) {
             window.handle_input(
                 &focus,
                 ElementInputHandler::new(bounds, self.view.clone()),
@@ -812,7 +803,10 @@ pub static LIVE_LINE_PAINT_LOG: std::sync::Mutex<Vec<(usize, usize)>> =
 #[cfg(test)]
 pub(crate) fn record_paint(line: usize, visible_len: usize) {
     if visible_len > 0 {
-        LIVE_LINE_PAINT_LOG.lock().unwrap().push((line, visible_len));
+        LIVE_LINE_PAINT_LOG
+            .lock()
+            .unwrap()
+            .push((line, visible_len));
     }
 }
 
@@ -875,7 +869,12 @@ mod tests {
             let trail = cell.len() - cell.trim_end().len();
             let content = (s + lead)..(e - trail).max(s + lead);
             let inactive = plan_cell(line, content.clone(), None, &Default::default());
-            let active = plan_cell(line, content.clone(), Some(content.clone()), &Default::default());
+            let active = plan_cell(
+                line,
+                content.clone(),
+                Some(content.clone()),
+                &Default::default(),
+            );
             // 两条路径都是 plan_cell：非揭示态只隐藏标记，可见文本一致。
             assert!(
                 !inactive.visible.is_empty(),
@@ -897,8 +896,8 @@ mod tests {
         // （live 编辑器的规则：保留原文 + 上样式，因为映射要字节精确；
         // 只有只读预览才把 `:tada:` 换成字形）。
         use crate::editor::markdown_live::block::table_cell_spans;
+        use crate::editor::markdown_live::block::{DocState, classify};
         use crate::editor::markdown_live::layout::{plan, plan_cell};
-        use crate::editor::markdown_live::block::{classify, DocState};
         for src in [
             "**bold**",
             "`code` and *it*",
@@ -996,14 +995,26 @@ mod tests {
             l: 0.5,
             ..Default::default()
         };
-        let out = apply_find_marks(vec![mk(10)], 10, &[(2, 4, false), (6, 8, true)], bg, current_bg);
+        let out = apply_find_marks(
+            vec![mk(10)],
+            10,
+            &[(2, 4, false), (6, 8, true)],
+            bg,
+            current_bg,
+        );
         let total: usize = out.iter().map(|r| r.len).sum();
         assert_eq!(total, 10);
-        let colored: Vec<_> = out.iter().filter(|r| r.background_color.is_some()).collect();
+        let colored: Vec<_> = out
+            .iter()
+            .filter(|r| r.background_color.is_some())
+            .collect();
         assert_eq!(colored.len(), 2);
         assert_eq!(colored[0].background_color, Some(bg));
         assert_eq!(colored[1].background_color, Some(current_bg));
         // Empty marks → untouched.
-        assert_eq!(apply_find_marks(vec![mk(4)], 4, &[], bg, current_bg).len(), 1);
+        assert_eq!(
+            apply_find_marks(vec![mk(4)], 4, &[], bg, current_bg).len(),
+            1
+        );
     }
 }

@@ -859,10 +859,22 @@ mod tests {
 
         // 行内 UTF-16 列 → 字节偏移。
         assert_eq!(rope.position_to_offset(&Position::new(0, 0)), 0);
-        assert_eq!(rope.position_to_offset(&Position::new(0, 1)), 1, "after 'a'");
+        assert_eq!(
+            rope.position_to_offset(&Position::new(0, 1)),
+            1,
+            "after 'a'"
+        );
         // 🎉 起点：UTF-16 列 1（= 'a' 之后）。
-        assert_eq!(rope.position_to_offset(&Position::new(0, 3)), 5, "after emoji");
-        assert_eq!(rope.position_to_offset(&Position::new(0, 4)), 6, "after 'b'");
+        assert_eq!(
+            rope.position_to_offset(&Position::new(0, 3)),
+            5,
+            "after emoji"
+        );
+        assert_eq!(
+            rope.position_to_offset(&Position::new(0, 4)),
+            6,
+            "after 'b'"
+        );
 
         // 字节偏移 → UTF-16 列。emoji 之后必须是 3，而不是 2（字符数）。
         assert_eq!(rope.offset_to_position(0), Position::new(0, 0));
@@ -885,7 +897,10 @@ mod tests {
             }
             let pos = rope.offset_to_position(offset);
             let back = rope.position_to_offset(&pos);
-            assert_eq!(back, offset, "round-trip broke at byte {offset} (pos {pos:?})");
+            assert_eq!(
+                back, offset,
+                "round-trip broke at byte {offset} (pos {pos:?})"
+            );
         }
     }
 
@@ -894,8 +909,14 @@ mod tests {
     fn test_position_multiline_with_emoji() {
         let rope = Rope::from("🎉x\ny🎉z\n");
         // 第 1 行（0 基）"y🎉z"：y=1, 🎉=2, z=1。
-        assert_eq!(rope.offset_to_position(rope.line_start_offset(1)), Position::new(1, 0));
-        assert_eq!(rope.offset_to_position(rope.line_start_offset(1) + 1), Position::new(1, 1));
+        assert_eq!(
+            rope.offset_to_position(rope.line_start_offset(1)),
+            Position::new(1, 0)
+        );
+        assert_eq!(
+            rope.offset_to_position(rope.line_start_offset(1) + 1),
+            Position::new(1, 1)
+        );
         assert_eq!(
             rope.offset_to_position(rope.line_start_offset(1) + 5),
             Position::new(1, 3),

@@ -41,9 +41,9 @@ use gpui::{
     WeakEntity, Window, div, point, px,
 };
 
+use crate::assets::Icon;
 use crate::components::input::{DiffLineKind, EditorInput, InputState};
 use crate::components::tooltip::Tooltip;
-use crate::assets::Icon;
 use crate::editor::editor::Editor;
 use crate::editor::syntax::{HighlightTheme, SimpleHighlighter};
 use crate::theme::ActiveTheme;
@@ -375,8 +375,7 @@ impl DiffView {
                         });
                         // 二进制占位文本不可编辑、不可保存：编辑后写回会
                         // 用占位文本覆盖二进制文件。
-                        let readonly = view.is_binary
-                            || matches!(view.target, DiffTarget::Staged);
+                        let readonly = view.is_binary || matches!(view.target, DiffTarget::Staged);
                         match view.target {
                             DiffTarget::Worktree => {
                                 view.right.update(cx, |state, cx| {
@@ -621,9 +620,7 @@ impl DiffView {
         cx: &mut Context<Self>,
     ) -> Entity<InputState> {
         cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor(language)
-                .multi_line(true);
+            let mut state = InputState::new_code_editor(language, window, cx);
             state.set_value(text, window, cx);
             state.disabled = readonly;
             // No soft wrap in diff views: hunk-anchored scroll sync assumes a
@@ -768,10 +765,9 @@ impl DiffView {
 
                     // 全量合并文本再按 CONTEXT 行数折叠未更改区
                     //（参考 UI 的 "N unmodified lines" 横幅）。
-                    let (unified, separators) =
-                        super::diff_model::build_unified_collapsed(
-                            &task_old, &task_new, &hunks, &expanded,
-                        );
+                    let (unified, separators) = super::diff_model::build_unified_collapsed(
+                        &task_old, &task_new, &hunks, &expanded,
+                    );
                     let hunk_rows = unified.hunk_rows.clone();
                     let runs = if should_highlight {
                         DiffView::merged_highlight_runs(
@@ -1187,15 +1183,18 @@ impl DiffView {
             if group_end > group_start {
                 let group_styles = highlighter.styles(&(group_start..group_end), theme);
                 for (range, style) in group_styles {
-                for (src, merged) in &members {
-                    let s = range.start.max(src.start);
-                    let e = range.end.min(src.end);
-                    if e > s {
-                        // 相对偏移映射（s ≥ src.start 恒成立）。merged 前缀可能比
-                        // 源前缀短（如源文件前部被删除），直接相减会下溢。
-                        runs.push((merged.start + (s - src.start)..merged.start + (e - src.start), style));
+                    for (src, merged) in &members {
+                        let s = range.start.max(src.start);
+                        let e = range.end.min(src.end);
+                        if e > s {
+                            // 相对偏移映射（s ≥ src.start 恒成立）。merged 前缀可能比
+                            // 源前缀短（如源文件前部被删除），直接相减会下溢。
+                            runs.push((
+                                merged.start + (s - src.start)..merged.start + (e - src.start),
+                                style,
+                            ));
+                        }
                     }
-                }
                 }
             }
         }
@@ -1762,13 +1761,11 @@ impl DiffView {
             .child(
                 icon_btn("diff-more", Icon::Ellipsis, "更多操作".into(), true, theme)
                     .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(
-                        |this, event: &gpui::MouseDownEvent, window, cx| {
+                        MouseButton::Left,
+                        cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
                             this.open_diff_menu(event.position, window, cx);
-                        },
+                        }),
                     ),
-                ),
             )
             .when(dirty && is_worktree && !self.is_binary, |this| {
                 this.child(
@@ -1784,7 +1781,11 @@ impl DiffView {
                         .text_size(px(12.0))
                         .bg(theme.accent)
                         .text_color(theme.accent_foreground)
-                        .child(if self.saving { "保存中…" } else { "保存" })
+                        .child(if self.saving {
+                            "保存中…"
+                        } else {
+                            "保存"
+                        })
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.save(cx);
                         })),
@@ -1828,10 +1829,10 @@ impl DiffView {
         let is_worktree = self.target == DiffTarget::Worktree;
         let staging = self.staging_hunk.is_some() || self.staging_file;
         let has_hunks = !self.hunks.is_empty();
-        let has_separators = !self.unified_separators.is_empty()
-            && self.effective_mode() == DiffMode::Unified;
-        let has_expanded = !self.expanded_separators.is_empty()
-            && self.effective_mode() == DiffMode::Unified;
+        let has_separators =
+            !self.unified_separators.is_empty() && self.effective_mode() == DiffMode::Unified;
+        let has_expanded =
+            !self.expanded_separators.is_empty() && self.effective_mode() == DiffMode::Unified;
         let path = self.path.clone();
         let preference = self.preference;
 
@@ -1842,81 +1843,75 @@ impl DiffView {
             if is_worktree && !staging && has_hunks {
                 {
                     let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("暂存该块").on_click(move |_, _, cx| {
-                            this.update(cx, |this, cx| {
-                                this.close_diff_menu(cx);
-                                if let Some(ix) = this.active_hunk_index(cx) {
-                                    this.stage_hunk(ix, cx);
-                                }
-                            });
-                        }),
-                    );
+                    menu = menu.item(PopupMenuItem::new("暂存该块").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| {
+                            this.close_diff_menu(cx);
+                            if let Some(ix) = this.active_hunk_index(cx) {
+                                this.stage_hunk(ix, cx);
+                            }
+                        });
+                    }));
                 }
                 {
                     let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("还原该块").on_click(move |_, window, cx| {
+                    menu = menu.item(PopupMenuItem::new("还原该块").on_click(
+                        move |_, window, cx| {
                             this.update(cx, |this, cx| {
                                 this.close_diff_menu(cx);
                                 if let Some(ix) = this.active_hunk_index(cx) {
                                     this.revert_hunk(ix, window, cx);
                                 }
                             });
-                        }),
-                    );
+                        },
+                    ));
                 }
             }
             if is_worktree && !staging && has_hunks {
                 {
                     let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("暂存文件").on_click(move |_, _, cx| {
-                            this.update(cx, |this, cx| {
-                                this.close_diff_menu(cx);
-                                this.stage_file(cx);
-                            });
-                        }),
-                    );
+                    menu = menu.item(PopupMenuItem::new("暂存文件").on_click(move |_, _, cx| {
+                        this.update(cx, |this, cx| {
+                            this.close_diff_menu(cx);
+                            this.stage_file(cx);
+                        });
+                    }));
                 }
                 menu = menu.separator();
             }
             if has_separators {
                 {
                     let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("展开全部未更改区域").on_click(move |_, _, cx| {
+                    menu = menu.item(PopupMenuItem::new("展开全部未更改区域").on_click(
+                        move |_, _, cx| {
                             this.update(cx, |this, cx| {
                                 this.close_diff_menu(cx);
                                 this.expand_all_separators(cx);
                             });
-                        }),
-                    );
+                        },
+                    ));
                 }
             }
             if has_expanded {
                 {
                     let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new("折叠全部未更改区域").on_click(move |_, _, cx| {
+                    menu = menu.item(PopupMenuItem::new("折叠全部未更改区域").on_click(
+                        move |_, _, cx| {
                             this.update(cx, |this, cx| {
                                 this.close_diff_menu(cx);
                                 this.collapse_all_separators(cx);
                             });
-                        }),
-                    );
+                        },
+                    ));
                 }
             }
             {
                 let this = this.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("刷新").on_click(move |_, _, cx| {
-                        this.update(cx, |this, cx| {
-                            this.close_diff_menu(cx);
-                            this.refresh(cx);
-                        });
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("刷新").on_click(move |_, _, cx| {
+                    this.update(cx, |this, cx| {
+                        this.close_diff_menu(cx);
+                        this.refresh(cx);
+                    });
+                }));
             }
             {
                 let this = this.clone();
@@ -1930,11 +1925,9 @@ impl DiffView {
                 );
             }
             {
-                menu = menu.item(
-                    PopupMenuItem::new("复制路径").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
-                    }),
-                );
+                menu = menu.item(PopupMenuItem::new("复制路径").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(path.clone()));
+                }));
             }
             // 布局分组：自动 / 单栏 / 并排，勾选当前偏好。
             menu = menu.separator();

@@ -103,11 +103,9 @@ impl DisplayMap {
 
     /// 紧贴 `line` 之上显示的插入块（`before_buffer_row == line`）。
     pub fn git_insertions_at(&self, line: usize) -> impl Iterator<Item = &GitInsertion> {
-        self.git_insertions
-            .iter()
-            .filter(move |ins| {
-                ins.before_buffer_row == line && !self.fold_map.is_row_hidden(ins.before_buffer_row)
-            })
+        self.git_insertions.iter().filter(move |ins| {
+            ins.before_buffer_row == line && !self.fold_map.is_row_hidden(ins.before_buffer_row)
+        })
     }
 
     /// 全部展开区行数（含锚点被折叠的——折叠时由查询方按需排除）。
@@ -393,8 +391,7 @@ impl DisplayMap {
     /// 必须包含这些视觉行高。
     pub fn display_row_for_buffer_line(&self, line: usize) -> usize {
         let wrap_row = self.wrap_map.buffer_line_to_first_wrap_row(line);
-        self.fold_map.visible_display_rows_before(wrap_row)
-            + self.git_insertion_rows_before(line)
+        self.fold_map.visible_display_rows_before(wrap_row) + self.git_insertion_rows_before(line)
     }
 
     /// Get the wrap row count (before folding)

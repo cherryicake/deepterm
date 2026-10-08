@@ -148,9 +148,9 @@ impl InputState {
     ) {
         // `a` = 光标右移一格后插入。行尾时不越过换行。
         let target = self.next_boundary(self.cursor());
-        let line_end = self.text.line_content_end_offset(
-            self.text.offset_to_point(self.cursor()).row,
-        );
+        let line_end = self
+            .text
+            .line_content_end_offset(self.text.offset_to_point(self.cursor()).row);
         self.move_to(target.min(line_end), None, cx);
         self.vim_switch_mode(VimMode::Insert, cx);
     }
@@ -235,9 +235,8 @@ impl InputState {
     ) {
         let count = self.vim_take_count();
         let from = self.vim_cursor();
-        let target = self.vim_repeat_motion(from, count, |s, at| {
-            motion::next_word_start(&s.text, at)
-        });
+        let target =
+            self.vim_repeat_motion(from, count, |s, at| motion::next_word_start(&s.text, at));
         if self.vim_try_operator(target, MotionKind::Exclusive, window, cx) {
             return;
         }
@@ -269,9 +268,8 @@ impl InputState {
     ) {
         let count = self.vim_take_count();
         let from = self.vim_cursor();
-        let target = self.vim_repeat_motion(from, count, |s, at| {
-            motion::next_word_end(&s.text, at)
-        });
+        let target =
+            self.vim_repeat_motion(from, count, |s, at| motion::next_word_end(&s.text, at));
         if self.vim_try_operator(target, MotionKind::Inclusive, window, cx) {
             return;
         }
@@ -326,7 +324,9 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let _ = self.vim_take_count();
-        let target = self.text.clip_offset(self.text.len().saturating_sub(1), sum_tree::Bias::Left);
+        let target = self
+            .text
+            .clip_offset(self.text.len().saturating_sub(1), sum_tree::Bias::Left);
         if self.vim_try_operator(target, MotionKind::Linewise, window, cx) {
             return;
         }
@@ -554,21 +554,11 @@ impl InputState {
 
     // ==================== 撤销 / 重做 ====================
 
-    pub(crate) fn vim_undo(
-        &mut self,
-        _: &Undo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
         InputState::vim_do_undo(self, window, cx);
     }
 
-    pub(crate) fn vim_redo(
-        &mut self,
-        _: &Redo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
         InputState::vim_do_redo(self, window, cx);
     }
 
@@ -719,21 +709,11 @@ impl InputState {
         self.page_down(&crate::components::input::MovePageDown, window, cx);
     }
 
-    pub(crate) fn vim_page_up(
-        &mut self,
-        _: &PageUp,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_page_up(&mut self, _: &PageUp, window: &mut Window, cx: &mut Context<Self>) {
         self.page_up(&crate::components::input::MovePageUp, window, cx);
     }
 
-    pub(crate) fn vim_window_top(
-        &mut self,
-        _: &WindowTop,
-        _: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn vim_window_top(&mut self, _: &WindowTop, _: &mut Window, cx: &mut Context<Self>) {
         InputState::vim_do_window_top(self, cx);
     }
 
@@ -784,7 +764,11 @@ impl InputState {
         // 复用查找面板的「下一个」。
         if let Some(panel) = self.search_panel.clone() {
             panel.update(cx, |panel, cx| {
-                panel.on_action_enter(&crate::components::input::Enter { secondary: false }, window, cx);
+                panel.on_action_enter(
+                    &crate::components::input::Enter { secondary: false },
+                    window,
+                    cx,
+                );
             });
         }
     }
@@ -1106,9 +1090,7 @@ impl InputState {
     }
 
     pub(crate) fn vim_mode_is_visual(&self) -> bool {
-        self.vim
-            .as_ref()
-            .is_some_and(|vim| vim.mode.is_visual())
+        self.vim.as_ref().is_some_and(|vim| vim.mode.is_visual())
     }
 
     /// 有待决操作符时执行「操作符 + 移动」，否则返回 false 让调用方移动光标。
@@ -1132,7 +1114,6 @@ impl InputState {
         true
     }
 
-
     fn vim_has_pending_operator(&self) -> bool {
         self.vim_peek_operator().is_some()
     }
@@ -1152,10 +1133,7 @@ impl InputState {
     /// 每个会用到计数的命令都必须调用它，**即使不使用返回值**：否则残留的
     /// 计数会被后续命令误用（`3j` 之后 `dw` 会删 3 个词）。
     pub(crate) fn vim_take_count(&mut self) -> usize {
-        self.vim
-            .as_mut()
-            .map(|vim| vim.take_count())
-            .unwrap_or(1)
+        self.vim.as_mut().map(|vim| vim.take_count()).unwrap_or(1)
     }
 
     /// 把一次「单步移动」重复 `count` 次，返回最终落点。
@@ -1205,7 +1183,12 @@ impl InputState {
 
     /// 纵向移动的落点。复用 `move_vertical` 的目标计算需要真实移动，
     /// 所以这里退化为「同列、上/下一行」——行长度不足时钳到行尾。
-    fn vim_motion_vertical(&self, lines: isize, _window: &mut Window, _cx: &mut Context<Self>) -> usize {
+    fn vim_motion_vertical(
+        &self,
+        lines: isize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> usize {
         let text = &self.text;
         let cursor = self.cursor();
         let row = text.offset_to_point(cursor).row;

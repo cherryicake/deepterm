@@ -208,7 +208,11 @@ pub fn find_char(
         if text.get_char(offset).ok() == Some(target) {
             if before {
                 // `t`：停在目标之前一格。
-                return Some(if forward { retreat(text, offset) } else { advance(text, offset) });
+                return Some(if forward {
+                    retreat(text, offset)
+                } else {
+                    advance(text, offset)
+                });
             }
             return Some(offset);
         }

@@ -170,10 +170,7 @@ mod tests {
             file::sections_of(source).unwrap_or_else(|err| panic!("{label} 解析失败：{err}"));
         }
         assert!(binding_count(DEFAULT_KEYMAP) > 0, "default.json 不应为空");
-        assert!(
-            binding_count(PLATFORM_KEYMAP) > 0,
-            "平台键位表不应为空"
-        );
+        assert!(binding_count(PLATFORM_KEYMAP) > 0, "平台键位表不应为空");
     }
 
     /// 迁移后键位数必须与迁移前 `state.rs` 的有效键位一致。
@@ -187,7 +184,10 @@ mod tests {
     fn default_keymaps_cover_all_migrated_bindings() {
         let total = binding_count(DEFAULT_KEYMAP) + binding_count(PLATFORM_KEYMAP);
         let expected = if cfg!(target_os = "macos") { 75 } else { 59 };
-        assert_eq!(total, expected, "迁移后键位数应与原 state.rs 的有效键位一致");
+        assert_eq!(
+            total, expected,
+            "迁移后键位数应与原 state.rs 的有效键位一致"
+        );
     }
 
     /// 每个 action 名都必须能在 gpui 的注册表里查到——否则该绑定是死键。
@@ -199,10 +199,9 @@ mod tests {
                 let sections = file::sections_of(source).unwrap();
                 for section in sections {
                     for (keystroke, action) in section.bindings.iter() {
-                        let (name, params) =
-                            file::split_action(action).unwrap_or_else(|err| {
-                                panic!("{label}: 键位 `{keystroke}` 的 action 非法：{err}")
-                            });
+                        let (name, params) = file::split_action(action).unwrap_or_else(|err| {
+                            panic!("{label}: 键位 `{keystroke}` 的 action 非法：{err}")
+                        });
                         assert!(
                             cx.build_action(&name, params).is_ok(),
                             "{label}: 键位 `{keystroke}` 引用了未注册的 action `{name}`"
@@ -222,10 +221,7 @@ mod tests {
             let mut total = 0;
             for (label, source) in builtin_documents() {
                 let (bindings, errors) = file::parse(source, cx);
-                assert!(
-                    errors.is_empty(),
-                    "{label} 有绑定未能构造：{errors:?}"
-                );
+                assert!(errors.is_empty(), "{label} 有绑定未能构造：{errors:?}");
                 assert_eq!(
                     bindings.len(),
                     binding_count(source),
@@ -257,7 +253,9 @@ mod tests {
                     .map(|key| gpui::Keystroke::parse(key).unwrap())
                     .collect();
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 迁移前由 `state.rs` 的 `cx.bind_keys` 提供；迁移后由 JSON 提供。
@@ -270,7 +268,10 @@ mod tests {
                 Some("editor::SearchPrevious"),
                 "迁移前的后写覆盖语义必须保持"
             );
-            assert_eq!(resolve(cx, "alt-z").as_deref(), Some("editor::ToggleSoftWrap"));
+            assert_eq!(
+                resolve(cx, "alt-z").as_deref(),
+                Some("editor::ToggleSoftWrap")
+            );
             assert_eq!(
                 resolve(cx, "alt-shift-up").as_deref(),
                 Some("editor::DuplicateLine")
@@ -320,7 +321,9 @@ mod tests {
                 let stack = [context];
                 let keys = vec![gpui::Keystroke::parse("h").unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 默认关闭：`h` 不应解析到 vim 命令。
@@ -351,6 +354,77 @@ mod tests {
                 resolve(cx).as_deref(),
                 Some("vim::Left"),
                 "关闭 vim 后应卸载 vim 键位表"
+            );
+        });
+    }
+
+    /// 嵌套的普通输入框不得继承祖先编辑器的 vim 键位。
+    ///
+    /// 编辑器的查找框是**普通输入框**，但渲染上位于编辑器 `key_context`
+    /// 内部（`EditorInput` 把搜索面板作为绝对定位子元素挂进去）。
+    /// gpui 的谓词匹配从最深上下文往上找，于是「编辑器处于 Normal 模式」
+    /// 这个**祖先**上下文会替查找框命中 `vim::Left`：用户在查找框里按 `h`，
+    /// 编辑器光标左移，字符进不去输入框。
+    #[gpui::test]
+    fn vim_bindings_do_not_leak_into_nested_plain_inputs(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            reload(cx);
+
+            let resolve = |stack: &[gpui::KeyContext]| -> Option<String> {
+                let keys = vec![gpui::Keystroke::parse("h").unwrap()];
+                let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, stack);
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+
+            let app_window = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("AppWindow");
+                context
+            };
+            // 编辑器（Normal 模式）自己的上下文，与 `EditorInput` 产出的形状一致。
+            let editor = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("Input");
+                context.add("VimControl");
+                context.set("vim_mode", "normal");
+                context.set("vim_operator", "none");
+                context
+            };
+            // 编辑器内的查找框：普通输入框的上下文。
+            //
+            // `NoVim` 是 `EditorInput` 对「不接受 vim 的输入框」注入的标记，
+            // 与生产渲染路径一致（见 `components/input/input.rs`）。
+            let find_input = || {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add("Input");
+                context.add(crate::vim::NO_VIM_CONTEXT);
+                context
+            };
+
+            // 正控制：焦点在编辑器自己身上时，`h` 必须是 vim 的移动。
+            assert_eq!(
+                resolve(&[app_window(), editor()]).as_deref(),
+                Some("vim::Left"),
+                "前置：焦点在编辑器里时 `h` 应命中 vim::Left"
+            );
+
+            // 焦点落进嵌套的查找框。
+            let mut search_panel = gpui::KeyContext::new_with_defaults();
+            search_panel.add("SearchPanel");
+            let nested = [app_window(), editor(), search_panel, find_input()];
+            // 按**前缀**排除而不是只排除 `vim::Left` 这一个动作名：后者在
+            // 某个 `vim::*` 改名或新增时仍会通过，起不到护栏的作用。
+            let resolved = resolve(&nested).unwrap_or_default();
+            assert!(
+                !resolved.starts_with("vim::"),
+                "焦点在嵌套的普通输入框里时，`h` 不得命中祖先编辑器的任何 vim 键位，\
+                 实际命中 {resolved}"
             );
         });
     }
@@ -389,7 +463,9 @@ mod tests {
                 let stack = [app_window, panel, input];
                 let keys = vec![gpui::Keystroke::parse(key).unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             // 无操作符时 `d` 开启操作符。
@@ -489,7 +565,9 @@ mod tests {
             let resolve = |cx: &mut gpui::App| -> Option<String> {
                 let keys = vec![gpui::Keystroke::parse("left").unwrap()];
                 let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
-                bindings.first().map(|binding| binding.action().name().to_string())
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
             };
 
             assert_eq!(resolve(cx).as_deref(), Some("editor::MoveLeft"));
@@ -541,8 +619,10 @@ mod tests {
                     .split_whitespace()
                     .map(|k| gpui::Keystroke::parse(k).unwrap())
                     .collect();
-                let (matched, _pending) =
-                    cx.key_bindings().borrow().bindings_for_input(&strokes, &stack);
+                let (matched, _pending) = cx
+                    .key_bindings()
+                    .borrow()
+                    .bindings_for_input(&strokes, &stack);
                 matched
                     .first()
                     .map(|binding| binding.action().name().to_string())

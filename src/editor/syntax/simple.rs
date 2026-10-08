@@ -774,8 +774,8 @@ fn merge_highlight_style(style: &mut HighlightStyle, other: &HighlightStyle) {
 mod tests {
     use super::*;
     use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle};
-    use crate::theme::syntax_theme::SyntaxColors;
     use crate::theme::ThemeAppearance;
+    use crate::theme::syntax_theme::SyntaxColors;
 
     fn test_theme() -> HighlightTheme {
         HighlightTheme {

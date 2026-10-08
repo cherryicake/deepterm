@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId,
-    ImageFormat, InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent,
-    ParentElement, Pixels, Render, ScrollDelta, ScrollWheelEvent, Style, Styled, Window, actions,
-    checkerboard, div, img, px,
+    App, Bounds, Context, Element, ElementId, Entity, FocusHandle, GlobalElementId, ImageFormat,
+    InspectorElementId, InteractiveElement, IntoElement, LayoutId, MouseDownEvent, ParentElement,
+    Pixels, Render, ScrollDelta, ScrollWheelEvent, Style, Styled, Window, actions, checkerboard,
+    div, img, px,
 };
 
 use crate::theme::ActiveTheme;

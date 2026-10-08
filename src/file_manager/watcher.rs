@@ -999,7 +999,11 @@ mod tests {
         watch_increment(&mut watched, path, fs_b.clone());
 
         // 两条独立状态（若 key 冲突则只会剩一条 ref=2）
-        assert_eq!(watched.len(), 2, "同路径的两台服务器必须是独立的 watch 状态");
+        assert_eq!(
+            watched.len(),
+            2,
+            "同路径的两台服务器必须是独立的 watch 状态"
+        );
 
         // 各自减到 0 各自移除；A unwatch 不应影响 B 的状态
         assert!(watch_decrement(&mut watched, path, &fs_a));
@@ -1033,7 +1037,10 @@ mod tests {
         // 远程事件：只匹配同一台服务器
         assert!(remote_event.is_from_backend(Some(&config)));
         assert!(!remote_event.is_from_backend(Some(&other)));
-        assert!(!remote_event.is_from_backend(None), "远程事件不匹配本地后端");
+        assert!(
+            !remote_event.is_from_backend(None),
+            "远程事件不匹配本地后端"
+        );
 
         // 本地事件：只匹配本地后端
         assert!(local_event.is_from_backend(None));
@@ -1138,9 +1145,7 @@ mod tests {
         let _probe = make_probe(cx, &watcher, events.clone());
 
         let fs = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
-        watcher.update(cx, |w, cx| {
-            w.watch(Path::new("/root"), fs.clone(), cx)
-        });
+        watcher.update(cx, |w, cx| w.watch(Path::new("/root"), fs.clone(), cx));
 
         // 首轮轮询：目录首次轮询会发一次携带真实 entries 的同步事件（幂等，
         // 订阅方对比后无变化则无事发生）
@@ -1200,30 +1205,28 @@ mod tests {
     /// 场景对应 `set_terminal_file_tree` 的真实切换顺序：
     /// 新树的 watch 先发生（旧状态仍在），旧树 cleanup 的 unwatch 后发生。
     #[gpui::test]
-    fn remote_watcher_distinguishes_servers_watching_same_path(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn remote_watcher_distinguishes_servers_watching_same_path(cx: &mut gpui::TestAppContext) {
         let events = Arc::new(StdMutex::new(Vec::new()));
         let watcher = cx.new(|cx| RemoteFsWatcher::new(cx));
         let _probe = make_probe(cx, &watcher, events.clone());
 
         // 服务器 A 的树先 watch /root
         let fs_a = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
-        watcher.update(cx, |w, cx| {
-            w.watch(Path::new("/root"), fs_a.clone(), cx)
-        });
+        watcher.update(cx, |w, cx| w.watch(Path::new("/root"), fs_a.clone(), cx));
         cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
         cx.run_until_parked();
         events.lock().unwrap().clear();
 
         // 切换到服务器 B 的终端：新树 watch /root（真实顺序：旧状态还在）
         let fs_b = Arc::new(RemoteMockFs::new("srv-b", &["a.txt", "b.txt"]));
-        watcher.update(cx, |w, cx| {
-            w.watch(Path::new("/root"), fs_b.clone(), cx)
-        });
+        watcher.update(cx, |w, cx| w.watch(Path::new("/root"), fs_b.clone(), cx));
         // 旧树 cleanup：unwatch
         watcher.update(cx, |w, cx| {
-            w.unwatch(Path::new("/root"), &(fs_a.clone() as Arc<dyn FileSystem>), cx)
+            w.unwatch(
+                Path::new("/root"),
+                &(fs_a.clone() as Arc<dyn FileSystem>),
+                cx,
+            )
         });
 
         // 在服务器 B 的终端里 `rm b.txt`

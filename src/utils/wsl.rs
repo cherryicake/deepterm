@@ -327,7 +327,6 @@ mod tests {
     fn recognizes_wsl_commands() {
         assert!(is_wsl_command("wsl.exe"));
         assert!(is_wsl_command("WSL.EXE"));
-        assert!(is_wsl_command(r"C:\Windows\System32\wsl.exe"));
         assert!(is_wsl_command("wsl"));
         // 不能把 wscript / wslpath 之类误判进来
         assert!(!is_wsl_command("wscript.exe"));
@@ -335,6 +334,17 @@ mod tests {
         // 主干不等于 wsl 的一律不算：`ends_with("wsl")` 会把这两个放进来
         assert!(!is_wsl_command("showsl"));
         assert!(!is_wsl_command("/usr/local/bin/mywsl"));
+    }
+
+    /// 绝对路径形式的 `wsl.exe` 也要认出来。
+    ///
+    /// `is_wsl_command` 取 `Path::file_stem()`，而 components 的切分是平台
+    /// 相关的：反斜杠只在 windows 上是分隔符，所以这条断言只在 windows 上
+    /// 成立。代码两边都对，因此单独成条而不是混进上面那条。
+    #[test]
+    #[cfg(windows)]
+    fn recognizes_wsl_command_by_absolute_path() {
+        assert!(is_wsl_command(r"C:\Windows\System32\wsl.exe"));
     }
 
     #[test]
@@ -359,19 +369,23 @@ mod tests {
 
     #[test]
     fn translates_linux_paths_into_wsl_unc() {
+        // 期望值只替换分隔符，段结构与前缀仍然写死：`linux_path_to_unc` 内部
+        // 用 `PathBuf::push` 逐段拼，接的就是**本平台**的分隔符。写死 `\`
+        // 的话这条在 unix 上必然失配，而它本来是个有意义的断言。
+        let sep = std::path::MAIN_SEPARATOR;
         assert_eq!(
-            linux_path_to_unc("Ubuntu-24.04", "/home/you/project"),
-            PathBuf::from(r"\\wsl$\Ubuntu-24.04\home\you\project")
+            linux_path_to_unc("Ubuntu-24.04", "/home/you/project").to_string_lossy(),
+            format!(r"\\wsl$\Ubuntu-24.04{sep}home{sep}you{sep}project")
         );
         // 根目录
         assert_eq!(
-            linux_path_to_unc("Ubuntu-24.04", "/"),
-            PathBuf::from(r"\\wsl$\Ubuntu-24.04")
+            linux_path_to_unc("Ubuntu-24.04", "/").to_string_lossy(),
+            r"\\wsl$\Ubuntu-24.04"
         );
         // 连续斜杠不该产生空段
         assert_eq!(
-            linux_path_to_unc("d", "//a//b"),
-            PathBuf::from(r"\\wsl$\d\a\b")
+            linux_path_to_unc("d", "//a//b").to_string_lossy(),
+            format!(r"\\wsl$\d{sep}a{sep}b")
         );
     }
 

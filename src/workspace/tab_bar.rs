@@ -1626,10 +1626,9 @@ impl TabBar {
                         div()
                             .min_w_0()
                             .text_ellipsis()
-                            .when(
-                                tab.agent_status == Some(AgentStatus::Working),
-                                |this| this.opacity(0.),
-                            )
+                            .when(tab.agent_status == Some(AgentStatus::Working), |this| {
+                                this.opacity(0.)
+                            })
                             .child(tab.label.clone()),
                     )
                     .when(tab.agent_status == Some(AgentStatus::Working), |this| {
@@ -2341,12 +2340,7 @@ mod tests {
         let github_light_bg: gpui::Hsla = rgb(0xFFFFFF).into();
         assert!(
             same(
-                TabBar::agent_sweep_color(
-                    0xFFFFFF,
-                    github_light_text,
-                    github_light_bg,
-                    accent
-                ),
+                TabBar::agent_sweep_color(0xFFFFFF, github_light_text, github_light_bg, accent),
                 accent
             ),
             "品牌色在标签底色上不可见时必须回落（白字压白底）"

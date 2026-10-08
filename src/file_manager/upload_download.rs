@@ -301,8 +301,7 @@ impl DirTransferDriver for RemoteToLocalDirDriver<'_> {
     fn prepare_destination_dir(
         &mut self,
         // 仅 unix 用它落地远端权限（chmod）；其他平台没有对应语义。
-        #[cfg_attr(not(unix), allow(unused_variables))]
-        remote_dir: &str,
+        #[cfg_attr(not(unix), allow(unused_variables))] remote_dir: &str,
         destination_dir: &PathBuf,
     ) -> anyhow::Result<()> {
         fs::create_dir_all(destination_dir)?;
@@ -310,8 +309,7 @@ impl DirTransferDriver for RemoteToLocalDirDriver<'_> {
         {
             use std::os::unix::fs::PermissionsExt;
             if let Ok(Some(mode)) = self.session.permissions(remote_dir) {
-                let _ =
-                    fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
+                let _ = fs::set_permissions(destination_dir, fs::Permissions::from_mode(mode));
             }
         }
         Ok(())

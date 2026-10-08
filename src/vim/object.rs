@@ -229,7 +229,10 @@ fn find_delimited(
         let end = right?;
 
         return Some(if around {
-            (start..text.clip_offset(end + 1, sum_tree::Bias::Right), MotionKind::Exclusive)
+            (
+                start..text.clip_offset(end + 1, sum_tree::Bias::Right),
+                MotionKind::Exclusive,
+            )
         } else {
             (
                 text.clip_offset(start + 1, sum_tree::Bias::Right)..end,
@@ -279,7 +282,10 @@ fn find_delimited(
     let start = open_at?;
 
     Some(if around {
-        (start..text.clip_offset(end + 1, sum_tree::Bias::Right), MotionKind::Exclusive)
+        (
+            start..text.clip_offset(end + 1, sum_tree::Bias::Right),
+            MotionKind::Exclusive,
+        )
     } else {
         (
             text.clip_offset(start + 1, sum_tree::Bias::Right)..end,
@@ -300,9 +306,8 @@ fn find_paragraph(
     let row = text.offset_to_point(cursor).row;
     let total = text.lines_len();
 
-    let is_blank = |row: usize| -> bool {
-        text.line_content_end_offset(row) == text.line_start_offset(row)
-    };
+    let is_blank =
+        |row: usize| -> bool { text.line_content_end_offset(row) == text.line_start_offset(row) };
 
     // 光标在空行上时，`ip` 选中的是这段空行本身。
     if is_blank(row) {
@@ -406,7 +411,10 @@ mod tests {
     #[test]
     fn word_object_inner_and_around() {
         let text = rope("hello world");
-        assert_eq!(range_of(&text, 0, TextObject::Word, false).as_deref(), Some("hello"));
+        assert_eq!(
+            range_of(&text, 0, TextObject::Word, false).as_deref(),
+            Some("hello")
+        );
         assert_eq!(
             range_of(&text, 0, TextObject::Word, true).as_deref(),
             Some("hello "),

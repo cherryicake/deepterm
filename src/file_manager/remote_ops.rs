@@ -212,13 +212,7 @@ impl DirTransferDriver for SameSessionDirDriver<'_> {
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary> {
-        copy_remote_file_to_remote_path(
-            self.session,
-            source_path,
-            destination,
-            cancelled,
-            progress,
-        )
+        copy_remote_file_to_remote_path(self.session, source_path, destination, cancelled, progress)
     }
 }
 

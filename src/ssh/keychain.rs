@@ -635,7 +635,9 @@ pub fn resolve_auth_method(auth_method: &AuthMethod) -> anyhow::Result<ResolvedA
             let password = store
                 .get_password_secret(keychain_id)?
                 .ok_or_else(|| anyhow!("系统 Keychain 中缺少身份密码: {}", keychain_id))?;
-            Ok(ResolvedAuthMethod::Password { password: password.into() })
+            Ok(ResolvedAuthMethod::Password {
+                password: password.into(),
+            })
         }
         AuthMethod::PrivateKeyRef { keychain_id } => {
             let store = KeychainStore::load_or_default();
@@ -845,10 +847,7 @@ mod tests {
         );
 
         entry.delete_credential().expect("删除测试凭据失败");
-        assert!(
-            entry.get_password().is_err(),
-            "删除后不应再读得到"
-        );
+        assert!(entry.get_password().is_err(), "删除后不应再读得到");
     }
 
     fn temp_ssh_path(name: &str) -> std::path::PathBuf {

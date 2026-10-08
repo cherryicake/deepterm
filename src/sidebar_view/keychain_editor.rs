@@ -6,13 +6,12 @@ use std::process::Command;
 use anyhow::anyhow;
 use gpui::prelude::*;
 use gpui::{
-    App, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, IntoElement,
-    KeyDownEvent, MouseButton, Render, ScrollHandle, ScrollWheelEvent, UTF16Selection, Window,
-    div, px,
+    App, Context, CursorStyle, Entity, EntityInputHandler, FocusHandle, IntoElement, KeyDownEvent,
+    MouseButton, Render, ScrollHandle, ScrollWheelEvent, UTF16Selection, Window, div, px,
 };
 
-use crate::components::callbacks::{OptionalAppCallback, OptionalStrAppCallback};
 use crate::components::button::{Button, ButtonVariants, Sizable, Size as ButtonSize};
+use crate::components::callbacks::{OptionalAppCallback, OptionalStrAppCallback};
 use crate::components::input::{EditorInput, InputState};
 use crate::ssh::keychain::{
     KeychainItem, KeychainItemKind, KeychainKeyFlavor, KeychainStore, normalize_private_key_path,

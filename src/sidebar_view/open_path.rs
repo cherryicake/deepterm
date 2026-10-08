@@ -51,10 +51,15 @@ pub fn handle_open_path(
                 // 先把树根对齐到终端 cwd（ remote cwd），再 reveal，绝不以点击路径为根。
                 // 退化兜底：cwd 完全未知且无现有树时才以点击目录建树（旧行为），
                 // 避免点了没反应；只要 cwd 已知就严格遵守 root == cwd。
-                let no_tree_no_cwd = sidebar.read(cx).file_tree_view().is_none()
-                    && desired_root.is_none();
-                let tree =
-                    ensure_tree_for_cwd(&sidebar, backend.clone(), desired_root, Some(&ssh_config), cx);
+                let no_tree_no_cwd =
+                    sidebar.read(cx).file_tree_view().is_none() && desired_root.is_none();
+                let tree = ensure_tree_for_cwd(
+                    &sidebar,
+                    backend.clone(),
+                    desired_root,
+                    Some(&ssh_config),
+                    cx,
+                );
                 if is_dir {
                     if let Some(tree) = tree {
                         let remote_path_clone = remote_path.clone();
@@ -81,7 +86,12 @@ pub fn handle_open_path(
                     let ssh_for_open = ssh_config.clone();
                     editor.update(cx, |e, cx| {
                         e.open_remote_file_at_line_col_no_notify(
-                            path, ssh_for_open, line, col, window, cx,
+                            path,
+                            ssh_for_open,
+                            line,
+                            col,
+                            window,
+                            cx,
                         );
                     });
                     if let Some(tree) = tree {

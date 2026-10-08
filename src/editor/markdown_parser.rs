@@ -34,8 +34,12 @@ pub enum MarkdownTag {
     Emphasis,
     Strong,
     Strikethrough,
-    Link { dest_url: String },
-    Image { dest_url: String },
+    Link {
+        dest_url: String,
+    },
+    Image {
+        dest_url: String,
+    },
     /// Definition-list term (bold paragraph).
     DefTerm,
     /// Definition-list definition (indented paragraph).
@@ -114,9 +118,7 @@ pub fn parse_markdown(source: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
 /// Split `^sup^` / `~sub~` out of text runs into synthetic style events
 /// (same [`inline::find_sup_sub`](crate::editor::markdown_live::inline::find_sup_sub)
 /// rules as the live editor, so both renderers agree).
-fn split_sup_sub(
-    events: Vec<(Range<usize>, MarkdownEvent)>,
-) -> Vec<(Range<usize>, MarkdownEvent)> {
+fn split_sup_sub(events: Vec<(Range<usize>, MarkdownEvent)>) -> Vec<(Range<usize>, MarkdownEvent)> {
     use crate::editor::markdown_live::inline::find_sup_sub;
     let mut out = Vec::with_capacity(events.len());
     let mut depth = 0usize;
@@ -318,7 +320,9 @@ fn linkify_bare_urls(
                 let base = range.start + span.start;
                 out.push((
                     base..base + span.len(),
-                    MarkdownEvent::Start(MarkdownTag::Link { dest_url: url.clone() }),
+                    MarkdownEvent::Start(MarkdownTag::Link {
+                        dest_url: url.clone(),
+                    }),
                 ));
                 out.push((
                     base..base + span.len(),
@@ -439,7 +443,6 @@ mod tests {
         })
     }
 
-
     #[test]
     fn math_events_parsed() {
         assert!(has_math("质能方程 $E = mc^2$ 展示"));
@@ -536,7 +539,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(texts, vec!["[".to_string(), "TOC".to_string(), "]".to_string()]);
+        assert_eq!(
+            texts,
+            vec!["[".to_string(), "TOC".to_string(), "]".to_string()]
+        );
     }
 
     #[test]

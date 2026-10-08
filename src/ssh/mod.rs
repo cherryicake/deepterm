@@ -15,8 +15,8 @@ pub mod auth;
 pub mod config;
 pub mod host_key;
 pub mod keychain;
-pub mod port_forward;
 pub mod platform;
+pub mod port_forward;
 pub mod russh_terminal;
 pub mod sftp_fs;
 pub mod shared_runtime;
@@ -267,7 +267,10 @@ pub fn parse_ssh_target(target: &str) -> (String, String, u16) {
     // （`root@[fe80::1%25eth0]:2222` 的 zone-id 段不含冒号，
     // 若把 user 前缀一起数冒号会误判端口位置）。
     let (user_host, port) = {
-        let hostport = target.rfind('@').map(|i| &target[i + 1..]).unwrap_or(target);
+        let hostport = target
+            .rfind('@')
+            .map(|i| &target[i + 1..])
+            .unwrap_or(target);
         if let Some(rest) = hostport.strip_prefix('[') {
             // [addr]:port 或 [addr] 形式的 IPv6：括号内是 host，`]` 后可选 :port
             let close = rest.find(']').unwrap_or(rest.len());

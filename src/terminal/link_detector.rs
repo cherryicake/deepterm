@@ -66,12 +66,7 @@ pub fn detect_hyperlinks_in_line(cells: &[IndexedCell]) -> Vec<HyperlinkRange> {
             continue;
         }
         flush(&mut current, &mut ranges);
-        current = Some((
-            link.id().to_owned(),
-            link.uri().to_owned(),
-            col,
-            col + 1,
-        ));
+        current = Some((link.id().to_owned(), link.uri().to_owned(), col, col + 1));
     }
     flush(&mut current, &mut ranges);
     ranges

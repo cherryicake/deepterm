@@ -7,8 +7,8 @@ pub use registry::*;
 // 主题类型已下沉到 theme::syntax_theme（修复 theme→editor 层次倒置），
 // 此处 re-export 保持 `editor::syntax::*` 旧路径兼容。
 pub use crate::theme::syntax_theme::{
-    FontStyle, FontWeightContent, HighlightTheme, HighlightThemeStyle, StatusColors, SyntaxColors,
-    ThemeStyle, HIGHLIGHT_NAMES,
+    FontStyle, FontWeightContent, HIGHLIGHT_NAMES, HighlightTheme, HighlightThemeStyle,
+    StatusColors, SyntaxColors, ThemeStyle,
 };
 
 pub mod languages;
@@ -64,7 +64,11 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    pub fn new(range: Range<usize>, severity: DiagnosticSeverity, message: impl Into<String>) -> Self {
+    pub fn new(
+        range: Range<usize>,
+        severity: DiagnosticSeverity,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             range,
             severity,
@@ -467,7 +471,10 @@ mod tests {
     fn reset_clears_everything() {
         let text = rope("abc");
         let mut set = DiagnosticSet::new(&text);
-        set.set(vec![Diagnostic::new(0..1, DiagnosticSeverity::Error, "e")], &text);
+        set.set(
+            vec![Diagnostic::new(0..1, DiagnosticSeverity::Error, "e")],
+            &text,
+        );
         assert!(!set.is_empty());
         set.reset(&text);
         assert!(set.is_empty());
@@ -516,7 +523,9 @@ mod tests {
             "expected at least one syntax diagnostic for {src:?}"
         );
         assert!(
-            diags.iter().all(|d| d.severity == DiagnosticSeverity::Error),
+            diags
+                .iter()
+                .all(|d| d.severity == DiagnosticSeverity::Error),
             "syntax diagnostics are errors"
         );
         assert!(

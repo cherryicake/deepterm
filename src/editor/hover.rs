@@ -112,8 +112,7 @@ pub struct HoverInfo {
 /// 对照 Zed 的 `hover_popover_hiding_delay`（默认 300ms 左右）。之所以要延迟
 /// 而不是立刻消失：用户常把鼠标往浮层方向移去点里面的链接/按钮，立刻收起会让
 /// 目标在指针到达前就没了。
-pub(crate) const HOVER_HIDING_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(300);
+pub(crate) const HOVER_HIDING_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// hover 浮层的状态机。
 ///
@@ -267,7 +266,9 @@ impl HoverState {
         self.task.take();
         self.request_generation = self.request_generation.wrapping_add(1);
         let generation = self.request_generation;
-        editor.update(cx, |state, _| state.set_hover_request_generation(generation));
+        editor.update(cx, |state, _| {
+            state.set_hover_request_generation(generation)
+        });
     }
 
     /// 指针是否正往浮层靠近（Zed `HoverState::is_mouse_getting_closer`）。
@@ -292,7 +293,8 @@ impl HoverState {
         {
             return false;
         }
-        self.closest_mouse_distance = Some(distance.min(self.closest_mouse_distance.unwrap_or(distance)));
+        self.closest_mouse_distance =
+            Some(distance.min(self.closest_mouse_distance.unwrap_or(distance)));
         true
     }
 
@@ -327,9 +329,7 @@ impl HoverState {
             return;
         }
         self.hiding_delay_task = Some(cx.spawn(async move |cx| {
-            cx.background_executor()
-                .timer(HOVER_HIDING_DELAY)
-                .await;
+            cx.background_executor().timer(HOVER_HIDING_DELAY).await;
             on_expired(cx);
         }));
     }
@@ -472,7 +472,9 @@ impl HoverState {
             // **鼠标每动一下都会换掉本任务**（见 `on_mouse_moved`），所以能
             // 走到这里就说明前半段 150ms 里指针是停着的。
             let still_current = editor
-                .update(cx, |state, _| state.hover_request_generation() == generation)
+                .update(cx, |state, _| {
+                    state.hover_request_generation() == generation
+                })
                 .unwrap_or(false);
             if !still_current {
                 log::info!("lsp: hover 请求已过期（前半段延迟后），丢弃");
@@ -495,12 +497,15 @@ impl HoverState {
             // 代号存在 `InputState` 上（任务拿得到弱引用），`HoverState` 自身
             // 在后台任务里不可达。
             let still_current = editor
-                .update(cx, |state, _| state.hover_request_generation() == generation)
+                .update(cx, |state, _| {
+                    state.hover_request_generation() == generation
+                })
                 .unwrap_or(false);
             if !still_current {
                 log::info!(
                     "lsp: hover 响应已过期，丢弃 pos={}:{}",
-                    position.line, position.character
+                    position.line,
+                    position.character
                 );
                 return;
             }
@@ -518,7 +523,8 @@ impl HoverState {
             if anchor_moved {
                 log::info!(
                     "lsp: hover 锚点已漂移（请求于 offset={offset}），丢弃 pos={}:{}",
-                    position.line, position.character
+                    position.line,
+                    position.character
                 );
                 return;
             }
@@ -571,8 +577,7 @@ impl HoverState {
                             // 就会因为这个过期安排被立即收走。
                             return None;
                         }
-                        let deadline =
-                            std::time::Instant::now() + HOVER_HIDING_DELAY;
+                        let deadline = std::time::Instant::now() + HOVER_HIDING_DELAY;
                         state.set_hover_hide_deadline(deadline);
                         Some(deadline)
                     })
@@ -583,7 +588,8 @@ impl HoverState {
                 };
                 log::info!(
                     "lsp: hover 无内容 -> 安排延迟隐藏 pos={}:{}",
-                    position.line, position.character
+                    position.line,
+                    position.character
                 );
                 // 睡到期再检查：deadline 必须还是当初记的那个（没被新内容 /
                 // 进卡片 / 新请求取消或推后），指针不在卡片上，没被键盘接管，
@@ -592,9 +598,7 @@ impl HoverState {
                 // 睡在**当前任务**里而不是等下一帧：鼠标静止时不会产生新帧，
                 // 光靠 `take_pending`（只在 render 里跑）这个 deadline 永远
                 // 等不到检查它的那一帧。
-                cx.background_executor()
-                    .timer(HOVER_HIDING_DELAY)
-                    .await;
+                cx.background_executor().timer(HOVER_HIDING_DELAY).await;
                 let hid = editor
                     .update(cx, |state, cx| {
                         if state.hover_hide_deadline() != Some(deadline) {
@@ -617,7 +621,8 @@ impl HoverState {
             };
             log::info!(
                 "lsp: hover 返回内容 pos={}:{}",
-                position.line, position.character
+                position.line,
+                position.character
             );
 
             editor
@@ -679,9 +684,7 @@ impl HoverState {
         // 判定要 `Window`，而这里只有 `App`；`App` 拿不到 window，所以焦点
         // 这一路由**调用方**（`Editor`，它有 `&mut Window`）提前挡掉，
         // 见 `Editor::toggle_hover` 与 `schedule_hover_hide`。
-        let pointer_inside = editor
-            .read(cx)
-            .hover_pointer_inside();
+        let pointer_inside = editor.read(cx).hover_pointer_inside();
         if pointer_inside {
             // 只取消在途请求，浮层与滚动位置都留着。
             self.task.take();
@@ -693,12 +696,13 @@ impl HoverState {
         // 弹回来」。抬代号才能让那些任务在检查点上自己退出。
         self.request_generation = self.request_generation.wrapping_add(1);
         let generation = self.request_generation;
-        editor.update(cx, |state, _| state.set_hover_request_generation(generation));
+        editor.update(cx, |state, _| {
+            state.set_hover_request_generation(generation)
+        });
         self.hide();
         editor.update(cx, |state, _cx| state.clear_hover_popover());
     }
 }
-
 
 /// 浮层被键盘接管时用来滚动内容的按键（按键名，不是事件）。
 ///
@@ -835,7 +839,6 @@ pub fn init_keystroke_interceptor(cx: &mut App) {
     }));
 }
 
-
 /// 渲染 hover 浮层的**内容**（不含定位）。
 ///
 /// 用仓库里已有的 markdown 渲染器**内联**渲染，而不是把文本按行塞进 div。
@@ -878,32 +881,24 @@ pub fn render_hover_card(
     // 内容区：可纵向滚动，并绑定**稳定**的句柄（浮层元素每帧重建，句柄不能
     // 每帧新建，否则滚动位置永远被重置回顶部）。
     let scroll_handle = info.scroll_handle.clone();
-    let body = div()
-        .flex()
-        .flex_col()
-        .w_full()
-        .children(
-            info.markdown
-                .as_ref()
-                .map(|md| {
-                    let style = crate::editor::markdown::MarkdownStyle::hover_style(
-                        window,
-                        cx,
-                        code_font.clone(),
-                    );
-                    crate::editor::markdown::Markdown::render_items_inline(
-                        md.clone(),
-                        style,
-                        cx,
-                    )
-                })
-                .unwrap_or_default()
-                .into_iter()
-                // 每个条目 `flex_shrink_0`：卡片有 `max_h`，flex 子项默认
-                // `flex_shrink: 1`，内容超高时会被压扁 —— 行高塌陷就是之前
-                // 「多行字符叠在一起」的直接原因。
-                .map(|item| div().flex_shrink_0().w_full().child(item)),
-        );
+    let body = div().flex().flex_col().w_full().children(
+        info.markdown
+            .as_ref()
+            .map(|md| {
+                let style = crate::editor::markdown::MarkdownStyle::hover_style(
+                    window,
+                    cx,
+                    code_font.clone(),
+                );
+                crate::editor::markdown::Markdown::render_items_inline(md.clone(), style, cx)
+            })
+            .unwrap_or_default()
+            .into_iter()
+            // 每个条目 `flex_shrink_0`：卡片有 `max_h`，flex 子项默认
+            // `flex_shrink: 1`，内容超高时会被压扁 —— 行高塌陷就是之前
+            // 「多行字符叠在一起」的直接原因。
+            .map(|item| div().flex_shrink_0().w_full().child(item)),
+    );
 
     let card = div()
         // `.id(...)` 不是装饰：它把 `Div` 变成 `Stateful<Div>`，而

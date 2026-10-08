@@ -88,12 +88,9 @@ mod ffi {
         // mach_task_self() 返回当前任务的 send right，生命周期为进程级。
         let mut info = TaskVmInfo::default();
         let kr = unsafe {
-            task_info(
-                mach_task_self(),
-                TASK_VM_INFO,
-                &mut info,
-                &mut { TASK_VM_INFO_COUNT },
-            )
+            task_info(mach_task_self(), TASK_VM_INFO, &mut info, &mut {
+                TASK_VM_INFO_COUNT
+            })
         };
         if kr != 0 {
             return None;

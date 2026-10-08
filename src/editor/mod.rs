@@ -1,6 +1,6 @@
+pub mod completion;
 pub mod diff_model;
 pub mod diff_view;
-pub mod completion;
 pub mod editor;
 pub mod encoding;
 pub mod git_marks;

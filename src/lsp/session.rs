@@ -57,11 +57,7 @@ pub struct LspSession {
 
 impl LspSession {
     /// 为一个本地文件创建会话；远程文件返回 `None`。
-    pub fn new(
-        path: &Path,
-        language_id: &str,
-        editor: WeakEntity<InputState>,
-    ) -> Option<Self> {
+    pub fn new(path: &Path, language_id: &str, editor: WeakEntity<InputState>) -> Option<Self> {
         let uri = crate::lsp::client::path_to_uri(path).ok()?;
         Some(Self {
             path: path.to_path_buf(),
@@ -226,10 +222,7 @@ impl LspSession {
         let text_str = text.to_string();
         // didOpen 必须在后台发：它在 await 期间不能占住 UI 线程。
         smol::spawn(async move {
-            if let Err(e) = client
-                .did_open(&uri, &language_id, 0, &text_str)
-                .await
-            {
+            if let Err(e) = client.did_open(&uri, &language_id, 0, &text_str).await {
                 log::warn!("lsp didOpen failed for {uri}: {e}");
             }
         })
@@ -321,11 +314,7 @@ impl LspSession {
     /// `continue` 掉——**没有任何人处理这条诊断**。实测三个标签里有一个的
     /// 诊断被静默丢弃。对照 VSCode：它的通知走 `Emitter.fire()` 广播，
     /// 过滤 uri 的是订阅者自己。
-    pub fn spawn_diagnostic_listener(
-        &mut self,
-        editor: &Entity<InputState>,
-        cx: &mut App,
-    ) {
+    pub fn spawn_diagnostic_listener(&mut self, editor: &Entity<InputState>, cx: &mut App) {
         let Some(client) = self.client.clone() else {
             log::warn!("lsp: no client, diagnostic listener not started");
             return;
@@ -345,9 +334,8 @@ impl LspSession {
 
                 // `$/progress`：服务器的工作进度（索引、扫描…）→ 状态栏。
                 if method == "$/progress" {
-                    let parsed = serde_json::from_value::<lsp_types::ProgressParams>(
-                        params.clone(),
-                    );
+                    let parsed =
+                        serde_json::from_value::<lsp_types::ProgressParams>(params.clone());
                     let Ok(progress) = parsed else {
                         // 解析失败**必须留日志**：这里原本是静默 `continue`，
                         // 于是「`end` 解析不上 → 令牌永不删除 → 状态栏永远卡在

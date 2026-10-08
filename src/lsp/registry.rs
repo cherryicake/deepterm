@@ -106,18 +106,8 @@ fn builtin_servers() -> HashMap<String, ServerConfig> {
     );
     insert(&mut m, "c", "clangd", &[]);
     insert(&mut m, "cpp", "clangd", &[]);
-    insert(
-        &mut m,
-        "json",
-        "vscode-json-language-server",
-        &["--stdio"],
-    );
-    insert(
-        &mut m,
-        "html",
-        "vscode-html-language-server",
-        &["--stdio"],
-    );
+    insert(&mut m, "json", "vscode-json-language-server", &["--stdio"]);
+    insert(&mut m, "html", "vscode-html-language-server", &["--stdio"]);
     insert(&mut m, "css", "vscode-css-language-server", &["--stdio"]);
     insert(&mut m, "lua", "lua-language-server", &[]);
     insert(&mut m, "zig", "zls", &[]);
@@ -150,7 +140,6 @@ pub fn server_for_language(language: &str, settings: Option<&LspContent>) -> Opt
     builtin_servers().get(language).cloned()
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,8 +160,7 @@ mod tests {
     fn merging_empty_user_document_keeps_lsp_enabled() {
         let mut merged = crate::settings::content::SettingsContent::default();
         // 模拟「用户 settings.json 里没有 lsp 段」：serde 用 Default 填充。
-        let user: crate::settings::content::SettingsContent =
-            serde_json::from_str("{}").unwrap();
+        let user: crate::settings::content::SettingsContent = serde_json::from_str("{}").unwrap();
         assert!(user.lsp.enabled, "empty user doc must default to enabled");
         merged.merge_from(&user);
         assert!(merged.lsp.enabled, "merge must not disable lsp");

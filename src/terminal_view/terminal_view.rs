@@ -153,28 +153,31 @@ const SEARCH_DRIFT_THROTTLE_MS: u64 = 400;
 
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
-    crate::keymap::bind(cx, [
-        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
-        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
-        // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell
-        // 的行首快捷键，不能占用）。
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
-        #[cfg(target_os = "windows")]
-        KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
-        #[cfg(not(target_os = "windows"))]
-        KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
-        // 回滚区搜索：macOS 用 cmd-f，其他平台 ctrl-shift-f
-        //（ctrl-f 是 shell 的 forward-char，不能占用）。
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-f", StartSearch, Some(CONTEXT)),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-f", StartSearch, Some(CONTEXT)),
-        // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
-        KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
-    ]);
+    crate::keymap::bind(
+        cx,
+        [
+            KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+            KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+            // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell
+            // 的行首快捷键，不能占用）。
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
+            #[cfg(target_os = "windows")]
+            KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
+            #[cfg(not(target_os = "windows"))]
+            KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
+            // 回滚区搜索：macOS 用 cmd-f，其他平台 ctrl-shift-f
+            //（ctrl-f 是 shell 的 forward-char，不能占用）。
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-f", StartSearch, Some(CONTEXT)),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-f", StartSearch, Some(CONTEXT)),
+            // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
+            KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
+        ],
+    );
 
     // Windows：把「默认发行版名」提前在后台问好。
     //
@@ -937,14 +940,14 @@ impl TerminalView {
                 .background_executor()
                 .spawn(async move { crate::utils::wsl::distro_home(&distro) })
                 .await;
-                let _ = this.update(cx, |this, cx| {
-                    if let Some(home) = home {
-                        this.wsl_cwd = Some(home);
-                        // 文件树要换根到发行版家目录。
-                        cx.emit(Event::TitleChanged);
-                    }
-                    cx.notify();
-                });
+            let _ = this.update(cx, |this, cx| {
+                if let Some(home) = home {
+                    this.wsl_cwd = Some(home);
+                    // 文件树要换根到发行版家目录。
+                    cx.emit(Event::TitleChanged);
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -1295,10 +1298,8 @@ impl TerminalView {
             ssh_config.port
         );
 
-        let ssh_config = &resolve_current_ssh_config(
-            ssh_config,
-            &SshGlobalConfig::load().saved_connections,
-        );
+        let ssh_config =
+            &resolve_current_ssh_config(ssh_config, &SshGlobalConfig::load().saved_connections);
 
         let focus_handle = cx.focus_handle();
         let ssh_config_clone = ssh_config.clone();
@@ -1452,7 +1453,7 @@ impl TerminalView {
                 tab_label_pending: false,
                 hook_prompt_answered: std::collections::HashSet::new(),
                 hook_installed_checked: std::collections::HashMap::new(),
-            hook_install_checks_in_flight: std::collections::HashSet::new(),
+                hook_install_checks_in_flight: std::collections::HashSet::new(),
                 window_handle: None,
                 hook_unsupported_modal: crate::components::modal::ModalState::entity(cx),
             };
@@ -2045,10 +2046,8 @@ impl TerminalView {
     ) -> Option<HoveredLink> {
         if let Some(ssh_config) = self.ssh_config.clone() {
             let cwd = self.current_remote_working_directory(cx);
-            let resolved = crate::builtin_commands::PathResolver::resolve_remote(
-                &hit.path,
-                cwd.as_deref(),
-            )?;
+            let resolved =
+                crate::builtin_commands::PathResolver::resolve_remote(&hit.path, cwd.as_deref())?;
             // Hover shows immediately; existence is validated asynchronously
             // on click (SFTP round-trip must not block mouse-move).
             return Some(HoveredLink {
@@ -2068,8 +2067,7 @@ impl TerminalView {
             working_directory: cwd.clone(),
             process_cwd: cwd,
         };
-        let resolved =
-            crate::builtin_commands::PathResolver::resolve_local(&hit.path, &ctx);
+        let resolved = crate::builtin_commands::PathResolver::resolve_local(&hit.path, &ctx);
         // Existence check kills false positives (`ls` prose vs real files).
         // Both files and directories are clickable. Cached with a short TTL
         // so sweeping the mouse across one file doesn't stat per mousemove.
@@ -2144,9 +2142,8 @@ impl TerminalView {
                     let resolved = resolved.clone();
                     async move {
                         use crate::file_manager::filesystem::FileSystem;
-                        let backend = crate::file_manager::filesystem::RemoteFileSystem::new(
-                            ssh_config,
-                        );
+                        let backend =
+                            crate::file_manager::filesystem::RemoteFileSystem::new(ssh_config);
                         backend
                             .metadata(&std::path::PathBuf::from(&resolved))
                             .is_ok()
@@ -2332,7 +2329,9 @@ impl TerminalView {
         cx.spawn(async move |this, cx| {
             let installed = cx
                 .background_executor()
-                .spawn(async move { read_installed_state_offline(agent, config.as_ref(), home.as_deref()) })
+                .spawn(async move {
+                    read_installed_state_offline(agent, config.as_ref(), home.as_deref())
+                })
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.hook_install_checks_in_flight.remove(&agent);
@@ -2360,7 +2359,9 @@ impl TerminalView {
 
         // 系统弹窗必须拿得到窗口。`AgentChanged` 可能赶在首帧 render 之前到达，
         // 此时先跳过：「已问过」还没记，下一次事件（每个工具调用都会发）会重试。
-        let Some(handle) = self.window_handle else { return; };
+        let Some(handle) = self.window_handle else {
+            return;
+        };
         // 先记「问过」再弹：系统弹窗没有 on_close 回调可记，且用户无论怎么关
         // 都不应在同一会话里被反复打扰。
         self.hook_prompt_answered.insert(agent);
@@ -2393,7 +2394,8 @@ impl TerminalView {
                 // 装的是**本次弹窗对应的那个 agent**：弹窗是异步应答的，
                 // 期间前台 agent 可能已经换了，不能等到这里再问一遍
                 // `agent_tab_state`（那会装错人）。
-                this.update(cx, |this, cx| this.install_hook_for(agent, cx)).ok();
+                this.update(cx, |this, cx| this.install_hook_for(agent, cx))
+                    .ok();
             }
         })
         .detach();
@@ -2561,31 +2563,30 @@ impl TerminalView {
     ///
     /// # 为什么要自己拼 `PATH`
     ///
-    /// `default_terminal_env` 给出的 `PATH` 是「系统目录 + Homebrew」，
-    /// 不含用户级可执行目录。Codex 的 standalone 安装器把二进制装在
-    /// `~/.local/bin`（`~/.codex/packages/standalone/current/bin/codex` 的
-    /// 软链），那种装法下 `Command::new("codex")` 直接 `NotFound`，安装
-    /// 在写 `hooks.json` 之前就失败。远端同因（见
-    /// [`crate::agent::hooks::USER_BIN_DIRS`]），所以两边共用同一份目录表。
+    /// `Command::new("codex")` 不走 shell。`default_terminal_env` 给出的
+    /// `PATH` 是「系统目录 + Homebrew」，不含用户级可执行目录；Codex 的
+    /// standalone 安装器把二进制装在 `~/.local/bin`（`~/.codex/packages/
+    /// standalone/current/bin/codex` 的软链），那种装法下直接 `NotFound`，
+    /// 安装在写 `hooks.json` 之前就失败。远端同因（见
+    /// [`crate::agent::hooks::codex_enable_hooks_command`]），所以两边共用
+    /// 同一份目录表。
     ///
     /// 找不到 `codex` 时报错而不是静默跳过：跳过会留下「hook 装好了但
     /// 特性没开」的半装状态，用户看到的是状态点永远不亮。
     fn enable_codex_hooks_local(&self, home: &std::path::Path) -> Result<(), String> {
         let mut env = crate::terminal::mappings::default_terminal_env();
-        // 三段都要：用户目录（standalone / cargo / npm 装法）、
-        // `default_terminal_env` 的系统 + Homebrew 表（Finder 启动时本进程
-        // 的 PATH 只有 launchd 那几个目录，Homebrew 的 codex 全靠它），
-        // 以及本进程自己的 PATH（从终端启动时带着用户的真实环境）。
-        let mut base: Vec<std::path::PathBuf> = env
-            .get("PATH")
-            .map(|system| std::env::split_paths(system).collect())
-            .unwrap_or_default();
-        base.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        let path = crate::agent::hooks::path_with_user_bins(home, &base)
-            .ok_or_else(|| "拼装 PATH 失败".to_string())?;
-        env.insert("PATH".to_string(), path);
+        // 与语言服务器、git 走同一条拼装（`local_spawn_path_for`）：用户级
+        // 目录（standalone / cargo / npm 装法）+ 系统与 Homebrew 表
+        // （Finder 启动时本进程的 PATH 只有 launchd 那几个目录，Homebrew 的
+        // codex 全靠它）。本进程自己的 PATH 已在 `system_search_path()` 的
+        // 第一段里，不重复拼。
+        env.insert(
+            "PATH".to_string(),
+            crate::utils::path::local_spawn_path_for(
+                home,
+                crate::utils::path::system_search_path(),
+            ),
+        );
 
         let output = crate::utils::console::hidden_command("codex")
             .args(["features", "enable", "hooks"])
@@ -2606,11 +2607,12 @@ impl TerminalView {
     /// 可执行位必须每次都设：`atomic_write` 走「写临时文件 + rename」，
     /// 每次装出来都是一个新文件，别指望上次的权限还在。
     fn write_reporter_script_local(&self, home: &std::path::Path) -> Result<(), String> {
-        use crate::agent::hooks::{agent_report_script, REPORTER_REL_PATH};
+        use crate::agent::hooks::{REPORTER_REL_PATH, agent_report_script};
 
         let path = home.join(REPORTER_REL_PATH);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
         }
         crate::utils::fs_atomic::atomic_write(&path, agent_report_script().as_bytes())
             .map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
@@ -2628,7 +2630,7 @@ impl TerminalView {
         &self,
         session: &mut crate::ssh::sftp_fs::BlockingSftpSession,
     ) -> anyhow::Result<()> {
-        use crate::agent::hooks::{agent_report_script, HOOK_SCRIPT_REL_DIR, REPORTER_REL_PATH};
+        use crate::agent::hooks::{HOOK_SCRIPT_REL_DIR, REPORTER_REL_PATH, agent_report_script};
         use crate::utils::shell::shell_quote_single;
 
         let script = agent_report_script();
@@ -2656,7 +2658,8 @@ impl TerminalView {
             .join(hooks::HOOK_SCRIPT_REL_DIR)
             .join(hooks::HOOK_SCRIPT_FILE_NAME);
         if let Some(parent) = script_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("创建 {} 失败：{e}", parent.display()))?;
         }
         std::fs::write(&script_path, hooks::hook_script())
             .map_err(|e| format!("写入 {} 失败：{e}", script_path.display()))?;
@@ -2691,11 +2694,18 @@ impl TerminalView {
         Ok(())
     }
     /// 远程安装：同内容写到远端家目录。
-    fn install_claude_hook_remote(&self, config: &crate::ssh::SshConnectionConfig) -> Result<(), String> {
+    fn install_claude_hook_remote(
+        &self,
+        config: &crate::ssh::SshConnectionConfig,
+    ) -> Result<(), String> {
         use crate::agent::hooks;
         use crate::utils::shell::shell_quote_single;
 
-        let script_rel = format!("{}/{}", hooks::HOOK_SCRIPT_REL_DIR, hooks::HOOK_SCRIPT_FILE_NAME);
+        let script_rel = format!(
+            "{}/{}",
+            hooks::HOOK_SCRIPT_REL_DIR,
+            hooks::HOOK_SCRIPT_FILE_NAME
+        );
         let script = hooks::hook_script();
         let settings_rel = hooks::SETTINGS_REL_PATH;
 
@@ -2766,7 +2776,12 @@ impl TerminalView {
     ///
     /// 成功走 `info_toast`，失败走 `toast_message`——后者在渲染里是警示色，
     /// 用户一眼能看出「配置没写成」这件事需要处理。
-    fn notify_hook_install(&mut self, message: String, kind: crate::components::notification::NotificationKind, cx: &mut Context<Self>) {
+    fn notify_hook_install(
+        &mut self,
+        message: String,
+        kind: crate::components::notification::NotificationKind,
+        cx: &mut Context<Self>,
+    ) {
         self.show_terminal_toast("Hook 安装".to_string(), message, kind, cx);
     }
 
@@ -2784,9 +2799,7 @@ impl TerminalView {
             NotificationKind::Error => {
                 self.toast_message = Some(message);
                 self.toast_hide_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(6))
-                        .await;
+                    cx.background_executor().timer(Duration::from_secs(6)).await;
                     this.update(cx, |this, cx| {
                         this.toast_message = None;
                         this.toast_hide_task = None;
@@ -2798,9 +2811,7 @@ impl TerminalView {
             _ => {
                 self.info_toast = Some((title, message));
                 self.info_toast_hide_task = Some(cx.spawn(async move |this, cx| {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(8))
-                        .await;
+                    cx.background_executor().timer(Duration::from_secs(8)).await;
                     this.update(cx, |this, cx| {
                         this.info_toast = None;
                         this.info_toast_hide_task = None;
@@ -4162,38 +4173,36 @@ impl TerminalView {
             .when(is_focused, |this| {
                 this.border(px(3.0)).border_color(theme.accent.opacity(0.5))
             })
-            .on_key_down(cx.listener(
-                |this, event: &gpui::KeyDownEvent, window, cx| {
-                    let key = event.keystroke.key.as_str();
-                    let mods = &event.keystroke.modifiers;
-                    let plain = !mods.control && !mods.platform && !mods.alt;
-                    match key {
-                        // Enter / Down（无修饰）：下一个命中
-                        "enter" | "return" if plain && !mods.shift => {
-                            this.search_step(true, cx);
-                            cx.stop_propagation();
-                        }
-                        // Shift-Enter / Up：上一个
-                        "enter" | "return" if plain && mods.shift => {
-                            this.search_step(false, cx);
-                            cx.stop_propagation();
-                        }
-                        "down" if plain => {
-                            this.search_step(true, cx);
-                            cx.stop_propagation();
-                        }
-                        "up" if plain => {
-                            this.search_step(false, cx);
-                            cx.stop_propagation();
-                        }
-                        "escape" => {
-                            this.close_search(window, cx);
-                            cx.stop_propagation();
-                        }
-                        _ => {}
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let key = event.keystroke.key.as_str();
+                let mods = &event.keystroke.modifiers;
+                let plain = !mods.control && !mods.platform && !mods.alt;
+                match key {
+                    // Enter / Down（无修饰）：下一个命中
+                    "enter" | "return" if plain && !mods.shift => {
+                        this.search_step(true, cx);
+                        cx.stop_propagation();
                     }
-                },
-            ))
+                    // Shift-Enter / Up：上一个
+                    "enter" | "return" if plain && mods.shift => {
+                        this.search_step(false, cx);
+                        cx.stop_propagation();
+                    }
+                    "down" if plain => {
+                        this.search_step(true, cx);
+                        cx.stop_propagation();
+                    }
+                    "up" if plain => {
+                        this.search_step(false, cx);
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        this.close_search(window, cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            }))
             // 搜索图标（灰，仅装饰）
             .child(
                 gpui::svg()
@@ -4284,9 +4293,7 @@ impl TerminalView {
         self.info_toast = Some((title, body));
         self.info_toast_hide_task = None;
         self.info_toast_hide_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(5))
-                .await;
+            cx.background_executor().timer(Duration::from_secs(5)).await;
             this.update(cx, |this, cx| {
                 this.info_toast = None;
                 this.info_toast_hide_task = None;
@@ -4363,7 +4370,12 @@ impl TerminalView {
     }
 
     /// 渲染信息型 Toast（OSC 9/777 终端通知）：顶部居中的通知卡片。
-    fn render_info_toast(&self, title: &str, body: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_info_toast(
+        &self,
+        title: &str,
+        body: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let theme = cx.theme().ui;
         let is_dark = cx.theme().appearance.is_dark();
         let title_shared: SharedString = title.to_string().into();
@@ -4371,7 +4383,12 @@ impl TerminalView {
         let body_element = if body.is_empty() {
             None
         } else {
-            Some(div().text_size(px(12.0)).text_color(theme.text_muted).child(body_shared))
+            Some(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(body_shared),
+            )
         };
 
         div()
@@ -4390,7 +4407,9 @@ impl TerminalView {
                     .px(px(12.0))
                     .py(px(8.0))
                     .rounded(px(8.0))
-                    .bg(theme.elevated_background.opacity(if is_dark { 0.92 } else { 0.97 }))
+                    .bg(theme
+                        .elevated_background
+                        .opacity(if is_dark { 0.92 } else { 0.97 }))
                     .border_1()
                     .border_color(theme.border_strong)
                     .child(
@@ -4995,7 +5014,7 @@ fn render_bell_flash(started: Instant, cx: &App) -> gpui::AnyElement {
     let terminal_theme = theme.terminal;
     let progress = (started.elapsed().as_secs_f32()
         / Duration::from_millis(BELL_FLASH_MS).as_secs_f32())
-        .clamp(0.0, 1.0);
+    .clamp(0.0, 1.0);
     let alpha = (1.0 - progress) * 0.55;
     if alpha <= 0.01 {
         return div().into_any_element();
@@ -5426,12 +5445,9 @@ impl Render for TerminalView {
                     // 回滚区搜索浮层（右上角）
                     .when(self.search.active, |this| {
                         // 直接向 window 查询输入框聚焦态（事件链可能丢帧，这里每次渲染都为准）
-                        let is_focused = self
-                            .search_input
-                            .as_ref()
-                            .is_some_and(|input| {
-                                input.read(cx).focus_handle(cx).is_focused(window)
-                            });
+                        let is_focused = self.search_input.as_ref().is_some_and(|input| {
+                            input.read(cx).focus_handle(cx).is_focused(window)
+                        });
                         this.child(self.render_search_bar(is_focused, cx))
                     })
                     // BEL 视觉闪烁：视区边缘一层随时间衰减的强调色描边。
@@ -5452,10 +5468,9 @@ impl Render for TerminalView {
             //
             // 返回的是 `tuple` 而不是单个元素：GPUI 的 `Render` 要求单一类型，
             // 用 `(a, b)` 表达「两个并列的兄弟」是既有惯例。
-            .when(
-                self.hook_unsupported_modal.read(cx).is_rendered(),
-                |this| this.child(self.render_hook_prompts(cx)),
-            )
+            .when(self.hook_unsupported_modal.read(cx).is_rendered(), |this| {
+                this.child(self.render_hook_prompts(cx))
+            })
     }
 }
 
@@ -5466,10 +5481,9 @@ impl TerminalView {
     /// `workspace::render_close_confirm_body` 的挂法一致：`Modal` 自己负责
     /// 遮罩与居中，这里只提供一个铺满的定位容器。
     fn render_hook_prompts(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .absolute()
-            .inset_0()
-            .when(self.hook_unsupported_modal.read(cx).is_rendered(), |this| {
+        div().absolute().inset_0().when(
+            self.hook_unsupported_modal.read(cx).is_rendered(),
+            |this| {
                 let state = self.hook_unsupported_modal.read(cx);
                 let view = cx.entity().downgrade();
                 this.child(
@@ -5488,7 +5502,8 @@ impl TerminalView {
                         })
                         .child(self.render_hook_unsupported_body(cx)),
                 )
-            })
+            },
+        )
     }
 
     /// CodeBuddy 的「暂不支持」提示框（**没有安装按钮**）。
@@ -5544,26 +5559,22 @@ impl TerminalView {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .justify_end()
-                    .child(
-                        Button::new("hook-unsupported-ok")
-                            .label("知道了")
-                            .rounded(px(10.0))
-                            .with_size(ButtonSize::Small)
-                            .px(px(14.0))
-                            .on_click(cx.listener(|this, _, _window, cx| {
-                                this.hook_unsupported_modal
-                                    .update(cx, |state, cx| state.close(cx));
-                            })),
-                    ),
+                div().flex().gap(px(8.0)).justify_end().child(
+                    Button::new("hook-unsupported-ok")
+                        .label("知道了")
+                        .rounded(px(10.0))
+                        .with_size(ButtonSize::Small)
+                        .px(px(14.0))
+                        .on_click(cx.listener(|this, _, _window, cx| {
+                            this.hook_unsupported_modal
+                                .update(cx, |state, cx| state.close(cx));
+                        })),
+                ),
             )
     }
 }
 
-    #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::terminal::Terminal;
@@ -5840,7 +5851,11 @@ mod tests {
 
         let (agent, status) = view.read_with(cx, |view, cx| view.agent_tab_state(cx));
         assert_eq!(agent, Some(crate::agent::CLIAgent::Claude));
-        assert_eq!(status, AgentStatus::Working, "前提：hook 已把状态推到 Working");
+        assert_eq!(
+            status,
+            AgentStatus::Working,
+            "前提：hook 已把状态推到 Working"
+        );
 
         // 模拟一次「检测什么都不知道」：headless 没有 pty fd，
         // 检测会返回 `Unavailable`（缺 fd 属于「查不了」，不是「没有 agent」）。
@@ -5852,8 +5867,7 @@ mod tests {
         view.update(cx, |view, cx| {
             view.refresh_foreground_agent(cx);
         });
-        cx.background_executor
-            .advance_clock(Duration::from_secs(3));
+        cx.background_executor.advance_clock(Duration::from_secs(3));
         cx.run_until_parked();
 
         // 「查不了」不该被当成「agent 退出了」。
@@ -5895,8 +5909,9 @@ mod tests {
         });
 
         view.update(cx, |view, cx| {
-            view.terminal
-                .update(cx, |term, cx| term.set_foreground_agent(Some(CLIAgent::CodeBuddy), cx));
+            view.terminal.update(cx, |term, cx| {
+                term.set_foreground_agent(Some(CLIAgent::CodeBuddy), cx)
+            });
         });
         cx.run_until_parked();
         assert_eq!(
@@ -5907,8 +5922,9 @@ mod tests {
 
         // 拿到了 argv 但没有一个 token 命中：这是**结论**。
         view.update(cx, |view, cx| {
-            view.terminal
-                .update(cx, |term, cx| term.apply_detected_agent(LocalAgentProbe::NoAgent, cx));
+            view.terminal.update(cx, |term, cx| {
+                term.apply_detected_agent(LocalAgentProbe::NoAgent, cx)
+            });
         });
         cx.run_until_parked();
 
@@ -5978,10 +5994,8 @@ mod tests {
     fn installed_state_reads_from_the_same_path_the_installer_writes() {
         use crate::agent::hooks;
 
-        let home = std::env::temp_dir().join(format!(
-            "deepterm-hook-path-test-{}",
-            std::process::id()
-        ));
+        let home =
+            std::env::temp_dir().join(format!("deepterm-hook-path-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).unwrap();
 
@@ -6064,7 +6078,6 @@ mod tests {
         // 前台没有 agent 时同样不弹。
         assert!(!should_prompt_hook_install(None, false, false));
     }
-
 
     /// 恢复会话时，端口转发规则必须来自磁盘上的当前配置，而不是会话快照。
     ///

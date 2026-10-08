@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyView, Context, Decorations, ElementId, Entity, InteractiveElement, IntoElement,
-    MouseButton, MouseMoveEvent, ParentElement, Pixels, Render, TitlebarOptions, Window,
-    WindowControlArea, div, px,
+    AnyView, Context, Decorations, ElementId, Entity, InteractiveElement, IntoElement, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, Render, TitlebarOptions, Window, WindowControlArea, div,
+    px,
 };
 
 use crate::theme::ActiveTheme;

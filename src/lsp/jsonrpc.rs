@@ -21,10 +21,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use async_channel::{Receiver, Sender, bounded};
+use async_lock::Mutex as AsyncMutex;
 use async_process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use futures::io::BufReader;
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
-use async_lock::Mutex as AsyncMutex;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -38,7 +38,11 @@ pub enum Message {
     /// 服务器向客户端发起的请求（如 `workspace/configuration`、
     /// `window/workDoneProgress/create`）。必须回一个响应，否则部分服务器
     /// 会一直等下去。
-    Request { id: u32, method: String, params: Value },
+    Request {
+        id: u32,
+        method: String,
+        params: Value,
+    },
     /// 对客户端请求的应答。`result` 与 `error` 互斥，由 LSP 保证；
     /// 解析时两者都缺视为协议错误。
     Response {
@@ -156,8 +160,7 @@ fn parse_frame(buf: &[u8]) -> Result<Option<(Message, usize)>> {
         Err(_) => return Ok(None),
     };
 
-    let header = std::str::from_utf8(&buf[..header_end])
-        .context("header is not valid UTF-8")?;
+    let header = std::str::from_utf8(&buf[..header_end]).context("header is not valid UTF-8")?;
     let mut content_length: Option<usize> = None;
     for line in header.lines() {
         let line = line.trim();
@@ -185,8 +188,12 @@ fn parse_frame(buf: &[u8]) -> Result<Option<(Message, usize)>> {
     let body = &buf[body_start..body_start + len];
     let raw: Value = serde_json::from_slice(body)
         .with_context(|| format!("invalid JSON body: {}", String::from_utf8_lossy(body)))?;
-    let msg: IncomingMessage = serde_json::from_value(raw.clone())
-        .with_context(|| format!("invalid JSON-RPC message: {}", String::from_utf8_lossy(body)))?;
+    let msg: IncomingMessage = serde_json::from_value(raw.clone()).with_context(|| {
+        format!(
+            "invalid JSON-RPC message: {}",
+            String::from_utf8_lossy(body)
+        )
+    })?;
 
     // `result` / `error` 是否存在只能看键——见 `IncomingMessage` 的说明。
     let has_result = raw.get("result").is_some();
@@ -336,29 +343,65 @@ pub struct Connection {
     watched_globs: Arc<Mutex<Vec<String>>>,
 }
 
+/// 构造启动语言服务器的命令（不真正 spawn）。
+///
+/// 抽出来是为了让「子进程拿到了什么环境」可断言：`PATH` 拼错时
+/// `Connection::spawn` 只会返回一个泛泛的 `NotFound`，看不出是缺二进制还是
+/// 环境没给对（见 [`spawn_command_environment`] 的说明）。
+pub fn spawn_command(program: &str, args: &[String]) -> Command {
+    let mut command = Command::new(program);
+    // 语言服务器是**常驻**子进程（不是跑一下就退的那种），所以 windows 上
+    // 若不抑制控制台，用户会看到编辑器旁边长期挂着一个跑 rust-analyzer 的
+    // 黑框。`CREATE_NO_WINDOW` 只影响是否分配可见控制台，管道照常。
+    crate::utils::console::hide_console_window_async(&mut command);
+    spawn_command_environment(&mut command);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    command
+}
+
+/// 给语言服务器子进程设上自拼的 `PATH`。
+///
+/// # 为什么必须自己拼
+///
+/// 从 Finder / Dock 启动时，本进程继承的是 launchd 的最小 `PATH`
+/// （`/usr/bin:/bin:/usr/sbin:/sbin`），`~/.cargo/bin` 与 Homebrew 都不在其中。
+/// rustup 装的 `rust-analyzer` 只在 `~/.cargo/bin`，于是按名字
+/// `Command::new("rust-analyzer")` 直接 `NotFound`——现场就是状态栏的
+/// 「LSP 失败: rust 服务器启动失败」，而同一台机器上用户在终端里敲
+/// `rust-analyzer --version` 一切正常。差别只在启动方式。
+///
+/// 这份 `PATH` 也会被服务器自己的子进程继承：rust-analyzer 要调 `cargo`，
+/// 拿不到 `~/.cargo/bin` 的话索引会失败（表现为「有诊断但补全不来」这类
+/// 半残状态，比启动失败更难排查）。
+///
+/// 取不到主目录时保持继承行为：设一个残缺的 `PATH` 比不设更糟。
+fn spawn_command_environment(command: &mut Command) {
+    if let Some(path) = crate::utils::path::local_spawn_path() {
+        command.env("PATH", path);
+    }
+}
+
 impl Connection {
     /// 启动一个语言服务器进程并完成握手。
     ///
     /// `spawn` 失败（命令不存在）会以 `Err` 返回，调用方降级为「无 LSP」，
     /// 不阻塞编辑器。
     pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
-        let mut command = Command::new(program);
-        // 语言服务器是**常驻**子进程（不是跑一下就退的那种），所以 windows 上
-        // 若不抑制控制台，用户会看到编辑器旁边长期挂着一个跑 rust-analyzer 的
-        // 黑框。`CREATE_NO_WINDOW` 只影响是否分配可见控制台，管道照常。
-        crate::utils::console::hide_console_window_async(&mut command);
-        command
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        let mut command = spawn_command(program, args);
 
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn language server `{program}`"))?;
 
         let stdin = child.stdin.take().context("language server has no stdin")?;
-        let stdout = child.stdout.take().context("language server has no stdout")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("language server has no stdout")?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         // 通知走**广播**：订阅者列表初始为空，由每个打开的标签经
@@ -383,7 +426,8 @@ impl Connection {
         let registered2 = Arc::clone(&conn.registered_methods);
         let globs2 = Arc::clone(&conn.watched_globs);
         smol::spawn(async move {
-            let result = read_loop(stdout, stdin2, pending2, subscribers, registered2, globs2).await;
+            let result =
+                read_loop(stdout, stdin2, pending2, subscribers, registered2, globs2).await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -440,9 +484,7 @@ impl Connection {
     pub fn should_notify_watched_file(&self, path: &std::path::Path) -> bool {
         let globs = self.watched_globs.lock().clone();
         if !globs.is_empty() {
-            return globs
-                .iter()
-                .any(|g| crate::lsp::glob::glob_match(g, path));
+            return globs.iter().any(|g| crate::lsp::glob::glob_match(g, path));
         }
         !crate::lsp::glob::is_build_artifact(path)
     }
@@ -479,7 +521,8 @@ impl Connection {
     /// [`REQUEST_TIMEOUT`] 超时返回 `Err`，并把自己的条目从 pending 表摘掉
     /// ——否则该条目会永远留在表里泄漏。
     pub async fn request(&self, method: &str, params: Option<&Value>) -> Result<Value> {
-        self.request_with_timeout(method, params, REQUEST_TIMEOUT).await
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
     }
 
     /// [`Self::request`] 的可指定超时版本（shutdown 用更短的上限）。
@@ -513,13 +556,10 @@ impl Connection {
         }
 
         // 有界等待：`or` 返回先完成的那一支（应答，或超时标记）。
-        let result = match smol::future::or(
-            async { Some(rx.recv().await) },
-            async {
-                smol::Timer::after(timeout).await;
-                None
-            },
-        )
+        let result = match smol::future::or(async { Some(rx.recv().await) }, async {
+            smol::Timer::after(timeout).await;
+            None
+        })
         .await
         {
             Some(Ok(value)) => value,
@@ -556,7 +596,10 @@ impl Connection {
 
         // 1) shutdown 请求。失败（超时/连接断）不阻断后续步骤。
         let started = std::time::Instant::now();
-        match self.request_with_timeout("shutdown", None, SHUTDOWN_TIMEOUT).await {
+        match self
+            .request_with_timeout("shutdown", None, SHUTDOWN_TIMEOUT)
+            .await
+        {
             Ok(_) => log::debug!("lsp: shutdown request acknowledged"),
             Err(e) => log::warn!("lsp: shutdown request did not complete cleanly: {e}"),
         }
@@ -1049,7 +1092,10 @@ mod tests {
     fn encode_frame_has_content_length() {
         let bytes = frame("{\"a\":1}");
         let text = String::from_utf8(bytes).unwrap();
-        assert!(text.starts_with("Content-Length: 7\r\n\r\n"), "got {text:?}");
+        assert!(
+            text.starts_with("Content-Length: 7\r\n\r\n"),
+            "got {text:?}"
+        );
         assert!(text.ends_with("{\"a\":1}"));
     }
 
@@ -1057,7 +1103,10 @@ mod tests {
     fn server_requests_get_answered_not_dropped() {
         // 回归：早期版本只记日志不应答，rust-analyzer 会反复重发
         // workDoneProgress/create 并卡住进度上报。
-        for method in ["client/registerCapability", "window/workDoneProgress/create"] {
+        for method in [
+            "client/registerCapability",
+            "window/workDoneProgress/create",
+        ] {
             match server_request_reply(method) {
                 ServerRequestReply::Value(_) => {}
                 other => panic!("{method} should be answered with a value, got {other:?}"),
@@ -1386,7 +1435,11 @@ mod tests {
     /// 辅助：往订阅者列表里塞一个容量 `cap` 的订阅者，返回它的接收端。
     fn add_sub(subs: &Mutex<Vec<Subscription>>, cap: usize, id: u64) -> Receiver<Message> {
         let (tx, rx) = bounded(cap);
-        subs.lock().push(Subscription { id, tx, rx: rx.clone() });
+        subs.lock().push(Subscription {
+            id,
+            tx,
+            rx: rx.clone(),
+        });
         rx
     }
 
@@ -1530,7 +1583,10 @@ mod tests {
         ] {
             record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
         }
-        assert!(set.lock().is_empty(), "malformed input must not register anything");
+        assert!(
+            set.lock().is_empty(),
+            "malformed input must not register anything"
+        );
     }
 
     /// 注册项里的 `watchers` glob 必须被记下来——发通知前就靠它过滤。
@@ -1580,7 +1636,10 @@ mod tests {
             }]
         });
         record_dynamic_registration(&set, &globs, "client/registerCapability", &params);
-        assert!(globs.lock().is_empty(), "non-watched-files registration must not add globs");
+        assert!(
+            globs.lock().is_empty(),
+            "non-watched-files registration must not add globs"
+        );
     }
 
     /// 撤销注册要清空 glob，让过滤退回「排除构建产物」的兜底。

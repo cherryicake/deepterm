@@ -33,7 +33,10 @@ pub fn watch_config_file(
     };
 
     if let Err(err) = std::fs::create_dir_all(&parent) {
-        log::warn!("failed to create config directory {}: {err}", parent.display());
+        log::warn!(
+            "failed to create config directory {}: {err}",
+            parent.display()
+        );
     }
 
     let (tx, rx) = async_channel::unbounded::<()>();

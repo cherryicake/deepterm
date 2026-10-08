@@ -1,7 +1,7 @@
 use gpui::prelude::*;
 use gpui::{
-    App, Context, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString,
-    Window, div, px,
+    App, Context, Entity, FocusHandle, FontWeight, IntoElement, Render, SharedString, Window, div,
+    px,
 };
 
 use crate::components::input::{EditorInput, InputEvent, InputState};

@@ -6,23 +6,23 @@
 #[path = "edit_primitives.rs"]
 mod edit_primitives;
 use edit_primitives::{
-    BRACKET_MATCH_SCAN_LIMIT, OCCURRENCE_MAX_MATCHES, OCCURRENCE_MAX_TEXT_LEN,
-    STICKY_MAX_LINES, WORD_SCAN_WINDOW, scan_matching_bracket,
+    BRACKET_MATCH_SCAN_LIMIT, OCCURRENCE_MAX_MATCHES, OCCURRENCE_MAX_TEXT_LEN, STICKY_MAX_LINES,
+    WORD_SCAN_WINDOW, scan_matching_bracket,
 };
 
 // 词法/括号原语已迁至 edit_primitives.rs；re-export 保持
 // `state::is_word_char` 等旧引用路径（element.rs / search.rs）不变。
+/// vim 的 `iw`/`aw` 复用同一套词判定。
+pub(crate) use edit_primitives::word_range_at;
 pub(crate) use edit_primitives::{
     is_code_bracket, is_word_char, scan_bracket_spans_text, scan_bracket_spans_tree,
 };
-/// vim 的 `iw`/`aw` 复用同一套词判定。
-pub(crate) use edit_primitives::word_range_at;
 
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, WeakEntity,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent,
-    ShapedLine, SharedString, Subscription, UTF16Selection, Window, actions, point, px,
+    EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
+    SharedString, Subscription, UTF16Selection, WeakEntity, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use ropey::{Rope, RopeSlice};
@@ -32,10 +32,10 @@ use std::rc::Rc;
 use sum_tree::Bias;
 use unicode_segmentation::*;
 
+use super::display_map::{GitInsertedLine, GitInsertion};
 use super::{
     Crease, DisplayMap, MASK_CHAR, blink_cursor::BlinkCursor, cursor::CursorShape, mode::InputMode,
 };
-use super::display_map::{GitInsertion, GitInsertedLine};
 use crate::components::button::Size;
 use crate::components::input::blink_cursor::CURSOR_WIDTH;
 use crate::components::input::change::Change;
@@ -46,9 +46,9 @@ use crate::components::input::rope_ext::Position;
 use crate::components::input::{
     RopeExt as _, Selection, display_map::LineLayout, element::RIGHT_MARGIN,
 };
-use crate::editor::syntax::{Diagnostic, DiagnosticSet, syntax_diagnostics_opt};
 #[cfg(not(target_family = "wasm"))]
 use crate::editor::syntax::LanguageRegistry;
+use crate::editor::syntax::{Diagnostic, DiagnosticSet, syntax_diagnostics_opt};
 
 /// 按下 Enter。
 ///
@@ -353,10 +353,7 @@ pub(crate) fn all_input_states() -> Vec<Entity<InputState>> {
 /// 遍历注册表并按焦点句柄匹配——比给「谁有焦点」再造一套全局状态更直接，
 /// 且天然支持多窗口（各自窗口的 `is_focused` 只会命中自己的那个）。
 /// 顺带清理已析构的条目。
-fn focused_for_intercept(
-    window: &mut Window,
-    _cx: &mut App,
-) -> Option<Entity<InputState>> {
+fn focused_for_intercept(window: &mut Window, _cx: &mut App) -> Option<Entity<InputState>> {
     FOCUSED_INPUTS.with(|inputs| {
         let mut inputs = inputs.borrow_mut();
         inputs.retain(|(_, weak)| weak.upgrade().is_some());
@@ -925,6 +922,24 @@ impl InputState {
         self
     }
 
+    /// 构造一个**代码编辑器**输入框（编辑器 tab 与 diff 视图共用）。
+    ///
+    /// 「同一条路径」不只是 [`InputMode`]：vim 状态也在这里装上
+    /// （`crate::vim` 的 `InputState::sync_vim_state`）。两处各写一遍 builder
+    /// 链时已经漂移过一次——diff 视图当初只在设置变化时被
+    /// `vim::disable_all` 补上 vim，于是「新开的 diff 编辑器没有 vim，
+    /// 改一次任意设置（字号、主题…）后 vim 突然出现」。构造函数让漂移在
+    /// 结构上不可能发生：新增代码编辑器请一律走这里。
+    pub fn new_code_editor(
+        language: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut state = Self::new(window, cx).code_editor(language).multi_line(true);
+        state.sync_vim_state(cx);
+        state
+    }
+
     /// Set Input to use [`InputMode::CodeEditor`] mode.
     ///
     /// Default options:
@@ -1282,7 +1297,11 @@ impl InputState {
     ///
     /// 锚点存**字节偏移而非像素**：像素坐标随滚动/软换行/行号栏宽度变化，
     /// 存下来必然过期（这正是之前浮层位置错乱的原因）。
-    pub fn set_hover_popover(&mut self, anchor_offset: usize, info: crate::editor::hover::HoverInfo) {
+    pub fn set_hover_popover(
+        &mut self,
+        anchor_offset: usize,
+        info: crate::editor::hover::HoverInfo,
+    ) {
         self.hover_popover = Some((anchor_offset, info));
         // 新内容落定：之前安排的延迟隐藏作废。
         self.hover_hide_deadline = None;
@@ -1525,11 +1544,7 @@ impl InputState {
     /// 而两者之间又有新请求发出，卡片内容（A 的）和位置（B 的）就会错位。
     /// 这正是之前 `HoverState::last_result_offset` 那个镜像字段想解决的，
     /// 但镜像和槽是两处状态，照样有竞态；合在一起才是原子的。
-    pub fn set_pending_hover(
-        &mut self,
-        info: crate::editor::hover::HoverInfo,
-        offset: usize,
-    ) {
+    pub fn set_pending_hover(&mut self, info: crate::editor::hover::HoverInfo, offset: usize) {
         self.pending_hover = Some((offset, info));
     }
 
@@ -1575,9 +1590,7 @@ impl InputState {
     /// 取走后台 hover 结果（取走即清空，避免重复弹出同一张卡片）。
     ///
     /// 返回 `(请求时的偏移, 内容)` —— 调用方必须用这个偏移当锚点。
-    pub fn take_pending_hover(
-        &mut self,
-    ) -> Option<(usize, crate::editor::hover::HoverInfo)> {
+    pub fn take_pending_hover(&mut self) -> Option<(usize, crate::editor::hover::HoverInfo)> {
         self.pending_hover.take()
     }
 
@@ -1645,9 +1658,7 @@ impl InputState {
         items: &[lsp_types::CompletionItem],
     ) -> std::ops::Range<usize> {
         let range = match items.first() {
-            Some(item) => {
-                crate::lsp::features::completion_replace_range(self.text(), offset, item)
-            }
+            Some(item) => crate::lsp::features::completion_replace_range(self.text(), offset, item),
             None => crate::lsp::features::word_range_before(self.text(), offset),
         };
         self.pending_completion_range = range.clone();
@@ -1674,7 +1685,8 @@ impl InputState {
         cx: &mut Context<Self>,
     ) -> bool {
         // 先把附加编辑换算成字节区间（基于当前文本），并从后往前排序。
-        let additional_bytes = crate::lsp::features::to_byte_edits(self.text(), additional.to_vec());
+        let additional_bytes =
+            crate::lsp::features::to_byte_edits(self.text(), additional.to_vec());
 
         // 逐条应用（已按起点降序）。任一区间失效就整体放弃，避免留下
         // 「导入加了但名字没插」的半成品。
@@ -1752,10 +1764,11 @@ impl InputState {
             .on_text_changed(&self.text, &range, &Rope::from(new_text), cx);
 
         self.history.push(
-            Change::new(range.clone(), &old_text, range.start..new_offset, new_text).with_selections(
-                old_selection.start..old_selection.end,
-                new_offset..new_offset,
-            ),
+            Change::new(range.clone(), &old_text, range.start..new_offset, new_text)
+                .with_selections(
+                    old_selection.start..old_selection.end,
+                    new_offset..new_offset,
+                ),
         );
         self.history.end_grouping();
         self.bump_text_version();
@@ -1809,9 +1822,7 @@ impl InputState {
             && let Some(applied) = self.applied_diagnostics_version
             && v < applied
         {
-            log::debug!(
-                "lsp: dropping stale diagnostics (version {v} < applied {applied})"
-            );
+            log::debug!("lsp: dropping stale diagnostics (version {v} < applied {applied})");
             return false;
         }
         if !self.set_diagnostics(items) {
@@ -2315,7 +2326,8 @@ impl InputState {
                             })
                             .collect(),
                     ),
-                })            })
+                })
+            })
             .collect();
         self.display_map.set_git_insertions(insertions);
     }
@@ -2423,7 +2435,8 @@ impl InputState {
             return Some(cache.ranges.clone());
         }
         let word = edit_primitives::word_range_at(&self.text, cursor)?;
-        let ranges = edit_primitives::find_word_occurrences(&self.text, &word, OCCURRENCE_MAX_MATCHES)?;
+        let ranges =
+            edit_primitives::find_word_occurrences(&self.text, &word, OCCURRENCE_MAX_MATCHES)?;
         let rc = std::rc::Rc::new(ranges);
         self.occurrence_cache = Some(OccurrenceCache {
             text_version: self.text_version,
@@ -2704,9 +2717,7 @@ impl InputState {
                 || (p.is_lowercase() && c.is_uppercase())
                 || (p.is_ascii_digit() && c.is_uppercase())
                 || (p.is_lowercase() && c.is_ascii_digit())
-                || (p.is_uppercase()
-                    && c.is_uppercase()
-                    && next.is_some_and(|n| n.is_lowercase()));
+                || (p.is_uppercase() && c.is_uppercase() && next.is_some_and(|n| n.is_lowercase()));
             if boundary {
                 starts.push(byte_i);
             }
@@ -2937,9 +2948,14 @@ impl InputState {
                         b'[' => b']',
                         _ => b'}',
                     };
-                    if let Some(m) =
-                        edit_primitives::scan_matching_bracket(text, off, false, b, close, BRACKET_MATCH_SCAN_LIMIT)
-                    {
+                    if let Some(m) = edit_primitives::scan_matching_bracket(
+                        text,
+                        off,
+                        false,
+                        b,
+                        close,
+                        BRACKET_MATCH_SCAN_LIMIT,
+                    ) {
                         return Some((off, m));
                     }
                 }
@@ -4871,8 +4887,7 @@ impl InputState {
     /// 注意淡入窗口内 `blink.visible()` 仍为 false（它是布尔语义），
     /// 所以绘制侧要同时接受「淡入中」：见 [`Self::should_paint_cursor`]。
     pub(crate) fn cursor_opacity(&self, window: &Window, cx: &App) -> f32 {
-        if !self.focus_handle.is_focused(window) || self.disabled || !window.is_window_active()
-        {
+        if !self.focus_handle.is_focused(window) || self.disabled || !window.is_window_active() {
             return 1.0;
         }
         self.blink_cursor.read(cx).opacity()
@@ -4884,8 +4899,7 @@ impl InputState {
     /// （相位尚未翻转），但透明度已经大于 0——此时必须绘制，否则淡入会
     /// 变成「到点突然出现」。
     pub(crate) fn should_paint_cursor(&self, window: &Window, cx: &App) -> bool {
-        if !self.focus_handle.is_focused(window) || self.disabled || !window.is_window_active()
-        {
+        if !self.focus_handle.is_focused(window) || self.disabled || !window.is_window_active() {
             return false;
         }
         let blink = self.blink_cursor.read(cx);
@@ -4954,9 +4968,22 @@ impl InputState {
     pub(crate) fn on_key_down(
         &mut self,
         event: &KeyDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 只处理「焦点真在自己身上」的击键。
+        //
+        // `on_key_down` 挂在编辑器的 div 上，而 gpui 的事件冒泡从焦点节点
+        // 往上走——焦点在**子输入框**（查找框、替换框）里时，这个监听器
+        // 照样会被调用。若不加这道判断，编辑器在 Normal 模式下会把子输入框
+        // 的字符一并吞掉：查找框里按 `h` 什么都不发生。
+        //
+        // `is_focused` 是精确判定（`window.focus == self`），不含后代，
+        // 正是这里需要的语义。
+        if !self.focus_handle.is_focused(window) {
+            return;
+        }
+
         self.pause_blink_cursor(cx);
 
         if !self.should_intercept_key(event) {
@@ -5354,10 +5381,7 @@ impl InputState {
                 entity
                     .update(cx, |state, cx| {
                         let items = syntax_diagnostics_opt(
-                            highlighter_rc
-                                .borrow()
-                                .as_ref()
-                                .and_then(|h| h.tree()),
+                            highlighter_rc.borrow().as_ref().and_then(|h| h.tree()),
                         );
                         if let Some(diagnostics) = state.mode.diagnostics_mut() {
                             diagnostics.set(items, &state.text);

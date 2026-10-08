@@ -46,11 +46,7 @@ pub fn offset_to_position(rope: &Rope, offset: usize) -> Position {
 pub fn range_to_bytes(rope: &Rope, range: lsp_types::Range) -> Range<usize> {
     let start = position_to_offset(rope, range.start);
     let end = position_to_offset(rope, range.end);
-    if start > end {
-        end..start
-    } else {
-        start..end
-    }
+    if start > end { end..start } else { start..end }
 }
 
 // ------------------------------------------------------------------ 诊断
@@ -282,12 +278,10 @@ pub fn first_location(response: &lsp_types::GotoDefinitionResponse) -> Option<Lo
     match response {
         lsp_types::GotoDefinitionResponse::Scalar(l) => Some(l.clone()),
         lsp_types::GotoDefinitionResponse::Array(v) => v.first().cloned(),
-        lsp_types::GotoDefinitionResponse::Link(links) => {
-            links.first().map(|l| Location {
-                uri: l.target_uri.clone(),
-                range: l.target_range,
-            })
-        }
+        lsp_types::GotoDefinitionResponse::Link(links) => links.first().map(|l| Location {
+            uri: l.target_uri.clone(),
+            range: l.target_range,
+        }),
     }
 }
 
@@ -555,7 +549,10 @@ pub struct FlatSymbol {
 ///
 /// 嵌套符号（`DocumentSymbol.children`）递归展开成带 `depth` 的平表，
 /// 这样 UI 只渲染一个列表，缩进由 depth 决定。
-pub fn flatten_symbols(rope: &Rope, response: &lsp_types::DocumentSymbolResponse) -> Vec<FlatSymbol> {
+pub fn flatten_symbols(
+    rope: &Rope,
+    response: &lsp_types::DocumentSymbolResponse,
+) -> Vec<FlatSymbol> {
     let mut out = Vec::new();
     match response {
         lsp_types::DocumentSymbolResponse::Nested(nested) => {
@@ -694,7 +691,10 @@ pub fn to_inlay_hints(rope: &Rope, hints: Vec<lsp_types::InlayHint>) -> Vec<Inla
 /// 把参数列表里当前参数高亮出来：普通文本面板无法做富文本，
 /// 用 `>` 前缀标记当前参数。
 pub fn signature_text(help: &lsp_types::SignatureHelp) -> String {
-    let signature = match help.signatures.get(help.active_signature.unwrap_or(0) as usize) {
+    let signature = match help
+        .signatures
+        .get(help.active_signature.unwrap_or(0) as usize)
+    {
         Some(s) => s,
         None => return String::new(),
     };
@@ -732,7 +732,10 @@ pub fn code_action_label(action: &lsp_types::CodeActionOrCommand) -> Option<(Str
 }
 
 /// 文档高亮 → 字节区间。
-pub fn to_highlight_ranges(rope: &Rope, highlights: Vec<lsp_types::DocumentHighlight>) -> Vec<Range<usize>> {
+pub fn to_highlight_ranges(
+    rope: &Rope,
+    highlights: Vec<lsp_types::DocumentHighlight>,
+) -> Vec<Range<usize>> {
     highlights
         .into_iter()
         .map(|h| range_to_bytes(rope, h.range))
@@ -740,7 +743,9 @@ pub fn to_highlight_ranges(rope: &Rope, highlights: Vec<lsp_types::DocumentHighl
 }
 
 /// 诊断计数（按严重级别），供状态栏显示。
-pub fn severity_counts(diagnostics: &[lsp_types::Diagnostic]) -> HashMap<DiagnosticSeverity, usize> {
+pub fn severity_counts(
+    diagnostics: &[lsp_types::Diagnostic],
+) -> HashMap<DiagnosticSeverity, usize> {
     let mut map = HashMap::new();
     for d in diagnostics {
         *map.entry(severity(d.severity)).or_insert(0) += 1;
@@ -903,7 +908,10 @@ mod tests {
     fn word_range_after_cjk_word() {
         // CJK 本身也是 alphanumeric，所以光标在 CJK 后应把整段 CJK 取进来。
         let text = rope("变量 x");
-        assert_eq!(word_range_before(&text, text.len()), text.len() - 1..text.len());
+        assert_eq!(
+            word_range_before(&text, text.len()),
+            text.len() - 1..text.len()
+        );
     }
 
     #[test]
@@ -969,12 +977,12 @@ mod tests {
     #[test]
     fn hover_language_string_becomes_code_block() {
         let hover = lsp_types::Hover {
-            contents: lsp_types::HoverContents::Scalar(
-                lsp_types::MarkedString::LanguageString(lsp_types::LanguageString {
+            contents: lsp_types::HoverContents::Scalar(lsp_types::MarkedString::LanguageString(
+                lsp_types::LanguageString {
                     language: "rust".into(),
                     value: "fn f()".into(),
-                }),
-            ),
+                },
+            )),
             range: None,
         };
         let text = hover_contents(&hover);
@@ -1178,8 +1186,7 @@ mod tests {
             ])),
             change_annotations: None,
         };
-        let edits =
-            edits_for_uri(&edit, &uri("file:///a.rs")).expect("documentChanges must work");
+        let edits = edits_for_uri(&edit, &uri("file:///a.rs")).expect("documentChanges must work");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "bar");
     }
@@ -1203,8 +1210,7 @@ mod tests {
             ])),
             change_annotations: None,
         };
-        let edits =
-            edits_for_uri(&edit, &uri("file:///a.rs")).expect("operations shape must work");
+        let edits = edits_for_uri(&edit, &uri("file:///a.rs")).expect("operations shape must work");
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].new_text, "baz");
     }
@@ -1234,7 +1240,10 @@ mod tests {
         };
         let edits = edits_for_uri(&edit, &uri("file:///a.rs")).unwrap();
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, "mine", "must not leak other files' edits");
+        assert_eq!(
+            edits[0].new_text, "mine",
+            "must not leak other files' edits"
+        );
     }
 
     /// 目标 uri 没有任何编辑 → `None`（调用方据此跳过应用）。
@@ -1252,7 +1261,10 @@ mod tests {
     #[test]
     fn workspace_edit_merges_both_shapes() {
         let mut changes = HashMap::new();
-        changes.insert(uri("file:///a.rs"), vec![text_edit(0, 0, 0, 1, "from-changes")]);
+        changes.insert(
+            uri("file:///a.rs"),
+            vec![text_edit(0, 0, 0, 1, "from-changes")],
+        );
         let edit = WorkspaceEdit {
             changes: Some(changes),
             document_changes: Some(lsp_types::DocumentChanges::Edits(vec![
@@ -1261,7 +1273,13 @@ mod tests {
                         uri: uri("file:///a.rs"),
                         version: None,
                     },
-                    edits: vec![lsp_types::OneOf::Left(text_edit(1, 0, 1, 1, "from-doc-changes"))],
+                    edits: vec![lsp_types::OneOf::Left(text_edit(
+                        1,
+                        0,
+                        1,
+                        1,
+                        "from-doc-changes",
+                    ))],
                 },
             ])),
             change_annotations: None,
@@ -1298,8 +1316,8 @@ mod tests {
             change_annotations: None,
         };
 
-        let edits = edits_for_uri(&edit, &uri("file:///a.rs"))
-            .expect("documentChanges must yield edits");
+        let edits =
+            edits_for_uri(&edit, &uri("file:///a.rs")).expect("documentChanges must yield edits");
         let byte_edits = to_byte_edits(&text, edits);
         let out = apply_byte_edits(&text.to_string(), &byte_edits);
         assert_eq!(out, "fn main() { new_name(); }\n");
@@ -1315,7 +1333,10 @@ mod tests {
     /// 当词字符（如 import 路径 `foo.ts`）。
     #[test]
     fn dot_is_punctuation_by_default() {
-        assert_eq!(char_kind('.', DEFAULT_EXTRA_WORD_CHARS), CharKind::Punctuation);
+        assert_eq!(
+            char_kind('.', DEFAULT_EXTRA_WORD_CHARS),
+            CharKind::Punctuation
+        );
         // 显式声明后才是词字符（对应 import 路径场景）。
         assert_eq!(char_kind('.', &['.']), CharKind::Word);
     }
@@ -1350,7 +1371,10 @@ mod tests {
     /// `-` 在 Tailwind 场景（显式声明）下是词字符。
     #[test]
     fn hyphen_is_word_char_when_scope_declares_it() {
-        assert_eq!(char_kind('-', DEFAULT_EXTRA_WORD_CHARS), CharKind::Punctuation);
+        assert_eq!(
+            char_kind('-', DEFAULT_EXTRA_WORD_CHARS),
+            CharKind::Punctuation
+        );
         assert_eq!(char_kind('-', &['-']), CharKind::Word);
     }
 

@@ -331,8 +331,8 @@ impl MarkdownElementBuilder {
                     // 而 `hover_style` 显式设成 `Normal` 来要求换行。
                     //
                     // 此前这里是无条件 `Nowrap`，把样式里给的设置直接丢掉了。
-                    let wrap = self.style.code_block.text.white_space
-                        == Some(gpui::WhiteSpace::Normal);
+                    let wrap =
+                        self.style.code_block.text.white_space == Some(gpui::WhiteSpace::Normal);
                     let mut inner = div().id(format!("code-inner-{}", code_block_id));
                     // 换行时不能留 `overflow_x_scroll`：不换行才有横向内容，
                     // 留着它会让 GPUI 把超宽内容当可滚动区，鼠标一进去就变成
@@ -1316,9 +1316,7 @@ impl MarkdownElementBuilder {
                             .child(div().text_size(px(18.)).child("🖼"))
                             .child({
                                 let txt = alt.clone();
-                                let mut t = div()
-                                    .text_size(px(13.))
-                                    .text_color(cx.theme().ui.text);
+                                let mut t = div().text_size(px(13.)).text_color(cx.theme().ui.text);
                                 if let Some(runs) = alt_runs.clone() {
                                     t = t.child(StyledText::new(txt).with_runs(runs));
                                 } else {
@@ -1337,20 +1335,19 @@ impl MarkdownElementBuilder {
             }
         };
         // 若有 alt 标题单独一行 caption
-        let caption =
-            if alt_text.is_empty() || alt_text == url {
-                None
-            } else {
-                Some(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_size(px(12.))
-                        .text_color(cx.theme().ui.text_muted)
-                        .child(alt_text.to_string())
-                        .into_any_element(),
-                )
-            };
+        let caption = if alt_text.is_empty() || alt_text == url {
+            None
+        } else {
+            Some(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(cx.theme().ui.text_muted)
+                    .child(alt_text.to_string())
+                    .into_any_element(),
+            )
+        };
         let card: AnyElement = image_card;
         // caption 放在卡片下方外部，保持 Notion 图注风格
         if let Some(cap) = caption {
@@ -1478,4 +1475,3 @@ fn replace_shortcodes(text: &str) -> String {
     out.push_str(&text[at..]);
     out
 }
-
