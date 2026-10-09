@@ -26,9 +26,7 @@
 use std::ops::Range;
 use std::time::Duration;
 
-use gpui::{
-    App, Entity, IntoElement, ParentElement as _, Styled as _, div, px,
-};
+use gpui::{App, Entity, IntoElement, ParentElement as _, Styled as _, div, px};
 use lsp_types::Url;
 use ropey::Rope;
 
@@ -190,7 +188,9 @@ impl HoverState {
         let editor_for_notify = editor.clone();
         // 代号要比对，放在任务够得到的 `InputState` 上。
         editor
-            .update(cx, |state, _| state.set_hover_request_generation(generation))
+            .update(cx, |state, _| {
+                state.set_hover_request_generation(generation)
+            })
             .ok();
         self.task = Some(cx.spawn(async move |cx| {
             smol::Timer::after(HOVER_DELAY).await;
@@ -248,7 +248,8 @@ impl HoverState {
                 if hidden {
                     log::info!(
                         "lsp: hover 无内容 -> 收起已显示浮层 pos={}:{}",
-                        position.line, position.character
+                        position.line,
+                        position.character
                     );
                     // 收起发生在 `InputState` 上，重绘由 `Editor` 的 render 读那边
                     // 的状态，所以要显式 notify 让下一帧跑起来。
@@ -296,7 +297,6 @@ impl HoverState {
         self.hide();
         editor.update(cx, |state, _cx| state.clear_hover_popover());
     }
-
 }
 
 /// 渲染 hover 浮层的**内容**（不含定位），从 `InputState` 取状态。

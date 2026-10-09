@@ -3072,13 +3072,7 @@ impl TextElement {
         // LSP 浮层/菜单的布局必须在这里做：`layout_as_root` 只允许在
         // request_layout / prepaint 调用，放到 paint 会 panic。
         // 用 prepaint 结束时算好的行布局与滚动偏移（Zed 同款）。
-        self.layout_lsp_popovers(
-            bounds,
-            &last_layout,
-            last_layout.line_height,
-            window,
-            cx,
-        );
+        self.layout_lsp_popovers(bounds, &last_layout, last_layout.line_height, window, cx);
 
         PrepaintState {
             bounds,
@@ -4297,7 +4291,6 @@ impl TextElement {
         window: &mut Window,
         cx: &mut App,
     ) {
-
         // 补全菜单优先：它在打字时出现，比 hover 更需要即时可见。
         if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
             let offset = state.completion_anchor()?;

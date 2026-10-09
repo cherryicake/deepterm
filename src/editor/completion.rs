@@ -177,9 +177,7 @@ impl CompletionState {
         self.uri = Some(uri.clone());
 
         let editor = editor.downgrade();
-        let offset = editor
-            .update(cx, |state, _| state.cursor())
-            .unwrap_or(0);
+        let offset = editor.update(cx, |state, _| state.cursor()).unwrap_or(0);
 
         self.task = Some(cx.spawn(async move |cx| {
             if let Some(delay) = delay {
@@ -198,7 +196,9 @@ impl CompletionState {
             // 代号落在 InputState 上供本任务比对（CompletionState 自身在
             // 后台任务里不可达）。
             editor
-                .update(cx, |state, _| state.set_completion_request_generation(generation))
+                .update(cx, |state, _| {
+                    state.set_completion_request_generation(generation)
+                })
                 .ok();
 
             // 把触发字符原样传给服务器（对照 LSP 的
@@ -212,10 +212,7 @@ impl CompletionState {
                 position.character,
                 trigger_character
             );
-            match client
-                .completion(&uri, position, trigger_character)
-                .await
-            {
+            match client.completion(&uri, position, trigger_character).await {
                 Ok((items, incomplete)) => {
                     // **await 之后必须再验代号**：等待期间用户可能又敲了几个
                     // 字符，那几轮的任务也会发请求。旧响应回来就写pending 槽，
@@ -226,10 +223,7 @@ impl CompletionState {
                         })
                         .unwrap_or(false);
                     if !still_current {
-                        log::info!(
-                            "lsp: completion 响应已过期，丢弃 {} 个候选",
-                            items.len()
-                        );
+                        log::info!("lsp: completion 响应已过期，丢弃 {} 个候选", items.len());
                         return;
                     }
                     log::info!(
@@ -263,7 +257,8 @@ impl CompletionState {
 
     /// 取走后台结果（Editor 每帧调用）。
     pub fn take_pending(&mut self, editor: &Entity<InputState>, cx: &mut App) {
-        let Some((items, _position)) = editor.update(cx, |state, _| state.take_pending_completions())
+        let Some((items, _position)) =
+            editor.update(cx, |state, _| state.take_pending_completions())
         else {
             return;
         };
@@ -272,8 +267,9 @@ impl CompletionState {
             self.hide_in(editor, cx);
             return;
         }
-        let (replace_range, cursor) =
-            editor.update(cx, |state, _| (state.completion_replace_range_for(&items), state.cursor()));
+        let (replace_range, cursor) = editor.update(cx, |state, _| {
+            (state.completion_replace_range_for(&items), state.cursor())
+        });
         let range_for_log = replace_range.clone();
         self.candidates = items
             .into_iter()
