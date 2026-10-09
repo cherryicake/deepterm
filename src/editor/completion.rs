@@ -286,8 +286,9 @@ impl CompletionState {
         // `None`），所以这里的 `cursor` 就是**发请求时**那个偏移，可以放心
         // 拿它当菜单锚点、拿去算替换区间。
         let cursor = pending.cursor_offset;
-        let replace_range =
-            editor.update(cx, |state, _| state.completion_replace_range_at(cursor, &items));
+        let replace_range = editor.update(cx, |state, _| {
+            state.completion_replace_range_at(cursor, &items)
+        });
         let range_for_log = replace_range.clone();
         self.candidates = items
             .into_iter()

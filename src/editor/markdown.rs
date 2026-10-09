@@ -188,10 +188,18 @@ impl MarkdownStyle {
         // `background_color` / `border_width` 这些名字。
         let code_block = StyleRefinement {
             padding: gpui::EdgesRefinement {
-                top: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(6.)))),
-                left: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                right: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(8.)))),
-                bottom: Some(gpui::DefiniteLength::Absolute(gpui::AbsoluteLength::Pixels(px(6.)))),
+                top: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(6.)),
+                )),
+                left: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                right: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(8.)),
+                )),
+                bottom: Some(gpui::DefiniteLength::Absolute(
+                    gpui::AbsoluteLength::Pixels(px(6.)),
+                )),
             },
             margin: gpui::EdgesRefinement {
                 top: Some(gpui::Length::Definite(px(4.).into())),

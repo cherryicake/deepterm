@@ -331,7 +331,10 @@ fn anchor_at_very_top_goes_below() {
         y > 0.0,
         "anchor at the very top has no room above; popover must go below, got y={y}"
     );
-    assert_eq!(y, 20.0, "should sit just below the anchor row (0 + row height 20)");
+    assert_eq!(
+        y, 20.0,
+        "should sit just below the anchor row (0 + row height 20)"
+    );
 }
 
 /// 底部锚点：下方放不下时必须翻到上方（另一侧的场景）。

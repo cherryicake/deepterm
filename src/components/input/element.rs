@@ -4310,10 +4310,7 @@ impl TextElement {
         // 滚过的内容原点：把「未滚动视口」平移滚动量得到，与正文绘制
         // （`paint_inner` 用 `prepaint.bounds`）一致。
         // 这样调用方只需给一个矩形，不会再出现「传错矩形」的错误。
-        let bounds = Bounds::new(
-            viewport.origin + scroll_offset,
-            viewport.size,
-        );
+        let bounds = Bounds::new(viewport.origin + scroll_offset, viewport.size);
         // 可见区的**结束字节**：最后一条可见行的下一行行首（钳到文本长度）。
         // 用它界定最后一条可见行——用 `text_len` 不行：那会把视口之后的
         // 所有偏移都算到最后一行上，滚动后浮层就粘在底部不消失。
@@ -4353,8 +4350,9 @@ impl TextElement {
             // 阶段调用会入队一个从未 prepaint 的元素，触发
             // "must call prepaint before paint"。
             window.defer_draw(content, origin, 2, None);
-            self.state
-                .update(cx, |state, _cx| state.record_popover_placement(origin, anchor_y));
+            self.state.update(cx, |state, _cx| {
+                state.record_popover_placement(origin, anchor_y)
+            });
         }
 
         // hover 浮层：优先画在锚点行上方（不遮住正在看的词）。
@@ -4396,10 +4394,7 @@ impl TextElement {
                 state.record_popover_placement(origin, anchor_y);
                 // 记下卡片实际占的矩形：滚轮事件冒泡到 `on_scroll_wheel` 时
                 // 靠它判断是否该放行给浮层自己滚。
-                state.record_hover_popover_bounds(Bounds {
-                    origin,
-                    size,
-                });
+                state.record_hover_popover_bounds(Bounds { origin, size });
             });
         }
     }

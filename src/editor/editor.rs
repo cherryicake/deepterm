@@ -107,59 +107,77 @@ pub fn init(cx: &mut App) {
     // 详情见 `hover::init_keystroke_interceptor`。
     crate::editor::hover::init_keystroke_interceptor(cx);
     // 实时 markdown 与只读预览共用复制/全选语义，仅上下文不同。
-    crate::keymap::bind(cx, [
-        KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
-        KeyBinding::new("ctrl-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
-        KeyBinding::new("cmd-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
-        KeyBinding::new("ctrl-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
-    ]);
-    crate::keymap::bind(cx, [
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
-        // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
-        KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
-        KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
-        KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
-        KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
-        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-        // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
-        KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
-        KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
-        KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
-        KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
-        // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
-        KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
-        KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
-        KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
-        KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
-        KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
-        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
-        KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
-        // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
-        // 焦点移进浮层，此后 hjkl 滚动内容。
-        //
-        // 放在 Rust 侧而不是 `default.json`：与上面这批 LSP 快捷键一致，且
-        // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
-        // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
-        KeyBinding::new("K", Hover, Some("EditorPanel")),
-        // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
-        // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
-        KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
-        KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
-        KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
-        KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
-        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-    ]);
+    crate::keymap::bind(
+        cx,
+        [
+            KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+            KeyBinding::new(
+                "ctrl-c",
+                crate::editor::markdown::Copy,
+                Some("LiveMarkdown"),
+            ),
+            KeyBinding::new(
+                "cmd-a",
+                crate::editor::markdown::SelectAll,
+                Some("LiveMarkdown"),
+            ),
+            KeyBinding::new(
+                "ctrl-a",
+                crate::editor::markdown::SelectAll,
+                Some("LiveMarkdown"),
+            ),
+        ],
+    );
+    crate::keymap::bind(
+        cx,
+        [
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
+            // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
+            KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
+            KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
+            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+            // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
+            KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
+            KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
+            KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
+            KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
+            // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
+            KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
+            KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
+            KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
+            KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
+            KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
+            KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
+            KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
+            // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
+            // 焦点移进浮层，此后 hjkl 滚动内容。
+            //
+            // 放在 Rust 侧而不是 `default.json`：与上面这批 LSP 快捷键一致，且
+            // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
+            // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
+            KeyBinding::new("K", Hover, Some("EditorPanel")),
+            // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
+            // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
+            KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
+            KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
+            KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
+            KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
+            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+        ],
+    );
 }
 
 /// 路径前缀替换：`from` 自身 → `to`，`from` 的后代 → `to` 下的同层级路径。
@@ -1941,7 +1959,8 @@ impl Editor {
         };
         let client = self.active_lsp_client(cx);
         let cursor = editor.read(cx).cursor();
-        self.hover.on_keyboard_triggered(cursor, &editor, client, uri, cx);
+        self.hover
+            .on_keyboard_triggered(cursor, &editor, client, uri, cx);
         cx.notify();
     }
 
@@ -5144,7 +5163,10 @@ impl Render for Editor {
                                             // 在那儿发一次 hover 请求，拿到「无内容」后
                                             // `clear_hover_popover` 把卡片擦掉 —— 表现为
                                             // **指针一移到卡片上，卡片立即消失**。
-                                            if editor.read(cx).hover_popover_contains(event.position) {
+                                            if editor
+                                                .read(cx)
+                                                .hover_popover_contains(event.position)
+                                            {
                                                 return;
                                             }
                                             // 指针回到编辑区 = 离开了浮层。复位这个标记，

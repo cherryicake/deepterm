@@ -331,8 +331,8 @@ impl MarkdownElementBuilder {
                     // 而 `hover_style` 显式设成 `Normal` 来要求换行。
                     //
                     // 此前这里是无条件 `Nowrap`，把样式里给的设置直接丢掉了。
-                    let wrap = self.style.code_block.text.white_space
-                        == Some(gpui::WhiteSpace::Normal);
+                    let wrap =
+                        self.style.code_block.text.white_space == Some(gpui::WhiteSpace::Normal);
                     let mut inner = div().id(format!("code-inner-{}", code_block_id));
                     // 换行时不能留 `overflow_x_scroll`：不换行才有横向内容，
                     // 留着它会让 GPUI 把超宽内容当可滚动区，鼠标一进去就变成

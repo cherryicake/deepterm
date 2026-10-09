@@ -1544,11 +1544,7 @@ impl InputState {
     /// 而两者之间又有新请求发出，卡片内容（A 的）和位置（B 的）就会错位。
     /// 这正是之前 `HoverState::last_result_offset` 那个镜像字段想解决的，
     /// 但镜像和槽是两处状态，照样有竞态；合在一起才是原子的。
-    pub fn set_pending_hover(
-        &mut self,
-        info: crate::editor::hover::HoverInfo,
-        offset: usize,
-    ) {
+    pub fn set_pending_hover(&mut self, info: crate::editor::hover::HoverInfo, offset: usize) {
         self.pending_hover = Some((offset, info));
     }
 
@@ -1594,9 +1590,7 @@ impl InputState {
     /// 取走后台 hover 结果（取走即清空，避免重复弹出同一张卡片）。
     ///
     /// 返回 `(请求时的偏移, 内容)` —— 调用方必须用这个偏移当锚点。
-    pub fn take_pending_hover(
-        &mut self,
-    ) -> Option<(usize, crate::editor::hover::HoverInfo)> {
+    pub fn take_pending_hover(&mut self) -> Option<(usize, crate::editor::hover::HoverInfo)> {
         self.pending_hover.take()
     }
 

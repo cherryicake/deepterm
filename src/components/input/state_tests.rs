@@ -882,11 +882,7 @@ fn pending_completion_is_drained_exactly_once(cx: &mut gpui::TestAppContext) {
             label: "foo_bar".into(),
             ..Default::default()
         };
-        state.set_pending_completions(
-            vec![item],
-            lsp_types::Position::new(0, 0),
-            state.cursor(),
-        );
+        state.set_pending_completions(vec![item], lsp_types::Position::new(0, 0), state.cursor());
         // 契约：写入后必须 notify，否则不会产生新的一帧，`render` 不跑，
         // `drain_lsp_results` 也就永远不会把候选搬进浮层状态。
         cx.notify();
@@ -946,13 +942,8 @@ fn pending_completion_is_dropped_once_cursor_moved(cx: &mut gpui::TestAppContext
             label: "at_request_position".into(),
             ..Default::default()
         };
-        state.set_pending_completions(
-            vec![item],
-            lsp_types::Position::new(0, 3),
-            requested_at,
-        );
+        state.set_pending_completions(vec![item], lsp_types::Position::new(0, 3), requested_at);
     });
-
 
     let taken = input.update(cx, |state, _cx| state.take_pending_completions());
     assert!(
@@ -992,7 +983,8 @@ fn pending_completion_reports_the_offset_it_was_requested_at(cx: &mut gpui::Test
         );
     });
 
-    let taken = input.update(cx, |state, _cx| state.take_pending_completions())
+    let taken = input
+        .update(cx, |state, _cx| state.take_pending_completions())
         .expect("光标未动，候选应可用");
     assert_eq!(
         taken.cursor_offset, requested_at,
@@ -1043,7 +1035,10 @@ fn hover_hide_deadline_cancel_paths(cx: &mut gpui::TestAppContext) {
     });
     std::thread::sleep(std::time::Duration::from_millis(5));
     input.read_with(cx, |state, _| {
-        assert!(state.hover_hide_expired(), "deadline 已过且无守卫，应判到期");
+        assert!(
+            state.hover_hide_expired(),
+            "deadline 已过且无守卫，应判到期"
+        );
     });
 
     // 取消路径 1：指针进入卡片。
@@ -1209,10 +1204,7 @@ fn hover_popover_covers_drives_debounce_restart(cx: &mut gpui::TestAppContext) {
     // 卡片没了：任何偏移都不该算覆盖（否则新位置会拿到「已覆盖」而永远不发请求）。
     input.update(cx, |state, _| state.clear_hover_popover());
     input.read_with(cx, |state, _| {
-        assert!(
-            !state.hover_popover_covers(4),
-            "浮层消失后必须重新起防抖"
-        );
+        assert!(!state.hover_popover_covers(4), "浮层消失后必须重新起防抖");
     });
 }
 
