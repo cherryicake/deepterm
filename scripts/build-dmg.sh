@@ -56,6 +56,17 @@ else
     echo -e "${GREEN}Terminfo compiled into bundle.${NC}"
 fi
 
+# Inject the Local Network usage description. cargo-bundle cannot set this
+# key, and without it macOS silently denies every LAN connection instead of
+# showing the permission prompt (observed as EHOSTUNREACH "No route to host").
+echo "Patching Info.plist for Local Network permission..."
+PLIST="${PROJECT_DIR}/${APP_BUNDLE}/Contents/Info.plist"
+LOCAL_NET_DESC="DeepTerm 需要访问本地网络,以连接局域网中的 SSH 服务器。"
+/usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string ${LOCAL_NET_DESC}" "${PLIST}" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription ${LOCAL_NET_DESC}" "${PLIST}"
+# Re-sign ad-hoc so the bundle signature matches the patched Info.plist
+codesign --force --deep --sign - "${PROJECT_DIR}/${APP_BUNDLE}"
+
 # Create DMG using create-dmg if available, otherwise use hdiutil
 if command -v create-dmg &> /dev/null; then
     echo -e "${GREEN}Creating DMG with create-dmg...${NC}"

@@ -101,6 +101,12 @@ pub struct BlockingSftpSession {
     /// 懒启的 bulk 通道：为管道化批量 read/write 使用独立 SFTP subsystem，
     /// 避免与常规 `sftp` 元数据操作竞争同一个 request id 空间。
     bulk: Option<Arc<RawSftpSession>>,
+    /// 本会话已确认存在的目录路径（`create_dir_all` 的正向缓存）。
+    ///
+    /// 每次调用原本从根逐组件 `exists`（深度 D ⇒ D 次往返）；缓存后重复
+    /// 调用只探测新增的后缀组件。remove/rename 会按路径前缀失效对应
+    /// 条目（见 invalidate_known_dir），缓存随会话销毁，不会跨会话陈旧。
+    known_dirs: std::collections::HashSet<String>,
 }
 
 impl BlockingSftpSession {
@@ -113,6 +119,7 @@ impl BlockingSftpSession {
             handle,
             sftp,
             bulk: None,
+            known_dirs: Default::default(),
         })
     }
 
@@ -207,49 +214,123 @@ impl BlockingSftpSession {
             return Ok(());
         }
 
+        // 已确认存在的完整路径：直接命中（目录树传输中同一目录会被
+        // 反复 create_dir_all，缓存把 O(深度) 次往返降为 0 次）。
+        if self.known_dirs.contains(path) {
+            return Ok(());
+        }
+
         let mut current = if path.starts_with('/') {
             "/".to_string()
         } else {
             String::new()
         };
 
-        for component in remote_components(path) {
+        let components = remote_components(path);
+        for (index, component) in components.iter().enumerate() {
             current = join_remote_path(&current, component);
-            if self.exists(&current)? {
+            if self.known_dirs.contains(&current) {
                 continue;
             }
-
-            sftp_block_on!({ self.sftp.create_dir(current.clone()).await })?;
+            if self.exists(&current)? {
+                // 已存在的祖先也记入缓存：同会话后续对这些前缀的
+                // create_dir_all 不再重复探测。
+                self.known_dirs.insert(current.clone());
+                continue;
+            }
+            if index == components.len() - 1 {
+                // 末级组件：直接建（常规语义），失败说明竞态中被并发的
+                // 传输建出来了——确认是目录后照样算成功。
+                if let Err(first_err) =
+                    sftp_block_on!({ self.sftp.create_dir(current.clone()).await })
+                {
+                    if self
+                        .metadata(&current)
+                        .is_ok_and(|m| m.kind == RemoteFileKind::Directory)
+                    {
+                        self.known_dirs.insert(current);
+                        return Ok(());
+                    }
+                    return Err(first_err.into());
+                }
+                self.known_dirs.insert(current);
+                return Ok(());
+            }
+            // 中间组件缺失：建一层并记缓存；建失败但实际已是目录
+            // （并发竞态）时按成功处理继续下钻。
+            if let Err(first_err) = sftp_block_on!({ self.sftp.create_dir(current.clone()).await })
+            {
+                if self
+                    .metadata(&current)
+                    .is_ok_and(|m| m.kind == RemoteFileKind::Directory)
+                {
+                    self.known_dirs.insert(current.clone());
+                    continue;
+                }
+                return Err(first_err.into());
+            }
+            self.known_dirs.insert(current.clone());
         }
 
         Ok(())
     }
 
+    /// 清除 known_dirs 中该路径及其全部缓存后代（前缀匹配）。
+    ///
+    /// remove/rename 让已确认存在的目录缓存变陈旧：会话按主机池化复用，
+    /// 「面板删除目录 → 重传同路径」若命中缓存会跳过建目录，叶子
+    /// create_dir 报 no such file 且在该会话存续期内一直失败。
+    fn invalidate_known_dir(&mut self, path: &str) {
+        let prefix = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{path}/")
+        };
+        self.known_dirs.remove(path);
+        self.known_dirs.retain(|cached| !cached.starts_with(&prefix));
+    }
+
     pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
-        sftp_block_on!({
+        // 目录改名等价于旧路径消失：两种失败形态都要防——旧路径被缓存
+        // （改名后重传到旧路径应报错而不是跳过创建）、新路径若恰好曾被
+        // 缓存过旧状态也一并清除。
+        let result = sftp_block_on!({
             self.sftp
                 .rename(from, to)
                 .await
                 .map_err(anyhow::Error::from)
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_known_dir(from);
+            self.invalidate_known_dir(to);
+        }
+        result
     }
 
     pub fn remove_file(&mut self, path: &str) -> anyhow::Result<()> {
-        sftp_block_on!({
+        let result = sftp_block_on!({
             self.sftp
                 .remove_file(path)
                 .await
                 .map_err(anyhow::Error::from)
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_known_dir(path);
+        }
+        result
     }
 
     pub fn remove_dir(&mut self, path: &str) -> anyhow::Result<()> {
-        sftp_block_on!({
+        let result = sftp_block_on!({
             self.sftp
                 .remove_dir(path)
                 .await
                 .map_err(anyhow::Error::from)
-        })
+        });
+        if result.is_ok() {
+            self.invalidate_known_dir(path);
+        }
+        result
     }
 
     pub fn upload_file_from_local_with_cancel_and_progress(
@@ -287,8 +368,11 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            // flush 排空 8 路 in-flight 写确认（写错误在此暴露）后直接
+            // shutdown 关句柄。不再逐文件 fsync：原子 rename 已保证
+            // 「要么旧文件、要么完整新文件」，fsync 只是把崩溃窗口再收窄
+            // 一点，却是每文件最贵的串行往返（服务端一次磁盘刷盘）。
             remote_file.flush().await?;
-            remote_file.sync_all().await?;
             remote_file.shutdown().await?;
             Ok(transferred)
         })
@@ -341,8 +425,8 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            // 与不带权限的上传一致：flush + shutdown，逐文件不做 fsync。
             remote_file.flush().await?;
-            remote_file.sync_all().await?;
             remote_file.shutdown().await?;
             Ok(transferred)
         })
@@ -355,6 +439,39 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
+        self.download_file_with_known_size(
+            remote_path,
+            local_path,
+            None,
+            cancelled,
+            progress,
+        )
+    }
+
+    /// 已知源大小的下载入口（跳过阈值判定的 metadata 往返）。
+    ///
+    /// 目录树下载的 walker 从 read_dir 条目里已拿到每个文件的 size，
+    /// 传入后每文件省一次串行 stat；`permissions` 同理可由调用方一并
+    /// 传入，落地 chmod 不再额外查询。
+    pub fn download_file_with_known_size(
+        &mut self,
+        remote_path: &str,
+        local_path: &Path,
+        known: Option<RemoteFileMetadata>,
+        cancelled: &AtomicBool,
+        progress: Option<&std::sync::atomic::AtomicU64>,
+    ) -> anyhow::Result<u64> {
+        // 大文件走 bulk 通道的流水线读（16×248K in-flight，吞吐不再受
+        // 「一请求一 RTT」限制）；russh-sftp 高层 File 的 poll_read 串行，
+        // 只能靠提高 in-flight 数换吞吐。
+        let size = match known {
+            Some(metadata) => metadata.size,
+            None => self.metadata(remote_path)?.size,
+        };
+        if size >= Self::PIPELINED_DOWNLOAD_THRESHOLD {
+            return self.download_file_pipelined(remote_path, local_path, size, cancelled, progress);
+        }
+
         let mut local_file = File::create(local_path)?;
         sftp_block_on!({
             let mut remote_file = self.sftp.open(remote_path).await?;
@@ -383,10 +500,45 @@ impl BlockingSftpSession {
                 return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
             }
 
+            // 本地侧同样只 flush 不 fsync：rename 到位即对用户可见，
+            // 逐文件 fsync 在大量小文件场景是磁盘级瓶颈（HDD 上每文件
+            // 10ms+），与远端 fsync 同理去掉。
             local_file.flush()?;
-            local_file.sync_all()?;
             Ok(transferred)
         })
+    }
+
+    /// 大文件流水线下载的阈值：低于它串行读已足够快，不值得多开一个
+    /// bulk channel（连接 + init 是纯开销）。
+    const PIPELINED_DOWNLOAD_THRESHOLD: u64 = 8 * 1024 * 1024;
+
+    /// 大文件流水线下载：bulk RawSftpSession 上保持 `parallel` 个 in-flight
+    /// read，响应按 FuturesOrdered 顺序到达后顺序写本地（offset 对齐，
+    /// 乱序响应不会写错位置）。写盘在 block_on 外借 std::fs 完成，不占
+    /// SSH runtime。
+    fn download_file_pipelined(
+        &mut self,
+        remote_path: &str,
+        local_path: &Path,
+        size: u64,
+        cancelled: &AtomicBool,
+        progress: Option<&std::sync::atomic::AtomicU64>,
+    ) -> anyhow::Result<u64> {
+        let raw = self.bulk_session()?;
+        let config = ParallelTransferConfig::from_env();
+        let mut local_file = File::create(local_path)?;
+        let transferred = crate::ssh::shared_runtime::shared_ssh_runtime()
+            .block_on(pipelined_download(
+                raw,
+                remote_path,
+                size,
+                config,
+                cancelled,
+                progress,
+                |chunk: Vec<u8>| local_file.write_all(&chunk),
+            ))?;
+        local_file.flush()?;
+        Ok(transferred)
     }
 
     /// 同服务器远程文件流式复制：源路径 → 目标路径，不写本地磁盘。
@@ -1635,6 +1787,95 @@ async fn pipelined_copy(
     // try_join!：任一端出错立刻中止另一端（channel 被 drop 时对方感知到 EOF/Closed）。
     let (_, bytes_written) = tokio::try_join!(reader, writer)?;
     Ok(bytes_written)
+}
+
+/// 流水线下载到回调：保持 `parallel` 个 in-flight read，完成按请求顺序
+/// 交付（每个块携带显式 offset，这里按序 write 回调天然对齐）。
+///
+/// 与 [`pipelined_read_to_vec`] 的差异：不把整个文件驻留内存，逐块交给
+/// `sink`（下载场景是写本地文件），内存占用恒为一个并发窗口。
+async fn pipelined_download(
+    raw: Arc<RawSftpSession>,
+    path: &str,
+    size: u64,
+    config: ParallelTransferConfig,
+    cancelled: &AtomicBool,
+    progress: Option<&AtomicU64>,
+    mut sink: impl FnMut(Vec<u8>) -> std::io::Result<()>,
+) -> anyhow::Result<u64> {
+    if size == 0 {
+        return Ok(0);
+    }
+    let handle = open_handle(&raw, path, OpenFlags::READ).await?;
+
+    use futures::future::FutureExt;
+    use futures::stream::{FuturesOrdered, StreamExt};
+
+    let chunk = config.chunk.max(1024) as u32;
+    let parallel = config.parallel.max(1);
+    let mut reads: FuturesOrdered<_> = FuturesOrdered::new();
+    let mut next_offset: u64 = 0;
+    let mut transferred: u64 = 0;
+
+    let make_read = |raw: Arc<RawSftpSession>, handle: String, offset: u64, len: u32| {
+        async move {
+            // 短读补齐循环：SFTP 协议允许单个 SSH_FXP_DATA 返回少于请求
+            // 字节数（russh-sftp 的 read 不循环重试）。假定满块读会在本地
+            // 文件留零洞并虚报进度；这里循环到取满请求窗口或收到 EOF。
+            let mut data = Vec::with_capacity(len as usize);
+            let mut got = 0u64;
+            while (got as u32) < len {
+                let part = raw
+                    .read(handle.as_str(), offset + got, len - got as u32)
+                    .await
+                    .map_err(|e| anyhow!("SFTP read({}) 失败: {}", offset + got, e))?;
+                let part_len = part.data.len() as u64;
+                if part_len == 0 {
+                    break; // EOF：不足 size 的提前结束由调用方按 offset 判定
+                }
+                data.extend_from_slice(&part.data);
+                got += part_len;
+            }
+            Ok((offset, data))
+        }
+        .boxed()
+    };
+
+    let result = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            break Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
+        }
+
+        while reads.len() < parallel && next_offset < size {
+            let len = (size - next_offset).min(chunk as u64) as u32;
+            reads.push_back(make_read(raw.clone(), handle.clone(), next_offset, len));
+            next_offset += len as u64;
+        }
+
+        match reads.next().await {
+            Some(Ok((offset, data))) => {
+                if data.is_empty() {
+                    return Err(anyhow!(
+                        "远程文件在 offset={offset} 提前结束 (预期大小 {size})"
+                    ));
+                }
+                // 按实际接收字节数记账（含跨 offset 的进度收敛）。
+                let n = ((offset + data.len() as u64).min(size) - offset) as u64;
+                transferred += n;
+                if let Some(p) = progress {
+                    p.fetch_add(n, Ordering::Relaxed);
+                }
+                if let Err(e) = sink(data) {
+                    break Err(anyhow!("写入本地文件失败: {e}"));
+                }
+            }
+            Some(Err(e)) => break Err(e),
+            None => break Ok(transferred.min(size)),
+        }
+    };
+
+    let _ = raw.close(handle).await;
+    result
 }
 
 async fn pipelined_reader(
