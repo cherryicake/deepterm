@@ -4375,52 +4375,23 @@ impl TextElement {
         // 量出尺寸以决定放哪边。
         let size = content.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
 
-        let y = popover_y(
-            anchor_y,
-            row_height,
-            size.height,
-            bounds.origin.y,
-            bounds.origin.y + bounds.size.height,
-            prefer_below,
-        );
+        let below = anchor_y + row_height;
+        let above = anchor_y - size.height - HOVER_POPOVER_GAP;
+        let viewport_bottom = bounds.origin.y + bounds.size.height;
+
+        let fits_below = below + size.height <= viewport_bottom;
+        let fits_above = above >= bounds.origin.y;
+
+        let y = match (prefer_below, fits_below, fits_above) {
+            (true, true, _) => below,
+            (true, false, true) => above,
+            (false, true, _) => above,
+            (false, false, true) => below,
+            // 两边都放不下：夹进可视区，至少不跑出屏幕。
+            _ => above.max(bounds.origin.y),
+        };
 
         Some(point(x, y))
-    }
-}
-
-/// 决定浮层画在哪一边，返回它的 y（窗口坐标）。
-///
-/// `prefer_below` 为 true 时优先画在锚点行**下方**（补全菜单：跟着光标往下
-/// 铺），为 false 时优先**上方**（hover：不遮住正在读的那一行）。
-///
-/// 判定顺序与 Zed 的 `can_place_above` / `can_place_below` 一致：
-/// 优先方向放得下就用优先方向，放不下翻到另一边，两边都放不下则夹进视口。
-///
-/// 抽成纯函数是因为「上下翻转」这类错误在真实绘制里很难断言——
-/// 而它恰恰是最容易写反的一步（曾经把 `prefer_below == false` 的两支写反，
-/// 结果底部代码的浮层跑到屏幕外下方、顶部代码的跑到屏幕外上方）。
-pub(crate) fn popover_y(
-    anchor_y: Pixels,
-    row_height: Pixels,
-    popover_height: Pixels,
-    viewport_top: Pixels,
-    viewport_bottom: Pixels,
-    prefer_below: bool,
-) -> Pixels {
-    let below = anchor_y + row_height;
-    let above = anchor_y - popover_height - HOVER_POPOVER_GAP;
-    let fits_below = below + popover_height <= viewport_bottom;
-    let fits_above = above >= viewport_top;
-
-    match (prefer_below, fits_below, fits_above) {
-        // 优先下方：下方放得下就下方，否则翻上方。
-        (true, true, _) => below,
-        (true, false, true) => above,
-        // 优先上方：上方放得下就上方，否则翻下方。
-        (false, _, true) => above,
-        (false, true, false) => below,
-        // 两边都放不下：夹进视口顶部，至少不跑出屏幕。
-        _ => above.max(viewport_top),
     }
 }
 
