@@ -3072,17 +3072,8 @@ impl TextElement {
         // LSP 浮层/菜单的布局必须在这里做：`layout_as_root` 只允许在
         // request_layout / prepaint 调用，放到 paint 会 panic。
         // 用 prepaint 结束时算好的行布局与滚动偏移（Zed 同款）。
-        // 只传**未滚动**的元素矩形（屏幕上的可视区）+ 滚动偏移：
-        // 滚过的内容原点由 `layout_lsp_popovers` 内部推导。
-        //
-        // 之所以不直接传 `bounds`：它在 `layout_cursor` 里已被
-        // `bounds.origin += scroll_offset` 改过，与「可视区」是两个不同的
-        // 矩形。曾经把滚过的它当视口，导致 `viewport_top` 少了 scroll_y，
-        // 顶部代码被误判成「上方放得下」而往上弹。
-        // 现在函数只收未滚动的视口，两者无法再被搞混。
         self.layout_lsp_popovers(
-            input_bounds,
-            cursor_scroll_offset,
+            bounds,
             &last_layout,
             last_layout.line_height,
             window,
@@ -4300,42 +4291,24 @@ impl TextElement {
     ///    `can_place_above` / `can_place_below`）。
     fn layout_lsp_popovers(
         &self,
-        viewport: Bounds<Pixels>,
-        scroll_offset: gpui::Point<Pixels>,
+        bounds: Bounds<Pixels>,
         last_layout: &LastLayout,
         line_height: Pixels,
         window: &mut Window,
         cx: &mut App,
     ) {
-        // 滚过的内容原点：把「未滚动视口」平移滚动量得到，与正文绘制
-        // （`paint_inner` 用 `prepaint.bounds`）一致。
-        // 这样调用方只需给一个矩形，不会再出现「传错矩形」的错误。
-        let bounds = Bounds::new(viewport.origin + scroll_offset, viewport.size);
-        // 可见区的**结束字节**：最后一条可见行的下一行行首（钳到文本长度）。
-        // 用它界定最后一条可见行——用 `text_len` 不行：那会把视口之后的
-        // 所有偏移都算到最后一行上，滚动后浮层就粘在底部不消失。
-        let visible_end = {
-            let state = self.state.read(cx);
-            let text = state.text();
-            match last_layout.visible_buffer_lines.last() {
-                Some(&last_row) => text.line_start_offset(last_row + 1).min(text.len()),
-                None => 0,
-            }
-        };
 
         // 补全菜单优先：它在打字时出现，比 hover 更需要即时可见。
         if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
             let offset = state.completion_anchor()?;
             let content = crate::editor::completion::render_completion_menu_from_state(state, cx)?;
             Some((offset, content))
-        }) && let Some((origin, anchor_y)) = self.place_at_anchor(
+        }) && let Some(origin) = self.place_at_anchor(
             anchor,
             &mut content,
             bounds,
-            viewport,
             last_layout,
             line_height,
-            visible_end,
             true,
             window,
             cx,
@@ -4345,9 +4318,6 @@ impl TextElement {
             // 阶段调用会入队一个从未 prepaint 的元素，触发
             // "must call prepaint before paint"。
             window.defer_draw(content, origin, 2, None);
-            self.state.update(cx, |state, _cx| {
-                state.record_popover_placement(origin, anchor_y)
-            });
         }
 
         // hover 浮层：优先画在锚点行上方（不遮住正在看的词）。
@@ -4355,21 +4325,17 @@ impl TextElement {
             let (offset, _) = state.hover_popover()?;
             let content = crate::editor::hover::render_hover_content_from_state(state, cx)?;
             Some((offset, content))
-        }) && let Some((origin, anchor_y)) = self.place_at_anchor(
+        }) && let Some(origin) = self.place_at_anchor(
             anchor,
             &mut content,
             bounds,
-            viewport,
             last_layout,
             line_height,
-            visible_end,
             false,
             window,
             cx,
         ) {
             window.defer_draw(content, origin, 2, None);
-            self.state
-                .update(cx, |state, _cx| state.record_popover_placement(origin, anchor_y));
         }
     }
 
@@ -4383,24 +4349,13 @@ impl TextElement {
         anchor_offset: usize,
         content: &mut gpui::AnyElement,
         bounds: Bounds<Pixels>,
-        viewport: Bounds<Pixels>,
         last_layout: &LastLayout,
         line_height: Pixels,
-        visible_end: usize,
         prefer_below: bool,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(gpui::Point<Pixels>, Pixels)> {
-        // 锚点必须落在**可见区**内才画。
-        //
-        // `visible_line_byte_offsets` 只覆盖可见区，最后一条可见行没有
-        // 「下一条起点」，所以要显式给上界；否则视口外的锚点会被算到
-        // 最后一个可见行上（滚动后浮层粘在底部不消失）。
-        let row_ix = visible_row_for_offset(
-            &last_layout.visible_line_byte_offsets,
-            anchor_offset,
-            visible_end,
-        )?;
+    ) -> Option<gpui::Point<Pixels>> {
+        let row_ix = visible_row_for_offset(&last_layout.visible_line_byte_offsets, anchor_offset)?;
 
         // 行顶与行高：与正文绘制**逐项对齐**（见 `row_top_in_viewport`）。
         let (row_top, row_height) =
@@ -4420,20 +4375,16 @@ impl TextElement {
         // 量出尺寸以决定放哪边。
         let size = content.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
 
-        // 视口用**未滚动**的 `viewport`：`bounds` 含滚动偏移，拿它算
-        // 「上方/下方放得下」会把判定整体平移一个滚动量。
         let y = popover_y(
             anchor_y,
             row_height,
             size.height,
-            viewport.origin.y,
-            viewport.origin.y + viewport.size.height,
+            bounds.origin.y,
+            bounds.origin.y + bounds.size.height,
             prefer_below,
         );
 
-        // 一并返回锚点行屏幕 y：调用方把它记进 state，测试据此判断
-        // 「浮层在锚点上方还是下方」，无需在测试里重算坐标公式。
-        Some((point(x, y), anchor_y))
+        Some(point(x, y))
     }
 }
 
@@ -4509,24 +4460,12 @@ fn row_top_in_viewport(
 /// 锚点字节偏移 → 可见行下标（`visible_line_byte_offsets` 与 `lines` 平行）。
 ///
 /// 抽成自由函数便于单测：hover 与补全菜单都用它定位。
-/// 锚点字节偏移 → 可见行下标；不在可见区内返回 `None`。
-///
-/// `offsets` 是各可见行的起始字节（与 `lines` 平行），`visible_end` 是可见区
-/// 结束字节（最后一条可见行的下一行行首，钳到文本长度）。
-///
-/// 之前用 `usize::MAX`（或全文长度）当最后一条可见行的结束，于是任何
-/// **视口之外**的锚点都会匹配到最后一条可见行：滚动到别处后浮层仍粘在
-/// 底部行上，而调用方以为「不在可见区就不画」。
-fn visible_row_for_offset(offsets: &[usize], offset: usize, visible_end: usize) -> Option<usize> {
-    if offsets.is_empty() || offset >= visible_end {
-        return None;
-    }
-    // 锚点在首个可见行之前：不可见。
-    if offset < offsets[0] {
+fn visible_row_for_offset(offsets: &[usize], offset: usize) -> Option<usize> {
+    if offsets.is_empty() {
         return None;
     }
     offsets.iter().enumerate().find_map(|(i, start)| {
-        let end = offsets.get(i + 1).copied().unwrap_or(visible_end);
+        let end = offsets.get(i + 1).copied().unwrap_or(usize::MAX);
         (offset >= *start && offset < end).then_some(i)
     })
 }
