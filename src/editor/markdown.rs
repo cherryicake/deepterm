@@ -159,132 +159,6 @@ impl MarkdownStyle {
             heading_border_color: Some(ui.border.opacity(if is_dark { 0.35 } else { 0.22 })),
         }
     }
-    /// hover 浮层专用的紧凑样式。
-    ///
-    /// 与 [`Self::themed`]（整页阅读，15px / 1.75 行高 / 780px 窄栏）刻意不同：
-    /// hover 卡片只有 680×320，要塞进签名、文档段落和代码块，字号与行高都得
-    /// 收紧，否则几行就被撑到折行、滚动条立刻出现。
-    ///
-    /// 对照 Zed `hover_popover.rs::hover_markdown_style`：它同样是独立的一套
-    /// `MarkdownStyle`，而不是复用 preview 的样式。
-    pub fn hover_style(window: &Window, cx: &App, code_font: String) -> Self {
-        let theme = cx.theme();
-        let ui = &theme.ui;
-        let is_dark = cx.theme().appearance.is_dark();
-
-        let mut base_text_style = window.text_style();
-        base_text_style.refine(&TextStyleRefinement {
-            color: Some(ui.text),
-            font_size: Some(px(12.).into()),
-            line_height: Some(rems(1.45).into()),
-            white_space: Some(WhiteSpace::Normal),
-            ..Default::default()
-        });
-
-        // 代码块：编辑器背景 + 淡边框，与浮层卡片自身有层次差。
-        //
-        // 字段形状照 [`Self::themed`] 的 `code_block`：`StyleRefinement` 用的是
-        // `background` / `border_widths` / `border_radius`，没有
-        // `background_color` / `border_width` 这些名字。
-        let code_block = StyleRefinement {
-            padding: gpui::EdgesRefinement {
-                top: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(6.)),
-                )),
-                left: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
-                )),
-                right: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
-                )),
-                bottom: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(6.)),
-                )),
-            },
-            margin: gpui::EdgesRefinement {
-                top: Some(gpui::Length::Definite(px(4.).into())),
-                left: Some(gpui::Length::Definite(px(0.).into())),
-                right: Some(gpui::Length::Definite(px(0.).into())),
-                bottom: Some(gpui::Length::Definite(px(4.).into())),
-            },
-            border_style: Some(gpui::BorderStyle::Solid),
-            border_widths: gpui::EdgesRefinement {
-                top: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                left: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                right: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                bottom: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-            },
-            border_color: Some(ui.border.opacity(if is_dark { 0.28 } else { 0.20 })),
-            background: Some(theme.editor_background().into()),
-            // **行高必须显式给且大于字号**：卡片有 `max_h`，行高塌陷会让
-            // 相邻两行叠在一起（用户看到的「多行字符堆叠」）。
-            text: TextStyleRefinement {
-                font_family: Some(code_font.clone().into()),
-                font_size: Some(px(11.5).into()),
-                line_height: Some(rems(1.55).into()),
-                white_space: Some(WhiteSpace::Normal),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        // 行内代码用**编辑器等宽字体**：hover 里出现的多半是签名与类型，
-        // 拿 UI 无衬线渲染会丢掉对齐关系。
-        //
-        // `white_space: Normal` 是为了长类型路径能换行：`` `Vec<impl Iterator<Item = ...>>` ``
-        // 这类写法在 680px 宽的卡片里放不下。
-        let inline_code = TextStyleRefinement {
-            font_family: Some(code_font.into()),
-            font_size: Some(px(11.5).into()),
-            white_space: Some(WhiteSpace::Normal),
-            background_color: Some(ui.text.opacity(if is_dark { 0.12 } else { 0.06 })),
-            ..Default::default()
-        };
-
-        let link = TextStyleRefinement {
-            color: Some(ui.accent),
-            underline: Some(gpui::UnderlineStyle {
-                color: Some(ui.accent.opacity(0.35)),
-                thickness: px(1.),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        // hover 里几乎不会出现标题，但真出现时行高必须大于字号，否则相邻两行
-        // 会叠在一起（这正是原先纯文本渲染的毛病）。
-        let heading = |size: f32, weight: gpui::FontWeight, height: f32| TextStyleRefinement {
-            font_size: Some(px(size).into()),
-            font_weight: Some(weight),
-            line_height: Some(px(size * height).into()),
-            ..Default::default()
-        };
-
-        Self {
-            base_text_style,
-            container_style: StyleRefinement::default(),
-            code_block,
-            inline_code,
-            block_quote: TextStyleRefinement {
-                color: Some(ui.text.opacity(0.78)),
-                font_style: Some(gpui::FontStyle::Italic),
-                ..Default::default()
-            },
-            link,
-            rule_color: ui.border.opacity(if is_dark { 0.5 } else { 0.45 }),
-            block_quote_border_color: ui.border.opacity(if is_dark { 0.9 } else { 0.65 }),
-            heading: StyleRefinement::default(),
-            heading_level_styles: [
-                Some(heading(15., gpui::FontWeight::BOLD, 1.5)),
-                Some(heading(14., gpui::FontWeight::BOLD, 1.5)),
-                Some(heading(13., gpui::FontWeight::BOLD, 1.5)),
-                Some(heading(12.5, gpui::FontWeight::BOLD, 1.5)),
-                Some(heading(12., gpui::FontWeight(600.), 1.5)),
-                Some(heading(12., gpui::FontWeight(600.), 1.5)),
-            ],
-            heading_border_color: None,
-        }
-    }
 }
 
 actions!(markdown, [Copy, SelectAll]);
@@ -615,8 +489,8 @@ impl Render for Markdown {
                     .size_full()
                     .overflow_hidden()
                     .child(
-                        list(list_state, move |ix, _window, cx| {
-                            Self::render_item(markdown.clone(), ix, cx, style.clone())
+                        list(list_state, move |ix, window, cx| {
+                            Self::render_item(markdown.clone(), ix, window, cx, style.clone())
                         })
                         .w_full()
                         .h_full(),
@@ -626,12 +500,10 @@ impl Render for Markdown {
 }
 
 impl Markdown {
-    /// 渲染单个条目。**不要 `window` 参数**：这里只用 `cx` 取样式与资源，
-    /// 多带一个 `&mut Window` 会让内联调用方（hover 卡片，绘制阶段拿不到
-    /// `Window`）不得不伪造窗口。
     fn render_item(
         markdown: Entity<Markdown>,
         ix: usize,
+        _window: &mut Window,
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
@@ -649,30 +521,6 @@ impl Markdown {
                 .build(&events, cx);
 
         div().w_full().children(elements).into_any_element()
-    }
-
-    /// 把全部条目**内联**渲染成元素列表（不带整页外壳）。
-    ///
-    /// [`Render::render`] 给的是整页版式：居中 780px 窄栏 + 自己的背景色，
-    /// 那是 markdown 预览 tab 用的。hover 卡片要保留自己的外观，只借用
-    /// markdown 的解析与语法高亮，所以必须走这个入口。
-    ///
-    /// 对照 Zed `hover_popover.rs`：它也是 `MarkdownElement::new(...)` 内联
-    /// 放进浮层，而不是把 markdown 实体整个渲染出来。
-    pub fn render_items_inline(
-        markdown: Entity<Markdown>,
-        style: MarkdownStyle,
-        cx: &mut App,
-    ) -> Vec<gpui::AnyElement> {
-        let count = markdown.read(cx).item_ranges.len();
-        (0..count)
-            .map(|ix| Self::render_item(markdown.clone(), ix, cx, style.clone()))
-            .collect()
-    }
-
-    /// 条目数量（0 表示内容是空的，不该渲染任何东西）。
-    pub fn item_count(&self) -> usize {
-        self.item_ranges.len()
     }
 }
 

@@ -1,11 +1,11 @@
 use std::{ops::Range, rc::Rc};
 
 use gpui::{
-    App, AvailableSpace, Bounds, Corners, CursorStyle, Element, ElementId, ElementInputHandler,
-    Entity, GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point,
-    ShapedLine, SharedString, Size, Style, TextAlign, TextRun, TextStyle, TextStyleRefinement,
-    UnderlineStyle, Window, fill, point, px, relative, size,
+    App, Bounds, Corners, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, Hsla, IntoElement, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, ShapedLine,
+    SharedString, Size, Style, TextAlign, TextRun, TextStyle, TextStyleRefinement, UnderlineStyle,
+    Window, fill, point, px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -4328,7 +4328,7 @@ impl TextElement {
             let offset = state.completion_anchor()?;
             let content = crate::editor::completion::render_completion_menu_from_state(state, cx)?;
             Some((offset, content))
-        }) && let Some((origin, anchor_y, size)) = self.place_at_anchor(
+        }) && let Some((origin, anchor_y)) = self.place_at_anchor(
             anchor,
             &mut content,
             bounds,
@@ -4337,14 +4337,9 @@ impl TextElement {
             line_height,
             visible_end,
             true,
-            // 补全菜单不换行：行是 `whitespace_nowrap`，量出来多宽画多宽。
-            None,
             window,
             cx,
         ) {
-            // 补全菜单不需要记矩形：它只有几行、从不滚动，滚轮穿透反而是
-            // 期望行为（在菜单上滚动应当滚动背后的代码）。
-            let _ = size;
             // `defer_draw` **必须**在 prepaint 阶段调用：它把元素入队，
             // gpui 随后对队列里的元素统一跑 prepaint + paint。放到 paint
             // 阶段调用会入队一个从未 prepaint 的元素，触发
@@ -4356,25 +4351,11 @@ impl TextElement {
         }
 
         // hover 浮层：优先画在锚点行上方（不遮住正在看的词）。
-        //
-        // **必须先在 `update` 里取齐数据、出闭包再渲染**：卡片渲染要拿
-        // `WeakEntity`（给鼠标回调回写 state），而同一个实体在 `update`
-        // 期间再被 `read` 会 panic
-        // （`entity_map.rs`: cannot read ... while it is already being updated）。
-        // 借用也不能带出 `update`，所以这里克隆一份 `HoverInfo` —— 它内部的
-        // markdown 实体与滚动句柄都是共享引用，克隆很便宜。
-        let Some((anchor, info, weak_state)) = self.state.update(cx, |state, cx| {
-            let (offset, info) = state.hover_popover()?;
-            Some((offset, info.clone(), cx.entity().downgrade()))
-        }) else {
-            return;
-        };
-        let Some(mut content) =
-            crate::editor::hover::render_hover_card(&info, window, weak_state, cx)
-        else {
-            return;
-        };
-        if let Some((origin, anchor_y, size)) = self.place_at_anchor(
+        if let Some((anchor, mut content)) = self.state.update(cx, |state, cx| {
+            let (offset, _) = state.hover_popover()?;
+            let content = crate::editor::hover::render_hover_content_from_state(state, cx)?;
+            Some((offset, content))
+        }) && let Some((origin, anchor_y)) = self.place_at_anchor(
             anchor,
             &mut content,
             bounds,
@@ -4383,19 +4364,12 @@ impl TextElement {
             line_height,
             visible_end,
             false,
-            // hover 卡片超宽就换行：`MinContent` 下文本不换行，长行会被直接
-            // 截掉（paint 用的是测量时的 layout）。`MAX_WIDTH` 见 hover.rs。
-            Some(px(crate::editor::hover::MAX_WIDTH)),
             window,
             cx,
         ) {
             window.defer_draw(content, origin, 2, None);
-            self.state.update(cx, |state, _cx| {
-                state.record_popover_placement(origin, anchor_y);
-                // 记下卡片实际占的矩形：滚轮事件冒泡到 `on_scroll_wheel` 时
-                // 靠它判断是否该放行给浮层自己滚。
-                state.record_hover_popover_bounds(Bounds { origin, size });
-            });
+            self.state
+                .update(cx, |state, _cx| state.record_popover_placement(origin, anchor_y));
         }
     }
 
@@ -4414,22 +4388,9 @@ impl TextElement {
         line_height: Pixels,
         visible_end: usize,
         prefer_below: bool,
-        // 内容超宽时换行用的宽度上限；`None` = 不换行（补全菜单的行本来就是
-        // `whitespace_nowrap`，量出来多宽就画多宽）。
-        //
-        // 为什么需要两遍测量：第一遍必须用 `MinContent` 才能知道「内容自然
-        // 有多宽」（太窄的卡片不该被撑满）；但 `MinContent` 下文本**不换行**，
-        // 长行会量出一个超宽尺寸 —— paint 用的就是这次 layout 的结果，所以
-        // 卡片里的长内容会被直接截掉、根本看不到（用户报的「不换行、长内容
-        // 渲染不出来」）。
-        //
-        // 于是超宽时再量第二遍：宽度给 `Definite`，文本按该宽度换行，paint
-        // 用的也是第二遍的结果（`layout_as_root` 换约束会重算，见 gpui
-        // `element.rs::layout_as_root`）。`max_h` 的截断与滚动不受影响。
-        wrap_at: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Option<(gpui::Point<Pixels>, Pixels, gpui::Size<Pixels>)> {
+    ) -> Option<(gpui::Point<Pixels>, Pixels)> {
         // 锚点必须落在**可见区**内才画。
         //
         // `visible_line_byte_offsets` 只覆盖可见区，最后一条可见行没有
@@ -4457,22 +4418,7 @@ impl TextElement {
         let anchor_y = row_top;
 
         // 量出尺寸以决定放哪边。
-        let mut size = content.layout_as_root(AvailableSpace::min_size(), window, cx);
-        // 超宽且调用方要求换行：再量一遍，宽度钉死，文本按该宽度换行。
-        // paint 用的是**最后一次** layout 的结果，所以这次重算同时修好了
-        // 「长内容渲染不出来」。
-        if let Some(max_w) = wrap_at
-            && size.width > max_w
-        {
-            size = content.layout_as_root(
-                Size {
-                    width: AvailableSpace::Definite(max_w),
-                    height: AvailableSpace::MaxContent,
-                },
-                window,
-                cx,
-            );
-        }
+        let size = content.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
 
         // 视口用**未滚动**的 `viewport`：`bounds` 含滚动偏移，拿它算
         // 「上方/下方放得下」会把判定整体平移一个滚动量。
@@ -4487,11 +4433,7 @@ impl TextElement {
 
         // 一并返回锚点行屏幕 y：调用方把它记进 state，测试据此判断
         // 「浮层在锚点上方还是下方」，无需在测试里重算坐标公式。
-        //
-        // 尺寸也一并带出：hover 卡片要靠它把**实际矩形**记进 state，
-        // `InputState::on_scroll_wheel` 才能判断「滚轮是不是落在卡片上」
-        // （见 `InputState::record_hover_popover_bounds`）。
-        Some((point(x, y), anchor_y, size))
+        Some((point(x, y), anchor_y))
     }
 }
 

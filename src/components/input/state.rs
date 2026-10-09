@@ -623,8 +623,6 @@ pub struct InputState {
     lsp_status: Option<crate::lsp::status::LspStatus>,
     /// 当前 hover 请求代号；见 [`Self::hover_request_generation`]。
     hover_request_generation: u64,
-    /// 当前 hover 请求的目标字符偏移；见 [`Self::hover_offset`]。
-    hover_offset: Option<usize>,
     /// 当前补全请求代号；见 [`Self::completion_request_generation`]。
     completion_request_generation: u64,
     /// 进行中的 `$/progress` 令牌表（服务器可同时开多个）。
@@ -656,38 +654,9 @@ pub struct InputState {
     ///
     /// hover 请求在后台完成，那时闭包里拿不到 `Editor` 上的浮层状态；
     /// 结果先放这里，由 Editor 在下一帧取走。
-    pending_hover: Option<(usize, crate::editor::hover::HoverInfo)>,
-    /// 指针是否正落在 hover 浮层上；见
-    /// [`Self::hover_pointer_inside`]。
-    hover_pointer_inside: bool,
-    /// hover 浮层在窗口坐标系里的矩形；见
-    /// [`Self::record_hover_popover_bounds`]。
-    hover_popover_bounds: Option<gpui::Bounds<gpui::Pixels>>,
-    /// hover 浮层被键盘接管（`K` 第二次按下）。
-    ///
-    /// **不用真焦点，用标志位**。卡片是用 `defer_draw` 画到窗口层上的，
-    /// 它从不经过 prepaint，也就进不了 GPUI 的 dispatch 树 ——
-    /// `window.focus()` 在它身上是空操作（`focus_node_id_in_rendered_frame`
-    /// 查不到就回退到根节点，按键照样走编辑器的路径）。
-    ///
-    /// 所以「接管」是虚拟的：焦点物理上还在编辑器里，但 `hjkl` 等键被全局
-    /// 按键拦截器（见 `hover::init_keystroke_interceptor`）提前拿走去滚动
-    /// 卡片，不再进 vim / 编辑器。所有隐藏路径都要先问这个标志，
-    /// 对照 Zed 用 `hover_state.focused()` 守卫的三处。
-    hover_keyboard_takeover: bool,
-    /// hover 浮层计划隐藏的时刻（`None` = 没安排）。
-    ///
-    /// 「鼠标移到空白处」不能**立刻**清浮层：从符号把指针挪进卡片的路上，
-    /// 必然经过编辑区的其它字符，每一步都会发一次 hover 请求 —— 只要其中
-    /// 一次先返回「无内容」并立刻清掉，卡片就会在指针到达之前消失
-    /// （用户报的「移上去就关闭」，大概率就是这个时序）。
-    ///
-    /// 对照 Zed 的 `hiding_delay_task`：无内容时只**安排**一次延迟隐藏，
-    /// 到期才真正收起；期间新内容到来、指针进入卡片、新的请求发出，
-    /// 都会取消它。
-    hover_hide_deadline: Option<std::time::Instant>,
+    pending_hover: Option<crate::editor::hover::HoverInfo>,
     /// LSP 补全候选的落地槽（同 `pending_hover` 的理由）。
-    pending_completions: Option<crate::editor::completion::PendingCompletions>,
+    pending_completions: Option<(Vec<lsp_types::CompletionItem>, lsp_types::Position)>,
     /// 补全要替换的字节区间。
     pending_completion_range: std::ops::Range<usize>,
     /// LSP 文档符号的落地槽。
@@ -813,15 +782,10 @@ impl InputState {
             applied_diagnostics_version: None,
             lsp_status: None,
             hover_request_generation: 0,
-            hover_offset: None,
             completion_request_generation: 0,
             lsp_progress: crate::lsp::status::ProgressTracker::default(),
             hover_popover: None,
             pending_hover: None,
-            hover_pointer_inside: false,
-            hover_popover_bounds: None,
-            hover_keyboard_takeover: false,
-            hover_hide_deadline: None,
             pending_completions: None,
             pending_completion_range: 0..0,
             pending_symbols: None,
@@ -1127,99 +1091,6 @@ impl InputState {
         self.last_popover_anchor_y = Some(anchor_y);
     }
 
-    /// 记录 hover 浮层在**窗口坐标系**里的实际矩形（`defer_draw` 之后的 bounds）。
-    ///
-    /// 有了它才能回答「滚轮事件是不是发生在浮层上」。这是必要的，因为：
-    /// - GPUI 为每个 `overflow: Scroll` 容器注册的滚动 listener
-    ///   （`div.rs::paint_scroll_listener`）**不会** `stop_propagation`，
-    ///   所以事件会继续冒泡到 `InputState::on_scroll_wheel`，把编辑器滚走；
-    /// - 但那套 listener 是按 paint 顺序注册的，靠「谁先 stop_propagation」
-    ///   去和它抢顺序并不可靠。
-    ///
-    /// 于是改成在**编辑器侧**用几何判断：滚轮落在浮层矩形内就不滚编辑器。
-    /// 浮层自身的滚动仍由 GPUI 那套 listener 完成，两者互不干扰。
-    ///
-    /// 对照 Zed：它的浮层由 `Editor` 自己绘制在独立的 popover 元素里，
-    /// 滚轮不会走到编辑器容器上，所以不需要这个判断。
-    pub fn record_hover_popover_bounds(&mut self, bounds: gpui::Bounds<gpui::Pixels>) {
-        self.hover_popover_bounds = Some(bounds);
-    }
-
-    /// 上一次记录的 hover 浮层矩形（见 [`Self::record_hover_popover_bounds`]）。
-    pub fn hover_popover_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
-        self.hover_popover_bounds
-    }
-
-    /// 某个窗口坐标是否落在当前 hover 浮层内。
-    ///
-    /// 只在**确实有浮层**时才算命中。浮层消失时 `hover_popover_bounds` 必须
-    /// 一并清掉 —— 否则指针恰好落在上一张卡片的位置上时，编辑器会莫名其妙
-    /// 地滚不动。
-    pub fn hover_popover_contains(&self, position: gpui::Point<gpui::Pixels>) -> bool {
-        if self.hover_popover.is_none() {
-            return false;
-        }
-        self.hover_popover_bounds
-            .is_some_and(|b| b.contains(&position))
-    }
-
-    /// 浮层当前是否被键盘接管（`K` 第二次按下）。
-    ///
-    /// 隐藏逻辑要先问它：被接管期间鼠标移动与点击外部都**不该**收起浮层，
-    /// 否则用户刚用 `K` 打开、还没来得及滚动就没了。
-    pub fn hover_keyboard_takeover(&self) -> bool {
-        self.hover_popover.is_some() && self.hover_keyboard_takeover
-    }
-
-    /// 设置键盘接管标志（见字段文档）。
-    pub fn set_hover_keyboard_takeover(&mut self, takeover: bool) {
-        // 只在有浮层时才有意义：没浮层时置位只会让一个「不存在的接管」
-        // 挡住下一次浮层的正常隐藏。
-        self.hover_keyboard_takeover = takeover && self.hover_popover.is_some();
-    }
-
-    /// 安排一次延迟隐藏：`delay` 之后到期（见字段文档）。
-    ///
-    /// 调用方是「服务器返回无内容」的后台任务。注意它**不负责**真正收起，
-    /// 只记时刻 —— 到期由 [`Self::hover_hide_expired`] 判定，检查点有两处：
-    /// 后台任务睡醒后，以及 Editor 每帧的 `take_pending`。
-    pub fn schedule_hover_hide(&mut self, delay: std::time::Duration) {
-        self.hover_hide_deadline = Some(std::time::Instant::now() + delay);
-    }
-
-    /// 取消待执行的延迟隐藏。
-    ///
-    /// 新内容到来、新请求发出、指针进入卡片时调用 —— 对照 Zed 在 `show_hover`
-    /// 里把 `hiding_delay_task` 置空。
-    pub fn cancel_hover_hide(&mut self) {
-        self.hover_hide_deadline = None;
-    }
-
-    /// 直接指定隐藏时刻（供后台任务认领用，见 `hover.rs` 的延迟隐藏）。
-    pub fn set_hover_hide_deadline(&mut self, deadline: std::time::Instant) {
-        self.hover_hide_deadline = Some(deadline);
-    }
-
-    /// 当前安排的隐藏时刻（`None` = 没安排）。
-    pub fn hover_hide_deadline(&self) -> Option<std::time::Instant> {
-        self.hover_hide_deadline
-    }
-
-    /// 延迟隐藏是否已到期（且浮层还在、指针不在卡片上、没被键盘接管）。
-    ///
-    /// 三个「不隐藏」的条件缺一不可：
-    /// - 指针在卡片上：用户正要操作内容；
-    /// - 键盘接管中：用户正用 hjkl 看内容；
-    /// - 浮层已经没了：无事可做。
-    pub fn hover_hide_expired(&self) -> bool {
-        self.hover_popover.is_some()
-            && !self.hover_pointer_inside
-            && !self.hover_keyboard_takeover
-            && self
-                .hover_hide_deadline
-                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-    }
-
     /// 上一次浮层落点（测试用观测点）。
     pub fn last_popover_origin(&self) -> Option<gpui::Point<gpui::Pixels>> {
         self.last_popover_origin
@@ -1303,8 +1174,6 @@ impl InputState {
         info: crate::editor::hover::HoverInfo,
     ) {
         self.hover_popover = Some((anchor_offset, info));
-        // 新内容落定：之前安排的延迟隐藏作废。
-        self.hover_hide_deadline = None;
     }
 
     /// 当前悬浮浮层（锚点偏移 + 内容）。
@@ -1312,64 +1181,9 @@ impl InputState {
         self.hover_popover.as_ref().map(|(o, i)| (*o, i))
     }
 
-    /// 正显示的 hover 卡片是否已经覆盖 `offset`。
-    ///
-    /// 对照 Zed `hover_popover.rs::same_info_hover`：命中区间的
-    /// `start..=end` 包含新偏移，或锚点完全相同（服务器没给命中区间时的
-    /// 兜底 —— 签名、纯文本 hover 都是 `range: None`）。
-    ///
-    /// `HoverState::request_at` 用它决定「要不要重新起防抖」：已经显示在
-    /// 覆盖同一区间的卡片上时直接返回，既不重启计时器也不重新发请求 ——
-    /// 否则鼠标在同一个符号里抖动会把任务一直往后推，卡片可能永远不出现。
-    ///
-    /// 用**闭区间** `start..=end`：LSP 常把 hover 结果挂在整个符号区间上，
-    /// 而鼠标正好停在符号末字符（该字节属于下一个偏移）时必须算「还在里面」。
-    /// Zed 这里同样是 `hover_range.start..=hover_range.end`。
-    pub fn hover_popover_covers(&self, offset: usize) -> bool {
-        let Some((anchor, info)) = self.hover_popover() else {
-            return false;
-        };
-        if anchor == offset {
-            return true;
-        }
-        info.range
-            .as_ref()
-            .is_some_and(|range| (range.start..=range.end).contains(&offset))
-    }
-
     /// 清空悬浮浮层。
     pub fn clear_hover_popover(&mut self) {
         self.hover_popover = None;
-        // 矩形必须同步清掉：否则 `hover_popover_contains` 会拿一个已经不存在的
-        // 卡片去判断命中，导致该区域内的滚动被无谓地吞掉。
-        self.hover_popover_bounds = None;
-        // 浮层没了，「指针在浮层上」这件事也随之失效。不重置的话，下一次
-        // 浮层弹出时 `hover_pointer_inside` 仍是 true，`hide` 会被无谓地跳过，
-        // 表现为「鼠标明明已经移开，浮层却赖着不走」。
-        self.hover_pointer_inside = false;
-        // 浮层都没了，待执行的延迟隐藏与键盘接管一并作废。
-        self.hover_hide_deadline = None;
-        self.hover_keyboard_takeover = false;
-    }
-
-    /// 标记指针是否正落在 hover 浮层上。
-    ///
-    /// 由浮层自己的 `on_mouse_move` / `on_mouse_down` 置位，由编辑区的
-    /// `on_mouse_move` 复位。隐藏逻辑（`HoverState::hide_in` 与延迟隐藏）
-    /// 要先问它：指针在卡片上时不能收起，否则用户根本没法把指针移进去
-    /// 点链接或滚动内容 —— 卡片会在指针到达之前就消失。
-    ///
-    /// 对照 Zed `hover_popover.rs:1068`：它在浮层上挂 `on_mouse_move` 并
-    /// `cx.stop_propagation()`，顺带把 `closest_mouse_distance` 归零、
-    /// 清掉 `hiding_delay_task`。我们没有独立的 `closest_mouse_distance`，
-    /// 用这个布尔量表达同一件事。
-    pub fn set_hover_pointer_inside(&mut self, inside: bool) {
-        self.hover_pointer_inside = inside;
-    }
-
-    /// 指针是否正落在 hover 浮层上（见 [`Self::set_hover_pointer_inside`]）。
-    pub fn hover_pointer_inside(&self) -> bool {
-        self.hover_pointer_inside
     }
 
     /// 补全菜单的文本锚点（字节偏移）。
@@ -1538,14 +1352,8 @@ impl InputState {
     }
 
     /// 存放后台 hover 请求的结果（供浮层取走）。
-    ///
-    /// `offset` 是**这次请求**的目标字符偏移，必须和结果一起存 ——
-    /// 取出时拿它当卡片锚点。若只存内容、取出时用「当前鼠标/光标位置」，
-    /// 而两者之间又有新请求发出，卡片内容（A 的）和位置（B 的）就会错位。
-    /// 这正是之前 `HoverState::last_result_offset` 那个镜像字段想解决的，
-    /// 但镜像和槽是两处状态，照样有竞态；合在一起才是原子的。
-    pub fn set_pending_hover(&mut self, info: crate::editor::hover::HoverInfo, offset: usize) {
-        self.pending_hover = Some((offset, info));
+    pub fn set_pending_hover(&mut self, info: crate::editor::hover::HoverInfo) {
+        self.pending_hover = Some(info);
     }
 
     /// 记录当前 hover 请求的代号（见 `HoverState::request_generation`）。
@@ -1563,20 +1371,6 @@ impl InputState {
         self.hover_request_generation
     }
 
-    /// 记录当前 hover 请求的目标字符偏移。
-    ///
-    /// 代号只随 `on_mouse_moved` 递增，所以鼠标**移出编辑区**时代号不变 ——
-    /// 只靠代号拦不住那种过期响应。这个偏移是第二道闸门：后台任务比对它，
-    /// 不一致就丢弃。
-    pub fn set_hover_offset(&mut self, offset: usize) {
-        self.hover_offset = Some(offset);
-    }
-
-    /// 当前 hover 请求的目标字符偏移（见 [`Self::set_hover_offset`]）。
-    pub fn hover_offset(&self) -> Option<usize> {
-        self.hover_offset
-    }
-
     /// 记录当前补全请求代号（见 [`Self::completion_request_generation`]）。
     pub fn set_completion_request_generation(&mut self, generation: u64) {
         self.completion_request_generation = generation;
@@ -1588,53 +1382,24 @@ impl InputState {
     }
 
     /// 取走后台 hover 结果（取走即清空，避免重复弹出同一张卡片）。
-    ///
-    /// 返回 `(请求时的偏移, 内容)` —— 调用方必须用这个偏移当锚点。
-    pub fn take_pending_hover(&mut self) -> Option<(usize, crate::editor::hover::HoverInfo)> {
+    pub fn take_pending_hover(&mut self) -> Option<crate::editor::hover::HoverInfo> {
         self.pending_hover.take()
     }
 
     /// 存放后台补全请求的结果。
-    ///
-    /// `cursor_offset` 是**发请求时**的光标字节偏移，不是收到结果时的。
-    ///
-    /// 必须记下来：`drain_lsp_results` 在 `render` 里跑，而后台任务结束与
-    /// 下一帧之间用户可能又敲了字符。那时若直接用「当前光标」去算
-    /// `replace_range` 与菜单锚点，就会拿 A 位置的候选按 B 位置替换 ——
-    /// 用户看到的正是「候选内容和光标处该有的东西对不上」。同理
-    /// [`Self::take_pending_completions`] 要靠它丢弃已过期的结果。
     pub fn set_pending_completions(
         &mut self,
         items: Vec<lsp_types::CompletionItem>,
         position: lsp_types::Position,
-        cursor_offset: usize,
     ) {
-        self.pending_completions = Some(crate::editor::completion::PendingCompletions {
-            items,
-            position,
-            cursor_offset,
-        });
+        self.pending_completions = Some((items, position));
     }
 
-    /// 取走后台补全结果，**但光标已经移开时返回 `None`**。
-    ///
-    /// 光标一动，先前那份候选就不再适用：显示它会让用户看到与光标处不匹配
-    /// 的内容，按下去还会替换错区间。与其展示一个错的菜单，不如让下一次
-    /// 请求的结果直接接管（`isIncomplete` 时 rust-analyzer 会继续补全）。
+    /// 取走后台补全结果。
     pub fn take_pending_completions(
         &mut self,
-    ) -> Option<crate::editor::completion::PendingCompletions> {
-        let pending = self.pending_completions.take()?;
-        if pending.cursor_offset != self.cursor() {
-            log::debug!(
-                "lsp: completion 结果已过期（请求于 offset={}，当前 offset={}），丢弃 {} 个候选",
-                pending.cursor_offset,
-                self.cursor(),
-                pending.items.len()
-            );
-            return None;
-        }
-        Some(pending)
+    ) -> Option<(Vec<lsp_types::CompletionItem>, lsp_types::Position)> {
+        self.pending_completions.take()
     }
 
     /// 按候选算出补全要替换的字节区间，并记下来供 `confirm` 使用。
@@ -1643,20 +1408,6 @@ impl InputState {
         items: &[lsp_types::CompletionItem],
     ) -> std::ops::Range<usize> {
         let offset = self.cursor();
-        self.completion_replace_range_at(offset, items)
-    }
-
-    /// 与 [`Self::completion_replace_range_for`] 相同，但**显式指定**用哪个
-    /// 光标偏移来算。
-    ///
-    /// 补全菜单必须用它而不是「当前光标」：候选是按**请求时**的位置取的，
-    /// 两者必须同源。`take_pending_completions` 已经保证取出时光标没动，
-    /// 这里传进来的 `offset` 才是那次请求的真实位置。
-    pub fn completion_replace_range_at(
-        &mut self,
-        offset: usize,
-        items: &[lsp_types::CompletionItem],
-    ) -> std::ops::Range<usize> {
         let range = match items.first() {
             Some(item) => crate::lsp::features::completion_replace_range(self.text(), offset, item),
             None => crate::lsp::features::word_range_before(self.text(), offset),
@@ -4228,20 +3979,6 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // **滚轮落在 hover 浮层上时不滚编辑器。**
-        //
-        // GPUI 为每个 `overflow: Scroll` 容器自动注册的滚动 listener 不会
-        // `stop_propagation`，所以浮层滚得动的同时事件也冒泡到了这里，结果是
-        // 「浮层和背后的代码一起滚」。浮层自己的滚动不需要我们操心（那是
-        // GPUI 那套 listener 的事），这里只负责不添乱。
-        //
-        // 用几何判断而非 `hover_pointer_inside`：后者只在 `on_mouse_move` 时
-        // 更新，而滚轮可能在鼠标静止不动时到来（例如用户停在卡片上直接滚）。
-        if self.hover_popover_contains(event.position) {
-            cx.stop_propagation();
-            return;
-        }
-
         let line_height = self
             .last_layout
             .as_ref()

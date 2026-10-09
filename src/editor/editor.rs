@@ -76,17 +76,7 @@ actions!(
         /// 文档符号大纲（cmd-shift-o）。
         DocumentSymbols,
         /// 应用首选 Code Action（快速修复，cmd-.）。
-        CodeAction,
-        /// 切换 hover 浮层的键盘接管（vim normal 下的 `K`）。
-        ///
-        /// 第一次按：用**光标位置**请求 hover 并显示。
-        /// 第二次按：把焦点移进浮层，此后 `hjkl` / 方向键滚动内容，
-        /// 鼠标移动与编辑器失焦都不再收起它。
-        ///
-        /// 对照 Zed：它的 `K` 绑到 `editor::Hover`，而 `show_keyboard_hover`
-        /// （`hover_popover.rs:98`）在已有键盘触发的浮层时会重新显示它，
-        /// 配合 `InfoPopover::focused()` 达成同样的「第二次进入」语义。
-        Hover
+        CodeAction
     ]
 );
 actions!(
@@ -102,82 +92,53 @@ actions!(
 
 pub fn init(cx: &mut App) {
     crate::editor::markdown::Markdown::init(cx);
-    // hover 浮层的键盘接管（`K` 第二次按下）靠全局按键拦截器实现 ——
-    // 卡片是 `defer_draw` 出来的，进不了 dispatch 树，`window.focus` 无效。
-    // 详情见 `hover::init_keystroke_interceptor`。
-    crate::editor::hover::init_keystroke_interceptor(cx);
     // 实时 markdown 与只读预览共用复制/全选语义，仅上下文不同。
-    crate::keymap::bind(
-        cx,
-        [
-            KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
-            KeyBinding::new(
-                "ctrl-c",
-                crate::editor::markdown::Copy,
-                Some("LiveMarkdown"),
-            ),
-            KeyBinding::new(
-                "cmd-a",
-                crate::editor::markdown::SelectAll,
-                Some("LiveMarkdown"),
-            ),
-            KeyBinding::new(
-                "ctrl-a",
-                crate::editor::markdown::SelectAll,
-                Some("LiveMarkdown"),
-            ),
-        ],
-    );
-    crate::keymap::bind(
-        cx,
-        [
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
-            // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
-            KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
-            KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
-            KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
-            KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
-            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-            // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
-            KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
-            KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
-            KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
-            KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
-            // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
-            KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
-            KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
-            KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
-            KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
-            KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
-            KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
-            KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
-            // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
-            // 焦点移进浮层，此后 hjkl 滚动内容。
-            //
-            // 放在 Rust 侧而不是 `default.json`：与上面这批 LSP 快捷键一致，且
-            // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
-            // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
-            KeyBinding::new("K", Hover, Some("EditorPanel")),
-            // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
-            // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
-            KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
-            KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
-            KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
-            KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
-            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
-        ],
-    );
+    crate::keymap::bind(cx, [
+        KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+        KeyBinding::new("ctrl-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+        KeyBinding::new("cmd-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
+        KeyBinding::new("ctrl-a", crate::editor::markdown::SelectAll, Some("LiveMarkdown")),
+    ]);
+    crate::keymap::bind(cx, [
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
+        // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
+        KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
+        KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
+        KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
+        KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
+        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+        // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
+        KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
+        KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
+        KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
+        KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
+        // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
+        KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
+        KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
+        KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
+        KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
+        KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
+        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
+        KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
+        // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
+        // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
+        KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
+        KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
+        KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
+        KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
+        KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
+        KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
+        KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+    ]);
 }
 
 /// 路径前缀替换：`from` 自身 → `to`，`from` 的后代 → `to` 下的同层级路径。
@@ -1910,60 +1871,6 @@ impl Editor {
         cx.notify();
     }
 
-    /// 切换 hover 浮层的键盘接管（vim normal 下的 `K`）。
-    ///
-    /// 三态：
-    /// 1. 没有浮层 → 按**光标位置**请求 hover（不等防抖），显示卡片；
-    /// 2. 有浮层但没被接管 → 打开键盘接管，此后 `hjkl` / 方向键滚动内容，
-    ///    鼠标移动与点击外部都不再收起它；
-    /// 3. 已被接管 → 退出接管（浮层保留，下次按 K 可再进入）。
-    ///
-    /// 接管是虚拟的（见 `InputState::hover_keyboard_takeover` 的文档）：
-    /// 焦点物理上还在编辑器里，只是 `hjkl` 等键被全局拦截器提前拿走。
-    /// 第2步之后隐藏路径都必须先问
-    /// [`InputState::hover_keyboard_takeover`] —— 对照 Zed：它在
-    /// `element/mouse.rs:466`、`editor.rs:10234`、`element.rs:697` 三处用
-    /// `hover_state.focused()` 做同样的守卫。
-    fn toggle_hover(&mut self, _: &Hover, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(editor) = self.active_text_editor(cx) else {
-            return;
-        };
-
-        // 态 3：已被接管 → 退出接管（浮层保留）。
-        if editor.read(cx).hover_keyboard_takeover() {
-            editor.update(cx, |state, cx| {
-                state.set_hover_keyboard_takeover(false);
-                cx.notify();
-            });
-            log::info!("lsp: hover 退出键盘接管");
-            return;
-        }
-
-        // 态 2：浮层已显示 → 打开接管。
-        if editor.read(cx).hover_popover().is_some() {
-            editor.update(cx, |state, cx| {
-                state.set_hover_keyboard_takeover(true);
-                // 接管期间不允许有待执行的延迟隐藏悬着。
-                state.cancel_hover_hide();
-                cx.notify();
-            });
-            log::info!("lsp: hover 已被键盘接管，hjkl 可滚动内容");
-            cx.notify();
-            return;
-        }
-
-        // 态 1：请求 hover。用光标位置（而不是鼠标位置）—— 按键触发的查询
-        // 关心的是「光标在哪」。
-        let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
-            return;
-        };
-        let client = self.active_lsp_client(cx);
-        let cursor = editor.read(cx).cursor();
-        self.hover
-            .on_keyboard_triggered(cursor, &editor, client, uri, cx);
-        cx.notify();
-    }
-
     /// 补全菜单：下一项。
     fn completion_next(
         &mut self,
@@ -2260,13 +2167,10 @@ impl Editor {
                 return;
             }
             cx.update_entity(&editor, |state, cx| {
-                // 签名帮助复用 hover 浮层，所以走同一个构造：它同样要 markdown
-                // 解析（rust-analyzer 给的签名是 ```rust 代码块）与滚动句柄。
-                let contents = crate::editor::hover::HoverInfo::from_plain_text(contents, cx);
-                // 锚点用当前光标：签名帮助本来就是按光标位置请求的
-                // （见 `set_pending_hover` 的文档）。
-                let at = state.cursor();
-                state.set_pending_hover(contents, at);
+                state.set_pending_hover(crate::editor::hover::HoverInfo {
+                    contents,
+                    range: None,
+                });
                 cx.notify();
             });
         })
@@ -2415,27 +2319,11 @@ impl Editor {
         let Some(target) = self.active_text_editor(cx) else {
             return;
         };
-        // 浮层被键盘接管时不安排隐藏 —— 用户正在用 hjkl 看内容。
-        if target.read(cx).hover_keyboard_takeover() {
-            return;
-        }
-        // 指针已经在浮层上就别安排了：延迟到期后 `hide_in` 虽然会因这个
-        // 标记而跳过收起，但白等 300ms 再让用户看着卡片不动毫无意义。
-        if target.read(cx).hover_pointer_inside() {
-            return;
-        }
         let owner = cx.entity().downgrade();
         self.hover.schedule_hide(cx, move |async_cx| {
             // 延迟到期时实体可能已销毁 —— `update` 返回 `None` 即「无需处理」。
-            // 到期也要再问一次：300ms 里指针可能进了卡片、键盘可能接管了。
             owner
                 .update(async_cx, |this, cx| {
-                    let guarded = target.update(cx, |state, _| {
-                        state.hover_keyboard_takeover() || state.hover_pointer_inside()
-                    });
-                    if guarded {
-                        return;
-                    }
                     this.hover.hide_in(&target, cx);
                     cx.notify();
                 })
@@ -5132,52 +5020,6 @@ impl Render for Editor {
                                             let Some(editor) = this.active_text_editor(cx) else {
                                                 return;
                                             };
-                                            // 浮层被键盘接管时，鼠标移动完全不参与：
-                                            // 既不重新查询也不隐藏。
-                                            // 对照 Zed `element/mouse.rs:466`：它开头
-                                            // 就是 `if editor.hover_state.focused(..) { return }`。
-                                            if editor.read(cx).hover_keyboard_takeover() {
-                                                return;
-                                            }
-                                            // **指针在 hover 卡片上时不再向底下发请求。**
-                                            //
-                                            // 主机制是卡片根节点的 `.occlude()`
-                                            // （`hover.rs::render_hover_card`，照抄
-                                            // Zed `InfoPopover::render`）：命中测试
-                                            // 走到卡片的 hitbox 就停住，编辑器容器的
-                                            // hitbox 根本不在 hovered 列表里，本监听器
-                                            // 压根不会触发 —— 这是 Zed 的做法（它
-                                            // `.occlude()` 与 `stop_propagation` 两个
-                                            // 都挂）。
-                                            //
-                                            // 这里保留几何判断作**兜底**，因为浮层是
-                                            // `defer_draw` 到窗口层的，它的 hitbox 要
-                                            // 等到自己那一帧的 prepaint 才登记，早于该
-                                            // 帧的命中测试里还没有它；而且 `is_hovered`
-                                            // 只看「在不在命中列表里」，
-                                            // `stop_propagation` 又注册在本监听器之后
-                                            // （Bubble 阶段我们先跑），拦不住。
-                                            //
-                                            // 漏掉这层的后果：`index_for_mouse_position`
-                                            // 把卡片上的坐标映射成编辑器里的某个字符，
-                                            // 在那儿发一次 hover 请求，拿到「无内容」后
-                                            // `clear_hover_popover` 把卡片擦掉 —— 表现为
-                                            // **指针一移到卡片上，卡片立即消失**。
-                                            if editor
-                                                .read(cx)
-                                                .hover_popover_contains(event.position)
-                                            {
-                                                return;
-                                            }
-                                            // 指针回到编辑区 = 离开了浮层。复位这个标记，
-                                            // 否则隐藏逻辑会一直以为指针还在卡片上，
-                                            // 浮层就再也收不掉了。
-                                            if editor.read(cx).hover_pointer_inside() {
-                                                editor.update(cx, |state, cx| {
-                                                    state.set_hover_pointer_inside(false);
-                                                    cx.notify();
-                                                });
-                                            }
                                             // 只取命中偏移。浮层的**像素位置在绘制阶段**
                                             // 用当前帧的行布局算（照抄 Zed 的
                                             // `layout_hover_popovers`）——在这里预先算
@@ -5199,16 +5041,11 @@ impl Render for Editor {
                                         },
                                     ))
                                     // 鼠标移出编辑区：收起浮层（否则它会一直挂着）。
-                                    // 键盘接管中不收 —— 用户正用 hjkl 看内容，
-                                    // 点外部只是顺手，浮层必须留着。
                                     .on_mouse_down_out(cx.listener(
                                         move |this, _: &gpui::MouseDownEvent, _window, cx| {
                                             let Some(editor) = this.active_text_editor(cx) else {
                                                 return;
                                             };
-                                            if editor.read(cx).hover_keyboard_takeover() {
-                                                return;
-                                            }
                                             this.hover.hide_in(&editor, cx);
                                             cx.notify();
                                         },
@@ -5362,9 +5199,6 @@ impl Render for Editor {
                 }))
                 .on_action(cx.listener(|this, _: &DocumentSymbols, window, cx| {
                     this.toggle_symbols(&DocumentSymbols, window, cx);
-                }))
-                .on_action(cx.listener(|this, _: &Hover, window, cx| {
-                    this.toggle_hover(&Hover, window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &CodeAction, window, cx| {
                     this.apply_code_action(&CodeAction, window, cx);
