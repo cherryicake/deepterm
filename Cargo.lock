@@ -1934,6 +1934,7 @@ dependencies = [
  "smallvec",
  "smol",
  "streaming-iterator",
+ "sysinfo",
  "tokio",
  "toml_edit 0.22.27",
  "tree-sitter",

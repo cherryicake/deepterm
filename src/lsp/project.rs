@@ -76,6 +76,46 @@ pub struct ServerKey {
     pub language: String,
 }
 
+/// 一个服务器进程的运行状态。
+///
+/// 状态栏和控制菜单共用这一份枚举：菜单里的圆点颜色、可用操作都从它推。
+/// 对照 Zed 的 `BinaryStatus` / `ServerHealth` 两个维度，这里合成一个——
+/// DeepTerm 一个 key 只有一个进程，没有 Zed 的"下载二进制"那几步。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerState {
+    /// 进程活着，握手已完成。
+    Running,
+    /// 进程已 spawn，`initialize` 握手中。
+    Starting,
+    /// 用户主动停掉的。
+    Stopped,
+    /// 启动失败（二进制不存在、握手超时等）。
+    Failed,
+}
+
+/// 一个服务器进程的快照，供 UI 列举（菜单 / 状态栏）。
+///
+/// 之所以拷贝成不依赖锁的结构：UI 渲染不能持着 `parking_lot` 的 guard，
+/// 而 `Arc<LspClient>` 又只该被用来发请求，不该被 UI 攥着。
+#[derive(Debug, Clone)]
+pub struct ServerSnapshot {
+    pub key: ServerKey,
+    /// 最终生效的启动命令名（`rust-analyzer` / `gopls` …）。
+    pub command: String,
+    pub state: ServerState,
+    /// 服务器自报的 pid（`true` 表示进程仍活着）。
+    pub pid: Option<u32>,
+    /// 服务器自报的版本，如 "1.98.0-nightly"。
+    pub version: Option<String>,
+}
+
+impl ServerSnapshot {
+    /// 是否在跑（菜单据此决定「启动」还是「停止」可用）。
+    pub fn is_running(&self) -> bool {
+        self.state == ServerState::Running
+    }
+}
+
 /// 后台可见的服务器表。
 ///
 /// 全部字段在 `Mutex` 下，`Send + Sync`，可被 `smol::spawn` 的任务直接访问。
@@ -89,6 +129,13 @@ struct ServerTable {
     /// 正在启动的 key → 等待结果的通知 channel。并发开同语言文件时
     /// 只 spawn 一次，其余排队。
     starting: HashMap<ServerKey, Vec<async_channel::Sender<Option<Arc<LspClient>>>>>,
+    /// 被用户手动停掉的 key：`server_for_file` 直接返回 `None`。
+    ///
+    /// 对照 Zed：`LocalLspStore::stopped_language_servers` +
+    /// `all_language_servers_stopped`。没有这张表的话，关掉服务器后
+    /// 【换个标签再切回来】就会把它重新拉起来——用户的「停止」活不过一次
+    /// 切换，等同于没这个功能。
+    stopped: HashSet<ServerKey>,
 }
 
 impl ServerTable {
@@ -97,8 +144,48 @@ impl ServerTable {
         self.ready.get(key).filter(|c| !c.is_closed()).cloned()
     }
 
+    /// 停掉一个已就绪的服务器，并把它标记为「用户已停止」。
+    ///
+    /// 返回被停掉的客户端（调用方负责发关闭握手）；本来就没在跑时返回
+    /// `None`——这种情况下**仍然**要写 `stopped` 标记：用户按「停止」时
+    /// 服务器可能正在握手（`starting` 里），不放标记会在他松手那一刻被
+    /// 拉起。
+    fn stop(&mut self, key: &ServerKey) -> Option<Arc<LspClient>> {
+        self.stopped.insert(key.clone());
+        self.starting.remove(key);
+        self.ready.remove(key)
+    }
+
+    /// 是否被用户停掉。
+    fn is_stopped(&self, key: &ServerKey) -> bool {
+        self.stopped.contains(key)
+    }
+
+    /// 解除停止/失败标记，允许重新拉起。
+    ///
+    /// 「启动」「重启」「重启全部」都走这里。两条标记都要清：`failed`
+    /// 是上次启动失败的疤痕，用户改了命令路径后本就不该再生效；
+    /// `stopped` 则是本次要解开的。
+    fn allow_start(&mut self, key: &ServerKey) {
+        self.stopped.remove(key);
+        self.failed.remove(key);
+    }
+
     /// 启动完成：写入结果并唤醒全部等待者。
+    ///
+    /// **`stopped` 优先于结果**：启动是异步的，用户在握手期间按「停止」后
+    /// 这里才收到结果。此时必须把这个「迟到」的进程丢掉，否则它会悄悄回到
+    /// `ready` 里，下次打开文件直接被复用——停止白按。
     fn finish(&mut self, key: ServerKey, client: Option<Arc<LspClient>>) {
+        if !self.accepts_start(&key) {
+            log::info!(
+                "lsp: discarding late-started `{language}` for {root:?} (stopped by user)",
+                language = key.language,
+                root = key.root,
+            );
+            self.starting.remove(&key);
+            return;
+        }
         let waiters = self.starting.remove(&key).unwrap_or_default();
         match client {
             Some(client) => {
@@ -114,6 +201,15 @@ impl ServerTable {
                 }
             }
         }
+    }
+
+    /// 这次启动的结果能不能落地。
+    ///
+    /// 抽成纯判定是为了可测：`finish` 要一个真实的 `LspClient` 才能在
+    /// 单测里跑到那一步，而这个「停止」判错正是最贵的那种 bug（用户必须
+    /// 重启应用才能把服务器停下来）。
+    fn accepts_start(&self, key: &ServerKey) -> bool {
+        !self.stopped.contains(key)
     }
 }
 
@@ -145,19 +241,42 @@ impl LspManager {
         path: &Path,
         language: &str,
     ) -> Option<async_channel::Receiver<Option<Arc<LspClient>>>> {
+        Self::server_for_key(cx, &server_key_for(path, language))
+    }
+
+    /// 按 key 取（必要时启动）服务器。
+    ///
+    /// 与 [`Self::server_for_file`] 分成两层：菜单要操作的服务器不一定对应
+    /// 「当前打开的文件」，而项目根 + 语言才是进程的唯一标识。
+    ///
+    /// 返回 `None` 表示：该语言无可用服务器、已被显式禁用、用户手动停掉、
+    /// 或之前启动失败。调用方降级为「无 LSP」即可。
+    ///
+    /// 返回 `Some(rx)` 时，结果通过 channel 送达——启动握手可能耗时数百毫秒，
+    /// 不能在 UI 线程上等。
+    pub fn server_for_key(
+        cx: &mut App,
+        key: &ServerKey,
+    ) -> Option<async_channel::Receiver<Option<Arc<LspClient>>>> {
         let settings: LspContent = cx
             .try_global::<crate::settings::SettingsStore>()
             .map(|s| s.content().lsp.clone())
             .unwrap_or_else(LspContent::default_enabled);
 
-        let config = server_for_language(language, Some(&settings))?;
-        let root = project_root(path);
-        let key = ServerKey {
-            root,
-            language: language.to_string(),
-        };
+        let config = server_for_language(&key.language, Some(&settings))?;
 
         let table = cx.global::<Self>().table.clone();
+
+        // 用户按过「停止」：不再自动拉起。这一条必须排在 `ready` 查询**之前**，
+        // 否则「停止 → 换标签再切回来」会把服务器复活。
+        if lock(&table).is_stopped(key) {
+            log::debug!(
+                "lsp: {} for {:?} is stopped by user, not starting",
+                key.language,
+                key.root
+            );
+            return None;
+        }
 
         // 已就绪：立即投递，不起任务。
         {
@@ -196,8 +315,13 @@ impl LspManager {
             let key2 = key.clone();
             let program = config.command.clone();
             let args = config.args.clone();
+            // 日志 sink 在 spawn 前就建好：`initialize` 握手那几帧要能看到。
+            // 挂在连接上而不是客户端上——发送与接收都发生在 `Connection` 里。
+            let logger = crate::lsp::log::sink_for(&key2);
             smol::spawn(async move {
-                let result = LspClient::start(&program, &args, key2.root.clone()).await;
+                let result =
+                    LspClient::start_with_logger(&program, &args, key2.root.clone(), Some(logger))
+                        .await;
                 let client = match result {
                     Ok(client) => {
                         log::info!("lsp: started `{program}` for {}", key2.language);
@@ -238,28 +362,147 @@ impl LspManager {
         server_for_language(language, Some(&settings)).map(|c| c.command)
     }
 
-    /// 同步查询已就绪的服务器（无则 `None`）。
-    pub fn get(&self, root: &Path, language: &str) -> Option<Arc<LspClient>> {
-        lock(&self.table).get(&ServerKey {
-            root: root.to_path_buf(),
-            language: language.to_string(),
-        })
+    /// 列举当前已知的全部服务器进程。
+    ///
+    /// 顺序：跑着的在前，启动中、已停止、失败的排后面；同状态内按语言名排，
+    /// 让菜单每次刷新不要跳。
+    ///
+    /// **只在用户打开菜单时调一次**：这里会持有锁并从每个 client 读
+    /// pid / 版本，虽然很快，但不该出现在 `render` 路径上。
+    pub fn snapshots(cx: &App) -> Vec<ServerSnapshot> {
+        let table = cx.global::<Self>().table.clone();
+        let settings: LspContent = cx
+            .try_global::<crate::settings::SettingsStore>()
+            .map(|s| s.content().lsp.clone())
+            .unwrap_or_else(LspContent::default_enabled);
+
+        let guard = lock(&table);
+        let mut out: Vec<ServerSnapshot> = Vec::new();
+        let mut push = |key: &ServerKey, state: ServerState, client: Option<&Arc<LspClient>>| {
+            let command = server_for_language(&key.language, Some(&settings))
+                .map(|c| c.command)
+                .unwrap_or_default();
+            out.push(ServerSnapshot {
+                pid: client.and_then(|c| c.connection_pid()),
+                version: client.and_then(|c| {
+                    c.capabilities()
+                        .server_info
+                        .as_ref()
+                        .and_then(|i| i.version.clone())
+                }),
+                key: key.clone(),
+                command,
+                state,
+            });
+        };
+
+        for (key, client) in &guard.ready {
+            // `ready` 里可能留着刚崩溃的进程（`server_for_file` 才清）。
+            // 如实报成 Failed，别让用户点一个已经死了的「停止」。
+            if client.is_closed() {
+                push(key, ServerState::Failed, None);
+            } else {
+                push(key, ServerState::Running, Some(client));
+            }
+        }
+        for key in guard.starting.keys() {
+            push(key, ServerState::Starting, None);
+        }
+        for key in &guard.stopped {
+            push(key, ServerState::Stopped, None);
+        }
+        for key in &guard.failed {
+            push(key, ServerState::Failed, None);
+        }
+        // 同一 key 可能同时出现在 ready 和 stopped（停止后未被摘干净）：
+        // 按 key 去重，保留先 push 的（优先级即上面的顺序）。
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|s| seen.insert(s.key.clone()));
+        out.sort_by(|a, b| {
+            state_rank(a.state)
+                .cmp(&state_rank(b.state))
+                .then_with(|| a.key.language.cmp(&b.key.language))
+                .then_with(|| a.key.root.cmp(&b.key.root))
+        });
+        out
     }
 
-    /// 清除失败记录。
+    /// 按 key 停服务器。菜单里操作的是 key（不依赖当前打开哪个文件）。
+    pub fn stop_server_for_key(cx: &App, key: &ServerKey) -> bool {
+        let client = lock(&cx.global::<Self>().table).stop(key);
+        if let Some(client) = client {
+            log::info!(
+                "lsp: stopped `{}` for {:?} (user request)",
+                key.language,
+                key.root
+            );
+            client.shutdown();
+            true
+        } else {
+            log::debug!(
+                "lsp: no running `{}` server for {:?}, marking stopped",
+                key.language,
+                key.root
+            );
+            false
+        }
+    }
+
+    /// 按 key 解除停止/失败标记。
+    pub fn resume_server_for_key(cx: &App, key: &ServerKey) {
+        lock(&cx.global::<Self>().table).allow_start(key);
+    }
+
+    /// 停掉全部服务器。
     ///
-    /// 设置变更后调用：用户改了命令路径，之前的失败不该永久生效。
-    pub fn clear_failures(cx: &mut App) {
-        lock(&cx.global::<Self>().table).failed.clear();
+    /// 返回停掉的进程数——「停止全部」在没有任何服务器跑着时是个空操作，
+    /// 调用方拿这个数字决定要不要弹提示。
+    pub fn stop_all(cx: &mut App) -> usize {
+        let mut guard = lock(&cx.global::<Self>().table);
+        let keys: Vec<ServerKey> = guard.ready.keys().cloned().collect();
+        let mut stopped = 0;
+        for key in keys {
+            if let Some(client) = guard.stop(&key) {
+                client.shutdown();
+                stopped += 1;
+            }
+        }
+        log::info!("lsp: stopped all servers ({stopped}) (user request)");
+        stopped
     }
 
     /// 关闭全部服务器进程（应用退出或设置里全局禁用时）。
+    ///
+    /// 与 [`Self::stop_all`] 的区别：这是**应用生命周期**的收尾，不写
+    /// `stopped` 标记（进程都要没了，标记没有意义）。
     pub fn shutdown_all(cx: &mut App) {
         let mut guard = lock(&cx.global::<Self>().table);
         for (_, client) in guard.ready.drain() {
             client.shutdown();
         }
         guard.starting.clear();
+        guard.stopped.clear();
+    }
+}
+
+/// 由文件路径与语言构造服务器键（项目根探测 + 语言）。
+fn server_key_for(path: &Path, language: &str) -> ServerKey {
+    ServerKey {
+        root: project_root(path),
+        language: language.to_string(),
+    }
+}
+
+/// 菜单里的排序权重：用户关心的排在前面。
+///
+/// 跑着的服务器是菜单的主要内容；已停止的排最后面——它们只是"可以再启动"
+/// 的记录，不该占据最显眼的位置。
+fn state_rank(state: ServerState) -> u8 {
+    match state {
+        ServerState::Running => 0,
+        ServerState::Starting => 1,
+        ServerState::Failed => 2,
+        ServerState::Stopped => 3,
     }
 }
 
@@ -359,5 +602,59 @@ mod tests {
             language: "go".into(),
         };
         assert!(table.get(&key).is_none());
+    }
+
+    #[test]
+    fn stop_marks_key_stopped() {
+        let mut table = ServerTable::default();
+        let key = ServerKey {
+            root: PathBuf::from("/tmp/stop-a"),
+            language: "rust".into(),
+        };
+        // 没在跑也返回 None，但标记必须写下去——否则「停止」之后
+        // 一次标签切换就把服务器悄悄拉起来了。
+        assert!(table.stop(&key).is_none());
+        assert!(table.is_stopped(&key));
+    }
+
+    #[test]
+    fn allow_start_clears_both_stopped_and_failed() {
+        let mut table = ServerTable::default();
+        let key = ServerKey {
+            root: PathBuf::from("/tmp/stop-b"),
+            language: "rust".into(),
+        };
+        table.stop(&key);
+        table.failed.insert(key.clone());
+
+        table.allow_start(&key);
+
+        assert!(!table.is_stopped(&key));
+        assert!(!table.failed.contains(&key));
+    }
+
+    /// 回归：启动握手是异步的，用户在等待期间按「停止」。
+    ///
+    /// 旧实现里 `finish` 无条件写 `ready`，这个迟到的进程会回到表里被复用
+    /// ——停止等于没按。现在 `stopped` 必须优先于启动结果。
+    #[test]
+    fn late_start_after_user_stop_is_discarded() {
+        let mut table = ServerTable::default();
+        let key = ServerKey {
+            root: PathBuf::from("/tmp/stop-c"),
+            language: "rust".into(),
+        };
+        assert!(
+            table.accepts_start(&key),
+            "启动前没有 stopped 标记，理应接受"
+        );
+
+        // 用户按下停止。
+        table.stop(&key);
+
+        assert!(
+            !table.accepts_start(&key),
+            "握手期间按了停止，迟到的启动结果必须被丢弃"
+        );
     }
 }

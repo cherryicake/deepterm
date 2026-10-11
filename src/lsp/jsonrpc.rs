@@ -29,6 +29,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::lsp::log as lsp_log;
+use crate::lsp::log::{Direction, LogSink, MessageKind};
+
 /// 一条 JSON-RPC 消息。
 ///
 /// 请求/响应/通知三态共用 `id` 字段：`id` 为 `Some` 且带 `method` 是
@@ -341,6 +344,12 @@ pub struct Connection {
     /// 对照 Zed `lsp_store.rs:12289`：它用 `DidChangeWatchedFilesRegistrationOptions`
     /// 建出 `GlobSet`，发通知前逐个 `is_match()`，不匹配的直接丢弃。
     watched_globs: Arc<Mutex<Vec<String>>>,
+    /// 报文日志接收端（View Logs 的数据源）。
+    ///
+    /// `None` 表示这个连接不记日志——测试里的替身连接没有 key，也没人看
+    /// 它的日志。只在**有 key 的真实连接**上挂：日志的价值正在于按服务器
+    /// 分桶，没有 key 的记录不知道该归给谁。
+    logger: Option<Arc<dyn LogSink>>,
 }
 
 /// 构造启动语言服务器的命令（不真正 spawn）。
@@ -390,7 +399,11 @@ impl Connection {
     ///
     /// `spawn` 失败（命令不存在）会以 `Err` 返回，调用方降级为「无 LSP」，
     /// 不阻塞编辑器。
-    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
+    pub async fn spawn(
+        program: &str,
+        args: &[String],
+        logger: Option<Arc<dyn LogSink>>,
+    ) -> Result<Self> {
         let mut command = spawn_command(program, args);
 
         let mut child = command
@@ -417,6 +430,7 @@ impl Connection {
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registered_methods: Arc::new(Mutex::new(std::collections::HashSet::new())),
             watched_globs: Arc::new(Mutex::new(Vec::new())),
+            logger,
         };
 
         // 读循环：独立于任何请求，寿命与连接相同。
@@ -425,9 +439,18 @@ impl Connection {
         let stdin2 = Arc::clone(&conn.stdin);
         let registered2 = Arc::clone(&conn.registered_methods);
         let globs2 = Arc::clone(&conn.watched_globs);
+        let logger2 = conn.logger.clone();
         smol::spawn(async move {
-            let result =
-                read_loop(stdout, stdin2, pending2, subscribers, registered2, globs2).await;
+            let result = read_loop(
+                stdout,
+                stdin2,
+                pending2,
+                subscribers,
+                registered2,
+                globs2,
+                logger2,
+            )
+            .await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -554,6 +577,15 @@ impl Connection {
             self.pending.lock().remove(&id);
             return Err(e);
         }
+        if let Some(logger) = &self.logger {
+            logger.record(lsp_log::message(
+                Direction::Outgoing,
+                MessageKind::Request,
+                method,
+                Some(id as i64),
+                params,
+            ));
+        }
 
         // 有界等待：`or` 返回先完成的那一支（应答，或超时标记）。
         let result = match smol::future::or(async { Some(rx.recv().await) }, async {
@@ -654,7 +686,19 @@ impl Connection {
             params,
         };
         let payload = serde_json::to_vec(&outgoing).context("failed to serialize notification")?;
-        self.write_frame(&payload).await
+        let result = self.write_frame(&payload).await;
+        if result.is_ok()
+            && let Some(logger) = &self.logger
+        {
+            logger.record(lsp_log::message(
+                Direction::Outgoing,
+                MessageKind::Notification,
+                method,
+                None,
+                params,
+            ));
+        }
+        result
     }
 
     /// 应答服务器发来的请求。
@@ -719,6 +763,7 @@ impl Connection {
             closed: Arc::clone(&self.closed),
             registered_methods: Arc::clone(&self.registered_methods),
             watched_globs: Arc::clone(&self.watched_globs),
+            logger: self.logger.clone(),
         }
     }
 }
@@ -739,6 +784,7 @@ async fn read_loop(
     subscribers: Arc<Mutex<Vec<Subscription>>>,
     registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
     watched_globs: Arc<Mutex<Vec<String>>>,
+    logger: Option<Arc<dyn LogSink>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
@@ -748,6 +794,9 @@ async fn read_loop(
         // 一次 read 拿到多条消息时避免反复进 read 系统调用。
         while let Some((msg, consumed)) = parse_frame(&buf)? {
             buf.drain(..consumed);
+            if let Some(logger) = &logger {
+                logger.record(describe_incoming(&msg));
+            }
             // 记录/清除服务器动态注册的能力（在应答之前处理，保证
             // 「注册成功」与「我们记住了」是同一时刻）。
             if let Message::Request { method, params, .. } = &msg {
@@ -795,6 +844,19 @@ async fn read_loop(
                         } else if let Err(e) = guard.flush().await {
                             log::warn!("lsp: failed to flush reply {id}: {e}");
                         } else {
+                            // 这条应答是读循环**就地**发的（不是谁调的
+                            // `request`），不记的话日志里只有服务器的请求、
+                            // 看不到我们回过——排「服务器是不是在等我们」
+                            // 时正好缺这一条。
+                            if let Some(logger) = &logger {
+                                logger.record(lsp_log::message(
+                                    Direction::Outgoing,
+                                    MessageKind::Response,
+                                    "",
+                                    Some(id as i64),
+                                    None,
+                                ));
+                            }
                             log::debug!("lsp: replied to server request id {id}");
                         }
                     }
@@ -813,6 +875,41 @@ async fn read_loop(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// 入站消息 → 一条日志记录。
+fn describe_incoming(msg: &Message) -> lsp_log::LogMessage {
+    let (kind, method, id, payload) = match msg {
+        Message::Request { id, method, params } => (
+            MessageKind::Request,
+            method.clone(),
+            Some(*id as i64),
+            params.clone(),
+        ),
+        Message::Response { id, result, error } => {
+            // 出错的响应只记消息文本：`-32801 content modified` 这类正是
+            // 日志要回答的问题。`data` 字段可能很大且形状不定，不给它。
+            let owned = match error {
+                Some(e) => serde_json::json!({ "error": e.message }),
+                // 正常响应的 `result` 是 `Option<Value>`：`null` 结果要落成
+                // `Value::Null`，类型才与其他分支一致。
+                None => result.clone().unwrap_or(Value::Null),
+            };
+            (
+                MessageKind::Response,
+                String::new(),
+                Some(*id as i64),
+                owned,
+            )
+        }
+        Message::Notification { method, params } => (
+            MessageKind::Notification,
+            method.clone(),
+            None,
+            params.clone(),
+        ),
+    };
+    lsp_log::message(Direction::Incoming, kind, method, id, Some(&payload))
 }
 
 /// 服务器主动请求的处理结果。

@@ -24,6 +24,7 @@ use lsp_types::{
 };
 
 use crate::lsp::jsonrpc::Connection;
+use crate::lsp::log::LogSink;
 
 /// 错误是否属于「服务器暂时不接受查询」，值得重试。
 ///
@@ -101,7 +102,22 @@ impl LspClient {
 
     /// 启动服务器并完成 `initialize` / `initialized` 握手。
     pub async fn start(program: &str, args: &[String], root: PathBuf) -> Result<Self> {
-        let conn = Connection::spawn(program, args).await?;
+        Self::start_with_logger(program, args, root, None).await
+    }
+
+    /// [`Self::start`] 的带报文日志版本。
+    ///
+    /// 生产路径走这里（[`crate::lsp::project::LspManager`] 知道服务器 key）。
+    /// 日志必须在 `Connection::spawn` **之前**就挂上：`initialize` 握手本身
+    /// 就是最值得看的那几帧（服务器迟迟不答 initialize，用户看到的现象只是
+    /// 状态栏停在「启动中」）。
+    pub async fn start_with_logger(
+        program: &str,
+        args: &[String],
+        root: PathBuf,
+        logger: Option<std::sync::Arc<dyn LogSink>>,
+    ) -> Result<Self> {
+        let conn = Connection::spawn(program, args, logger).await?;
         let conn = Arc::new(conn);
 
         let root_uri = path_to_uri(&root)?;

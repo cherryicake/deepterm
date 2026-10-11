@@ -73,51 +73,60 @@ impl LspContent {
 ///
 /// 命令名都是各自生态里 `PATH` 上的约定名称；参数带上是因为不加的话
 /// 多数服务器会进入非 stdio 模式或打印帮助后退出。
-fn builtin_servers() -> HashMap<String, ServerConfig> {
-    let mut m = HashMap::new();
-    let insert = |m: &mut HashMap<String, ServerConfig>, lang: &str, cmd: &str, args: &[&str]| {
-        m.insert(
-            lang.to_string(),
-            ServerConfig {
-                command: cmd.to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                enabled: true,
-            },
+///
+/// **缓存成 `OnceLock`**：这张表是常量，但状态栏现在每帧都要问一次
+/// 「当前语言的服务器叫什么」（呼吸点那一帧）。`server_for_language` 在
+/// 渲染热路径上，原来的做法是每次调用都重建整张表（19 个 `String` +
+/// 若干 `Vec`）——呼吸动画把它从「每帧一点」放大成真正的每帧开销。
+fn builtin_servers() -> &'static HashMap<String, ServerConfig> {
+    static TABLE: std::sync::OnceLock<HashMap<String, ServerConfig>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut m = HashMap::new();
+        let insert =
+            |m: &mut HashMap<String, ServerConfig>, lang: &str, cmd: &str, args: &[&str]| {
+                m.insert(
+                    lang.to_string(),
+                    ServerConfig {
+                        command: cmd.to_string(),
+                        args: args.iter().map(|s| s.to_string()).collect(),
+                        enabled: true,
+                    },
+                );
+            };
+
+        insert(&mut m, "rust", "rust-analyzer", &[]);
+        insert(&mut m, "go", "gopls", &[]);
+        // pyright 的 stdio 入口是 `pyright-langserver`；`pyright` 本体不带
+        // `--stdio`。二者都常见，前者优先。
+        insert(&mut m, "python", "pyright-langserver", &["--stdio"]);
+        insert(
+            &mut m,
+            "typescript",
+            "typescript-language-server",
+            &["--stdio"],
         );
-    };
+        insert(&mut m, "tsx", "typescript-language-server", &["--stdio"]);
+        insert(
+            &mut m,
+            "javascript",
+            "typescript-language-server",
+            &["--stdio"],
+        );
+        insert(&mut m, "c", "clangd", &[]);
+        insert(&mut m, "cpp", "clangd", &[]);
+        insert(&mut m, "json", "vscode-json-language-server", &["--stdio"]);
+        insert(&mut m, "html", "vscode-html-language-server", &["--stdio"]);
+        insert(&mut m, "css", "vscode-css-language-server", &["--stdio"]);
+        insert(&mut m, "lua", "lua-language-server", &[]);
+        insert(&mut m, "zig", "zls", &[]);
+        insert(&mut m, "java", "jdtls", &[]);
+        insert(&mut m, "bash", "bash-language-server", &["start"]);
+        insert(&mut m, "yaml", "yaml-language-server", &["--stdio"]);
+        insert(&mut m, "toml", "taplo", &["lsp", "stdio"]);
+        insert(&mut m, "kotlin", "kotlin-language-server", &[]);
 
-    insert(&mut m, "rust", "rust-analyzer", &[]);
-    insert(&mut m, "go", "gopls", &[]);
-    // pyright 的 stdio 入口是 `pyright-langserver`；`pyright` 本体不带
-    // `--stdio`。二者都常见，前者优先。
-    insert(&mut m, "python", "pyright-langserver", &["--stdio"]);
-    insert(
-        &mut m,
-        "typescript",
-        "typescript-language-server",
-        &["--stdio"],
-    );
-    insert(&mut m, "tsx", "typescript-language-server", &["--stdio"]);
-    insert(
-        &mut m,
-        "javascript",
-        "typescript-language-server",
-        &["--stdio"],
-    );
-    insert(&mut m, "c", "clangd", &[]);
-    insert(&mut m, "cpp", "clangd", &[]);
-    insert(&mut m, "json", "vscode-json-language-server", &["--stdio"]);
-    insert(&mut m, "html", "vscode-html-language-server", &["--stdio"]);
-    insert(&mut m, "css", "vscode-css-language-server", &["--stdio"]);
-    insert(&mut m, "lua", "lua-language-server", &[]);
-    insert(&mut m, "zig", "zls", &[]);
-    insert(&mut m, "java", "jdtls", &[]);
-    insert(&mut m, "bash", "bash-language-server", &["start"]);
-    insert(&mut m, "yaml", "yaml-language-server", &["--stdio"]);
-    insert(&mut m, "toml", "taplo", &["lsp", "stdio"]);
-    insert(&mut m, "kotlin", "kotlin-language-server", &[]);
-
-    m
+        m
+    })
 }
 
 /// 查某语言最终生效的服务器配置。

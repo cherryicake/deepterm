@@ -33,6 +33,12 @@ pub enum LspStatus {
     Ready { errors: usize, warnings: usize },
     /// 启动失败或进程已退出。
     Failed { reason: String },
+    /// 用户主动停止：进程没在跑，直到用户点「启动」/「重启」。
+    ///
+    /// 与 [`Self::Failed`] 分开是因为语义完全不同：失败是意外（红），
+    /// 停止是用户的选择（灰）。混成一个态会让用户以为自己的操作搞坏了
+    /// 什么，也会让菜单无法判断该把「启动」还是「停止」置灰。
+    Stopped,
 }
 
 impl LspStatus {
@@ -66,6 +72,7 @@ impl LspStatus {
                 (e, w) => format!("{e} 错误 {w} 警告"),
             },
             Self::Failed { reason } => format!("LSP 失败: {reason}"),
+            Self::Stopped => "已停止".to_string(),
         }
     }
 }

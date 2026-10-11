@@ -303,6 +303,28 @@ impl LspSession {
         self.opened = false;
     }
 
+    /// 用户主动停止服务器：断开当前会话，但保留 uri / language_id / 版本号。
+    ///
+    /// 与 [`Self::close`] 的两点差别：
+    /// - **发 `didClose` 后还要收进程**：`close` 只通知服务器「文档关了」，
+    ///   进程交给 `Drop` 兜底；而用户按「停止」要的就是进程消失，必须显式
+    ///   `shutdown()`（握手 → 等退出 → 超时强杀）。
+    /// - **不清会话**：`connect` 之后还能原样重启，`uri` / `version` 都在。
+    pub fn stop(&mut self) {
+        self.change_task.take();
+        self.notify_task.take();
+        if let Some(client) = self.client.take() {
+            let uri = self.uri.clone();
+            smol::spawn(async move {
+                let _ = client.did_close(&uri).await;
+                client.shutdown();
+            })
+            .detach();
+            log::info!("lsp: stopped server for {}", self.uri);
+        }
+        self.opened = false;
+    }
+
     /// 订阅服务器的 `publishDiagnostics`，写进编辑器的 `DiagnosticSet`。
     ///
     /// **每个标签一份独立订阅**（`client.notifications()` 现在是广播订阅，

@@ -52,7 +52,7 @@ def record(obj):
 
 /// 启动替身服务器（`initialize` 由替身脚本自己应答）。
 async fn start_stub(script: &std::path::Path, _dir: &std::path::Path) -> Connection {
-    Connection::spawn("python3", &[script.display().to_string()])
+    Connection::spawn("python3", &[script.display().to_string()], None)
         .await
         .expect("stub server should start")
 }
