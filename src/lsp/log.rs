@@ -163,6 +163,18 @@ pub fn clear(key: &ServerKey) {
     }
 }
 
+/// 移除某服务器的日志桶（用户显式停止该服务器时调用）。
+///
+/// 单桶有界（`MAX_MESSAGES`），但**桶的数量**没有：键空间 = 会话中启动过
+/// 的每个 (项目根, 语言)。停止/崩溃的服务器其桶会永久驻留（`clear` 甚至
+/// 会用 `or_default()` 重建空桶），多仓库会话下持续累积。启动失败的桶
+/// **不**在此移除——那正是用户排障「服务器为什么没起来」的唯一证据。
+pub fn remove_server(key: &ServerKey) {
+    if let Ok(mut servers) = logs().lock() {
+        servers.remove(key);
+    }
+}
+
 /// 构造一条记录（收敛构造点，统一走 [`summarize`] 精简）。
 pub fn message(
     direction: Direction,

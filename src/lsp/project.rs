@@ -428,6 +428,10 @@ impl LspManager {
     }
 
     /// 按 key 停服务器。菜单里操作的是 key（不依赖当前打开哪个文件）。
+    ///
+    /// **不**回收日志桶：重启（先停后起）也走这里，而重启正是为了看报文
+    /// 排障，把桶一起删掉就没了证据。只有用户显式「Stop」才回收桶
+    /// （见 [`Self::stop_server_for_key_and_purge_logs`]）。
     pub fn stop_server_for_key(cx: &App, key: &ServerKey) -> bool {
         let client = lock(&cx.global::<Self>().table).stop(key);
         if let Some(client) = client {
@@ -448,15 +452,29 @@ impl LspManager {
         }
     }
 
+    /// 按 key 停服务器并回收日志桶（菜单里用户显式「Stop」用）。
+    ///
+    /// 桶数无界（键 = 会话中启动过的每个 (项目根, 语言)），停止的服务器其桶
+    /// 会永久驻留，见 `log::remove_server`。启动失败的桶**不**回收——那是
+    /// 用户排障「服务器为什么没起来」的唯一证据。
+    pub fn stop_server_for_key_and_purge_logs(cx: &App, key: &ServerKey) -> bool {
+        let stopped = Self::stop_server_for_key(cx, key);
+        crate::lsp::log::remove_server(key);
+        stopped
+    }
+
     /// 按 key 解除停止/失败标记。
     pub fn resume_server_for_key(cx: &App, key: &ServerKey) {
         lock(&cx.global::<Self>().table).allow_start(key);
     }
 
-    /// 停掉全部服务器。
+    /// 停掉全部服务器（用户显式操作：菜单/设置里「停止全部」）。
     ///
     /// 返回停掉的进程数——「停止全部」在没有任何服务器跑着时是个空操作，
     /// 调用方拿这个数字决定要不要弹提示。
+    ///
+    /// 日志桶一并回收：这是用户主动清场的批量操作，不打算再留着这些报文。
+    /// （单键的 `stop_server_for_key` 不回收，重启要走它。）
     pub fn stop_all(cx: &mut App) -> usize {
         let mut guard = lock(&cx.global::<Self>().table);
         let keys: Vec<ServerKey> = guard.ready.keys().cloned().collect();
@@ -466,6 +484,7 @@ impl LspManager {
                 client.shutdown();
                 stopped += 1;
             }
+            crate::lsp::log::remove_server(&key);
         }
         log::info!("lsp: stopped all servers ({stopped}) (user request)");
         stopped

@@ -313,6 +313,9 @@ pub struct EditorOpenFileInfo {
     pub encoding: FileEncoding,
     /// 只读文件标记。
     pub read_only: bool,
+    /// 有未保存修改：文件树状态淘汰时据此跳过（淘汰会丢全文与撤销历史，
+    /// 脏文件必须留下等用户处理）。加载中的文件为 false。
+    pub dirty: bool,
     /// diff tab 的仓库快照（仅 `diff-` tab 为 Some）：恢复时后台重载 diff，
     /// 而不是走纯文本 `restore_file_from_cache`（否则页面空白）。
     pub diff_repo: Option<crate::editor::git_repository::GitRepository>,
@@ -438,6 +441,17 @@ pub struct FileTreeEditorState {
     /// diff tab 的视图缓存：切组时整实体保留，未保存的右侧编辑、滚动、折叠状态不丢。
     pub cached_diff_views: HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
     pub active_file_id: Option<SharedString>,
+}
+
+impl FileTreeEditorState {
+    /// 是否含未保存修改（决定文件树状态能否被淘汰）。
+    ///
+    /// 淘汰会丢掉 `cached_editor_states` 里的 InputState 实体——那是该树下
+    /// 所有打开文件的全文与撤销历史的唯一持有者，切回时只能重新从磁盘读。
+    /// 因此脏条目必须留下，宁可让有界表暂时超限。
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.open_files_info.iter().any(|info| info.dirty)
+    }
 }
 
 pub struct Editor {
@@ -781,6 +795,7 @@ impl Editor {
                 },
                 encoding: f.encoding,
                 read_only: f.read_only,
+                dirty: f.dirty,
                 diff_repo: f.diff_repo.clone(),
             })
             .collect()
@@ -2832,12 +2847,15 @@ impl Editor {
     /// - `LspManager`：把进程从全局表里摘掉并打 stopped 标记，这样
     ///   「换个标签再切回来」不会把它复活；
     /// - `LspSession`：断开编辑器侧持有的 client。
+    ///
+    /// 日志桶一并回收（桶数无界，见 `lsp::log::remove_server`）。重启不走
+    /// 这条路径——它调 `stop_server_for_key`，日志要留着排障。
     pub(crate) fn stop_lsp_server_for_key(
         &mut self,
         key: &crate::lsp::project::ServerKey,
         cx: &mut Context<Self>,
     ) {
-        crate::lsp::LspManager::stop_server_for_key(cx, key);
+        crate::lsp::LspManager::stop_server_for_key_and_purge_logs(cx, key);
         self.stop_sessions_for_key(key, cx);
         self.mark_server_stopped(key, cx);
         log::info!(
@@ -2876,6 +2894,9 @@ impl Editor {
     ///
     /// 顺序很重要：只解标记不真停的话，`server_for_key` 会把 `ready` 里那个
     /// 半死的 client 直接投递回来，等于没重启。
+    ///
+    /// 走 `stop_server_for_key`（而非带清桶的 Stop 变体）：重启通常就是为了
+    /// 看报文排障，日志桶必须留着。
     pub(crate) fn restart_lsp_server_for_key(
         &mut self,
         key: &crate::lsp::project::ServerKey,
@@ -6417,6 +6438,7 @@ mod tests {
             original_content: Some("# hi\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         cx.update(|window, cx| {
@@ -6482,6 +6504,7 @@ mod tests {
             original_content: None,
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
 
@@ -6717,6 +6740,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         cx.update(|window, cx| {
@@ -6840,6 +6864,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         // 空编辑器不参与分摊：侧边栏宽度变化全部归主区。
@@ -6976,6 +7001,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         let open_one = |editor: &gpui::Entity<Editor>, cx: &mut gpui::VisualTestContext| {
