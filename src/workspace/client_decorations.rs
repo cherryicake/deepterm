@@ -43,15 +43,18 @@ pub fn client_side_decorations(
                 .when(!(tiling.bottom || tiling.left), |div| {
                     div.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING)
                 })
-                // 内边距必须始终保留：它把内容推离顶部缩放热区
-                // （见下方 resize_edge，`pos.y < CLIENT_SIDE_DECORATION_SHADOW`
-                // 即判定为顶边缩放）。若按 tiling 丢弃 pt，全屏时（tiling.top
-                // 为真）内容会上移 SHADOW 像素，标题栏/tab 栏的上沿就落入缩放带，
-                // 点击被 start_window_resize 吃掉而看似无响应。
-                // tiling 只应控制装饰外观（圆角/边框/阴影），不控制内容位移。
-                .pt(CLIENT_SIDE_DECORATION_SHADOW)
+                // 四边内边距一律按 tiling 收放。这块留白是给窗口阴影用的透明区，
+                // 窗口一旦贴边（最大化时 tiling 四边皆 true），留在那儿的 padding
+                // 就变屏幕上一条肉眼可见的缝——实测左边和上边各 10px，而右边和下边
+                // 本来就带着 when，所以看不出问题。
+                //
+                // pt/pl 过去是无条件保留的，旧注释给的理由是「怕内容上移后标题栏
+                // 落进顶部缩放热区」。这个担心是多余的：resize_edge() 里判定顶边
+                // 缩放的第一个条件就是 `!tiling.top`，左边同理 `!tiling.left`，
+                // 贴边时这两条分支根本不会返回，留着 padding 保护不了任何东西。
+                .when(!tiling.top, |div| div.pt(CLIENT_SIDE_DECORATION_SHADOW))
                 .when(!tiling.bottom, |div| div.pb(CLIENT_SIDE_DECORATION_SHADOW))
-                .pl(CLIENT_SIDE_DECORATION_SHADOW)
+                .when(!tiling.left, |div| div.pl(CLIENT_SIDE_DECORATION_SHADOW))
                 .when(!tiling.right, |div| div.pr(CLIENT_SIDE_DECORATION_SHADOW))
                 .on_mouse_down(MouseButton::Left, move |e, window, _| {
                     let size = window.window_bounds().get_bounds().size;

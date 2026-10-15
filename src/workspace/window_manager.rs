@@ -78,6 +78,15 @@ impl WindowManager {
                 window_bounds: Some(gpui::WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitleBar::title_bar_options()),
                 window_decorations: Some(WindowDecorations::Client),
+                // 桌面环境靠它识别应用：X11 下 gpui 据此写 WM_CLASS，
+                // Wayland 下据此写 xdg_toplevel 的 app_id。
+                //
+                // 不设的话这两个属性**都不存在**（不是空值，是压根没有这个
+                // property），GNOME Shell 匹配不到任何 .desktop 条目，dock
+                // 只能画通用的「未知应用」图标 —— 此时 _NET_WM_ICON 也是空的，
+                // 连兜底都没有。值必须与 deepterm.desktop 的 StartupWMClass
+                // 一致才能匹配上 Icon=deepterm 装进 hicolor 的那张图。
+                app_id: Some("deepterm".to_string()),
                 #[cfg(target_os = "macos")]
                 is_movable: false,
                 #[cfg(not(target_os = "macos"))]
