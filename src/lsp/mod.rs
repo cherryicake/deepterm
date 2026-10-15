@@ -11,8 +11,9 @@
 //! | [`features`] | LSP 响应 → 编辑器数据结构的转换 |
 //!
 //! 约定：
-//! - **只服务本地文件**。远程（SSH）标签不启动服务器：服务器进程跑在本地，
-//!   看到的路径与远程文件不一致，语义上不成立。
+//! - **本地与远端都服务**，但远端服务器必须跑在**文件所在的那台主机**上
+//!   （经 [`ssh::lsp_channel`] 的 channel exec）：服务器读的是那台机器上的
+//!   项目文件，跑在本地时看到的路径与远程文件不一致，语义上不成立。
 //! - **失败一律降级**。服务器缺失、启动失败、请求出错都只记日志，
 //!   编辑器退回「纯 tree-sitter」状态，绝不弹窗或阻塞输入。
 
@@ -20,6 +21,7 @@ pub mod client;
 pub mod features;
 pub mod glob;
 pub mod jsonrpc;
+pub mod log;
 pub mod project;
 pub mod registry;
 pub mod session;
@@ -29,6 +31,11 @@ pub mod status;
 mod feature_tests;
 #[cfg(test)]
 mod integration_tests;
+// 远端真机用例：要连一台真实的 SSH 主机，默认跳过（见模块文档的环境变量）。
+#[cfg(test)]
+mod remote_editor_tests;
+#[cfg(test)]
+mod remote_integration_tests;
 // 协议层用例用一个 `python3` 脚本当替身服务器，存活探测走 `libc::kill`。
 // 两者都是 POSIX 专有（`libc` 只在 `cfg(unix)` 下依赖），故整模块按 unix 裁剪。
 // 被验的协议行为本身与平台无关——换掉替身实现即可在 Windows 上跑，

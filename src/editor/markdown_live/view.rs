@@ -433,6 +433,16 @@ impl LiveMarkdownView {
         self.wide_blocks.clear();
         self.mermaid.clear_block_state();
         self.h_scroll.clear();
+        // 同理：image_cache 以 URL 为键持有解码后的位图（`Arc<gpui::Image>`，
+        // 单张可达数 MB），键空间是「本文档出现过的每个 URL」——不清则每次
+        // set_text（切文档/外部重载）都往上一份文档的残留里再叠一份，
+        // 反复编辑长会话下只增不减。
+        //
+        // 代价是每次 set_text 后首帧要重新读盘 + 解码本文档的所有图片
+        // （外部重载 / stale-while-revalidate 刷新都会触发 set_text）。
+        // 只清「新文档里不再出现的 URL」不解决问题：重载时图片大多仍在，
+        // 却因内容变化必须重解码；而真正的大头（上一个文档的残留）全都会被清掉。
+        self.image_cache.clear();
         self.scroll_to_cursor = true;
         self.emitted_version = self.buffer.text_version();
         if let Some(panel) = self.search_panel.clone() {
@@ -4045,8 +4055,17 @@ impl LiveMarkdownView {
                         Some((image, size)) => ImageSlot::Ready { image, size, stamp },
                         None => ImageSlot::Failed,
                     };
-                    view.image_cache.insert(url_owned, slot);
-                    cx.notify();
+                    // 期间可能又 set_text 过（切文档 / 外部重载），缓存已被清空。
+                    // 此时旧 URL 可能已不在新文档里：直接插回去会让上一份文档的
+                    // 位图继续驻留。只在该 URL 仍是本次期望的加载结果时写回。
+                    if view
+                        .image_cache
+                        .get(&url_owned)
+                        .is_some_and(|s| matches!(s, ImageSlot::Loading))
+                    {
+                        view.image_cache.insert(url_owned, slot);
+                        cx.notify();
+                    }
                 });
             }
         })

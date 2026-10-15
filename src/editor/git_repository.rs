@@ -69,6 +69,41 @@ type StatusCache = HashMap<String, (Instant, Vec<StatusEntry>, Vec<(String, Diff
 /// 键 = 远端会话标识 + 起始路径；值为 find 结果。
 type FindCache = HashMap<String, (Instant, Result<Option<GitRepository>, String>)>;
 
+/// HEAD / STATUS 缓存容量上限（键 = 会话中查询过的远端仓库 root）。
+///
+/// 读取侧只有 TTL 门控、**过期条目不淘汰**：只有同 key 再次查询时才被
+/// 覆盖。SSH 到过多主机/目录后，每条目（全仓库 status + numstat，大仓库
+/// 几十至上百 KB）会一直驻留。这里在插入侧收敛：先淘汰过期条目，仍超限
+/// 则整表清空——对齐 `REMOTE_DIFF_CACHE_CAP` 的既有做法，代价是 TTL 内
+/// 按需重建（一次远端 git 调用）。
+const HEAD_CACHE_CAP: usize = 32;
+const STATUS_CACHE_CAP: usize = 32;
+
+/// 有界插入 HEAD 缓存：淘汰过期 → 超限清空 → 插入。
+///
+/// `!contains_key` 守卫与 `REMOTE_DIFF_CACHE_CAP` 一致：刷新一个已知 key
+/// 不该把表里其他仍在 TTL 内的条目一起清掉。
+fn bounded_insert_head(cache: &mut HeadCache, key: String, value: (Instant, Option<String>)) {
+    cache.retain(|_, (at, _)| at.elapsed() < HEAD_TTL);
+    if cache.len() >= HEAD_CACHE_CAP && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, value);
+}
+
+/// 有界插入 STATUS 缓存（语义同 [`bounded_insert_head`]）。
+fn bounded_insert_status(
+    cache: &mut StatusCache,
+    key: String,
+    value: (Instant, Vec<StatusEntry>, Vec<(String, DiffStat)>),
+) {
+    cache.retain(|_, (at, ..)| at.elapsed() < STATUS_TTL);
+    if cache.len() >= STATUS_CACHE_CAP && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, value);
+}
+
 static HEAD_CACHE: OnceLock<Mutex<HeadCache>> = OnceLock::new();
 fn head_cache() -> &'static Mutex<HeadCache> {
     HEAD_CACHE.get_or_init(Mutex::default)
@@ -487,9 +522,14 @@ impl GitRepository {
             .cloned()
             .collect();
         let numstat = parse_numstat(&numstat_text);
-        status_cache()
-            .lock()
-            .insert(key, (Instant::now(), entries.clone(), numstat.clone()));
+        {
+            let mut cache = status_cache().lock();
+            bounded_insert_status(
+                &mut cache,
+                key,
+                (Instant::now(), entries.clone(), numstat.clone()),
+            );
+        }
         Ok((entries, numstat))
     }
 
@@ -696,9 +736,14 @@ impl GitRepository {
         .filter(|r| r.success())
         .map(|r| decode_bytes_to_string(&r.stdout).trim().to_string())
         .filter(|s| !s.is_empty());
-        head_cache()
-            .lock()
-            .insert(self.root.clone(), (Instant::now(), result.clone()));
+        {
+            let mut cache = head_cache().lock();
+            bounded_insert_head(
+                &mut cache,
+                self.root.clone(),
+                (Instant::now(), result.clone()),
+            );
+        }
         result
     }
 }

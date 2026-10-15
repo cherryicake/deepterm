@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +35,19 @@ const PERSISTED_VERSION: u32 = 1;
 const MAX_PERSISTED_FILES_PER_HOST: usize = 200;
 const MAX_PERSISTED_DIRS_PER_HOST: usize = 500;
 const MAX_CACHED_FILE_SIZE: usize = 512 * 1024;
+/// 单台服务器**内存侧**文件内容条数上限（与磁盘持久化口径一致）。
+///
+/// `MAX_PERSISTED_FILES_PER_HOST` 只约束落盘/读盘的那两条路径；内存
+/// `HashMap` 此前无任何上限——编辑器每打开一个文件就插入全文（上限
+/// 20MB/个）、hover 每划过一个文件插入最多 128KB，且关闭标签不回收，
+/// 长会话下 RSS 单调增长。这里补上内存侧同口径上限 + FIFO 淘汰。
+const MAX_CACHED_FILES_PER_SERVER: usize = MAX_PERSISTED_FILES_PER_HOST;
+/// 单台服务器内存侧文件内容的**字节**上限。
+///
+/// 条数上限不设大小约束：用户显式打开的文件可达编辑器上限 20MB/个
+/// （大小守卫只作用于 hover 这类 transient 副本），200 个大文件就是 GB 级。
+/// 这里按字节再收一次，超限时同样走 FIFO 淘汰。
+const MAX_CACHED_BYTES_PER_SERVER: usize = 32 * 1024 * 1024;
 
 fn cache_file_path() -> PathBuf {
     dirs::cache_dir()
@@ -79,6 +92,14 @@ struct FileContentEntry {
 struct ServerFileCache {
     /// path -> FileContentEntry，按文件路径索引
     files: HashMap<PathBuf, FileContentEntry>,
+    /// 插入序（FIFO 淘汰用）。与 `files` 同步维护：删除必须走
+    /// [`Self::forget`]，否则会堆积已移除路径的陈旧键，把淘汰队列堵死。
+    order: VecDeque<PathBuf>,
+    /// 当前驻留字节数（`files` 各条目 `content.len()` 之和），随增删同步。
+    /// 条数上限之外的第二道闸：用户显式打开的文件不受大小守卫约束
+    /// （见 [`RemoteFileTreeCache::insert_file_content`），200 个大文件
+    /// 足以把 RSS 顶到 GB 级，这里按字节再收一次。
+    bytes: usize,
 }
 
 /// 单台远程服务器的目录树（文件系统已浏览子集）
@@ -162,7 +183,9 @@ impl RemoteFileTreeCache {
                 if persisted_file.content.len() > MAX_CACHED_FILE_SIZE {
                     continue;
                 }
-                fc.files.insert(
+                // 走有界插入：磁盘恢复的条目也记入 FIFO 序，参与内存侧淘汰
+                // （否则它们永远不进 order，超限时淘汰不动它们）。
+                fc.insert_bounded(
                     PathBuf::from(p_str),
                     FileContentEntry {
                         content: persisted_file.content,
@@ -434,6 +457,16 @@ impl RemoteFileTreeCache {
     }
 
     /// 缓存远程文件内容（默认持久化；hover / 目录预取请传 `persist: false`）
+    ///
+    /// 有界保护：
+    /// - **大小守卫**（仅 `persist: false`）：transient 副本（hover / 目录
+    ///   预取）超过 `MAX_CACHED_FILE_SIZE` 不入缓存——它本就是「省一次 SFTP
+    ///   往返」的顺手优化，为大文件永久留一份副本只会把 RSS 顶高。用户显式
+    ///   打开的文件不走守卫：编辑器自己允许开到 20MB，这里卡一道会让
+    ///   512KB~20MB 的文件每次重开都走完整异步加载（加载态 + 一次 SFTP
+    ///   往返），把「秒开」变成可感知的等待；而条数上限已把总量约束住。
+    /// - **条数上限**：`MAX_CACHED_FILES_PER_SERVER`，FIFO 淘汰（非持久化
+    ///   的 hover 副本优先），见 [`ServerFileCache::insert_bounded`]。
     pub fn insert_file_content(
         &mut self,
         config: &SshConnectionConfig,
@@ -443,17 +476,26 @@ impl RemoteFileTreeCache {
         persist: bool,
     ) {
         let key = Self::server_key(config);
+        if !persist && content.len() > MAX_CACHED_FILE_SIZE {
+            log::debug!(
+                "FileTreeCache skip oversized file content ({} bytes): {}:{}",
+                content.len(),
+                key,
+                path.display()
+            );
+            return;
+        }
         let file_cache = self
             .file_caches
             .entry(key.clone())
             .or_insert_with(ServerFileCache::new);
         log::debug!(
-            "FileTreeCache insert file content (persist={}): {}{}",
+            "FileTreeCache insert file content (persist={}): {}:{}",
             persist,
             key,
             path.display()
         );
-        file_cache.files.insert(
+        file_cache.insert_bounded(
             path.to_path_buf(),
             FileContentEntry {
                 content,
@@ -506,8 +548,8 @@ impl RemoteFileTreeCache {
     pub fn remove_file(&mut self, config: &SshConnectionConfig, path: &Path) {
         let key = Self::server_key(config);
         if let Some(file_cache) = self.file_caches.get_mut(&key) {
-            if file_cache.files.remove(path).is_some() {
-                log::debug!("FileTreeCache remove file: {}{}", key, path.display());
+            if file_cache.forget(path) {
+                log::debug!("FileTreeCache remove file: {}:{}", key, path.display());
                 self.schedule_save();
             }
         }
@@ -539,7 +581,7 @@ impl RemoteFileTreeCache {
         // 文件内容缓存失效，避免重新打开文件时看到旧内容
         if matches!(event.kind, FsChangeKind::Remove | FsChangeKind::Modify) {
             if let Some(file_cache) = self.file_caches.get_mut(&key) {
-                file_cache.files.remove(&event.path);
+                file_cache.forget(&event.path);
             }
         }
         self.schedule_save();
@@ -561,6 +603,78 @@ impl ServerFileCache {
     fn new() -> Self {
         Self {
             files: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// 有界插入：新键记入 FIFO 序；超出 `MAX_CACHED_FILES_PER_SERVER`（条数）
+    /// 或 `MAX_CACHED_BYTES_PER_SERVER`（字节）时，**先淘汰最旧的非持久化条目**
+    /// （hover / 目录预取产生的 transient 副本），没有非持久化条目才淘汰最旧
+    /// 的持久化条目（用户显式打开过的文件）。
+    ///
+    /// 刚插入的条目不参与淘汰：缓存已满且全是持久化条目时，新来的
+    /// `persist: false` 副本是唯一的非持久化条目，会被自己这一步选走并删掉，
+    /// 于是 hover/目录预取静默失效（插进去就没了）。超出预算时改为淘汰最旧
+    /// 的持久化条目——那也只是一个「秒开」副本，服务器仍是内容权威。
+    ///
+    /// 淘汰只损失「秒开」优化：被淘汰的文件下次打开从服务器重新拉取，
+    /// 不影响正确性（内容的唯一权威在服务器与编辑器实体）。
+    fn insert_bounded(&mut self, path: PathBuf, entry: FileContentEntry) {
+        self.bytes += entry.content.len();
+        if let Some(previous) = self.files.insert(path.clone(), entry) {
+            // 同键覆盖：旧条目的字节先扣掉，否则 `bytes` 会只增不减地虚高。
+            self.bytes -= previous.content.len();
+        } else {
+            self.order.push_back(path.clone());
+        }
+        // 超限才淘汰。单条就可能顶满字节预算：此时新条目自身也必须可被淘汰
+        // （缓存装不下就是装不下），否则循环永远收敛不了。
+        let single_too_big = self.bytes > MAX_CACHED_BYTES_PER_SERVER;
+        let skip = (!single_too_big).then_some(path.as_path());
+        while self.files.len() > MAX_CACHED_FILES_PER_SERVER
+            || self.bytes > MAX_CACHED_BYTES_PER_SERVER
+        {
+            let Some(victim) = self.take_victim(skip) else {
+                break;
+            };
+            if let Some(removed) = self.files.remove(&victim) {
+                self.bytes -= removed.content.len();
+            }
+        }
+    }
+
+    /// 取下一条淘汰候选：最旧的非持久化条目优先，否则最旧条目。
+    ///
+    /// `skip` 是本次插入的键，永不被选中（见 [`Self::insert_bounded`]）。
+    ///
+    /// `order` 里可能含有已被 `forget` 之外的路径移除的键（防御性）：
+    /// 这些键不在 `files` 里，`position` 会跳过，`pop_front` 会消耗掉，
+    /// 循环必然收敛。
+    fn take_victim(&mut self, skip: Option<&Path>) -> Option<PathBuf> {
+        let is_candidate = |p: &PathBuf| {
+            Some(p.as_path()) != skip && self.files.get(p).is_some_and(|e| !e.persist)
+        };
+        if let Some(pos) = self.order.iter().position(|p| is_candidate(p)) {
+            return self.order.remove(pos);
+        }
+        // 全是持久化条目：从队首跳过 `skip` 与已失效的陈旧键。
+        let pos = self
+            .order
+            .iter()
+            .position(|p| Some(p.as_path()) != skip && self.files.contains_key(p))?;
+        self.order.remove(pos)
+    }
+
+    /// 删除条目并同步 FIFO 序（所有移除出口都走这里）。
+    fn forget(&mut self, path: &Path) -> bool {
+        match self.files.remove(path) {
+            Some(removed) => {
+                self.bytes -= removed.content.len();
+                self.order.retain(|p| p != path);
+                true
+            }
+            None => false,
         }
     }
 }

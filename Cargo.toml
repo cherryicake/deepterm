@@ -22,6 +22,9 @@ chrono = { version = "0.4", features = ["serde"] }
 alacritty_terminal = "0.26"
 parking_lot = "0.12"
 async-channel = "2.0"
+# LSP 菜单里显示服务器进程的内存占用（与 Zed `lsp_button.rs` 同源）。
+# 已经在依赖图里（zed-scap 传递依赖），直接引用不会多编译一个 crate。
+sysinfo = "0.31"
 itertools = "0.13"
 futures = "0.3"
 smol = "2.0"
@@ -33,6 +36,11 @@ polling = "3.11"
 bytes = "1"
 russh-sftp = "2.1.1"
 async-trait = "0.1"
+# 远端 LSP 用：russh channel 的读写是 `tokio::io::AsyncRead/AsyncWrite`，
+# 而 LSP 的帧循环基于 `futures` 的同名 trait。`compat` 提供两个方向的
+# 桥接。该 crate 已在依赖树里（russh-sftp 传递引入），开 feature 不新增
+# 编译单元，只需重编它自己。
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # Credential storage (for secure password/key storage)
 #

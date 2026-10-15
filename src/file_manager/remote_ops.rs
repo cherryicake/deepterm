@@ -189,8 +189,23 @@ impl DirTransferDriver for SameSessionDirDriver<'_> {
         policy: ConflictPolicy,
         resolver: Option<&dyn ConflictResolver>,
         cancelled: &AtomicBool,
+        dir_names: &mut crate::file_manager::utils::RemoteDirNames,
     ) -> anyhow::Result<Option<String>> {
-        resolve_remote_conflict(self.session, desired, policy, resolver, cancelled)
+        crate::file_manager::utils::resolve_remote_conflict_with_names(
+            self.session,
+            desired,
+            policy,
+            resolver,
+            cancelled,
+            dir_names,
+        )
+    }
+
+    fn snapshot_destination_names(
+        &mut self,
+        destination_dir: &String,
+    ) -> crate::file_manager::utils::RemoteDirNames {
+        crate::file_manager::utils::snapshot_remote_dir_names(self.session, destination_dir)
     }
 
     fn prepare_destination_dir(

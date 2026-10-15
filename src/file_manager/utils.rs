@@ -351,6 +351,125 @@ pub fn renamed_local_candidate(path: &Path, index: usize) -> PathBuf {
     parent.join(renamed_file_name(&original_name, index))
 }
 
+/// 远端目录现有名字的快照 + 当前遍历已占用的名字覆盖层。
+///
+/// 目录树传输的每文件/每目录冲突探测、改名候选探测原本都是一次独立的
+/// `session.exists`（一次 SFTP 往返）。深层级多文件场景下这些固定往返是
+/// 主要耗时。walker 在进入每个目标目录时读取一次快照，该目录下所有
+/// 条目的探测全部走内存 Set，把 O(条目数) 次往返降为 O(目录数) 次。
+///
+/// 关键正确性：快照建立后，本目录内每个条目解析出的**最终名字**（含
+/// AutoRename/保留两者 生成的副本名）必须立即 `claim` 进覆盖层——否则
+/// 后续兄弟条目会探测到同样的可用名，两个 job 改名/写入到同一路径，
+/// 后者覆盖或报错（旧内联流程靠「解析后立刻上传改名」天然避免）。
+pub struct RemoteDirNames {
+    names: std::collections::HashSet<String>,
+    /// read_dir 是否成功：false 时探测回退逐次 exists（快照不可信）。
+    readable: bool,
+}
+
+impl RemoteDirNames {
+    /// 不可用快照（目录读不了）：探测走逐次 exists 兜底。
+    pub fn unavailable() -> Self {
+        Self {
+            names: Default::default(),
+            readable: false,
+        }
+    }
+
+    /// 是否包含该名字（目录内条目存在性判定，含本次遍历已占用的）。
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.contains(name)
+    }
+
+    /// 记入一个已被本次遍历占用/创建的名字（AutoRename 结果、新建
+    /// 子目录名），供后续兄弟条目的探测看到。
+    pub fn claim(&mut self, name: &str) {
+        self.names.insert(name.to_string());
+    }
+
+    /// 目录是否不可读取（read_dir 失败）：探测回退到逐次 exists。
+    pub fn is_unavailable(&self) -> bool {
+        !self.readable
+    }
+}
+
+/// 单次 `read_dir` 构建目录名字快照；读不了（权限/竞态删除）时返回
+/// `is_unavailable` 的不可用快照，调用方按老路径逐次 exists 兜底。
+pub fn snapshot_remote_dir_names(
+    session: &mut sftp_fs::BlockingSftpSession,
+    remote_dir: &str,
+) -> RemoteDirNames {
+    match session.read_dir(remote_dir) {
+        Ok(entries) => RemoteDirNames {
+            names: entries.into_iter().map(|e| e.name).collect(),
+            readable: true,
+        },
+        Err(_) => RemoteDirNames::unavailable(),
+    }
+}
+
+/// 远端冲突解决（带目录名字快照）：
+/// [`resolve_remote_conflict`] 的快照版，见 [`snapshot_remote_dir_names`]。
+pub fn resolve_remote_conflict_with_names(
+    session: &mut sftp_fs::BlockingSftpSession,
+    desired_path: &str,
+    conflict_policy: ConflictPolicy,
+    resolver: Option<&dyn ConflictResolver>,
+    cancelled: &AtomicBool,
+    dir_names: &mut RemoteDirNames,
+) -> anyhow::Result<Option<String>> {
+    let name = remote_file_name(desired_path)?;
+    let occupied = dir_names.contains(&name);
+    // 快照不可用（目录读不了）时回退到单次 exists，保持旧语义。
+    let exists = if dir_names.is_unavailable() {
+        session.exists(desired_path)?
+    } else {
+        occupied
+    };
+    if !exists {
+        // 目标路径仍要 claim：它是本次遍历即将创建/覆盖的名字，
+        // 后续兄弟条目的探测必须能看到。
+        dir_names.claim(&name);
+        return Ok(Some(desired_path.to_string()));
+    }
+
+    match conflict_policy {
+        // Overwrite 也 claim：覆盖后该名字被本条目占用（状态未变，
+        // 但 claim 是幂等的且让意图明确）。
+        ConflictPolicy::Overwrite => {
+            dir_names.claim(&name);
+            Ok(Some(desired_path.to_string()))
+        }
+        ConflictPolicy::Skip => Ok(None),
+        ConflictPolicy::Ask => {
+            let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
+            let resolution =
+                prompt_conflict(name.clone(), desired_path.to_string(), resolver, cancelled)?;
+            match resolution {
+                ConflictResolution::Skip => Ok(None),
+                ConflictResolution::Overwrite => {
+                    dir_names.claim(&name);
+                    Ok(Some(desired_path.to_string()))
+                }
+                ConflictResolution::AutoRename => Ok(first_available_remote_rename_with_names(
+                    session,
+                    desired_path,
+                    cancelled,
+                    dir_names,
+                )?),
+                ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
+            }
+        }
+        ConflictPolicy::AutoRename => Ok(first_available_remote_rename_with_names(
+            session,
+            desired_path,
+            cancelled,
+            dir_names,
+        )?),
+    }
+}
+
 pub fn resolve_remote_conflict(
     session: &mut sftp_fs::BlockingSftpSession,
     desired_path: &str,
@@ -358,67 +477,61 @@ pub fn resolve_remote_conflict(
     resolver: Option<&dyn ConflictResolver>,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<Option<String>> {
-    if !session.exists(desired_path)? {
-        return Ok(Some(desired_path.to_string()));
-    }
-
-    match conflict_policy {
-        ConflictPolicy::Overwrite => Ok(Some(desired_path.to_string())),
-        ConflictPolicy::Skip => Ok(None),
-        ConflictPolicy::Ask => {
-            let resolver = resolver.ok_or_else(|| anyhow!("Ask 策略需要提供冲突解决器"))?;
-            let file_name = remote_file_name(desired_path).unwrap_or_else(|_| "file".to_string());
-            let resolution =
-                prompt_conflict(file_name, desired_path.to_string(), resolver, cancelled)?;
-            match resolution {
-                ConflictResolution::Skip => Ok(None),
-                ConflictResolution::Overwrite => Ok(Some(desired_path.to_string())),
-                ConflictResolution::AutoRename => Ok(first_available_remote_rename(
-                    session,
-                    desired_path,
-                    cancelled,
-                )?),
-                ConflictResolution::Stop => bail!("{}", TRANSFER_CANCELLED_MSG),
-            }
-        }
-        ConflictPolicy::AutoRename => {
-            first_available_remote_rename(session, desired_path, cancelled)
-        }
-    }
+    resolve_remote_conflict_with_names(
+        session,
+        desired_path,
+        conflict_policy,
+        resolver,
+        cancelled,
+        &mut RemoteDirNames::unavailable(),
+    )
 }
 
-/// AutoRename 的可用名探测。
+/// AutoRename 的可用名探测（带 walker 已取好的目录名字快照）。
 ///
-/// 此前对 1..10_000 逐个候选发一次 `session.exists`（每次一个 SFTP RTT）——
-/// 目录里已有上千个 `xxx_副本N` 时一次改名要付出 O(N) 次网络往返（50ms/RTT
-/// 下 1000 个副本 ≈ 50 秒）。改为一次 `read_dir` 把父目录现有名字收进
-/// HashSet，本地直接跳到第一个空位；read_dir 失败时退回逐个探测。
-fn first_available_remote_rename(
+/// 候选名判定走快照 ∪ 已占用覆盖层（免逐候选 exists：目录里已有上千个
+/// `xxx_副本N` 时 O(N) 次往返 ≈ 50 秒 @50ms RTT）；快照不可用（目录
+/// 读不了，或走不带快照的旧入口）时先 read_dir 一次父目录，仍失败才
+/// 退回逐个 exists 探测。
+fn first_available_remote_rename_with_names(
     session: &mut sftp_fs::BlockingSftpSession,
     desired_path: &str,
     cancelled: &AtomicBool,
+    dir_names: &mut RemoteDirNames,
 ) -> anyhow::Result<Option<String>> {
-    let parent = sftp_fs::remote_parent(desired_path)
-        .ok_or_else(|| anyhow!("无法解析远程父目录: {desired_path}"))?;
-    let existing: Option<std::collections::HashSet<String>> = session
-        .read_dir(&parent)
-        .ok()
-        .map(|entries| entries.into_iter().map(|e| e.name).collect());
-
+    let existing: Option<std::collections::HashSet<String>> = if dir_names.is_unavailable() {
+        snapshot_parent_names(session, desired_path)?
+    } else {
+        None
+    };
     for index in 1..10_000 {
         if cancelled.load(Ordering::Relaxed) {
             bail!("{}", TRANSFER_CANCELLED_MSG);
         }
         let candidate = renamed_remote_candidate(desired_path, index)?;
+        let candidate_name = remote_file_name(&candidate).unwrap_or_default();
         let taken = match &existing {
-            Some(names) => names.contains(&remote_file_name(&candidate).unwrap_or_default()),
-            None => session.exists(&candidate)?,
+            Some(names) => names.contains(&candidate_name),
+            None => dir_names.contains(&candidate_name),
         };
         if !taken {
             return Ok(Some(candidate));
         }
     }
     bail!("无法为 {} 找到可用的远程文件名", desired_path)
+}
+
+/// 单次 read_dir 取父目录现有名字；失败返回 None（探测回退逐次 exists）。
+fn snapshot_parent_names(
+    session: &mut sftp_fs::BlockingSftpSession,
+    desired_path: &str,
+) -> anyhow::Result<Option<std::collections::HashSet<String>>> {
+    let parent = sftp_fs::remote_parent(desired_path)
+        .ok_or_else(|| anyhow!("无法解析远程父目录: {desired_path}"))?;
+    Ok(session
+        .read_dir(&parent)
+        .ok()
+        .map(|entries| entries.into_iter().map(|e| e.name).collect()))
 }
 
 pub fn renamed_remote_candidate(path: &str, index: usize) -> anyhow::Result<String> {
@@ -449,24 +562,38 @@ pub trait DirTransferDriver {
         name: &str,
     ) -> Self::Destination;
 
-    /// 冲突解决：`None` 表示跳过。
+    /// 冲突解决：`None` 表示跳过。`dir_names` 为目标目录的名字快照 +
+    /// 本次遍历的占用覆盖层（解析结果必须 claim 进去，供兄弟条目探测）。
     fn resolve_conflict(
         &mut self,
         desired: &Self::Destination,
         policy: ConflictPolicy,
         resolver: Option<&dyn ConflictResolver>,
         cancelled: &AtomicBool,
+        dir_names: &mut RemoteDirNames,
     ) -> anyhow::Result<Option<Self::Destination>>;
 
     /// 进入一个目录层前的准备：创建目标目录并把源目录权限同步过去。
     ///
-    /// 每层递归都会调用（与原三份内联实现一致），保证子目录的
-    /// mode 位在复制后与源保持一致。
+    /// 父目录链已由上一层 walker 建立（walk_remote_dir 自顶向下递归），
+    /// 实现只需确保**末级**目录存在；实现方仍可调用 create_dir_all——
+    /// BlockingSftpSession 内置的已存在路径缓存会把重复探测降为单次。
     fn prepare_destination_dir(
         &mut self,
         remote_dir: &str,
         destination_dir: &Self::Destination,
     ) -> anyhow::Result<()>;
+
+    /// 目标目录现有名字快照：本目录下所有条目的冲突/改名探测走内存。
+    ///
+    /// 默认实现返回不可用快照（等价旧语义：逐条目 exists）；需要省往返
+    /// 的 driver 覆盖它，在进入目录时一次性 read_dir。
+    fn snapshot_destination_names(
+        &mut self,
+        _destination_dir: &Self::Destination,
+    ) -> RemoteDirNames {
+        RemoteDirNames::unavailable()
+    }
 
     /// 传输单个文件，返回增量统计。
     fn transfer_file(
@@ -476,12 +603,21 @@ pub trait DirTransferDriver {
         cancelled: &Arc<AtomicBool>,
         progress: Option<&AtomicU64>,
     ) -> anyhow::Result<TransferSummary>;
+
+    /// walker 分派文件条目传输前回调（默认空实现）。
+    ///
+    /// 用于把 read_dir 已产出的条目元信息（如 size）暂存到 driver，
+    /// 供 transfer_file 免去一次重复 stat。
+    fn will_transfer_entry(&mut self, _entry: &sftp_fs::RemoteFileEntry) {}
 }
 
 /// 远程目录递归传输的统一 walker。三个传输场景（同会话复制 /
 /// 下载到本地 / 跨会话复制）的公共循环：
 /// 条目分派 → 冲突 resolve → `Some` 递归或传输 / `None` skip /
 /// 不支持条目 warn + skip。
+///
+/// 每进入一个目标目录取一次名字快照（见 [`snapshot_remote_dir_names`]），
+/// 该目录下所有条目的冲突/改名探测走内存，不再逐条目一次 exists 往返。
 pub fn walk_remote_dir<D>(
     driver: &mut dyn DirTransferDriver<Destination = D>,
     remote_dir: &str,
@@ -493,6 +629,7 @@ pub fn walk_remote_dir<D>(
 ) -> anyhow::Result<TransferSummary> {
     // 每层递归先建目录并同步源目录权限（含最顶层）。
     driver.prepare_destination_dir(remote_dir, destination_dir)?;
+    let mut dir_names = driver.snapshot_destination_names(destination_dir);
 
     let mut summary = TransferSummary::default();
 
@@ -506,8 +643,10 @@ pub fn walk_remote_dir<D>(
                 conflict_policy,
                 resolver,
                 cancelled,
+                &mut dir_names,
             )? {
                 Some(path) => {
+                    driver.will_transfer_entry(&entry);
                     summary.merge(driver.transfer_file(&entry.path, &path, cancelled, progress)?)
                 }
                 None => summary.merge(TransferSummary::one_skipped()),
@@ -518,6 +657,7 @@ pub fn walk_remote_dir<D>(
                 conflict_policy,
                 resolver,
                 cancelled,
+                &mut dir_names,
             )? {
                 Some(path) => {
                     // prepare_destination_dir 在递归的 walk_remote_dir 里执行，

@@ -15,6 +15,16 @@ use lsp_types::{ProgressToken, WorkDoneProgress};
 /// 语言服务器当前状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LspStatus {
+    /// 未启动：这门语言有可用的服务器，但还没起来。
+    ///
+    /// 与 [`Self::Stopped`] 的区别是**语义**：`Stopped` 是用户主动按过
+    /// 「停止」，`NotStarted` 是「默认关闭，用户还没决定」。默认关闭时
+    /// 每一个新打开的代码文件都是这个状态——状态栏把它显示成可点的入口，
+    /// 而不是留白（留白等于告诉用户「这个文件没有 LSP」）。
+    ///
+    /// 与 `None`（根本没有状态栏位）的区别：那个表示「这个文件不可能有
+    /// LSP」（图片、diff、不支持的语言）。
+    NotStarted,
     /// 正在启动：进程已 spawn，`initialize` 握手中。
     Starting,
     /// 服务器正在工作（分析 / 索引），可能带进度。
@@ -33,6 +43,12 @@ pub enum LspStatus {
     Ready { errors: usize, warnings: usize },
     /// 启动失败或进程已退出。
     Failed { reason: String },
+    /// 用户主动停止：进程没在跑，直到用户点「启动」/「重启」。
+    ///
+    /// 与 [`Self::Failed`] 分开是因为语义完全不同：失败是意外（红），
+    /// 停止是用户的选择（灰）。混成一个态会让用户以为自己的操作搞坏了
+    /// 什么，也会让菜单无法判断该把「启动」还是「停止」置灰。
+    Stopped,
 }
 
 impl LspStatus {
@@ -44,6 +60,9 @@ impl LspStatus {
     /// 状态栏上的短标签。
     pub fn label(&self) -> String {
         match self {
+            // 未启动与已停止一样显示服务器名（由调用方传入），没有名字时
+            // 给一句可操作的提示。
+            Self::NotStarted => "未启动".to_string(),
             Self::Starting => "启动中".to_string(),
             Self::Working {
                 title,
@@ -66,6 +85,7 @@ impl LspStatus {
                 (e, w) => format!("{e} 错误 {w} 警告"),
             },
             Self::Failed { reason } => format!("LSP 失败: {reason}"),
+            Self::Stopped => "已停止".to_string(),
         }
     }
 }
@@ -94,10 +114,19 @@ fn token_key(token: &ProgressToken) -> String {
     }
 }
 
+/// 这条进度「拿得出手」吗：标题、消息、百分比全空的进度画出来就是
+/// 一个转圈 + 空白文字，不如当没有。
+///
+/// `is_empty` 与 `representative` 共用这一个判定——两边口径不一致时，
+/// chip 会停在既没有文字也没有灯的态上。
+fn displayable(progress: &ActiveProgress) -> bool {
+    !progress.title.is_empty() || progress.message.is_some() || progress.percentage.is_some()
+}
+
 impl ProgressTracker {
-    /// 是否还有进行中的进度。
+    /// 是否还有**可显示**的进行中进度。
     pub fn is_empty(&self) -> bool {
-        self.active.is_empty()
+        !self.active.values().any(displayable)
     }
 
     /// 应用一条 `$/progress` 通知。
@@ -120,24 +149,39 @@ impl ProgressTracker {
             WorkDoneProgress::Report(report) => {
                 // 服务器可能只发 report 不发 begin（少见但合法）：此时按
                 // 空标题建一个，总比丢掉进度好。
+                //
+                // 但**内容全空的 report 不建条目**：只有 `end` 会删条目，
+                // 而没发过 begin 的令牌永远等不到自己的 end——建了就是个
+                // 清不掉的空进度，chip 会一直转圈（灯也就永远出不来）。
+                if !self.active.contains_key(&key)
+                    && report.message.is_none()
+                    && report.percentage.is_none()
+                {
+                    return false;
+                }
                 let entry = self.active.entry(key).or_insert_with(|| ActiveProgress {
                     title: String::new(),
                     message: None,
                     percentage: None,
                 });
                 // `message` 缺省表示「沿用上一次」，不能覆盖成 None。
-                if report.message.is_some() {
+                let msg_changed = report.message.is_some() && entry.message != report.message;
+                let pct_changed =
+                    report.percentage.is_some() && entry.percentage != report.percentage;
+                if msg_changed {
                     entry.message = report.message.clone();
                 }
-                if report.percentage.is_some() {
+                if pct_changed {
                     entry.percentage = report.percentage;
                 }
-                true
+                // 重复送达同一条进度（rust-analyzer 实测会连续发几十条
+                // message/percentage 都不变的 report）要报「没变化」——
+                // 调用方据此跳过重绘，否则每条通知都会重建整个 UI。
+                msg_changed || pct_changed
             }
             WorkDoneProgress::End(_) => {
-                // 令牌结束：删掉。未知令牌的 end 也算「有变化」但不影响展示。
-                self.active.remove(&key);
-                true
+                // 令牌结束：删掉。未知令牌的 end 什么都不删，也就什么都没变。
+                self.active.remove(&key).is_some()
             }
         }
     }
@@ -148,7 +192,9 @@ impl ProgressTracker {
     /// 最后任意一条。同优先级下按令牌名排序，保证多次渲染结果稳定
     /// （HashMap 迭代顺序不定，不排序会导致标签闪烁）。
     pub fn representative(&self) -> Option<(String, Option<String>, Option<u32>)> {
-        let mut items: Vec<(&String, &ActiveProgress)> = self.active.iter().collect();
+        // 只考虑「拿得出手」的条目（见 [`displayable`]）。
+        let mut items: Vec<(&String, &ActiveProgress)> =
+            self.active.iter().filter(|(_, p)| displayable(p)).collect();
         items.sort_by(|a, b| a.0.cmp(b.0));
 
         let pick = items
@@ -216,6 +262,33 @@ mod tests {
         t.apply(&token("a"), &end());
         assert!(t.is_empty(), "end must remove the token");
         assert!(t.representative().is_none());
+    }
+
+    /// 内容没变的 report 必须报「没变化」。
+    ///
+    /// 调用方拿这个布尔决定要不要 `cx.notify()`——rust-analyzer 索引期实测
+    /// 一轮推 800 条，其中相当一部分 message/percentage 都没动，而每次通知
+    /// 都是整棵视图树重建。
+    #[test]
+    fn an_identical_report_reports_no_change() {
+        let mut t = ProgressTracker::default();
+        assert!(t.apply(&token("a"), &begin("Indexing", Some(10))));
+        assert!(
+            !t.apply(&token("a"), &report(None, Some(10))),
+            "什么都没补上的 report 不该算变化"
+        );
+        assert!(t.apply(&token("a"), &report(None, Some(11))));
+    }
+
+    /// 未知令牌的 `end` 什么都不删，也就没有变化。
+    #[test]
+    fn an_end_for_an_unknown_token_changes_nothing() {
+        let mut t = ProgressTracker::default();
+        assert!(
+            !t.apply(&token("ghost"), &end()),
+            "没有这个令牌，end 不该算变化"
+        );
+        assert!(t.is_empty());
     }
 
     #[test]
@@ -347,5 +420,49 @@ mod tests {
             .label()
             .contains("not found")
         );
+    }
+
+    /// 未启动是「静止」状态：不该转圈。
+    ///
+    /// 转圈意味着「有个进程在忙」，而这里连进程都没有。UI 侧据此不画
+    /// 转圈也不画灯（见 `render_lsp_status_chip`）。
+    #[test]
+    fn not_started_is_not_busy() {
+        assert!(!LspStatus::NotStarted.is_busy());
+        assert_eq!(LspStatus::NotStarted.label(), "未启动");
+    }
+
+    /// 内容全空的 `$/progress` 不能留下清不掉的进度。
+    ///
+    /// 只有 `end` 会删条目，而没发过 begin 的令牌永远等不到自己的 end。
+    /// 一旦建了空条目，`is_empty` 永远为假 → chip 永久停在 Busy（转圈、
+    /// 没有涟漪灯）。这正是「Python 前面怎么没有点」的一类原因。
+    #[test]
+    fn an_empty_report_does_not_create_a_stuck_progress() {
+        let mut t = ProgressTracker::default();
+        // 真在跑的进度。
+        t.apply(&token("a"), &begin("Indexing", Some(10)));
+        t.apply(&token("a"), &end());
+        assert!(t.is_empty(), "begin/end 走完必须回到没有进度");
+
+        // 另一个令牌只发了个什么都没带的 report。
+        assert!(
+            !t.apply(&token("b"), &report(None, None)),
+            "空 report 不该算「有变化」"
+        );
+        assert!(t.is_empty(), "空 report 不该留下条目");
+        assert!(t.representative().is_none());
+    }
+
+    /// `begin` 给了空标题也算没有可显示的进度。
+    ///
+    /// 规范允许 `title` 为空串（虽然罕见）。这种进度画出来是「转圈 + 空白」，
+    /// 比不画更糟。
+    #[test]
+    fn a_blank_title_is_not_displayable() {
+        let mut t = ProgressTracker::default();
+        t.apply(&token("a"), &begin("", None));
+        assert!(t.representative().is_none());
+        assert!(t.is_empty());
     }
 }

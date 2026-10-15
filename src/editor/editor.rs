@@ -1,3 +1,54 @@
+/// 把状态栏的弹出菜单挂到点击处。
+///
+/// 两层 `anchored`：外层铺满整个窗口，负责「点外面就关」；内层按锚点定位。
+///
+/// **`Anchor::BottomRight` 是刻意的**：状态栏在窗口底部，菜单从 chip 正上方
+/// 往上长，是唯一不会挡住编辑区的方向；右对齐则保证它不会从窗口右边缘跑
+/// 出去（`snap_to_window_with_margin` 管左/上/下三侧）。默认的 `TopLeft`
+/// 会让菜单从点击点往右下长，压在编辑器正文上。
+///
+/// ## 为什么关闭要挂在外层 div 上，而不是菜单自己的 `on_mouse_down_out`
+///
+/// `on_mouse_down_out` 的触发条件是「指针在该元素的 bounds 之外」，判定完全
+/// 依赖命中测试。而这里是 `deferred` + `anchored` 的浮层，命中测试的结果不
+/// 总是如我们所愿——实测点了外面菜单毫无反应。外层这块铺满窗口的 div 则没有
+/// 这个问题：任何一次按下都先落到它头上（菜单画在它之上，但**捕获阶段是
+/// 父先子后**，所以父永远先收到）。
+///
+/// 代价是「点菜单项也会触发关闭」。这恰好是 Zed / VSCode 的行为（菜单项点完
+/// 即关），比留着菜单让人再点一次外面更符合预期。
+///
+/// 泛型在 `E` 上：语言菜单（`PopupMenu`）与 LSP 菜单（`LspMenu`）只有
+/// `Render` 不同，锚定逻辑完全一样。
+fn render_status_menu<E: Render + 'static>(
+    menu: &Entity<E>,
+    position: gpui::Point<Pixels>,
+    window: &Window,
+    on_dismiss: std::rc::Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+) -> gpui::AnyElement {
+    gpui::deferred(
+        gpui::anchored().child(
+            div()
+                .w(window.bounds().size.width)
+                .h(window.bounds().size.height)
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                // 整窗遮罩：任何按下都关菜单。不再依赖命中测试。
+                .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                    on_dismiss(window, cx)
+                })
+                .child(
+                    gpui::anchored()
+                        .anchor(gpui::Anchor::BottomRight)
+                        .position(position)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(menu.clone()),
+                ),
+        ),
+    )
+    .with_priority(1)
+    .into_any_element()
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -102,6 +153,8 @@ actions!(
 
 pub fn init(cx: &mut App) {
     crate::editor::markdown::Markdown::init(cx);
+    // 语言服务器控制菜单的 Escape 关闭。
+    crate::editor::lsp_menu::init(cx);
     // hover 浮层的键盘接管（`K` 第二次按下）靠全局按键拦截器实现 ——
     // 卡片是 `defer_draw` 出来的，进不了 dispatch 树，`window.focus` 无效。
     // 详情见 `hover::init_keystroke_interceptor`。
@@ -225,11 +278,26 @@ struct EditorFile {
     /// diff tab 的仓库（含 root + local/remote 后端）：`path` 存的是仓库相对路径，
     /// 切标签页组后重建 `DiffView` 需要它（后台重新 `diff_file_contents`）。
     diff_repo: Option<crate::editor::git_repository::GitRepository>,
-    /// LSP 会话。**仅本地文件**有值：语言服务器跑在本地，远程文件的路径
-    /// 在服务器看来不存在，语义上不成立。
+    /// LSP 会话。本地文件由本地子进程服务；远程文件由**那台主机上**的进程
+    /// 服务（见 `LspSession::ssh_config`）——远端路径在远端服务器看来就是
+    /// 它自己的绝对路径，语义成立。
     ///
-    /// `None` 也可能是「该语言没有服务器」——失败一律降级为普通编辑器。
+    /// `None` 也可能是「该语言没有服务器」或「默认关闭且还没手动起」——
+    /// 失败一律降级为普通编辑器。
     lsp: Option<crate::lsp::session::LspSession>,
+}
+
+impl EditorFile {
+    /// 这个标签的语言是否匹配某个服务器 key。
+    ///
+    /// 会话是权威来源（它记录了接入时用的 `language_id`，不会随用户在标签里
+    /// 临时改语言而变）；没有会话时退回编辑器当前的语言。
+    fn lsp_language_matches(&self, language: &str, cx: &App) -> bool {
+        match self.lsp.as_ref() {
+            Some(session) => session.language_id() == language,
+            None => self.editor_state.read(cx).language().as_deref() == Some(language),
+        }
+    }
 }
 
 /// 编辑器打开文件的简化信息，用于标签页组切换时保存
@@ -247,6 +315,9 @@ pub struct EditorOpenFileInfo {
     pub encoding: FileEncoding,
     /// 只读文件标记。
     pub read_only: bool,
+    /// 有未保存修改：文件树状态淘汰时据此跳过（淘汰会丢全文与撤销历史，
+    /// 脏文件必须留下等用户处理）。加载中的文件为 false。
+    pub dirty: bool,
     /// diff tab 的仓库快照（仅 `diff-` tab 为 Some）：恢复时后台重载 diff，
     /// 而不是走纯文本 `restore_file_from_cache`（否则页面空白）。
     pub diff_repo: Option<crate::editor::git_repository::GitRepository>,
@@ -374,6 +445,17 @@ pub struct FileTreeEditorState {
     pub active_file_id: Option<SharedString>,
 }
 
+impl FileTreeEditorState {
+    /// 是否含未保存修改（决定文件树状态能否被淘汰）。
+    ///
+    /// 淘汰会丢掉 `cached_editor_states` 里的 InputState 实体——那是该树下
+    /// 所有打开文件的全文与撤销历史的唯一持有者，切回时只能重新从磁盘读。
+    /// 因此脏条目必须留下，宁可让有界表暂时超限。
+    pub fn has_unsaved_edits(&self) -> bool {
+        self.open_files_info.iter().any(|info| info.dirty)
+    }
+}
+
 pub struct Editor {
     tab_bar: Entity<TabBar>,
     open_files: Vec<EditorFile>,
@@ -437,6 +519,18 @@ pub struct Editor {
     language_menu: Option<Entity<crate::components::menu::PopupMenu>>,
     _language_menu_subscription: Option<Subscription>,
     language_menu_position: gpui::Point<Pixels>,
+    /// 语言服务器控制菜单（状态栏 LSP chip 点击时创建）。
+    ///
+    /// 只服务**当前文件的那一个服务器**：chip 本身就是「这个文件的服务器」，
+    /// 用户点它想知道的是「它怎么了、能不能重启」。对照 Zed 的
+    /// `crates/language_tools/src/lsp_button.rs`——它在同一位置列出全部服务器，
+    /// 那是 workspace 级状态栏的取舍，这里不需要。
+    lsp_menu: Option<Entity<crate::editor::lsp_menu::LspMenu>>,
+    _lsp_menu_subscription: Option<Subscription>,
+    lsp_menu_position: gpui::Point<Pixels>,
+    /// LSP 报文日志面板（View Logs）。
+    lsp_log_view: Option<Entity<crate::editor::lsp_log_view::LspLogView>>,
+    _lsp_log_view_subscription: Option<Subscription>,
     /// LSP 悬浮提示浮层状态。
     hover: hover::HoverState,
     /// LSP 补全菜单状态。
@@ -457,6 +551,41 @@ pub struct Editor {
     last_inlay_range: Option<lsp_types::Range>,
     /// 上次请求签名帮助时的光标位置（避免重复请求）。
     last_signature_cursor: Option<usize>,
+    /// 上一次记进日志的 chip（文案 + 状态），`render_lsp_status_chip` 的去重状态。
+    ///
+    /// 键含文案与状态（不只是文案）：`NotStarted`/`Stopped`/`Ready` 文案相同，
+    /// 只记文案就把「点了 Stop」和「起来了但有错」这两条抹平了。
+    ///
+    /// 存状态本身而不是拼好的键：`render` 每帧都跑，拼键就是每帧 3 次分配。
+    ///
+    /// 放在 Editor 上而不是 `thread_local!`：多个编辑器（多窗口、多工作区）
+    /// 交替重绘时共享一份「上一条」会让文案每帧来回变化，去重形同不存在——
+    /// 而它防的正是渲染路径逐帧打日志（实测一次会话 6.9 万行，把有用线索冲掉）。
+    last_chip_log: std::cell::RefCell<Option<(String, crate::lsp::status::LspStatus)>>,
+    /// 上一次记进日志的补全菜单可见性（同上，`drain_lsp_results` 用）。
+    last_completion_visible_log: std::cell::Cell<bool>,
+    /// 远端标签：项目根还在后台探测、因此暂时接不上 LSP 的那些。
+    ///
+    /// 接标签要先算 `ServerKey.root`，而远端的根只能在那台机器上探。这趟
+    /// 往返若在 UI 线程上等，主机卡住就是 15 秒的界面冻结——所以先挂起，
+    /// 探完由后台任务把对应的标签取回来重走 `start_lsp_for_tab`。
+    pending_root_attach: Vec<String>,
+    /// LSP 跳转打开的文件：目标路径 → **发起跳转的那个会话的根**。
+    ///
+    /// 键含主机（`(路径, host:port:user)`）：`/srv/app/main.py` 在两台主机上
+    /// 是两个文件，各自的服务器也是两个。
+    ///
+    /// 为什么要有这张表：跳转的落点经常**不在当前项目里**——Python 点进
+    /// `List[int]` 会落到 typeshed 的 `typing.pyi`，Rust 会落到 registry 里
+    /// 的源。目标文件若按自己的路径重算根，就在存根目录边上另起了一个服务器
+    /// （Python 侧 pyright 冷启动要索引整个 typeshed，用户体感是「跳一次卡
+    /// 一次」，且多占一个进程）。这些文件属于**报告这个位置的服务器的工作区**，
+    /// 所以把它的根传过去，二者复用同一个进程。
+    ///
+    /// 用表而不是函数参数：跨文件打开要经过 `open_*_at_line_col_no_notify`
+    /// （终端 Cmd+Click 也用它，那边没有会话概念），而远端文件还是异步加载的
+    /// ——真正接 LSP 的时刻在 `finish_file_load` 里，中间没有传参的通道。
+    lsp_jump_roots: HashMap<(String, Option<(String, u16, String)>), PathBuf>,
     next_load_generation: u64,
 }
 
@@ -563,6 +692,11 @@ impl Editor {
             language_menu: None,
             _language_menu_subscription: None,
             language_menu_position: gpui::point(px(0.0), px(0.0)),
+            lsp_menu: None,
+            _lsp_menu_subscription: None,
+            lsp_menu_position: gpui::point(px(0.0), px(0.0)),
+            lsp_log_view: None,
+            _lsp_log_view_subscription: None,
             hover: hover::HoverState::new(),
             completion: completion::CompletionState::new(),
             rename_panel: None,
@@ -571,6 +705,10 @@ impl Editor {
             last_highlight_cursor: None,
             last_inlay_range: None,
             last_signature_cursor: None,
+            last_chip_log: std::cell::RefCell::new(None),
+            last_completion_visible_log: std::cell::Cell::new(false),
+            pending_root_attach: Vec::new(),
+            lsp_jump_roots: HashMap::new(),
             next_load_generation: 0,
         };
 
@@ -698,6 +836,7 @@ impl Editor {
                 },
                 encoding: f.encoding,
                 read_only: f.read_only,
+                dirty: f.dirty,
                 diff_repo: f.diff_repo.clone(),
             })
             .collect()
@@ -1061,8 +1200,15 @@ impl Editor {
         // 文件时服务器不会自动知道，它的分析会基于过期内容。对照 Zed：它订阅
         // 文件系统事件后发 `workspace/didChangeWatchedFiles`。
         //
-        // 只对**本地**文件发（远程文件的路径在服务器看来不存在）。
-        if event.is_from_backend(None)
+        // 本地与远端都发，但**事件的来源必须匹配当前会话的归属**：远程事件
+        // 推给本地会话（或反过来）时，那个 uri 在服务器眼里根本不存在，
+        // 属于无意义的噪声；两台主机有同名路径时更是错配。
+        // `is_from_backend(session.ssh_config())` 同时承担了「匹配主机」与
+        // 「匹配本地/远程」两件事。
+        let backend = self
+            .active_lsp_session()
+            .and_then(|s| s.ssh_config().cloned());
+        if event.is_from_backend(backend.as_ref())
             && let Some(path) = crate::lsp::client::path_to_uri(&event.path).ok()
             && let Some(session) = self.active_lsp_session()
             && let Some(client) = session.client().cloned()
@@ -1678,6 +1824,8 @@ impl Editor {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
+        // 归属在发请求**之前**捕获：响应到达时用户可能已经切了标签。
+        let origin = self.lsp_jump_origin();
         // 跳转前记录「从哪来」，供 `ctrl--` 返回。
         self.push_nav_history(cx);
         cx.spawn_in(window, async move |this, cx| {
@@ -1694,11 +1842,38 @@ impl Editor {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.open_lsp_location(&location, window, cx);
+                this.open_lsp_location(&location, origin, window, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Cmd+Click（其余平台 Ctrl+Click）跳到点击处的定义——和 VSCode 一样。
+    ///
+    /// 事件顺序天然对齐 VSCode：更深一层的输入框先收到这次按下，并把光标
+    /// 移到点击位置（VSCode `gotoDefinition()` 的第一行也正是
+    /// `this.editor.setPosition(position)`），我们随后按**当前光标**发请求
+    /// （它的 `goToCommands` 读的同样是 `editor.getPosition()`）。所以这里
+    /// 不必自己换算偏移，只需要判定与转发。
+    fn goto_definition_at_click(
+        &mut self,
+        event: &gpui::MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !is_goto_definition_click(event) {
+            return;
+        }
+        let Some(editor) = self.active_text_editor(cx) else {
+            return;
+        };
+        // 必须点在正文上：行号栏、git 色条、折叠箭头各自有点击语义。
+        // 对照 VSCode 的 `target.type === MouseTargetType.CONTENT_TEXT`。
+        if !editor.read(cx).click_is_in_text(event.position) {
+            return;
+        }
+        self.goto_kind(LspGotoKind::Definition, window, cx);
     }
 
     /// 打开一个 LSP `Location`：同文件直接选中，跨文件先开目标文件再跳。
@@ -1775,9 +1950,20 @@ impl Editor {
         cx.notify();
     }
 
+    /// 捕获当前会话的跳转归属（必须在发请求**之前**调，理由见 [`LspJumpOrigin`]）。
+    fn lsp_jump_origin(&self) -> Option<LspJumpOrigin> {
+        self.active_lsp_session().map(|s| LspJumpOrigin {
+            uri: s.uri().clone(),
+            ssh_config: s.ssh_config().cloned(),
+            root: s.server_root().map(|r| r.to_path_buf()),
+        })
+    }
+
+    /// 打开一个 LSP `Location`：同文件直接选中，跨文件先开目标文件再跳。
     fn open_lsp_location(
         &mut self,
         location: &lsp_types::Location,
+        origin: Option<LspJumpOrigin>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1786,9 +1972,14 @@ impl Editor {
         // 必须走 `uri_eq` 而不是 `==`：windows 上 rust-analyzer 回的盘符
         // 小写（`/c:/...`）而我们存的是大写（`/C:/...`），精确比较会把
         // 同文件跳转误判成跨文件 → 每次跳转都新开标签而非原地移光标。
-        let same_file = self
-            .active_lsp_session()
-            .map(|s| crate::lsp::client::uri_eq(s.uri(), &location.uri))
+        //
+        // 归属（uri + 主机）用**发起请求时**捕获的 `origin`；事后重问
+        // `active_lsp_session()` 在用户切过标签后会拿到错的会话。没捕获到的
+        // 调用方（测试里的直接跳转）退回当前会话，行为与改动前一致。
+        let active = origin.or_else(|| self.lsp_jump_origin());
+        let same_file = active
+            .as_ref()
+            .map(|o| crate::lsp::client::uri_eq(&o.uri, &location.uri))
             .unwrap_or(false);
 
         match lsp_location_action(location, same_file) {
@@ -1798,14 +1989,46 @@ impl Editor {
             }
             LspJumpAction::JumpInPlace { line, col } => {
                 if let Some(tab_id) = self.active_file_id.clone() {
-                    self.jump_to_line_col(&tab_id, line, Some(col), cx);
+                    self.jump_to_line_col(&tab_id, line, Some(col), window, cx);
                 }
             }
             // 跨文件（或目标未打开）：打开并定位。
-            // `open_file_at_line_col_no_notify` 会处理「已打开就切过去并跳」
-            // 「正在加载则记 pending_jumps」两种情况。
+            //
+            // **按当前会话的归属决定走哪条打开路径**：远端会话（服务器跑在
+            // SSH 那台机器上）返回的 Location 路径也在那台机器上，必须走
+            // 远程打开；按本地路径打开会去本机磁盘上找一个不存在的文件，
+            // 结果是「跳转了但什么也没发生」。
             LspJumpAction::OpenFile { path, line, col } => {
-                self.open_file_at_line_col_no_notify(path, Some(line), Some(col), window, cx);
+                // 归属拆成两半：主机决定走哪条打开路径，根决定目标文件接哪个服务器。
+                let (remote, origin_root) = match active {
+                    Some(o) => (o.ssh_config, o.root),
+                    None => (None, None),
+                };
+                let path_str = path.to_string_lossy().to_string();
+                if let Some(root) = origin_root {
+                    // 记下「这个文件是这台服务器报出来的」。`start_lsp_for_tab`
+                    // 打开它时直接挂回这个根，不再按落点路径另算一个。
+                    let key = lsp_jump_root_key(&path_str, remote.as_ref());
+                    self.lsp_jump_roots.insert(key.clone(), root);
+                    self.prune_lsp_jump_roots(&key);
+                }
+                match remote {
+                    Some(ssh_config) => self.open_remote_file_at_line_col_no_notify(
+                        path_str,
+                        ssh_config,
+                        Some(line),
+                        Some(col),
+                        window,
+                        cx,
+                    ),
+                    None => self.open_file_at_line_col_no_notify(
+                        path,
+                        Some(line),
+                        Some(col),
+                        window,
+                        cx,
+                    ),
+                }
             }
         }
     }
@@ -1819,6 +2042,8 @@ impl Editor {
             return;
         };
         let position = editor.read(cx).lsp_cursor_position();
+        // 归属在发请求**之前**捕获（同 `goto_kind`）。
+        let origin = self.lsp_jump_origin();
         self.push_nav_history(cx);
         cx.spawn_in(window, async move |this, cx| {
             let Ok(locations) = client.references(&uri, position, true).await else {
@@ -1828,7 +2053,7 @@ impl Editor {
                 return;
             };
             this.update_in(cx, |this, window, cx| {
-                this.open_lsp_location(&first, window, cx);
+                this.open_lsp_location(&first, origin, window, cx);
             })
             .ok();
         })
@@ -2497,18 +2722,13 @@ impl Editor {
         };
         // 只在「可见性变化」时记录：`drain_lsp_results` 每帧都跑，逐帧打
         // 会瞬间灌满日志文件（实测一次会话 6.9 万行），把有用线索冲掉。
+        // 去重状态放在本 Editor 上（不用 `thread_local!`），理由见
+        // `Editor::last_completion_visible_log`。
         {
-            use std::cell::Cell;
-            thread_local! {
-                static LAST_VIS: Cell<bool> = const { Cell::new(false) };
-            }
             let visible = self.completion.is_visible();
-            LAST_VIS.with(|last| {
-                if last.get() != visible {
-                    log::info!("lsp: completion 可见性 -> {visible}");
-                    last.set(visible);
-                }
-            });
+            if self.last_completion_visible_log.replace(visible) != visible {
+                log::info!("lsp: completion 可见性 -> {visible}");
+            }
         }
         self.hover.take_pending(&editor, cx);
         self.completion.take_pending(&editor, cx);
@@ -2522,19 +2742,6 @@ impl Editor {
         }
     }
 
-    /// 测试用：已打开文件的数量。
-    #[cfg(test)]
-    pub(crate) fn open_file_count(&self) -> usize {
-        self.open_files.len()
-    }
-
-    /// 测试用：某个路径是否已打开成标签。
-    #[cfg(test)]
-    pub(crate) fn has_open_path(&self, path: &std::path::Path) -> bool {
-        let want = path.to_string_lossy();
-        self.open_files.iter().any(|f| f.path == want)
-    }
-
     /// 测试用：取某个已打开文件的光标位置（0 基行列）。
     #[cfg(test)]
     pub(crate) fn cursor_position_of_open_path(
@@ -2546,6 +2753,28 @@ impl Editor {
         let file = self.open_files.iter().find(|f| f.path == want)?;
         let pos = file.editor_state.read(cx).cursor_position();
         Some((pos.line as usize, pos.character as usize))
+    }
+
+    /// 测试用：跳转之后**键盘焦点**有没有落在这个路径的编辑器上。
+    ///
+    /// 为什么单独立一条：`cursor_position_of_open_path` 那种断言（选区落在
+    /// 目标行列）本来就有，却仍然漏掉了用户报的缺陷——选区设了也没用，
+    /// **绘制与按键都以 focus 为门**，界面上看到的就是「只打开了文件」。
+    #[cfg(test)]
+    pub(crate) fn is_text_editor_of_path_focused(
+        &self,
+        path: &std::path::Path,
+        window: &Window,
+        cx: &App,
+    ) -> bool {
+        let want = path.to_string_lossy();
+        self.open_files
+            .iter()
+            .find(|f| f.path == want)
+            .filter(|f| {
+                f.diff.is_none() && f.image.is_none() && f.markdown.is_none() && f.live.is_none()
+            })
+            .is_some_and(|f| f.editor_state.read(cx).focus_handle.is_focused(window))
     }
 
     /// 测试用：把当前 tab 的 LSP 会话 uri 设成给定值。
@@ -2570,7 +2799,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_lsp_location(location, window, cx);
+        self.open_lsp_location(location, None, window, cx);
     }
 
     /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览/实时返回 None）。
@@ -2643,6 +2872,366 @@ impl Editor {
         self.language_menu = Some(menu);
         self._language_menu_subscription = Some(subscription);
         self.language_menu_position = position;
+        // 两个菜单不并存：开一个就关另一个。
+        self.lsp_menu = None;
+        self._lsp_menu_subscription = None;
+        cx.notify();
+    }
+
+    /// 状态栏 LSP chip → 弹出**当前这一个服务器**的控制菜单。
+    ///
+    /// 菜单出现在 **chip 正上方**（见 `render_status_menu` 的
+    /// `Anchor::BottomRight`）：状态栏在窗口底部，往上下开是唯一不会挡住
+    /// 编辑区的方向。
+    fn open_lsp_menu(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::editor::lsp_menu::LspMenu;
+
+        // 图片、diff 视图没有可分析的文本，点了不该弹东西。
+        // 远程文件**要**弹：服务器跑在那台主机上，启停都在这个菜单里。
+        let Some(tab_id) = self.active_file_id.clone() else {
+            return;
+        };
+        if let Some(file) = self.open_files.iter().find(|f| f.id == tab_id) {
+            if file.image.is_some() || file.diff.is_some() {
+                return;
+            }
+        }
+
+        // 点开菜单是「用户正在等一个答案」的时刻，而远端候选链很可能还没探过
+        // （UI 路径一律只读缓存）。先交给后台补探：探完 `notify`，菜单与 chip
+        // 上的名字会从语言名补成真正的命令名。
+        let active = self.open_files.iter().find(|f| f.id == tab_id).map(|f| {
+            let language = f
+                .lsp
+                .as_ref()
+                .map(|s| s.language_id().to_string())
+                .or_else(|| f.editor_state.read(cx).language().map(|l| l.to_string()))
+                .unwrap_or_default();
+            (language, f.ssh_config.clone())
+        });
+        if let Some((language, ssh_config)) = active {
+            if !language.is_empty() {
+                self.warm_lsp_chain(&language, ssh_config.as_ref(), cx);
+            }
+        }
+
+        let Some(snapshot) = self.active_lsp_snapshot(cx) else {
+            return;
+        };
+        let weak = cx.entity().downgrade();
+        let dismiss_weak = cx.entity().downgrade();
+        // `LspMenu::new` 要 `Context<LspMenu>`，所以走 `cx.new` 而不能直接把
+        // `Context<Editor>` 递过去。
+        let menu = cx.new(|cx| LspMenu::new(weak, snapshot, cx));
+        let subscription = window.subscribe(&menu, cx, move |_, _: &gpui::DismissEvent, _, cx| {
+            let _ = dismiss_weak.update(cx, |this: &mut Editor, cx| {
+                this.lsp_menu = None;
+                this._lsp_menu_subscription = None;
+                cx.notify();
+            });
+        });
+        // 抢焦点：Escape 的 keybinding 挂在菜单的 key context 上，不聚焦就
+        // 收不到。`track_focus` 只是「跟踪」，不等于「获得」。
+        let handle = menu.read(cx).focus_handle();
+        window.focus(&handle, cx);
+        self.lsp_menu = Some(menu);
+        self._lsp_menu_subscription = Some(subscription);
+        self.lsp_menu_position = position;
+        // 开 LSP 菜单时关掉语言菜单，两个浮层不叠在一起。
+        self.language_menu = None;
+        self._language_menu_subscription = None;
+        cx.notify();
+    }
+
+    /// 让这台主机的候选链在后台探完，探完再重画一次状态栏。
+    ///
+    /// UI 侧读的全是 `registry` 的缓存，且**绝不发网络请求**（见
+    /// [`crate::lsp::LspManager::configured_command_on`]）——远端探测是一次
+    /// 同步 SSH 往返，而 chip 每帧都要问一次服务器名，放在渲染路径上等于
+    /// 「主机不可达时每帧冻 15 秒」。代价是第一次打开远程文件时「还不知道」，
+    /// chip 只能退回语言名。这里把那次往返交给后台线程：结果落回同一个缓存，
+    /// 任务完成时 `notify` 一次，chip 自己就补上真正的命令名。
+    ///
+    /// 只在「开标签 / 点开菜单」这类事件上调，不在 `render` 里调：待探列表
+    /// 本身只是缓存读，但每帧 spawn 一个后台任务毫无意义。
+    fn warm_lsp_chain(
+        &mut self,
+        language: &str,
+        ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+        cx: &mut Context<Self>,
+    ) {
+        // 本机不需要探（`command_exists` 在 UI 线程上也就是一次子进程，
+        // 且早已按命令名缓存）。
+        let Some(ssh) = ssh_config.cloned() else {
+            return;
+        };
+        let pending = crate::lsp::LspManager::pending_chain_probe(cx, language, Some(&ssh));
+        if pending.is_empty() {
+            return;
+        }
+        log::debug!("lsp(remote): warming probe cache for {language}: {pending:?}");
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                crate::lsp::registry::probe_commands_pending(&pending, Some(&ssh));
+            })
+            .await;
+            if let Some(entity) = this.upgrade() {
+                entity.update(cx, |_, cx| cx.notify());
+            }
+        })
+        .detach();
+    }
+
+    /// 当前活动 tab 对应的服务器快照（没有服务器时为 `None`）。
+    ///
+    /// 快照里带 pid / 版本 / 状态，菜单与日志面板都靠它说话。
+    ///
+    /// 服务器还没起时**合成一个 `Stopped` 快照**而不是返回 `None`：默认关闭
+    /// 下用户点状态栏 chip 的唯一目的就是「把它开起来」，此时没有快照就没菜单，
+    /// 用户会被一个看得见却点不动的 chip 卡住。
+    fn active_lsp_snapshot(&self, cx: &App) -> Option<crate::lsp::project::ServerSnapshot> {
+        let tab_id = self.active_file_id.clone()?;
+        let file = self.open_files.iter().find(|f| f.id == tab_id)?;
+        // 语言以**会话**为准（服务器是按它起的），没有会话时退回标签自己的
+        // 语言。必须由标签兜底：默认关闭时 `start_lsp_for_tab` 在拿不到服务器
+        // 那条分支上就 `return` 了（见该函数），`file.lsp` 从未被写入——
+        // 而 chip 存在的意义恰恰是这一态，点不开就等于把唯一的开启入口封死。
+        // 曾经这里直接 `file.lsp.as_ref()?`，把下面那段「合成 Stopped 快照」
+        // 变成不可达代码。
+        let language = match file.lsp.as_ref() {
+            Some(session) => session.language_id().to_string(),
+            None => file
+                .editor_state
+                .read(cx)
+                .language()
+                .map(|l| l.to_string())
+                .unwrap_or_default(),
+        };
+        if language.is_empty() {
+            // 纯文本、没有语言：这门语言压根没有可接的服务器，菜单没什么可开的。
+            return None;
+        }
+        // 根按归属算：远端标签在那台主机上探测（一次 SFTP 往返，只在
+        // 用户点开菜单时发生），本地标签走本地探测。口径统一由
+        // `lsp::project::root_for` 提供——编辑器里各写各的回退曾经算出过
+        // 两个不同的键，菜单操作落到不存在的进程上。
+        let root = crate::lsp::project::root_for(Path::new(&file.path), file.ssh_config.as_ref());
+        let key = crate::lsp::project::ServerKey {
+            root,
+            language,
+            // 远端标签要按主机区分服务器：两台机器的同名项目根是两个进程。
+            ssh_config: file.ssh_config.clone(),
+        };
+        if let Some(found) = crate::lsp::LspManager::snapshots(cx)
+            .into_iter()
+            .find(|s| s.key == key)
+        {
+            return Some(found);
+        }
+        // 表里没有：这门语言还没起过（默认关闭 / 用户停过）。菜单照样要能开，
+        // 于是补一份最小快照——状态取 `Stopped`，菜单据此显示「Start Server」。
+        Some(crate::lsp::project::ServerSnapshot {
+            // 命令名按目标主机挑：菜单上显示的必须是那台机器上实际会起的那个。
+            command: crate::lsp::LspManager::configured_command_on(
+                cx,
+                &key.language,
+                key.ssh_config.as_ref(),
+            )
+            .unwrap_or_else(|| key.language.clone()),
+            state: crate::lsp::project::ServerState::Stopped,
+            key,
+            pid: None,
+            version: None,
+        })
+    }
+
+    /// 打开某个服务器的报文日志面板（View Logs）。
+    pub(crate) fn open_lsp_log_view(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::editor::lsp_log_view::LspLogView;
+
+        // 一次查表拿标题与状态：菜单点开的那个 key 一定在表里，但服务器可能
+        // 刚被停掉，那时 state 会是 Stopped，面板顶栏照样说得清。
+        let snapshot = crate::lsp::LspManager::snapshots(cx)
+            .into_iter()
+            .find(|s| &s.key == key);
+        let title = snapshot
+            .as_ref()
+            .map(|s| s.command.clone())
+            .unwrap_or_else(|| key.language.clone());
+        let state = snapshot
+            .map(|s| s.state)
+            .unwrap_or(crate::lsp::project::ServerState::Stopped);
+
+        let view = cx.new(|cx| LspLogView::new(key.clone(), title, state, cx));
+        // 轮询在这里起而不是在 `LspLogView::new` 里：那会儿还没有实体句柄。
+        crate::editor::lsp_log_view::spawn_refresh(&view, &mut cx.to_async());
+        let subscription = cx.subscribe_in(&view, window, |this: &mut Editor, _, _, _, cx| {
+            this.lsp_log_view = None;
+            cx.notify();
+        });
+        self.lsp_log_view = Some(view);
+        self._lsp_log_view_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// 找出所有「属于这个服务器 key」的标签。
+    ///
+    /// 判定用 `language` + 项目根一致：进程的唯一标识就是
+    /// (项目根, 语言)，多个标签共享同一个进程（同一门语言开十个文件）。
+    ///
+    /// 根的比较按**标签自己的归属**算：远端标签的项目根要在那台主机上探测
+    /// （`remote_project_root`），本地标签走本地 `project_root`。混用会让
+    /// 「远端项目根」与「本地碰巧存在的同名目录」互相错配。口径取自
+    /// `lsp::project::root_for`，与 `active_lsp_snapshot`、服务器表键
+    /// 完全同源——否则这里判定的归属与菜单操作的 key 会错开。
+    fn tabs_for_server_key(&self, key: &crate::lsp::project::ServerKey, cx: &App) -> Vec<String> {
+        self.open_files
+            .iter()
+            .filter(|f| {
+                // 归属必须一致：本地标签只归本地 key，远端标签只归同一台主机的 key。
+                //
+                // 按**主机身份**比而不是整份 `SshConnectionConfig`：`os` 是连上后
+                // 才探测写回的，标签与 key 各自可能在「探测前/后」两个版本上，
+                // 整份比较会把同一台主机的标签全部判成不属于这个 key——
+                // 服务器起来了但一个标签都接不回来。
+                if crate::lsp::project::host_identity(f.ssh_config.as_ref())
+                    != crate::lsp::project::host_identity(key.ssh_config.as_ref())
+                {
+                    return false;
+                }
+                let root = crate::lsp::project::root_for(Path::new(&f.path), f.ssh_config.as_ref());
+                root == key.root && f.lsp_language_matches(&key.language, cx)
+            })
+            .map(|f| f.id.to_string())
+            .collect()
+    }
+
+    /// 断开某个 key 的所有会话（`didClose` + 回收子进程）。
+    ///
+    /// `LspManager` 那半件事在调用方，这里只处理编辑器侧持有的 client——
+    /// 不这么做的话，编辑器还攥着已经死掉的 client 继续发请求，刷一片失败
+    /// 日志。
+    fn stop_sessions_for_key(&mut self, key: &crate::lsp::project::ServerKey, cx: &App) {
+        for tab_id in self.tabs_for_server_key(key, cx) {
+            let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
+                continue;
+            };
+            if let Some(session) = self.open_files[idx].lsp.as_mut() {
+                log::debug!("lsp: closing session for {} ({})", tab_id, key.language);
+                session.stop();
+            }
+        }
+    }
+
+    /// 把属于某个 key 的所有标签状态置为「已停止」。
+    fn mark_server_stopped(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        cx: &mut Context<Self>,
+    ) {
+        for tab_id in self.tabs_for_server_key(key, cx) {
+            let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
+                continue;
+            };
+            self.open_files[idx].editor_state.update(cx, |state, _| {
+                state.set_lsp_status(Some(crate::lsp::status::LspStatus::Stopped));
+            });
+        }
+    }
+
+    /// 停止一个服务器（菜单操作，不依赖当前打开哪个文件）。
+    ///
+    /// 两步都要做，只做任一个都会漏：
+    /// - `LspManager`：把进程从全局表里摘掉并打 stopped 标记，这样
+    ///   「换个标签再切回来」不会把它复活；
+    /// - `LspSession`：断开编辑器侧持有的 client。
+    ///
+    /// 日志桶一并回收（桶数无界，见 `lsp::log::remove_server`）。重启不走
+    /// 这条路径——它调 `stop_server_for_key`，日志要留着排障。
+    pub(crate) fn stop_lsp_server_for_key(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        cx: &mut Context<Self>,
+    ) {
+        crate::lsp::LspManager::stop_server_for_key_and_purge_logs(cx, key);
+        self.stop_sessions_for_key(key, cx);
+        self.mark_server_stopped(key, cx);
+        log::info!(
+            "lsp: user stopped `{}` server for {:?}",
+            key.language,
+            key.root
+        );
+        cx.notify();
+    }
+
+    /// 启动一个服务器。
+    ///
+    /// 即使当前没有打开该语言的文件也要启动：进程进 `ready` 表，之后打开
+    /// 第一个文件时能立刻握手，省掉一次冷启动（rust-analyzer 要几百毫秒）。
+    ///
+    /// **绕过全局开关**（`override_disabled`）：LSP 默认关闭，而这一条正是
+    /// 用户开启它的入口。若这里也受全局开关约束，「Start Server」在默认
+    /// 状态下点了没反应——用户看到 chip、点开菜单、按启动，什么都不会发生。
+    /// 语言级的显式禁用不受影响（那是对某门语言的明确选择）。
+    pub(crate) fn start_lsp_server_for_key(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        cx: &mut Context<Self>,
+    ) {
+        crate::lsp::LspManager::resume_server_for_key(cx, key);
+        // 先把进程拉起来；结果走 channel，握手完成前不阻塞 UI。
+        crate::lsp::LspManager::server_for_key_with_override(cx, key, true);
+        // 有关联标签就顺便接上会话（didOpen 要全文）。
+        for tab_id in self.tabs_for_server_key(key, cx) {
+            self.start_lsp_for_tab(&tab_id, cx);
+        }
+        log::info!(
+            "lsp: user started `{}` server for {:?}",
+            key.language,
+            key.root
+        );
+        cx.notify();
+    }
+
+    /// 重启一个服务器：先停 → 解标记 → 重新握手。
+    ///
+    /// 顺序很重要：只解标记不真停的话，`server_for_key` 会把 `ready` 里那个
+    /// 半死的 client 直接投递回来，等于没重启。
+    ///
+    /// 走 `stop_server_for_key`（而非带清桶的 Stop 变体）：重启通常就是为了
+    /// 看报文排障，日志桶必须留着。
+    ///
+    /// 同样绕过全局开关（理由见 [`Self::start_lsp_server_for_key`]）：重启是
+    /// 用户显式操作，不该被默认关闭挡回去。
+    pub(crate) fn restart_lsp_server_for_key(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        cx: &mut Context<Self>,
+    ) {
+        crate::lsp::LspManager::stop_server_for_key(cx, key);
+        self.stop_sessions_for_key(key, cx);
+        crate::lsp::LspManager::resume_server_for_key(cx, key);
+        // 先把进程拉起来（绕过全局开关）；下面再给每个标签接会话。
+        crate::lsp::LspManager::server_for_key_with_override(cx, key, true);
+        // 新会话走完整握手；旧会话在 Drop 时补发 didClose。
+        for tab_id in self.tabs_for_server_key(key, cx) {
+            self.start_lsp_for_tab(&tab_id, cx);
+        }
+        log::info!(
+            "lsp: user restarted `{}` server for {:?}",
+            key.language,
+            key.root
+        );
         cx.notify();
     }
 
@@ -2677,13 +3266,25 @@ impl Editor {
         let selected_len = state.selected_range.len();
         let total = state.text().lines_len().max(1);
         let encoding_label = file.encoding.label();
-        let language_label = state
-            .language()
-            .map(|l| {
-                let id = l.to_string();
-                Language::from_id(&id).display_name().to_string()
-            })
-            .unwrap_or_else(|| "纯文本".to_string());
+        let language_id = state.language().map(|l| l.to_string()).unwrap_or_default();
+        let language_label = Language::from_id(&language_id).display_name().to_string();
+        // 就绪态 chip 上要显示服务器名（"rust-analyzer" 而不是"就绪"）。
+        //
+        // 每帧查一次：候选表的判定结果已按命令名缓存，所以这里只是一次
+        // HashMap 查找；换来的是改语言/改设置后立刻生效，不必额外维护缓存。
+        //
+        // **按归属挑**：远端标签要问那台机器装了什么，否则 chip 上显示的是
+        // 本机的服务器名，与远端实际跑的不是一个（本地 pyright、远端 ruff
+        // 时会显示成 pyright）。
+        let lsp_server_name = if language_id.is_empty() {
+            None
+        } else {
+            crate::lsp::LspManager::configured_command_on(
+                cx,
+                &language_id,
+                file.ssh_config.as_ref(),
+            )
+        };
         // 缩进单元：硬 Tab 显示 "Tab"，空格缩进显示单元宽度。
         let tab_size = state.tab_size;
         let indent_label = if tab_size.hard_tabs {
@@ -2751,8 +3352,32 @@ impl Editor {
                     .gap(px(4.0))
                     // 语言服务器实时状态：转圈（工作时）+ 阶段名/进度/诊断计数。
                     // 没有 LSP 的文件（远程、无服务器）不占位。
+                    //
+                    // 点击弹出服务器控制菜单（启动/停止/重启/查看日志）——
+                    // 状态栏是用户唯一能注意到 LSP 异常的地方，光显示不处理
+                    // 等于把用户逼去重启整个应用。
                     .when_some(state.lsp_status(), |this, status| {
-                        this.child(render_lsp_status_chip(status, &theme))
+                        this.child(
+                            div()
+                                .id("lsp-status-chip-hit")
+                                .cursor_pointer()
+                                .rounded(px(6.0))
+                                .hover(|this| this.bg(theme.tab_hover_background))
+                                .on_mouse_down(
+                                    gpui::MouseButton::Left,
+                                    cx.listener(
+                                        move |this, event: &gpui::MouseDownEvent, window, cx| {
+                                            this.open_lsp_menu(event.position, window, cx);
+                                        },
+                                    ),
+                                )
+                                .child(render_lsp_status_chip(
+                                    status,
+                                    lsp_server_name.as_deref(),
+                                    &theme,
+                                    &self.last_chip_log,
+                                )),
+                        )
                     })
                     .child(
                         div()
@@ -2872,11 +3497,14 @@ impl Editor {
 
     /// Apply a `line:col` jump to an already-open tab. No-op when `line` is
     /// `None` or the tab is still loading (caller should use `pending_jumps`).
+    ///
+    /// 跳转的落点包含**键盘焦点**：见 [`Self::focus_editor_tab`]。
     pub fn jump_to_line_col(
         &mut self,
         tab_id: &str,
         line: u32,
         col: Option<u32>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::components::input::RopeExt;
@@ -2915,6 +3543,33 @@ impl Editor {
             cx.notify();
         });
         self.switch_to_file(tab_id, cx);
+        self.focus_editor_tab(tab_id, window, cx);
+    }
+
+    /// 把键盘焦点交给这个标签的编辑器。
+    ///
+    /// 只设 `selected_range` 不够：**选区与光标的绘制都以 focus 为门**
+    /// （`components/input/element.rs` 的 `layout_selections` 与
+    /// `should_paint_cursor` 在非聚焦时直接返回），所以用户看到的是
+    /// 「文件打开了，光标却没跳过去，接着敲键还打在原来那个文件里」。
+    /// 对照 VSCode：`openCodeEditor` 不带 `preserveFocus`，目标编辑器所在
+    /// 分组被激活（`editorGroupView.ts` 的 `activateGroup`）。
+    fn focus_editor_tab(&mut self, tab_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) else {
+            return;
+        };
+        // 这几种标签渲染的不是 InputState（diff / 图片 / markdown 预览 /
+        // 同屏实时编辑器各有自己的视图），聚焦一个屏幕上不存在的输入框等于
+        // 把键盘焦点从界面上拿走。
+        if file.diff.is_some()
+            || file.image.is_some()
+            || file.markdown.is_some()
+            || file.live.is_some()
+        {
+            return;
+        }
+        let focus_handle = file.editor_state.read(cx).focus_handle.clone();
+        window.focus(&focus_handle, cx);
     }
 
     fn take_pending_jump(&mut self, tab_id: &str) -> Option<(u32, Option<u32>)> {
@@ -3145,7 +3800,7 @@ impl Editor {
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
             if let Some(line) = line {
-                self.jump_to_line_col(&tab_id, line, col, cx);
+                self.jump_to_line_col(&tab_id, line, col, window, cx);
             }
             return;
         }
@@ -3286,7 +3941,10 @@ impl Editor {
 
                 match result {
                     Ok(loaded) => {
-                        let _ = weak.update(cx, |this, cx| {
+                        // `update_in`：这一段的结尾要把跳转落点连**焦点**一起
+                        // 应用（`take_pending_jump` → `jump_to_line_col`），而
+                        // 聚焦需要 window。
+                        let _ = weak.update_in(cx, |this, window, cx| {
                             if !this.is_load_current(&tab_id, load_generation) {
                                 return;
                             }
@@ -3334,19 +3992,14 @@ impl Editor {
                             // Terminal Cmd+Click deferred jump: content just
                             // arrived, apply line:col now (clamped to total).
                             if let Some((line, col)) = this.take_pending_jump(&tab_id) {
-                                this.jump_to_line_col(&tab_id, line, col, cx);
+                                this.jump_to_line_col(&tab_id, line, col, window, cx);
                             }
                             // 加载完成才有内容：此时才接语言服务器（didOpen
-                            // 需要把全文发给服务器）。
-                            let is_local = this
-                                .open_files
-                                .iter()
-                                .find(|f| f.id == tab_id)
-                                .map(|f| f.ssh_config.is_none())
-                                .unwrap_or(false);
-                            if is_local {
-                                this.start_lsp_for_tab(&tab_id, cx);
-                            }
+                            // 需要把全文发给服务器）。远端同样要接——服务器
+                            // 跑在那台主机上，`start_lsp_for_tab` 自己按标签
+                            // 的 ssh_config 分流；漏掉这条的话远程文件永远
+                            // 只在「同步加载完成」的那一次机会之外没有诊断。
+                            this.start_lsp_for_tab(&tab_id, cx);
                             let file_path = this
                                 .open_files
                                 .iter()
@@ -3424,6 +4077,20 @@ impl Editor {
         .detach();
     }
 
+    /// 远程标签的 id：**必须带主机**。
+    ///
+    /// 只用路径会在两台主机之间撞车——同一份 checkout 在两台机器上路径完全
+    /// 相同，于是第二台的主机打开 `a.rs` 会命中第一台已开的 tab：`switch_to_file`
+    /// 把用户切到**另一台机器**的内容上，看起来在编辑远端文件，实际保存会写回
+    /// 错的那台。带上 `user@host:port` 后，不同主机天然是不同标签
+    /// （与 `ServerKey` 按主机分开的口径一致）。
+    fn remote_tab_id(path: &str, ssh_config: &SshConnectionConfig, suffix: &str) -> String {
+        format!(
+            "editor-remote-{}-{path}{suffix}",
+            ssh_config.connection_string()
+        )
+    }
+
     pub fn open_remote_file(
         &mut self,
         path: String,
@@ -3445,15 +4112,19 @@ impl Editor {
         col: Option<u32>,
     ) {
         let live_mode = Self::default_live_mode(std::path::Path::new(&path), false, false);
-        let tab_id = if live_mode {
-            format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
-        } else {
-            format!("editor-remote-{}", path)
-        };
+        let tab_id = Self::remote_tab_id(
+            &path,
+            &ssh_config,
+            if live_mode {
+                Self::MARKDOWN_LIVE_SUFFIX
+            } else {
+                ""
+            },
+        );
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
             if let Some(line) = line {
-                self.jump_to_line_col(&tab_id, line, col, cx);
+                self.jump_to_line_col(&tab_id, line, col, window, cx);
             }
             return;
         }
@@ -3488,7 +4159,7 @@ impl Editor {
             if still_loading {
                 self.pending_jumps.insert(tab_id.clone(), (line, col));
             } else {
-                self.jump_to_line_col(&tab_id, line, col, cx);
+                self.jump_to_line_col(&tab_id, line, col, window, cx);
             }
         }
     }
@@ -3530,13 +4201,14 @@ impl Editor {
         silent: bool,
     ) {
         let live_mode = Self::default_live_mode(std::path::Path::new(&path), edit_mode, live_mode);
-        let tab_id = if live_mode {
-            format!("editor-remote-{}{}", path, Self::MARKDOWN_LIVE_SUFFIX)
+        let suffix = if live_mode {
+            Self::MARKDOWN_LIVE_SUFFIX
         } else if edit_mode {
-            format!("editor-remote-{}{}", path, Self::MARKDOWN_EDIT_SUFFIX)
+            Self::MARKDOWN_EDIT_SUFFIX
         } else {
-            format!("editor-remote-{}", path)
+            ""
         };
+        let tab_id = Self::remote_tab_id(&path, &ssh_config, suffix);
 
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
@@ -4175,9 +4847,9 @@ impl Editor {
             );
         });
 
-        // LSP：本地文件在标签建好后异步接语言服务器。
+        // LSP：标签建好后异步接语言服务器（本地与远端都接）。
         // 加载中的文件没有内容，等加载完成再接（见 `finish_file_load`）。
-        if is_local && !is_loading {
+        if !is_loading {
             self.start_lsp_for_tab(&tab_id, cx);
         }
 
@@ -4185,12 +4857,35 @@ impl Editor {
         cx.notify();
     }
 
-    /// 为一个本地标签接上语言服务器。
+    /// 收敛 [`Self::lsp_jump_roots`]：只留还开着的标签，外加刚记下的 `keep`。
+    ///
+    /// 每条记录的作用只在「目标文件被打开并接上 LSP」那一刻——之后归属就存在
+    /// 会话自己的 `server_root` 里了，表里这份只是留给「同一文件再次打开」用的。
+    /// 长会话里反复跳转会让它无界增长（每个落点一条），所以超过标签数一截就扫
+    /// 一遍；没超过就不扫，免得每次跳转都重建一遍路径集合。
+    ///
+    /// 匹配只看路径、不看主机：同一台主机上的同一个路径才是同一个文件，而
+    /// 关掉的标签已经不存在，留着哪条主机的记录都没用。
+    fn prune_lsp_jump_roots(&mut self, keep: &(String, Option<(String, u16, String)>)) {
+        if self.lsp_jump_roots.len() <= self.open_files.len() + 8 {
+            return;
+        }
+        let open_paths: HashMap<String, ()> = self
+            .open_files
+            .iter()
+            .map(|f| (f.path.to_string(), ()))
+            .collect();
+        let keep = keep.clone();
+        self.lsp_jump_roots
+            .retain(|key, _| *key == keep || open_paths.contains_key(&key.0));
+    }
+
+    /// 为一个标签接上语言服务器（本地或远端）。
     ///
     /// 全流程异步且可失败：拿到服务器后 didOpen，再订阅诊断。任何一步失败
     /// 都只记日志，编辑器退回纯 tree-sitter 状态（诊断仍由语法树产出）。
     fn start_lsp_for_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        // 测试可关掉 LSP 接入：`server_for_file` 会 `smol::spawn` 到全局
+        // 测试可关掉 LSP 接入：`server_for_key` 会 `smol::spawn` 到全局
         // 执行器（真实线程），而 gpui 的 `TestScheduler` 会把「其它线程有活动」
         // 判为非确定性并 abort 整个测试二进制。测试关心的是跳转/打开逻辑，
         // 不需要真实语言服务器。
@@ -4201,11 +4896,9 @@ impl Editor {
         let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
             return;
         };
-        // 远程文件、图片、diff 视图都不走 LSP。
-        if self.open_files[idx].ssh_config.is_some()
-            || self.open_files[idx].image.is_some()
-            || self.open_files[idx].diff.is_some()
-        {
+        // 图片、diff 视图不走 LSP（没有可分析的文本内容）。
+        // 远程文件**走**：服务器跑在那台主机上，见 `LspSession` 的 ssh_config。
+        if self.open_files[idx].image.is_some() || self.open_files[idx].diff.is_some() {
             return;
         }
         let language = self.open_files[idx]
@@ -4218,18 +4911,109 @@ impl Editor {
             return;
         }
         let path = PathBuf::from(&self.open_files[idx].path);
+        // 远端主机的配置：None 表示本地文件。
+        let ssh_config = self.open_files[idx].ssh_config.clone();
+        // 远端标签：把这台主机的候选链交给后台探一次（见 `warm_lsp_chain`）。
+        // 本函数跑在 UI 线程，而下面紧接着要判「该不该给 chip 占位」——那里
+        // 只读缓存，第一次多半还不知道，占位先挂着，探完 notify 再补名字。
+        self.warm_lsp_chain(&language, ssh_config.as_ref(), cx);
+        // 跳转打开的文件（`.pyi` 存根、依赖源码……）该挂哪个根**已经知道**了：
+        // 用发起跳转的那个会话的根，别让落点自己另算一个（见 `lsp_jump_roots`）。
+        let jump_root = self
+            .lsp_jump_roots
+            .get(&lsp_jump_root_key(
+                &self.open_files[idx].path,
+                ssh_config.as_ref(),
+            ))
+            .cloned();
+        // 远端标签：项目根还不知道就先挂起，别在 UI 线程上等那趟往返。
+        //
+        // `ServerKey.root` 是进程身份的一部分，而远端的根只能在那台机器上探
+        // （逐个父目录 `stat` 找 `Cargo.toml`/`pyproject.toml` 之类的标记）。
+        // 下面 `session.connect` 会经 `key_for_file` 走到它，本机文件
+        // 是一次 `Path::exists`，远端则是一次同步 SSH 往返——主机慢或不通时，
+        // 打开文件这一步就是十几秒的界面冻结。
+        //
+        // 挂起不等于放弃：探测交给后台，落地后重走本函数。终止性由
+        // `remote_project_root` 保证——每条出路要么缓存根，要么记下「这次问不到」
+        // 的失败，两者都让 `remote_root_is_known` 返回真，第二次就不再 defer。
+        // 那时若仍没有根，`root_for` 退回路径本身的目录（与之前行为一致）。
+        //
+        // 已经带着根来的（`jump_root`）不在这条路上：既不用探，也就不会挂起。
+        if jump_root.is_none() {
+            if let Some(ssh) = ssh_config.as_ref() {
+                if !crate::lsp::project::remote_root_is_known(ssh, &self.open_files[idx].path)
+                    && !self.pending_root_attach.iter().any(|t| t == tab_id)
+                {
+                    self.pending_root_attach.push(tab_id.to_string());
+                    let path_for_probe = self.open_files[idx].path.clone();
+                    let ssh_for_probe = ssh.clone();
+                    let tab = tab_id.to_string();
+                    log::debug!(
+                        "lsp(remote): deferring attach for {tab} until project root is known"
+                    );
+                    cx.spawn(async move |this, cx| {
+                        cx.background_spawn(async move {
+                            crate::lsp::project::remote_project_root(
+                                &ssh_for_probe,
+                                &path_for_probe,
+                            );
+                        })
+                        .await;
+                        let Some(entity) = this.upgrade() else {
+                            return;
+                        };
+                        entity.update(cx, |editor, cx| {
+                            editor.pending_root_attach.retain(|t| t != &tab);
+                            editor.start_lsp_for_tab(&tab, cx);
+                        });
+                    })
+                    .detach();
+                    return;
+                }
+            }
+        }
         // 记下路径：跨文件跳转时用它判断「是不是同一个文件」。
         self.open_files[idx].editor_state.update(cx, |state, _| {
             state.set_lsp_file_path(path.display().to_string())
         });
         let editor = self.open_files[idx].editor_state.downgrade();
 
-        let Some(mut session) = crate::lsp::session::LspSession::new(&path, &language, editor)
+        let Some(mut session) =
+            crate::lsp::session::LspSession::new(&path, &language, editor, ssh_config)
         else {
             return;
         };
+        // 目标主机配置：从会话里取（`ssh_config` 的所有权已交给会话）。
+        // 下面两处都要按它判定——「有没有服务器」与「失败时报哪个命令名」。
+        let tab_ssh_config = session.ssh_config().cloned();
+        // 跳转打开的文件：挂回**发起跳转的那个服务器**。
+        if let Some(root) = jump_root {
+            session.set_server_root(root);
+        }
         let Some(rx) = session.connect(cx) else {
-            log::info!("lsp: no server available for {language} ({path:?})");
+            // 拿不到服务器。三种原因里只有一种要在状态栏上占位：
+            //
+            // - 默认关闭（`lsp.enabled = false`）或用户手动停过 → 占位显示
+            //   服务器名，chip 可点，点开菜单就能启动；
+            // - 这门语言没有可配的服务器 → 真的没有 LSP，不占位（否则
+            //   每个 .txt 文件旁边都挂一盏点不动的灯）；
+            // - 之前启动失败 → 由 `Failed` 分支自己记账，不在这条路上。
+            //
+            // 分界靠「目标主机上有没有一个能跑起来的候选」：远端标签要问
+            // 那台机器，否则本机装了 pyright、远端什么都没装时也会显示
+            // 「未启动」，用户点了启动只会失败。
+            let has_server = crate::lsp::LspManager::language_has_server_on(
+                cx,
+                &language,
+                tab_ssh_config.as_ref(),
+            );
+            log::info!("lsp: no server for {language} ({path:?}), has_server={has_server}");
+            if has_server {
+                self.open_files[idx].editor_state.update(cx, |state, _| {
+                    state.set_lsp_status(Some(crate::lsp::status::LspStatus::NotStarted));
+                });
+            }
             return;
         };
         log::debug!("lsp: connecting {language} for {path:?}");
@@ -4237,11 +5021,16 @@ impl Editor {
         self.open_files[idx].editor_state.update(cx, |state, _| {
             state.set_lsp_status(Some(crate::lsp::status::LspStatus::Starting));
         });
+        // 失败原因要按**目标主机**挑命令名（见下面）。远端标签的 ssh_config
+        // 从会话里取——会话是唯一同时拿着路径与主机配置的地方。
+        // 必须在 `lsp = Some(session)` 之前取：那次移动之后就拿不到了。
+        let status_ssh_config = tab_ssh_config;
         self.open_files[idx].lsp = Some(session);
 
         // 等服务器就绪（spawn + initialize 握手）。
         let tab_id = tab_id.to_string();
         let language_for_status = language.clone();
+
         cx.spawn(async move |this, cx| {
             let client = rx.recv().await.ok().flatten();
             let Some(client) = client else {
@@ -4255,9 +5044,13 @@ impl Editor {
                     // 缺的是哪个二进制。**不断言原因**——这条分支同时覆盖
                     // 「二进制不存在」与「握手失败/服务器立刻退出」，写成
                     // 「找不到 X」在后者上是错的。精确原因在日志里。
-                    let reason = match crate::lsp::LspManager::configured_command(
+                    //
+                    // 按目标主机挑命令名：远端启动失败时报的必须是那台机器上
+                    // 实际尝试的那个（候选链挑中的），而不是本机装的那个。
+                    let reason = match crate::lsp::LspManager::configured_command_on(
                         cx,
                         &language_for_status,
+                        status_ssh_config.as_ref(),
                     ) {
                         Some(command) => format!("{command} 启动失败"),
                         None => format!("{language_for_status} 服务器启动失败"),
@@ -5167,6 +5960,22 @@ impl Render for Editor {
                                     .flex_1()
                                     .min_h_0()
                                     .child(EditorInput::new(&file.editor_state))
+                                    // Cmd+Click 跳定义。挂在**容器**上而不是输入框
+                                    // 内部：那里拿不到 uri/client，也碰不到 Editor 的
+                                    // 跳转管线。输入框自己的按下监听更深一层，先跑完
+                                    // （它把光标移到点击处），我们随后接上——与 VSCode
+                                    // 「setPosition 之后再发请求」同序。
+                                    .on_mouse_down(
+                                        gpui::MouseButton::Left,
+                                        cx.listener(
+                                            move |this,
+                                                  event: &gpui::MouseDownEvent,
+                                                  window,
+                                                  cx| {
+                                                this.goto_definition_at_click(event, window, cx);
+                                            },
+                                        ),
+                                    )
                                     // LSP 悬浮提示：鼠标停稳后请求，浮层跟随命中字符。
                                     // 用 `on_mouse_move` 而不是 input 内部的事件：
                                     // 后者既没有 uri/client，也不能碰 Editor 的浮层状态。
@@ -5312,6 +6121,21 @@ impl Render for Editor {
                                         )
                                     }),
                             )
+                            // LSP 报文日志（View Logs）：底部居中，盖在状态栏上方。
+                            // 跟上面几个面板不同，它要的是「贴底」而不是「贴顶」
+                            // ——那是状态栏 chip 的方向，日志从那儿长出来最自然。
+                            .when_some(self.lsp_log_view.clone(), |this, panel| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(8.0))
+                                        .left_0()
+                                        .right_0()
+                                        .flex()
+                                        .justify_center()
+                                        .child(panel),
+                                )
+                            })
                             .child(status_bar)
                             .into_any_element()
                     }
@@ -5450,22 +6274,32 @@ impl Render for Editor {
                     }
                 }))
         };
-        let language_menu = |menu: Entity<crate::components::menu::PopupMenu>| {
-            gpui::deferred(
-                gpui::anchored().child(
-                    div()
-                        .w(window.bounds().size.width)
-                        .h(window.bounds().size.height)
-                        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                        .child(
-                            gpui::anchored()
-                                .position(self.language_menu_position)
-                                .snap_to_window_with_margin(px(8.0))
-                                .child(menu.clone()),
-                        ),
-                ),
-            )
-            .with_priority(1)
+        // 状态栏 chip 的弹出菜单（语言 / LSP 共用 `render_status_menu`）。
+        //
+        // 关闭回调在建树前备好：它们要捕获 Editor 的弱句柄，而 `when_some`
+        // 的闭包里再 `cx.entity()` 会把 `cx` 的借用和 `self` 的借用搅在一起。
+        let editor_weak = cx.entity().downgrade();
+        let close_language_menu = {
+            let weak = editor_weak.clone();
+            std::rc::Rc::new(move |_window: &mut Window, cx: &mut gpui::App| {
+                weak.update(cx, |editor: &mut Editor, cx| {
+                    editor.language_menu = None;
+                    editor._language_menu_subscription = None;
+                    cx.notify();
+                })
+                .ok();
+            })
+        };
+        let close_lsp_menu = {
+            let weak = editor_weak.clone();
+            std::rc::Rc::new(move |_window: &mut Window, cx: &mut gpui::App| {
+                weak.update(cx, |editor: &mut Editor, cx| {
+                    editor.lsp_menu = None;
+                    editor._lsp_menu_subscription = None;
+                    cx.notify();
+                })
+                .ok();
+            })
         };
         let root: gpui::AnyElement = if is_empty {
             with_panel_actions(
@@ -5482,7 +6316,20 @@ impl Render for Editor {
             .child(tab_bar)
             .child(content)
             .when_some(self.language_menu.clone(), |this, menu| {
-                this.child(language_menu(menu))
+                this.child(render_status_menu(
+                    &menu,
+                    self.language_menu_position,
+                    window,
+                    close_language_menu.clone(),
+                ))
+            })
+            .when_some(self.lsp_menu.clone(), |this, menu| {
+                this.child(render_status_menu(
+                    &menu,
+                    self.lsp_menu_position,
+                    window,
+                    close_lsp_menu.clone(),
+                ))
             })
             .into_any_element()
         } else {
@@ -5553,7 +6400,20 @@ impl Render for Editor {
             )
             .child(padded)
             .when_some(self.language_menu.clone(), |this, menu| {
-                this.child(language_menu(menu))
+                this.child(render_status_menu(
+                    &menu,
+                    self.language_menu_position,
+                    window,
+                    close_language_menu.clone(),
+                ))
+            })
+            .when_some(self.lsp_menu.clone(), |this, menu| {
+                this.child(render_status_menu(
+                    &menu,
+                    self.lsp_menu_position,
+                    window,
+                    close_lsp_menu.clone(),
+                ))
             })
             .into_any_element()
         };
@@ -5719,48 +6579,148 @@ fn atomic_write_local(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// 状态栏上的语言服务器状态 chip。
 ///
-/// 三态视觉：
-/// - **工作中/启动中**：转圈图标 + 阶段名（+ 百分比），配色用主题强调色；
-/// - **就绪且无问题**：绿色小圆点 + "就绪"；
-/// - **就绪但有诊断**：按最严重的级别着色（有错红、只有警告黄）；
-/// - **失败**：红色文字 + 原因。
-fn render_lsp_status_chip(
+/// 状态栏 chip 的（文字, 灯色）——纯决策，便于单测。
+///
+/// 抽出来是因为「默认关闭」这个产品决策正好落在这一处分支上：未启动态
+/// 要显示**服务器名**（用户据此知道这个文件本来能接哪个 LSP、点什么能开），
+/// 而 `Failed` 要显示原因。两者混在一个 `match` 里，只有渲染时才跑得到，
+/// 测不了。
+pub(crate) fn lsp_chip_content(
     status: &crate::lsp::status::LspStatus,
-    theme: &crate::theme::UiTheme,
-) -> gpui::AnyElement {
+    server_name: Option<&str>,
+) -> (String, LspChipTone) {
     use crate::lsp::status::LspStatus;
 
-    let label = status.label();
+    match status {
+        // 就绪 / 已停止 / 未启动都显示服务器名：状态由灯色表达，文字位留给名字。
+        LspStatus::Ready { errors, warnings } => {
+            let tone = if *errors > 0 {
+                LspChipTone::Error
+            } else if *warnings > 0 {
+                LspChipTone::Warning
+            } else {
+                LspChipTone::Ok
+            };
+            // 没有名字时退回**状态本身**，而不是硬写「未启动」：Ready 分支下
+            // 进程明明活着（远端候选链还没探完时就会这样），报「未启动」是把
+            // 用户往反方向指。
+            (
+                server_name
+                    .map(str::to_string)
+                    .unwrap_or_else(|| status.label()),
+                tone,
+            )
+        }
+        // 停止是用户的选择，不报警；未启动没有任何进程，灯不亮。
+        LspStatus::Stopped => (
+            server_name
+                .map(str::to_string)
+                .unwrap_or_else(|| status.label()),
+            LspChipTone::Muted,
+        ),
+        LspStatus::NotStarted => (
+            server_name.unwrap_or("未启动").to_string(),
+            LspChipTone::Dim,
+        ),
+        LspStatus::Starting | LspStatus::Working { .. } => (status.label(), LspChipTone::Busy),
+        LspStatus::Failed { .. } => (status.label(), LspChipTone::Error),
+    }
+}
+
+/// chip 是否点灯：**按状态判断，不按颜色分档**。
+///
+/// 灯表示「这个文件挂着一台服务器，它现在稳定了」——`Ready` 与 `Stopped`
+/// 都点，两者靠灰度区分（见 `LspChipTone::Muted`）；忙的时候用转圈，不用灯。
+/// 曾经它挂在 tone 上，于是 `Ready { errors > 0 }` 归到 `Error` 档 → 不画灯——
+/// 最需要被看见的状态反倒成了唯一没有灯的态。实测现象：Rust 文件（0 诊断）有
+/// 绿点，Python 文件（basedpyright 报了 59 条）只有红字、没有点，用户据此以为
+/// 「Python 的 LSP 没起来」。
+///
+/// `Failed` / `NotStarted` 依然不点灯：那时压根没有可挂的进程。
+pub(crate) fn lsp_chip_shows_lamp(status: &crate::lsp::status::LspStatus) -> bool {
+    use crate::lsp::status::LspStatus;
+    matches!(status, LspStatus::Ready { .. } | LspStatus::Stopped)
+}
+
+/// chip 的颜色分档（是否点灯见 [`lsp_chip_shows_lamp`]，是否转圈看 `Busy`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LspChipTone {
+    /// 有进程在忙：转圈 + 强调色。
+    Busy,
+    /// 干净就绪：绿灯。
+    Ok,
+    /// 有警告：黄灯。
+    Warning,
+    /// 有错误 / 启动失败：红灯。
+    Error,
+    /// 用户主动停止：最淡的一档，灯仍呼吸。
+    Muted,
+    /// 未启动：没有进程，灯不亮。
+    Dim,
+}
+
+/// 状态栏上的 LSP chip。
+///
+/// 视觉分档：
+/// - **就绪**：**服务器名**（rust-analyzer / gopls …）+ 涟漪指示灯。灯芯的
+///   颜色即状态：绿=干净、黄=有警告、红=有错误，外圈一圈圈从中心扩散。
+///   用名字 + 一盏"活着"的灯代替原来的绿字"就绪"——名字才是用户排查时
+///   真正需要的（哪个进程在服务这个文件），"就绪"两个字不携带这个信息；
+/// - **工作中/启动中**：转圈图标 + 阶段名（+ 百分比），配色用主题强调色；
+/// - **失败**：红色文字 + 原因；
+/// - **未启动**（默认关闭时的初始态）：服务器名 + 淡色文字，**不点灯**——
+///   没有进程可点。这是用户发现「这个文件可以接 LSP」并点开菜单开启的入口。
+///
+/// 就绪与已停止都走「涟漪灯 + 服务器名」：服务器名才是用户排查时真正需要的
+/// 信息（哪个进程在服务这个文件），两种状态只差灯的颜色。
+///
+/// 外层由调用方包上点击命中区（`lsp-status-chip-hit`），这个函数只管内容，
+/// 免得同一个 `id` 被渲染二遍。
+///
+/// `server_name`：当前语言的服务器命令名（如 `rust-analyzer`），只有就绪态
+/// 会用到；该语言没有可用服务器时为 `None`，退化成原来的"就绪"。
+fn render_lsp_status_chip(
+    status: &crate::lsp::status::LspStatus,
+    server_name: Option<&str>,
+    theme: &crate::theme::UiTheme,
+    last_log: &std::cell::RefCell<Option<(String, crate::lsp::status::LspStatus)>>,
+) -> gpui::AnyElement {
+    let (label, tone) = lsp_chip_content(status, server_name);
     // 状态栏是「用户唯一能看到 LSP 状态的地方」，它不变化就没有任何线索。
     // 这里只在标签真的变化时记录（`render` 每帧都跑，逐帧打会淹掉日志）。
-    thread_local! {
-        static LAST_LABEL: std::cell::RefCell<Option<String>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    LAST_LABEL.with(|last| {
-        let mut last = last.borrow_mut();
-        if last.as_deref() != Some(label.as_str()) {
+    // 去重状态由调用方（每个 Editor 一份）传入，理由见
+    // `Editor::last_chip_log`。
+    //
+    // 键必须带上**状态**：`NotStarted` / `Stopped` / `Ready` 的文案都是服务器
+    // 名，只比文案的话「用户点了 Stop」「服务器起来了但一片红」这两条在日志
+    // 里都不留痕迹——本次排查就是靠这条日志定位的，差点被这个盲区带偏。
+    {
+        let mut last = last_log.borrow_mut();
+        let changed = match last.as_ref() {
+            Some((prev_label, prev_status)) => prev_label != &label || prev_status != status,
+            None => true,
+        };
+        if changed {
             log::info!("lsp-status: {label}   (raw={status:?})");
-            *last = Some(label.clone());
+            *last = Some((label.clone(), status.clone()));
         }
-    });
-    let (color, show_spinner) = match status {
-        LspStatus::Starting | LspStatus::Working { .. } => (theme.accent, true),
-        LspStatus::Ready { errors, warnings } => {
-            if *errors > 0 {
-                (theme.error, false)
-            } else if *warnings > 0 {
-                (theme.warning, false)
-            } else {
-                // 无问题：用较淡的文本色，不抢注意力。
-                (theme.text_muted.opacity(0.8), false)
-            }
-        }
-        LspStatus::Failed { .. } => (theme.error, false),
+    }
+    let color = match tone {
+        // 有进程在忙：转圈 + 强调色。
+        LspChipTone::Busy => theme.accent,
+        LspChipTone::Ok => theme.success,
+        LspChipTone::Warning => theme.warning,
+        LspChipTone::Error => theme.error,
+        // 停止是用户的选择，不是故障：用最淡的一档，不报警。灯照旧呼吸——
+        // 「还在跑」和「被停了」靠灰度区分，不靠静止。
+        LspChipTone::Muted => theme.text_muted.opacity(0.6),
+        // 未启动：没有进程，**不画灯**。灯意味着「有个东西活着」。
+        LspChipTone::Dim => theme.text_muted.opacity(0.85),
     };
+    let show_lamp = lsp_chip_shows_lamp(status);
+    let show_spinner = tone == LspChipTone::Busy;
 
     let mut chip = div()
-        .id("lsp-status-chip")
         .flex()
         .flex_row()
         .items_center()
@@ -5779,7 +6739,7 @@ fn render_lsp_status_chip(
                 .path(crate::assets::Icon::Loader.path())
                 .with_animation(
                     "lsp-status-spinner",
-                    gpui::Animation::new(std::time::Duration::from_millis(800)).repeat(),
+                    gpui::Animation::new(Duration::from_millis(800)).repeat(),
                     |this, delta| {
                         this.with_transformation(gpui::Transformation::rotate(gpui::percentage(
                             delta,
@@ -5787,11 +6747,9 @@ fn render_lsp_status_chip(
                     },
                 ),
         );
-    } else if let LspStatus::Ready { errors, warnings } = status
-        && (*errors > 0 || *warnings > 0)
-    {
-        // 有诊断：画一个小圆点，颜色与数字一致。
-        chip = chip.child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(color));
+    } else if show_lamp {
+        // 就绪 / 已停止共用一盏涟漪灯：颜色区分状态，动画表示"活着"。
+        chip = chip.child(crate::editor::lsp_lamp::lamp(color));
     }
 
     chip.child(label).into_any_element()
@@ -5816,7 +6774,8 @@ pub(crate) fn is_rename_rejection(err: &anyhow::Error) -> bool {
         || msg.contains("-32602")
 }
 
-/// 测试用：关掉 LSP 接入（见 `Editor::start_lsp_for_tab`）。
+// 测试用：关掉 LSP 接入（见 `Editor::start_lsp_for_tab`）。
+// 用 `//` 而不是 `///`：下面是宏调用，rustdoc 不收宏调用的文档注释。
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_DISABLE_LSP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -5859,6 +6818,44 @@ pub(crate) enum LspGotoKind {
     Declaration,
     TypeDefinition,
     Implementation,
+}
+
+/// 发起跳转的那个会话的归属，在**发请求之前**捕获。
+///
+/// 结果是在 `cx.spawn_in` 里 await 之后才回到 UI 线程的，那时用户可能已经
+/// 切了标签。若到那时再问 `active_lsp_session()`，拿到的是**新标签**的会话，
+/// 两处会错：
+/// - 跨文件时按错的归属开文件——远端结果去本机磁盘上找一个不存在的路径
+///   （表现为「跳了但什么也没发生」），本地结果反过来去开一个远程标签；
+/// - 同文件判定比的是新标签的 uri，跨标签的跳转会被误判成原地跳。
+/// 所以归属必须随请求一起走，不能事后重问。
+#[derive(Debug, Clone)]
+struct LspJumpOrigin {
+    uri: lsp_types::Url,
+    ssh_config: Option<crate::ssh::SshConnectionConfig>,
+    /// 发起跳转的会话挂在哪个项目根上（= 它的 `ServerKey.root`）。
+    ///
+    /// 跳转的落点常常在**那个工作区里**而不在当前文件目录下（typeshed 存根、
+    /// registry 里的依赖源码）。目标文件因此要挂回同一个根，否则会在落点旁边
+    /// 另起一个服务器（见 [`Editor::lsp_jump_roots`]）。
+    ///
+    /// `None` = 会话还没连上（`connect` 之后才有根），退回按路径自己算。
+    root: Option<PathBuf>,
+}
+
+/// [`Editor::lsp_jump_roots`] 的键：目标文件路径 + 它所在的主机（本地为 `None`）。
+///
+/// 主机必须在键里：同一个绝对路径（`/srv/app/main.py`）在两台主机上是两个
+/// 文件，各自的服务器也是两个进程。这与 `ServerKey` 用
+/// `(root, language, 主机)` 认身份是同一个理由。
+pub(crate) fn lsp_jump_root_key(
+    path: &str,
+    ssh: Option<&crate::ssh::SshConnectionConfig>,
+) -> (String, Option<(String, u16, String)>) {
+    (
+        path.to_string(),
+        ssh.map(|c| (c.host.clone(), c.port, c.username.clone())),
+    )
 }
 
 /// LSP 跳转该怎么做（纯决策，便于单测）。
@@ -5904,6 +6901,21 @@ pub(crate) fn lsp_location_action(
     }
 }
 
+/// Cmd+Click 跳定义的触发条件（纯判定，便于单测）。
+///
+/// 照抄 VSCode `gotoSymbol/browser/link/clickLinkGesture.ts` 的三条守卫：
+/// 左键、单次按下（对应它的 `event.detail <= 1`——双击/三击各有语义）、
+/// 触发键在**按下那一刻**就按住（它记 `_hasTriggerModifierOnMouseDown`，
+/// 避免拖选途中按下修饰键把选区当成一次跳转）。
+///
+/// macOS 的触发键是 Cmd、其余平台是 Ctrl，这正是
+/// [`gpui::Modifiers::secondary`] 的语义。VSCode 默认
+/// `editor.multiCursorModifier: "alt"`，把 Cmd/Ctrl 让给了跳转（实测其
+/// 安装包里的默认值也是 `"altKey"`）。
+pub(crate) fn is_goto_definition_click(event: &gpui::MouseDownEvent) -> bool {
+    event.button == gpui::MouseButton::Left && event.modifiers.secondary() && event.click_count <= 1
+}
+
 pub(crate) fn guess_language_from_extension(path: &Path) -> String {
     // Makefile 通常没有扩展名：按文件名匹配（Makefile / GNUmakefile / BSDmakefile）。
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -5926,7 +6938,15 @@ pub(crate) fn guess_language_from_extension(path: &Path) -> String {
             "ts" => "typescript",
             "tsx" => "tsx",
             "json" => "json",
-            "py" => "python",
+            // `.pyi` 是 Python 的**类型声明存根**（typeshed / stub 包），
+            // 语法就是 Python，`List[int]` 这类跳转的落点正是它。
+            // 原来只认 `py`，于是点开一个存根得到 `text`：高亮没了、`#`
+            // 注释切换没了、LSP 也不接（`text` 不在语言表里，没有候选服务器，
+            // chip 都不出现）——用户看到的「跳到了 .pyi
+            // 但编辑器不认这个文件」就是这一条。语言 id 保持 `python`
+            // （与 pyright/basedpyright 的 `didOpen` 口径一致，它们把存根
+            // 也当 python 文档处理）。
+            "py" | "pyi" => "python",
             "go" => "go",
             "cpp" | "cc" | "cxx" | "hpp" => "cpp",
             "c" | "h" => "c",
@@ -6086,6 +7106,7 @@ mod tests {
             original_content: Some("# hi\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         cx.update(|window, cx| {
@@ -6151,6 +7172,7 @@ mod tests {
             original_content: None,
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
 
@@ -6386,6 +7408,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         cx.update(|window, cx| {
@@ -6509,6 +7532,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         // 空编辑器不参与分摊：侧边栏宽度变化全部归主区。
@@ -6645,6 +7669,7 @@ mod tests {
             original_content: Some("hello\n".to_string()),
             encoding: FileEncoding::Utf8,
             read_only: false,
+            dirty: false,
             diff_repo: None,
         };
         let open_one = |editor: &gpui::Entity<Editor>, cx: &mut gpui::VisualTestContext| {

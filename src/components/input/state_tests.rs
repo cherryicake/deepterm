@@ -952,7 +952,8 @@ fn pending_completion_is_dropped_once_cursor_moved(cx: &mut gpui::TestAppContext
     );
 }
 
-/// 光标没动时，候选要能正常取走，且带出**请求时**的偏移。#[gpui::test]
+/// 光标没动时，候选要能正常取走，且带出**请求时**的偏移。
+#[gpui::test]
 fn pending_completion_reports_the_offset_it_was_requested_at(cx: &mut gpui::TestAppContext) {
     let cell = std::cell::RefCell::new(None);
     let (_host, cx) = cx.add_window_view(|window, cx| {
@@ -1297,4 +1298,82 @@ fn apply_completion_rejects_non_char_boundary(cx: &mut gpui::TestAppContext) {
             assert_eq!(state.value().as_ref(), "中x");
         })
         .unwrap();
+}
+
+/// 诊断计数没变时既不改状态、也不触发重绘。
+///
+/// 服务器每次改动都会**重发同一份**诊断（实测 basedpyright 保存一次就重发
+/// 全部 59 条），而 `cx.notify()` 的代价是整棵视图树重建。返回「是否变化」
+/// 让监听侧能把它跳过。
+#[gpui::test]
+fn identical_diagnostic_counts_are_a_no_op(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("python"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input.update(cx, |state, _| {
+        assert!(
+            state.set_lsp_diagnostic_counts(59, 0),
+            "首次计数必须落进状态"
+        );
+        assert!(
+            !state.set_lsp_diagnostic_counts(59, 0),
+            "同样的计数不该再算一次变化"
+        );
+        assert!(
+            state.set_lsp_diagnostic_counts(58, 1),
+            "计数变了就要重绘——灯色跟着计数走"
+        );
+    });
+}
+
+/// 「什么都没带」的 `$/progress` 不能把 chip 钉死在转圈态。
+///
+/// 转圈没有灯：chip 上那个「有没有进程活着」的圆点会消失。实测的疑问
+/// 「Python 前面为什么没有点」有一半是这个（另一半见 `lsp_chip_shows_lamp`）。
+#[gpui::test]
+fn a_content_less_progress_report_changes_nothing(cx: &mut gpui::TestAppContext) {
+    use crate::lsp::status::LspStatus;
+
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("python"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input.update(cx, |state, _| {
+        assert!(state.set_lsp_diagnostic_counts(0, 0));
+        let token = lsp_types::ProgressToken::String("orphan".into());
+        let empty = lsp_types::WorkDoneProgress::Report(lsp_types::WorkDoneProgressReport {
+            cancellable: None,
+            message: None,
+            percentage: None,
+        });
+        assert!(
+            !state.apply_lsp_progress(&token, &empty),
+            "空 report 不该算变化"
+        );
+        assert!(
+            matches!(state.lsp_status(), Some(LspStatus::Ready { .. })),
+            "chip 必须还停在就绪（有灯），而不是转圈"
+        );
+    });
 }

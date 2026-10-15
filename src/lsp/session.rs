@@ -8,7 +8,9 @@
 //! `Window`（聚焦、滚动、弹层），而 `InputState` 的编辑路径只有
 //! `Context<InputState>`。`Editor` 侧订阅 `InputEvent::Change` 驱动同步。
 //!
-//! **只服务本地文件**：远程（SSH）标签不创建会话。
+//! **本地与远端都服务**：远程（SSH）标签的服务器跑在那台主机上，
+//! stdio 经 SSH channel 桥接（见 [`crate::ssh::lsp_channel`]）。
+//! 协议与文档同步逻辑两边完全共用。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +24,7 @@ use crate::components::input::InputState;
 use crate::lsp::client::LspClient;
 use crate::lsp::features;
 use crate::lsp::jsonrpc::Message;
-use crate::lsp::project::LspManager;
+use crate::lsp::project::{LspManager, ServerKey};
 
 /// didChange 的防抖窗口。
 ///
@@ -36,6 +38,19 @@ pub struct LspSession {
     path: PathBuf,
     uri: Url,
     language_id: String,
+    /// 远端主机配置；`None` 表示本地文件。
+    ///
+    /// 决定两件事：服务器在哪台机器上跑（`LspManager` 据此选本地子进程还是
+    /// SSH channel），以及跨文件跳转时目标文件该用哪条打开路径
+    /// （`Editor::open_lsp_location`）。
+    ssh_config: Option<crate::ssh::SshConnectionConfig>,
+    /// 该会话挂的项目根，也就是它用的 `ServerKey.root`。
+    ///
+    /// `connect` 时定下来并缓存：跳转打开的目标文件（典型是 `.pyi` 存根、
+    /// 标准库、第三方包）往往不在当前文件的项目树里，若每个文件都按自己的
+    /// 路径重算根，就会在存根目录另起一个昂贵的服务器。`Editor` 把发起跳转
+    /// 的会话的根传给目标会话，二者于是共用一个进程。
+    server_root: Option<PathBuf>,
     /// 文档版本号，每次 didChange 递增。
     /// 已**送达**服务器的文档版本。
     ///
@@ -56,13 +71,26 @@ pub struct LspSession {
 }
 
 impl LspSession {
-    /// 为一个本地文件创建会话；远程文件返回 `None`。
-    pub fn new(path: &Path, language_id: &str, editor: WeakEntity<InputState>) -> Option<Self> {
+    /// 为一个文件创建会话。
+    ///
+    /// `ssh_config` 为 `None` 时是本地文件；`Some` 时是远端主机上的文件，
+    /// 服务器将跑在那台机器上（uri 仍是 `file:///remote/path`——
+    /// 服务器视角与本地视角在这个 uri 上是一致的）。
+    ///
+    /// 返回 `None` 表示路径无法构成合法 uri（不该发生，防御性返回）。
+    pub fn new(
+        path: &Path,
+        language_id: &str,
+        editor: WeakEntity<InputState>,
+        ssh_config: Option<crate::ssh::SshConnectionConfig>,
+    ) -> Option<Self> {
         let uri = crate::lsp::client::path_to_uri(path).ok()?;
         Some(Self {
             path: path.to_path_buf(),
             uri,
             language_id: language_id.to_string(),
+            ssh_config,
+            server_root: None,
             version: std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0)),
             client: None,
             change_task: None,
@@ -89,6 +117,14 @@ impl LspSession {
     /// 文件路径。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 该会话是否服务远端主机上的文件。
+    ///
+    /// 调用方据此决定：跨文件跳转时目标文件走本地打开还是远端打开，
+    /// 以及 `didChangeWatchedFiles` 该匹配哪个后端的事件源。
+    pub fn ssh_config(&self) -> Option<&crate::ssh::SshConnectionConfig> {
+        self.ssh_config.as_ref()
     }
 
     /// 是否已连上服务器。
@@ -194,9 +230,32 @@ impl LspSession {
         &self.language_id
     }
 
+    /// 这个会话挂在**哪个项目根**上（= 它的 `ServerKey.root`）。
+    ///
+    /// 跨文件跳转要用：服务器回的 `Location` 指的是它自己工作区里的文件，
+    /// 所以那个文件属于**这台服务器**，而不属于「目标路径自己最近的带标记
+    /// 祖先目录」。少了这个值，从 `List[int]` 跳进 typeshed 的 `typing.pyi`
+    /// 会按存根所在目录另起一个服务器（见 `crate::editor::Editor::lsp_jump_roots`）。
+    ///
+    /// `None` = 还没连过（`connect` 时才知道根）。
+    pub fn server_root(&self) -> Option<&std::path::Path> {
+        self.server_root.as_deref()
+    }
+
+    /// 显式指定这个会话该挂到哪个项目根上（**必须在 `connect` 之前**调）。
+    ///
+    /// 只有一条路会用到：文件是由 LSP 跳转打开的，发起跳转的会话已经知道自己
+    /// 的根。不指定时 `connect` 按文件路径自己算（那是打开项目内文件的常规路径）。
+    pub fn set_server_root(&mut self, root: std::path::PathBuf) {
+        self.server_root = Some(root);
+    }
+
     /// 连接服务器：必要时启动进程，然后 didOpen 并订阅诊断。
     ///
     /// 可以重复调用（例如服务器崩溃后重连）；已连接时是空操作。
+    ///
+    /// 远端会话把 `ssh_config` 一起交给管理器：服务器要跑在那台主机上，
+    /// 且「同路径不同主机」必须是两个独立的键（否则两个进程互相顶掉）。
     pub fn connect(
         &mut self,
         cx: &mut App,
@@ -204,7 +263,16 @@ impl LspSession {
         if self.is_active() {
             return None;
         }
-        let rx = LspManager::server_for_file(cx, &self.path, &self.language_id)?;
+        // 根要么已被调用方指定（跳转打开的文件），要么按这个文件自己算。
+        // 两条都在这里定下来并**存进会话**：菜单与跳转之后的归属判定都读它。
+        let key = server_key_for(
+            self.server_root.as_deref(),
+            &self.path,
+            &self.language_id,
+            self.ssh_config.clone(),
+        );
+        self.server_root = Some(key.root.clone());
+        let rx = LspManager::server_for_key(cx, &key)?;
         Some(rx)
     }
 
@@ -303,6 +371,28 @@ impl LspSession {
         self.opened = false;
     }
 
+    /// 用户主动停止服务器：断开当前会话，但保留 uri / language_id / 版本号。
+    ///
+    /// 与 [`Self::close`] 的两点差别：
+    /// - **发 `didClose` 后还要收进程**：`close` 只通知服务器「文档关了」，
+    ///   进程交给 `Drop` 兜底；而用户按「停止」要的就是进程消失，必须显式
+    ///   `shutdown()`（握手 → 等退出 → 超时强杀）。
+    /// - **不清会话**：`connect` 之后还能原样重启，`uri` / `version` 都在。
+    pub fn stop(&mut self) {
+        self.change_task.take();
+        self.notify_task.take();
+        if let Some(client) = self.client.take() {
+            let uri = self.uri.clone();
+            smol::spawn(async move {
+                let _ = client.did_close(&uri).await;
+                client.shutdown();
+            })
+            .detach();
+            log::info!("lsp: stopped server for {}", self.uri);
+        }
+        self.opened = false;
+    }
+
     /// 订阅服务器的 `publishDiagnostics`，写进编辑器的 `DiagnosticSet`。
     ///
     /// **每个标签一份独立订阅**（`client.notifications()` 现在是广播订阅，
@@ -322,7 +412,6 @@ impl LspSession {
         log::debug!("lsp: starting diagnostic listener for {}", self.uri);
         let weak = editor.downgrade();
         let uri = self.uri.clone();
-        let source_name = self.language_id.clone();
 
         self.notify_task.take();
         self.notify_task = Some(cx.spawn(async move |cx| {
@@ -344,14 +433,18 @@ impl LspSession {
                         continue;
                     };
                     let lsp_types::ProgressParamsValue::WorkDone(value) = progress.value;
-                    let alive = weak
-                        .update(cx, |state: &mut InputState, cx| {
-                            state.apply_lsp_progress(&progress.token, &value);
+                    // 闭包的返回值是「状态是否变了」，**不能**用它表示实体存活：
+                    // 一条不改变状态的进度通知会让 `unwrap_or(false)` 把「没变化」
+                    // 读成「编辑器已关」，从而永久终止监听——此后这个文件的诊断
+                    // 与进度再也不会更新（chip 停在最后一次变化的样子）。
+                    let changed = weak.update(cx, |state: &mut InputState, cx| {
+                        let changed = state.apply_lsp_progress(&progress.token, &value);
+                        if changed {
                             cx.notify();
-                            true
-                        })
-                        .unwrap_or(false);
-                    if !alive {
+                        }
+                        changed
+                    });
+                    if changed.is_err() {
                         break;
                     }
                     continue;
@@ -378,40 +471,45 @@ impl LspSession {
                 let diagnostics = publish.diagnostics;
                 // 版本门控：服务器可能乱序推送，过期的那条不能覆盖新的。
                 let version = publish.version;
-                let source = source_name.clone();
                 // 编辑器已被关闭时 `update` 返回 Err：停止监听，避免任务泄漏。
-                let alive = weak
-                    .update(cx, |state: &mut InputState, cx| {
-                        // 换算与写入都在 `set_diagnostics_versioned` 里完成：
-                        // 调用方只有 `&mut self`，无法同时持有 `text()` 的借用。
-                        let items = features::to_diagnostics(state.text(), diagnostics);
-                        // LSP 诊断是**全量快照**：直接覆盖，不做合并。
-                        // 上一轮的 stale 诊断会随本次快照一起消失。
-                        let _ = &source;
-                        let applied = state.set_diagnostics_versioned(items, version);
-                        // 状态栏的「实时状态」：按严重级别统计当前文件。
-                        let counts = state
-                            .diagnostics()
-                            .map(|set| {
-                                set.items().iter().fold((0usize, 0usize), |acc, d| {
-                                    match d.severity {
-                                        crate::editor::syntax::DiagnosticSeverity::Error => {
-                                            (acc.0 + 1, acc.1)
-                                        }
-                                        crate::editor::syntax::DiagnosticSeverity::Warning => {
-                                            (acc.0, acc.1 + 1)
-                                        }
-                                        _ => acc,
+                //
+                // 闭包返回的是「有没有变化」，与存活判断**分开**（`is_err`）：
+                // 用同一个布尔表示两件事，会让一条被版本门控丢弃的诊断
+                // （`applied == false`）被当成「编辑器关了」而终止监听——
+                // 此后这个文件的诊断与进度再也不更新，chip 停在旧值。
+                let changed = weak.update(cx, |state: &mut InputState, cx| {
+                    // 换算与写入都在 `set_diagnostics_versioned` 里完成：
+                    // 调用方只有 `&mut self`，无法同时持有 `text()` 的借用。
+                    let items = features::to_diagnostics(state.text(), diagnostics);
+                    // LSP 诊断是**全量快照**：直接覆盖，不做合并。
+                    // 上一轮的 stale 诊断会随本次快照一起消失。
+                    let applied = state.set_diagnostics_versioned(items, version);
+                    // 状态栏的「实时状态」：按严重级别统计当前文件。
+                    let counts = state
+                        .diagnostics()
+                        .map(|set| {
+                            set.items()
+                                .iter()
+                                .fold((0usize, 0usize), |acc, d| match d.severity {
+                                    crate::editor::syntax::DiagnosticSeverity::Error => {
+                                        (acc.0 + 1, acc.1)
                                     }
+                                    crate::editor::syntax::DiagnosticSeverity::Warning => {
+                                        (acc.0, acc.1 + 1)
+                                    }
+                                    _ => acc,
                                 })
-                            })
-                            .unwrap_or((0, 0));
-                        state.set_lsp_diagnostic_counts(counts.0, counts.1);
+                        })
+                        .unwrap_or((0, 0));
+                    let changed = state.set_lsp_diagnostic_counts(counts.0, counts.1) || applied;
+                    // 只在**内容或状态真的变了**时重绘：`notify` 的代价是整棵
+                    // 视图树重建，而服务器每次改动都会重发同一份诊断。
+                    if changed {
                         cx.notify();
-                        applied
-                    })
-                    .unwrap_or(false);
-                if !alive {
+                    }
+                    changed
+                });
+                if changed.is_err() {
                     break;
                 }
             }
@@ -525,4 +623,78 @@ where
     .detach();
     let _ = cx;
     Some(rx)
+}
+
+/// 这个会话该挂到哪个服务器键上。
+///
+/// **显式根优先**，没有才按文件路径算（[`LspManager::key_for_file`]）。
+/// 抽成纯函数是因为 `connect` 要 gpui 的 `App` 且会真的拉起进程，而这条
+/// 「谁决定归属」的分支正是跨文件跳转的要点：
+///
+/// 从项目里点 `List[int]` 跳到 typeshed 的 `typing.pyi`，落点**不在项目树内**。
+/// 若按落点自己的路径算根，就在存根目录旁边另起了一个 Python 服务器
+/// （pyright 冷启动要索引整个 typeshed，用户体感是「跳一次卡一次」）。
+/// 显式把发起跳转的会话的根传进来，两个文件于是共用同一个进程。
+///
+/// 远端一侧还有个副作用：显式根**不需要**去那台机器上探项目根，
+/// 所以跳转打开的文件不会走编辑器的「等根探测先挂起」那条路。
+fn server_key_for(
+    session_root: Option<&Path>,
+    path: &Path,
+    language: &str,
+    ssh_config: Option<crate::ssh::SshConnectionConfig>,
+) -> ServerKey {
+    match session_root {
+        Some(root) => ServerKey {
+            root: root.to_path_buf(),
+            language: language.to_string(),
+            ssh_config,
+        },
+        None => LspManager::key_for_file(path, language, ssh_config),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 跳转打开的文件挂回**发起跳转的服务器**，而不是落点目录。
+    #[test]
+    fn explicit_root_wins_over_the_path_derived_one() {
+        let project = std::env::temp_dir().join("deepterm-stub-project");
+        let stub = project.join("../typeshed/typing.pyi");
+        let key = server_key_for(Some(&project), &stub, "python", None);
+        assert_eq!(key.root, project, "跳转过来的文件必须挂回原根");
+        assert_eq!(key.language, "python");
+        assert!(key.ssh_config.is_none());
+    }
+
+    /// 没指定根时按文件自己算（普通打开的那条路）。
+    #[test]
+    fn without_an_explicit_root_the_path_decides() {
+        let dir = std::env::temp_dir().join("deepterm-stub-free");
+        std::fs::create_dir_all(&dir).ok();
+        let key = server_key_for(None, &dir.join("main.py"), "python", None);
+        // 兜底口径：探不到项目标记就退到文件所在目录（见 `fallback_root`）。
+        assert_eq!(key.root, crate::lsp::project::fallback_root(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 「同路径不同主机」仍是两个键：根一样也不能合并。
+    #[test]
+    fn explicit_root_keeps_the_host_in_the_key() {
+        let ssh =
+            crate::ssh::SshConnectionConfig::new("10.0.0.1", "bob", crate::ssh::AuthMethod::Agent);
+        let key = server_key_for(
+            Some(Path::new("/srv/app")),
+            Path::new("/srv/app/main.rs"),
+            "rust",
+            Some(ssh),
+        );
+        assert_eq!(key.root, Path::new("/srv/app"));
+        assert_eq!(
+            key.ssh_config.as_ref().map(|c| c.host.as_str()),
+            Some("10.0.0.1")
+        );
+    }
 }

@@ -1231,7 +1231,7 @@ impl TabBar {
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap(px(6.0))
+            .gap_1()
             .rounded(px(TAB_RADIUS_PX))
             .border_1()
             .border_color(border)

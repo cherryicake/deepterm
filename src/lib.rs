@@ -1,5 +1,5 @@
 //! DeepTerm 应用库：全部业务模块。`main.rs` 仅保留进程入口与全局分配器。
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 pub mod agent;
@@ -69,13 +69,77 @@ const SIDEBAR_QUICK_MENUS: &[(&str, &str)] = &[
     ("font", "字体"),
 ];
 
+/// 每个标签页组保留的「非当前」文件树编辑器状态上限（FIFO 淘汰最旧）。
+///
+/// 每个条目持有该文件树下所有打开文件的全文基线（`original_content`）、
+/// InputState 实体（Rope + 撤销历史 + tree-sitter 树）与 DiffView 实体，
+/// 单条目即可达数十 MB。键空间 = 会话中访问过的每个终端/目录：关闭终端
+/// 不会回收、只有切回同一棵树才 `take`，无上限时长会话单调增长
+/// （长时间使用 RSS 涨到 1GB+ 的主要来源之一）。
+///
+/// 超出上限时淘汰最旧条目：被淘汰的树切回时按空状态恢复（文件需重新打开），
+/// 内存从「随访问过的目录数线性增长」收敛为常数窗口。含未保存修改的条目
+/// **不淘汰**（见 [`FileTreeEditorStates::save`]）。
+const MAX_FILE_TREE_EDITOR_STATES: usize = 8;
+
+/// `FileTreeKey -> FileTreeEditorState` 的有界表（FIFO 淘汰）。
+///
+/// 两处使用：默认标签页组（`AppWindow::default_file_tree_editor_states`）与
+/// 各标签页组（`TabGroupWorkspace::file_tree_editor_states`）。
+#[derive(Default)]
+struct FileTreeEditorStates {
+    map: HashMap<FileTreeKey, FileTreeEditorState>,
+    /// 插入序（只含仍存活的键）。淘汰从队首取；`take` 时同步摘除。
+    order: VecDeque<FileTreeKey>,
+}
+
+impl FileTreeEditorStates {
+    /// 保存一个文件树的状态。已存在的键刷新内容并保持原队位（不重复入队）。
+    ///
+    /// 淘汰跳过带未保存修改的条目：`FileTreeEditorState` 是这些编辑的唯一
+    /// 持有者，淘汰即静默丢失用户还没保存的工作（切回时只能重新从磁盘读）。
+    fn save(&mut self, key: FileTreeKey, state: FileTreeEditorState) {
+        if self.map.insert(key.clone(), state).is_none() {
+            self.order.push_back(key);
+        }
+        // 淘汰跳过脏条目：每轮最多绕队列一周，全脏时保留全部（宁占内存不丢数据）。
+        let mut scanned = 0usize;
+        while self.map.len() > MAX_FILE_TREE_EDITOR_STATES && scanned < self.order.len() {
+            let Some(oldest) = self.order.front().cloned() else {
+                break;
+            };
+            scanned += 1;
+            if self
+                .map
+                .get(&oldest)
+                .is_some_and(|state| state.has_unsaved_edits())
+            {
+                // 脏条目不可淘汰：挪到队尾，让它排在干净条目之后被淘汰。
+                self.order.pop_front();
+                self.order.push_back(oldest);
+                continue;
+            }
+            self.order.pop_front();
+            self.map.remove(&oldest);
+            // 淘汰成功说明队列里还有干净条目，下一轮重新计扫描预算。
+            scanned = 0;
+        }
+    }
+
+    /// 取出并移除一个文件树的状态（切回该树时恢复用）。
+    fn take(&mut self, key: &FileTreeKey) -> Option<FileTreeEditorState> {
+        self.order.retain(|k| k != key);
+        self.map.remove(key)
+    }
+}
+
 /// Root component that contains title bar, sidebar and workspace
 struct TabGroupWorkspace {
     id: String,
     workspace: Option<Entity<Workspace>>,
     pending_session: Option<WorkspaceSessionState>,
-    /// 每个文件树的编辑器状态
-    file_tree_editor_states: HashMap<FileTreeKey, FileTreeEditorState>,
+    /// 每个文件树的编辑器状态（有界，见 [`FileTreeEditorStates`]）
+    file_tree_editor_states: FileTreeEditorStates,
 }
 
 pub struct AppWindow {
@@ -90,8 +154,8 @@ pub struct AppWindow {
     pub(crate) editor: Entity<Editor>,
     notification_manager: Entity<NotificationManager>,
     tab_group_select: Entity<MacosSelect>,
-    /// 默认标签页组的文件树编辑器状态
-    default_file_tree_editor_states: HashMap<FileTreeKey, FileTreeEditorState>,
+    /// 默认标签页组的文件树编辑器状态（有界，见 [`FileTreeEditorStates`]）
+    default_file_tree_editor_states: FileTreeEditorStates,
     /// 当前活动的文件树标识符
     current_file_tree_key: Option<FileTreeKey>,
     _sidebar_hide_task: Option<gpui::Task<()>>,
@@ -167,7 +231,7 @@ impl AppWindow {
             editor: wired.editor,
             notification_manager: cx.new(|_cx| NotificationManager::new()),
             tab_group_select: wired.tab_group_select,
-            default_file_tree_editor_states: HashMap::new(),
+            default_file_tree_editor_states: FileTreeEditorStates::default(),
             current_file_tree_key: None,
             _sidebar_hide_task: None,
             host_view: bundle.host_view.clone(),
@@ -742,7 +806,7 @@ impl AppWindow {
                 id: group.id.clone(),
                 workspace: None,
                 pending_session: group.workspace.clone(),
-                file_tree_editor_states: HashMap::new(),
+                file_tree_editor_states: FileTreeEditorStates::default(),
             })
             .collect();
 
@@ -962,7 +1026,7 @@ impl AppWindow {
             id: group_id.clone(),
             workspace: Some(workspace.clone()),
             pending_session: None,
-            file_tree_editor_states: HashMap::new(),
+            file_tree_editor_states: FileTreeEditorStates::default(),
         });
         self.switch_tab_group_workspace(&group_id, window, cx);
     }
@@ -987,7 +1051,7 @@ impl AppWindow {
 
             if from_group_id == DEFAULT_TAB_GROUP_ID {
                 self.default_file_tree_editor_states
-                    .insert(file_tree_key, file_tree_state);
+                    .save(file_tree_key, file_tree_state);
             } else if let Some(group) = self
                 .tab_group_workspaces
                 .iter_mut()
@@ -995,7 +1059,7 @@ impl AppWindow {
             {
                 group
                     .file_tree_editor_states
-                    .insert(file_tree_key, file_tree_state);
+                    .save(file_tree_key, file_tree_state);
             }
         }
 
@@ -1037,7 +1101,7 @@ impl AppWindow {
                     id: group_id.to_string(),
                     workspace: Some(workspace.clone()),
                     pending_session: None,
-                    file_tree_editor_states: HashMap::new(),
+                    file_tree_editor_states: FileTreeEditorStates::default(),
                 });
             }
             workspace
@@ -1095,15 +1159,13 @@ impl AppWindow {
             let from_group_id = self.active_tab_group_id();
             if from_group_id == DEFAULT_TAB_GROUP_ID {
                 self.default_file_tree_editor_states
-                    .insert(old_key, file_tree_state);
+                    .save(old_key, file_tree_state);
             } else if let Some(group) = self
                 .tab_group_workspaces
                 .iter_mut()
                 .find(|group| group.id == from_group_id)
             {
-                group
-                    .file_tree_editor_states
-                    .insert(old_key, file_tree_state);
+                group.file_tree_editor_states.save(old_key, file_tree_state);
             }
         }
 
@@ -1113,12 +1175,12 @@ impl AppWindow {
         // 3. 从新文件树的存储中恢复之前保存的文件
         let from_group_id = self.active_tab_group_id();
         let file_tree_state = if from_group_id == DEFAULT_TAB_GROUP_ID {
-            self.default_file_tree_editor_states.remove(&new_key)
+            self.default_file_tree_editor_states.take(&new_key)
         } else {
             self.tab_group_workspaces
                 .iter_mut()
                 .find(|group| group.id == from_group_id)
-                .and_then(|group| group.file_tree_editor_states.remove(&new_key))
+                .and_then(|group| group.file_tree_editor_states.take(&new_key))
         };
 
         // 4. 如果有需要恢复的文件，恢复到编辑器

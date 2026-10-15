@@ -529,6 +529,8 @@ static FILE_EXTENSION_ICONS: LazyLock<HashMap<&'static str, &'static str>> = Laz
     map.insert("purs", "icons/file_icons/purescript.svg");
     map.insert("pxm", "icons/file_icons/image.svg");
     map.insert("py", "icons/file_icons/python.svg");
+    // 类型存根与 `.py` 同一个图标：它是 Python 文档的一种，不是另一种语言。
+    map.insert("pyi", "icons/file_icons/python.svg");
     map.insert("r", "icons/file_icons/R.svg");
     map.insert("rb", "icons/file_icons/ruby.svg");
     map.insert("re", "icons/file_icons/reasonml.svg");

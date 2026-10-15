@@ -228,10 +228,7 @@ impl CompletionState {
                 position.character,
                 trigger_character
             );
-            match client
-                .completion(&uri, position, trigger_character)
-                .await
-            {
+            match client.completion(&uri, position, trigger_character).await {
                 Ok((items, incomplete)) => {
                     // **await 之后必须再验代号**：等待期间用户可能又敲了几个
                     // 字符，那几轮的任务也会发请求。旧响应回来就写pending 槽，
@@ -242,10 +239,7 @@ impl CompletionState {
                         })
                         .unwrap_or(false);
                     if !still_current {
-                        log::info!(
-                            "lsp: completion 响应已过期，丢弃 {} 个候选",
-                            items.len()
-                        );
+                        log::info!("lsp: completion 响应已过期，丢弃 {} 个候选", items.len());
                         return;
                     }
                     log::info!(

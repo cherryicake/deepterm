@@ -54,7 +54,11 @@ use russh::client;
 use serde::{Deserialize, Serialize};
 
 /// 一条反向端口转发规则。
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Hash` 与 `PartialEq`/`Eq` 一起 derive：`SshConnectionConfig` 的手写
+/// `Hash` 要哈希这个 `Vec`（服务器表按主机复用 LSP 进程），纯数据结构
+/// 没有自定义相等语义，derive 即可。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PortForwardRule {
     /// 远端监听地址。默认 `127.0.0.1`（只本机可用）；写 `0.0.0.0` 即对外暴露。
     #[serde(default = "default_bind_host")]

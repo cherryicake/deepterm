@@ -20,14 +20,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
-use async_channel::{Receiver, Sender, bounded};
+use async_channel::{Receiver, Sender, bounded, unbounded};
 use async_lock::Mutex as AsyncMutex;
-use async_process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use async_process::{Child, Command, Stdio};
 use futures::io::BufReader;
 use futures::{AsyncReadExt as _, AsyncWriteExt as _};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::lsp::log as lsp_log;
+use crate::lsp::log::{Direction, LogSink, MessageKind};
 
 /// 一条 JSON-RPC 消息。
 ///
@@ -142,6 +145,9 @@ struct IncomingMessage {
 ///
 /// 头部字段按 `:` 切分并 `trim`，值大小写不敏感。载荷长度以头声明为准，
 /// 缓冲区不足则判定为「半包」——不能按 UTF-8 提前截断。
+///
+/// 长度必须是 `0 < n <= MAX_FRAME_BYTES`：超界按协议错误返回 `Err`，
+/// 而不是「继续等」——见 [`MAX_FRAME_BYTES`] 的说明。
 fn parse_frame(buf: &[u8]) -> Result<Option<(Message, usize)>> {
     // 找头部结束的空行。LSP 规定用 \r\n，但容忍裸 \n。
     let header_end = find_header_end(buf).ok_or_else(|| {
@@ -171,11 +177,15 @@ fn parse_frame(buf: &[u8]) -> Result<Option<(Message, usize)>> {
             continue;
         };
         if key.trim().eq_ignore_ascii_case("content-length") {
+            // 上限与上面 64KB 的头部长限同一条理由：声明的长度决定读循环往
+            // `buf` 里攒多少字节，`Content-Length: 10^12`（服务器出 bug 或
+            // 流错位）会让它一路涨到内存耗尽，且永远「等不齐」——整条连接
+            // 无声挂死，比报协议错误难查得多。
             content_length = value
                 .trim()
                 .parse::<usize>()
                 .ok()
-                .filter(|n| *n > 0 || true);
+                .filter(|n| *n > 0 && *n <= MAX_FRAME_BYTES);
         }
     }
 
@@ -281,6 +291,35 @@ pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// 关闭握手的等待上限（Zed 的 `SERVER_SHUTDOWN_TIMEOUT` 同为 5s）。
 pub const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// 服务器进程的两种宿主：本地子进程，或远端的 SSH channel。
+///
+/// 抽象出来的意义：语言服务器是个常驻进程，本地与远端都成立；差别只在
+/// 「怎么拿到它的 stdio」和「怎么让它退出」。抽掉这一层，帧编解码、请求
+/// 配对、动态注册、日志全部可以两边共用（对照 Zed
+/// `lsp/src/lsp.rs:465` 的 `new_internal` 对 stdin/stdout 泛型）。
+///
+/// **本地分支保留 `Child`**：关闭路径要靠 `try_status`/`kill` 收尸，否则
+/// 留下僵尸进程。远端没有 pid 可杀，只能关 channel + 断开连接。
+pub(crate) enum ServerProcess {
+    Local(Child),
+    Remote(crate::ssh::lsp_channel::RemoteLspProcess),
+}
+
+/// 写端句柄：本地子进程 stdin，或远端 channel 的 writer。
+///
+/// 装箱成 trait 对象而不是泛型：`Connection` 是被多个 UI 任务共享的长生命周期
+/// 对象（字段进 `Arc`），泛型会让每种传输各实例化一份完整结构。
+type ServerStdin = Box<dyn futures::AsyncWrite + Send + Unpin + 'static>;
+
+/// 读循环交给专职写任务的一条应答。
+///
+/// `id` 只为写成功后能按同一格式记进报文日志（排「服务器是不是在等我们」
+/// 时，日志里必须看得到我们回过）。
+struct OutgoingReply {
+    frame: Vec<u8>,
+    id: u32,
+}
+
 /// 一条到语言服务器的连接。
 ///
 /// 内部结构全部 `Arc`，因为读写循环跑在后台任务里、而 `Connection`
@@ -291,7 +330,11 @@ pub struct Connection {
     /// 必须是**异步**锁而不是 `parking_lot` 的：写帧要跨 `await`，
     /// 而 `parking_lot::MutexGuard` 不是 `Send`，会让整个 future 失去
     /// `Send`，从而无法交给 `smol::spawn`。
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+    stdin: Arc<AsyncMutex<ServerStdin>>,
+    /// 应答服务器主动请求的**队列**（由专职写任务消费，见 [`reply_writer`]）。
+    ///
+    /// 无界：读循环绝不能因为「写端正忙」而停下来不读。
+    replies: Sender<OutgoingReply>,
     pending: Pending,
     next_id: AtomicU32,
     /// 服务器主动通知的**订阅者列表**（广播）。
@@ -313,8 +356,9 @@ pub struct Connection {
     /// 条，而 `Sender` 没有出队接口，只有 `Receiver` 能 `try_recv`。持有
     /// Receiver 不会额外消费——只有分发路径在用它。
     subscribers: Arc<Mutex<Vec<Subscription>>>,
-    /// 子进程句柄：drop 时用来 `kill`，避免僵尸进程。
-    child: Arc<Mutex<Option<Child>>>,
+    /// 服务器进程句柄：drop / 关闭时用来收尸，避免僵尸进程或泄漏连接。
+    /// `None` 表示这是测试用的替身连接（没有真实进程）。
+    process: Arc<Mutex<Option<ServerProcess>>>,
     /// 读循环是否已经退出（进程关闭/崩溃）。置位后所有请求立即失败，
     /// 不必等到超时。
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -341,6 +385,12 @@ pub struct Connection {
     /// 对照 Zed `lsp_store.rs:12289`：它用 `DidChangeWatchedFilesRegistrationOptions`
     /// 建出 `GlobSet`，发通知前逐个 `is_match()`，不匹配的直接丢弃。
     watched_globs: Arc<Mutex<Vec<String>>>,
+    /// 报文日志接收端（View Logs 的数据源）。
+    ///
+    /// `None` 表示这个连接不记日志——测试里的替身连接没有 key，也没人看
+    /// 它的日志。只在**有 key 的真实连接**上挂：日志的价值正在于按服务器
+    /// 分桶，没有 key 的记录不知道该归给谁。
+    logger: Option<Arc<dyn LogSink>>,
 }
 
 /// 构造启动语言服务器的命令（不真正 spawn）。
@@ -390,7 +440,11 @@ impl Connection {
     ///
     /// `spawn` 失败（命令不存在）会以 `Err` 返回，调用方降级为「无 LSP」，
     /// 不阻塞编辑器。
-    pub async fn spawn(program: &str, args: &[String]) -> Result<Self> {
+    pub async fn spawn(
+        program: &str,
+        args: &[String],
+        logger: Option<Arc<dyn LogSink>>,
+    ) -> Result<Self> {
         let mut command = spawn_command(program, args);
 
         let mut child = command
@@ -403,31 +457,98 @@ impl Connection {
             .take()
             .context("language server has no stdout")?;
 
+        let conn = Self::assemble(
+            Box::new(stdin),
+            Box::new(stdout),
+            Some(ServerProcess::Local(child)),
+            logger,
+        );
+
+        Ok(conn)
+    }
+
+    /// 在一条已就绪的远端 SSH channel 上建立连接。
+    ///
+    /// 调用方负责：连上 SSH、`channel_open_session`、`exec` 服务器命令、
+    /// 主机密钥校验。这里只把 channel 的 reader/writer 接进帧循环，
+    /// 关闭路径靠 `process` 里的句柄关 channel。
+    ///
+    /// `reader` / `writer` 由 russh 的 `make_reader` / `make_writer` 产出，
+    /// 是 `tokio::io` 的 trait；`assemble` 内部会桥接到 `futures` 家族
+    /// （见 [`crate::ssh::lsp_channel`] 的说明）。
+    pub(crate) fn spawn_over_channel(
+        mut process: crate::ssh::lsp_channel::RemoteLspProcess,
+        logger: Option<Arc<dyn LogSink>>,
+    ) -> Result<Self> {
+        let (reader, writer) = process.take_io()?;
+        let conn = Self::assemble(
+            Box::new(writer),
+            Box::new(reader),
+            Some(ServerProcess::Remote(process)),
+            logger,
+        );
+        Ok(conn)
+    }
+
+    /// 把「已拿到的读写端 + 进程句柄」组装成一条连接。
+    ///
+    /// 本地与远端共用：两者只在 stdio 的来源和关闭方式上不同，帧循环、
+    /// 请求配对、订阅广播完全一致。拆出这个函数正是为了那一行
+    /// 「拿 stdio」成为唯一的差异点（对照 Zed 的 `new_internal`）。
+    fn assemble(
+        stdin: ServerStdin,
+        stdout: Box<dyn futures::AsyncRead + Send + Unpin + 'static>,
+        process: Option<ServerProcess>,
+        logger: Option<Arc<dyn LogSink>>,
+    ) -> Self {
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         // 通知走**广播**：订阅者列表初始为空，由每个打开的标签经
         // `Connection::subscribe` 注册（理由见字段文档）。
         let subscribers: Arc<Mutex<Vec<Subscription>>> = Arc::new(Mutex::new(Vec::new()));
+        // 应答服务器的主动请求走一条独立队列 + 专职写任务（见 `replies` 字段）。
+        // 无界：读循环绝不能因为「写端正忙」而停下来不读。
+        let (replies_tx, replies_rx) = unbounded::<OutgoingReply>();
 
         let conn = Self {
             stdin: Arc::new(AsyncMutex::new(stdin)),
+            replies: replies_tx,
             pending: pending.clone(),
             next_id: AtomicU32::new(1),
             subscribers: subscribers.clone(),
-            child: Arc::new(Mutex::new(Some(child))),
+            process: Arc::new(Mutex::new(process)),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             registered_methods: Arc::new(Mutex::new(std::collections::HashSet::new())),
             watched_globs: Arc::new(Mutex::new(Vec::new())),
+            logger,
         };
+
+        // 写任务：只消费应答队列。它的寿命 = 还有 `Connection` 活着
+        // （sender 全 drop 后 `recv` 报错退出），不会泄漏任务。
+        let stdin3 = Arc::clone(&conn.stdin);
+        let logger3 = conn.logger.clone();
+        smol::spawn(async move {
+            reply_writer(stdin3, replies_rx, logger3).await;
+        })
+        .detach();
 
         // 读循环：独立于任何请求，寿命与连接相同。
         let pending2 = pending.clone();
         let closed2 = conn.closed.clone();
-        let stdin2 = Arc::clone(&conn.stdin);
+        let replies2 = conn.replies.clone();
         let registered2 = Arc::clone(&conn.registered_methods);
         let globs2 = Arc::clone(&conn.watched_globs);
+        let logger2 = conn.logger.clone();
         smol::spawn(async move {
-            let result =
-                read_loop(stdout, stdin2, pending2, subscribers, registered2, globs2).await;
+            let result = read_loop(
+                stdout,
+                replies2,
+                pending2,
+                subscribers,
+                registered2,
+                globs2,
+                logger2,
+            )
+            .await;
             if let Err(e) = result {
                 log::error!("lsp read loop terminated: {e}");
             }
@@ -440,7 +561,7 @@ impl Connection {
         })
         .detach();
 
-        Ok(conn)
+        conn
     }
 
     /// 是否已断开（进程退出或读循环终止）。
@@ -449,8 +570,23 @@ impl Connection {
     }
 
     /// 子进程 pid（测试用来独立确认进程已被回收）。
+    ///
+    /// 远端连接没有本地 pid：服务器跑在另一台机器上，`sysinfo` 读不到。
     pub fn child_pid(&self) -> Option<u32> {
-        self.child.lock().as_ref().map(|c| c.id())
+        match self.process.lock().as_ref() {
+            Some(ServerProcess::Local(child)) => Some(child.id()),
+            _ => None,
+        }
+    }
+
+    /// 进程跑在**另一台机器**上（SSH channel），而不是本地子进程。
+    ///
+    /// 握手时要按它决定 `processId`：那个字段的语义是「父进程 pid，父进程
+    /// 死了你也该退」，本地 pid 对远端服务器毫无意义——更糟的是远端可能
+    /// 恰好有一个同号进程，于是「它什么时候死」变成一件不可控的事。
+    /// 规范对此给了正确取值：没有可关联的父进程时传 `null`。
+    pub fn is_remote(&self) -> bool {
+        matches!(self.process.lock().as_ref(), Some(ServerProcess::Remote(_)))
     }
 
     /// 仍在等待应答的请求数（测试用来确认超时后没有泄漏）。
@@ -554,6 +690,15 @@ impl Connection {
             self.pending.lock().remove(&id);
             return Err(e);
         }
+        if let Some(logger) = &self.logger {
+            logger.record(lsp_log::message(
+                Direction::Outgoing,
+                MessageKind::Request,
+                method,
+                Some(id as i64),
+                params,
+            ));
+        }
 
         // 有界等待：`or` 返回先完成的那一支（应答，或超时标记）。
         let result = match smol::future::or(async { Some(rx.recv().await) }, async {
@@ -579,17 +724,17 @@ impl Connection {
         result
     }
 
-    /// LSP 关闭握手：`shutdown` 请求 → `exit` 通知 → 回收子进程。
+    /// LSP 关闭握手：`shutdown` 请求 → `exit` 通知 → 回收进程。
     ///
     /// 顺序与 Zed 的 `LanguageServer::shutdown` 一致：
     /// 1. 发 `shutdown` 请求并**有界等待**应答（服务器可能在忙，不能无限等）；
     /// 2. 无论应答与否都发 `exit` 通知（规范要求 exit 才算完成关闭）；
-    /// 3. 关 stdin，宽限后 `kill` 并 `status()` 回收，避免留下孤儿进程。
+    /// 3. 收尸：本地子进程走 `kill` + `status()`，远端走关 channel + 断开 SSH。
     ///
     /// 幂等：重复调用只做一次。
     pub async fn shutdown_gracefully(&self) {
-        // 已经关过就直接返回（`child` 已被取走）。
-        if self.child.lock().is_none() {
+        // 已经关过就直接返回（`process` 已被取走）。
+        if self.process.lock().is_none() {
             self.closed.store(true, Ordering::SeqCst);
             return;
         }
@@ -609,37 +754,54 @@ impl Connection {
             log::debug!("lsp: exit notification not delivered: {e}");
         }
 
-        // 3) 关 stdin + 回收子进程。
+        // 3) 关 stdin + 回收进程。
         self.closed.store(true, Ordering::SeqCst);
-        // 先把子进程句柄**取出来**（释放锁），再 await：`parking_lot` 的
+        // 先把进程句柄**取出来**（释放锁），再 await：`parking_lot` 的
         // guard 不是 `Send`，跨 await 持着它会让整个 future 无法 spawn。
-        let child = self.child.lock().take();
-        if let Some(mut child) = child {
-            drop(child.stdin.take());
-            // 等服务器自行退出的预算与请求超时**共享**同一个上限：
-            // 否则最坏情况是「请求等 5s + 回收再等 5s」= 2× 常量，
-            // 退出路径被拖成 10s。
-            let step = std::time::Duration::from_millis(50);
-            while started.elapsed() < SHUTDOWN_TIMEOUT {
-                match child.try_status() {
-                    // 已退出：`status()` 收尸，避免僵尸。
-                    Ok(Some(_)) => {
-                        let _ = child.status().await;
-                        log::debug!("lsp: language server exited after shutdown handshake");
+        let process = self.process.lock().take();
+        match process {
+            Some(ServerProcess::Local(mut child)) => {
+                drop(child.stdin.take());
+                // 等服务器自行退出的预算与请求超时**共享**同一个上限：
+                // 否则最坏情况是「请求等 5s + 回收再等 5s」= 2× 常量，
+                // 退出路径被拖成 10s。
+                let step = std::time::Duration::from_millis(50);
+                while started.elapsed() < SHUTDOWN_TIMEOUT {
+                    match child.try_status() {
+                        // 已退出：`status()` 收尸，避免僵尸。
+                        Ok(Some(_)) => {
+                            let _ = child.status().await;
+                            log::debug!("lsp: language server exited after shutdown handshake");
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            log::debug!("lsp: error polling language server status: {e}");
+                            break;
+                        }
+                    }
+                    smol::Timer::after(step).await;
+                }
+                // 没自己退：强杀并收尸。
+                let _ = child.kill();
+                let _ = child.status().await;
+                log::debug!("lsp: language server killed after shutdown timeout");
+            }
+            // 远端没有 pid 可杀：关 SSH channel 让远端进程收到 EOF 自行退出，
+            // 再断开连接。关不掉也只是泄漏一个远端进程，不影响本地。
+            Some(ServerProcess::Remote(remote)) => {
+                let step = std::time::Duration::from_millis(50);
+                while started.elapsed() < SHUTDOWN_TIMEOUT {
+                    if remote.is_finished() {
+                        log::debug!("lsp: remote language server exited after shutdown handshake");
                         return;
                     }
-                    Ok(None) => {}
-                    Err(e) => {
-                        log::debug!("lsp: error polling language server status: {e}");
-                        break;
-                    }
+                    smol::Timer::after(step).await;
                 }
-                smol::Timer::after(step).await;
+                remote.close();
+                log::debug!("lsp: remote language server channel closed after shutdown timeout");
             }
-            // 没自己退：强杀并收尸。
-            let _ = child.kill();
-            let _ = child.status().await;
-            log::debug!("lsp: language server killed after shutdown timeout");
+            None => {}
         }
     }
 
@@ -654,7 +816,19 @@ impl Connection {
             params,
         };
         let payload = serde_json::to_vec(&outgoing).context("failed to serialize notification")?;
-        self.write_frame(&payload).await
+        let result = self.write_frame(&payload).await;
+        if result.is_ok()
+            && let Some(logger) = &self.logger
+        {
+            logger.record(lsp_log::message(
+                Direction::Outgoing,
+                MessageKind::Notification,
+                method,
+                None,
+                params,
+            ));
+        }
+        result
     }
 
     /// 应答服务器发来的请求。
@@ -706,40 +880,55 @@ impl Connection {
 
     /// 取一份只含关闭所需字段的轻量句柄。
     ///
-    /// 关闭路径只需要写端、pending 表与子进程句柄，所以单独复制这几项。
+    /// 关闭路径只需要写端、应答队列、pending 表与子进程句柄，所以单独复制
+    /// 这几项。带上 `replies` 而不是让它空掉：写任务的寿命跟着 sender 走，
+    /// 关闭握手期间投出去的应答还得有人写。
     ///
     /// 订阅者列表是 `Arc`，共享即可——关闭时不需要再收通知。
     fn clone_for_shutdown(&self) -> Connection {
         Connection {
             stdin: Arc::clone(&self.stdin),
+            replies: self.replies.clone(),
             pending: Arc::clone(&self.pending),
             next_id: AtomicU32::new(self.next_id.load(Ordering::SeqCst)),
             subscribers: Arc::clone(&self.subscribers),
-            child: Arc::clone(&self.child),
+            process: Arc::clone(&self.process),
             closed: Arc::clone(&self.closed),
             registered_methods: Arc::clone(&self.registered_methods),
             watched_globs: Arc::clone(&self.watched_globs),
+            logger: self.logger.clone(),
         }
     }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if self.child.lock().is_some() {
+        if self.process.lock().is_some() {
             self.shutdown();
         }
     }
 }
 
-/// 读循环：切帧 → 配对响应 / 转发通知。
-async fn read_loop(
-    stdout: ChildStdout,
-    stdin: Arc<AsyncMutex<ChildStdin>>,
+/// 读循环：切帧 → 配对响应 / 转发通知 / 投递应答。
+///
+/// 对读端泛型：本地是 `ChildStdout`，远端是 russh channel 桥接过来的
+/// `futures` trait 对象。除了数据来源，两条路径的帧处理完全一致。
+///
+/// 这个循环**不碰写端**：要应答就丢进队列，由 [`reply_writer`] 落笔。它一旦
+/// 停在写锁上，服务器等不到应答、我们等不到它后续的字节，远端 channel 的
+/// 缓冲就是这两者之间的死结。
+async fn read_loop<R>(
+    stdout: R,
+    replies: Sender<OutgoingReply>,
     pending: Pending,
     subscribers: Arc<Mutex<Vec<Subscription>>>,
     registered_methods: Arc<Mutex<std::collections::HashSet<String>>>,
     watched_globs: Arc<Mutex<Vec<String>>>,
-) -> Result<()> {
+    logger: Option<Arc<dyn LogSink>>,
+) -> Result<()>
+where
+    R: futures::AsyncRead + Unpin + Send + 'static,
+{
     let mut reader = BufReader::new(stdout);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
 
@@ -748,6 +937,9 @@ async fn read_loop(
         // 一次 read 拿到多条消息时避免反复进 read 系统调用。
         while let Some((msg, consumed)) = parse_frame(&buf)? {
             buf.drain(..consumed);
+            if let Some(logger) = &logger {
+                logger.record(describe_incoming(&msg));
+            }
             // 记录/清除服务器动态注册的能力（在应答之前处理，保证
             // 「注册成功」与「我们记住了」是同一时刻）。
             if let Message::Request { method, params, .. } = &msg {
@@ -777,25 +969,15 @@ async fn read_loop(
                     }
                 };
                 match payload {
+                    // 投递，不在这里写。读循环一旦去抢 `stdin` 的锁，就可能停在
+                    // 一个正被 `write_frame` 持着、而它等的数据又要靠本循环腾出来的
+                    // 锁上（远端 channel 满时是实打实的死锁）。
                     Ok(payload) => {
-                        let frame = encode_frame(&payload);
-                        let t0 = std::time::Instant::now();
-                        let mut guard = stdin.lock().await;
-                        let waited = t0.elapsed();
-                        if waited > std::time::Duration::from_millis(200) {
-                            log::warn!(
-                                "lsp: 应答服务器请求 id {id} 前等锁 {waited:?}（pending={}）",
-                                pending.lock().len()
-                            );
-                        }
-                        // 写入失败只记日志：服务器请求应答丢了不会损坏本地
-                        // 状态，下一次请求照常。
-                        if let Err(e) = guard.write_all(&frame).await {
-                            log::warn!("lsp: failed to reply to server request {id}: {e}");
-                        } else if let Err(e) = guard.flush().await {
-                            log::warn!("lsp: failed to flush reply {id}: {e}");
-                        } else {
-                            log::debug!("lsp: replied to server request id {id}");
+                        if let Err(e) = replies.try_send(OutgoingReply {
+                            frame: encode_frame(&payload),
+                            id,
+                        }) {
+                            log::warn!("lsp: failed to queue reply to server request {id}: {e}");
                         }
                     }
                     Err(e) => log::warn!("lsp: failed to serialize reply {id}: {e}"),
@@ -813,6 +995,91 @@ async fn read_loop(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+/// 写任务：把读循环投递出来的应答落笔到写端。
+///
+/// 与读循环分开，是为了让读循环永不等待写锁（见 [`read_loop`] 的说明）。
+/// 写失败只记日志：应答丢了不会损坏本地状态，服务器的下一次请求照常。
+async fn reply_writer<W>(
+    stdin: Arc<AsyncMutex<W>>,
+    replies: Receiver<OutgoingReply>,
+    logger: Option<Arc<dyn LogSink>>,
+) where
+    W: futures::AsyncWrite + Unpin + Send + 'static,
+{
+    while let Ok(reply) = replies.recv().await {
+        let t0 = std::time::Instant::now();
+        let mut guard = stdin.lock().await;
+        let waited = t0.elapsed();
+        if waited > std::time::Duration::from_millis(200) {
+            log::warn!(
+                "lsp: 应答服务器请求 id {} 前等锁 {waited:?}（队列 {} 条待写）",
+                reply.id,
+                replies.len()
+            );
+        }
+        let wrote = match guard.write_all(&reply.frame).await {
+            Ok(()) => guard.flush().await,
+            Err(e) => Err(e),
+        };
+        drop(guard);
+        match wrote {
+            Ok(()) => {
+                // 这条应答是读循环投递、本任务代发（不是谁调的 `request`），
+                // 不记的话日志里只有服务器的请求、看不到我们回过——排
+                // 「服务器是不是在等我们」时正好缺这一条。
+                if let Some(logger) = &logger {
+                    logger.record(lsp_log::message(
+                        Direction::Outgoing,
+                        MessageKind::Response,
+                        "",
+                        Some(reply.id as i64),
+                        None,
+                    ));
+                }
+                log::debug!("lsp: replied to server request id {}", reply.id);
+            }
+            Err(e) => {
+                log::warn!("lsp: failed to reply to server request {}: {e}", reply.id);
+            }
+        }
+    }
+}
+
+/// 入站消息 → 一条日志记录。
+fn describe_incoming(msg: &Message) -> lsp_log::LogMessage {
+    let (kind, method, id, payload) = match msg {
+        Message::Request { id, method, params } => (
+            MessageKind::Request,
+            method.clone(),
+            Some(*id as i64),
+            params.clone(),
+        ),
+        Message::Response { id, result, error } => {
+            // 出错的响应只记消息文本：`-32801 content modified` 这类正是
+            // 日志要回答的问题。`data` 字段可能很大且形状不定，不给它。
+            let owned = match error {
+                Some(e) => serde_json::json!({ "error": e.message }),
+                // 正常响应的 `result` 是 `Option<Value>`：`null` 结果要落成
+                // `Value::Null`，类型才与其他分支一致。
+                None => result.clone().unwrap_or(Value::Null),
+            };
+            (
+                MessageKind::Response,
+                String::new(),
+                Some(*id as i64),
+                owned,
+            )
+        }
+        Message::Notification { method, params } => (
+            MessageKind::Notification,
+            method.clone(),
+            None,
+            params.clone(),
+        ),
+    };
+    lsp_log::message(Direction::Incoming, kind, method, id, Some(&payload))
 }
 
 /// 服务器主动请求的处理结果。
@@ -965,6 +1232,14 @@ fn reply_for_params(method: &str, params: &Value) -> ServerRequestReply {
 ///
 /// 服务器狂推诊断时不能无限堆积内存；满了丢最旧的一条（见 [`broadcast`]）。
 const NOTIFY_QUEUE_CAPACITY: usize = 256;
+
+/// 单帧载荷的字节上限（[`parse_frame`] 据此拒绝超长的 `Content-Length`）。
+///
+/// 取值远大于现实中会见到的帧：一次 `publishDiagnostics` 推整个 workspace
+/// 的诊断、或 `documentSymbol`/`rename` 回一大坨 JSON，实测都在几 MB 内。
+/// 上限要拦的是**畸形**长度（服务器 bug、流错位后把正文当头部解析），
+/// 那种帧永远不会「等齐」，而读循环会照着它一路往缓冲里攒字节。
+const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 /// 把一条通知**广播**给所有订阅者。
 ///
@@ -1316,6 +1591,27 @@ mod tests {
     #[test]
     fn missing_content_length_is_error() {
         let buf = b"\r\n\r\n{}";
+        assert!(parse_frame(buf).is_err());
+    }
+
+    /// 畸形的大 `Content-Length` 必须**当场报错**，而不是返回「半包、继续等」。
+    ///
+    /// 后者才是危险的那个分支：读循环会照着这个长度一直往缓冲里攒字节，
+    /// 永远等不齐，连接无声挂死。
+    #[test]
+    fn oversized_content_length_is_error_not_half_packet() {
+        let buf = b"Content-Length: 1099511627776\r\n\r\n{}";
+        let err = parse_frame(buf).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("missing or invalid Content-Length header"),
+            "oversized length must be rejected as an invalid header, got: {err}"
+        );
+    }
+
+    #[test]
+    fn zero_content_length_is_error() {
+        let buf = b"Content-Length: 0\r\n\r\n";
         assert!(parse_frame(buf).is_err());
     }
 
