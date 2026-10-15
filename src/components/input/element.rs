@@ -4383,8 +4383,8 @@ impl TextElement {
             line_height,
             visible_end,
             false,
-            // hover 卡片超宽就换行：`MinContent` 下文本不换行，长行会被直接
-            // 截掉（paint 用的是测量时的 layout）。`MAX_WIDTH` 见 hover.rs。
+            // hover 卡片按 `MAX_WIDTH` **定宽**测量：文本只有拿到定宽才会换行
+            //（详见 `place_at_anchor` 的 `wrap_at` 注释）。`MAX_WIDTH` 见 hover.rs。
             Some(px(crate::editor::hover::MAX_WIDTH)),
             window,
             cx,
@@ -4414,18 +4414,20 @@ impl TextElement {
         line_height: Pixels,
         visible_end: usize,
         prefer_below: bool,
-        // 内容超宽时换行用的宽度上限；`None` = 不换行（补全菜单的行本来就是
-        // `whitespace_nowrap`，量出来多宽就画多宽）。
+        // 宽度上限，同时表示「按它换行」；`None` = 不限宽也不换行（补全菜单的
+        // 行本来就是 `whitespace_nowrap`，量出来多宽就画多宽）。
         //
-        // 为什么需要两遍测量：第一遍必须用 `MinContent` 才能知道「内容自然
-        // 有多宽」（太窄的卡片不该被撑满）；但 `MinContent` 下文本**不换行**，
-        // 长行会量出一个超宽尺寸 —— paint 用的就是这次 layout 的结果，所以
-        // 卡片里的长内容会被直接截掉、根本看不到（用户报的「不换行、长内容
-        // 渲染不出来」）。
+        // 给了 `wrap_at` 就必须量**定宽**（`AvailableSpace::Definite`）：gpui
+        // 的文本只有拿到 `Definite` 才会换行 —— `elements/text.rs::TextLayout::layout`
+        // 的 `wrap_width` 只在 Definite 下才有值，用 `MinContent` / `MaxContent`
+        // 量到的永远是「不换行时的自然宽度」。
         //
-        // 于是超宽时再量第二遍：宽度给 `Definite`，文本按该宽度换行，paint
-        // 用的也是第二遍的结果（`layout_as_root` 换约束会重算，见 gpui
-        // `element.rs::layout_as_root`）。`max_h` 的截断与滚动不受影响。
+        // 「先 MinContent 量一遍、超宽了再补一遍 Definite」这条走不通：卡片自己
+        // 的 `max_w` 已经把第一遍的结果夹成 680，`680 > 680` 恒为假，定宽那一遍
+        // 永远不执行 —— 于是卡片 680 宽、里面只有一行高，长段落与代码块全溢出
+        // 到卡片外面（用户报的「文本不换行 / 代码块比浮窗宽」）。
+        //
+        // `max_h` 的截断与滚动不受影响（`MaxContent` 只是不给高度上限）。
         wrap_at: Option<Pixels>,
         window: &mut Window,
         cx: &mut App,
@@ -4457,22 +4459,27 @@ impl TextElement {
         let anchor_y = row_top;
 
         // 量出尺寸以决定放哪边。
-        let mut size = content.layout_as_root(AvailableSpace::min_size(), window, cx);
-        // 超宽且调用方要求换行：再量一遍，宽度钉死，文本按该宽度换行。
-        // paint 用的是**最后一次** layout 的结果，所以这次重算同时修好了
-        // 「长内容渲染不出来」。
-        if let Some(max_w) = wrap_at
-            && size.width > max_w
-        {
-            size = content.layout_as_root(
+        //
+        // 定宽量一遍即可（为什么不能两遍，见上面 `wrap_at` 的注释）：文本按
+        // `max_w` 换行，`paint` 用的就是这次 layout 的结果。
+        //
+        // 「定宽会不会把浮层撑满 `max_w`」—— 不会。浮层是 flex 容器，宽度取
+        // 子内容的 cross size（taffy `determine_container_cross_size` 只用
+        // `known_dimensions` / 各行 cross，不用可用宽度），可用宽度只作为**子内容**
+        // 的约束往下传（`determine_available_space`）。所以短内容仍然只占内容宽；
+        // 超宽内容由卡片自己的 `max_w` 夹到上限，同时子内容拿到 `max_w - padding`
+        // 的定宽去换行。
+        let size = match wrap_at {
+            Some(max_w) => content.layout_as_root(
                 Size {
                     width: AvailableSpace::Definite(max_w),
                     height: AvailableSpace::MaxContent,
                 },
                 window,
                 cx,
-            );
-        }
+            ),
+            None => content.layout_as_root(AvailableSpace::min_size(), window, cx),
+        };
 
         // 视口用**未滚动**的 `viewport`：`bounds` 含滚动偏移，拿它算
         // 「上方/下方放得下」会把判定整体平移一个滚动量。
