@@ -118,6 +118,10 @@ pub enum TerminalBlink {
 }
 const SCROLLBAR_VISIBLE_AFTER_SCROLL: Duration = Duration::from_secs(2);
 const TAB_LABEL_DEBOUNCE_DELAY: Duration = Duration::from_millis(100);
+/// 本地 shell 进程 cwd 后台查询缓存的 TTL（见 `TerminalView::local_process_cwd`）。
+/// 仅 unix：lsof 贵需要节流；windows 的 PEB 读微秒级不走 TTL，每次调用直接刷新。
+#[cfg(not(windows))]
+const PROCESS_CWD_TTL: Duration = Duration::from_secs(2);
 
 /// WSL cwd 轮询的「输出静默窗口」。
 ///
@@ -363,9 +367,9 @@ impl TerminalSearchState {
 
 /// 本地 shell 进程 cwd 的后台刷新缓存。
 ///
-/// 查询走 lsof / /proc 子进程（单次几十至几百毫秒），不能在 UI 线程执行：
-/// 按键（内建命令补全）、标签刷新、拖拽等路径只读缓存，由
-/// [`TerminalView::local_process_cwd`] 在后台线程刷新。
+/// 查询走 PEB 读（windows）/ lsof / /proc 子进程（unix，单次几十至几百
+/// 毫秒），不能在 UI 线程执行：按键（内建命令补全）、标签刷新、拖拽等
+/// 路径只读缓存，由 [`TerminalView::local_process_cwd`] 在后台线程刷新。
 #[derive(Default)]
 struct ProcessCwdCache {
     /// 最近一次后台查询结果
@@ -374,6 +378,9 @@ struct ProcessCwdCache {
     checked_at: Option<Instant>,
     /// 后台查询进行中（同时只允许一个）
     refresh_in_flight: bool,
+    /// 「过期后唤醒补查」已排期（见 `TerminalView::schedule_process_cwd_recheck`）。
+    /// 与 `refresh_in_flight` 一样是防抖位：同一时刻至多一个唤醒任务。
+    recheck_scheduled: bool,
 }
 
 /// 本地前台 agent 的后台检测节流。
@@ -1686,20 +1693,38 @@ impl TerminalView {
             .or_else(|| self.working_directory.clone())
     }
 
-    /// 读取并按需后台刷新本地 shell 进程的实时 cwd（lsof / /proc）。
+    /// 读取并按需后台刷新本地 shell 进程的实时 cwd（PEB / lsof / /proc）。
     ///
     /// 查询移到后台线程：此前按键、标签刷新、拖拽等高频路径在 UI 线程
     /// 同步起 lsof 子进程，单次可达几十到几百毫秒，造成明显卡顿。
-    /// 缓存 2 秒内直接复用；过期且有 pid 时后台刷新一次（in-flight 防抖），
-    /// 期间返回旧值。无 pid（远程终端/尚未启动）也记录时间戳，避免重复进入。
+    /// 节流按平台分：unix 缓存 2 秒内复用（`PROCESS_CWD_TTL`，lsof 贵）；
+    /// windows 的 PEB 读是微秒级、不节流，每次调用都刷（cd 后即时跟随），
+    /// 靠 in-flight 防抖合并并发，期间返回旧值。
+    /// 无 pid（远程终端/尚未启动）也记录时间戳，避免重复进入。
     fn local_process_cwd(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
-        const TTL: Duration = Duration::from_secs(2);
-
+        // windows：TTL 缓存不再节流，每次调用都派一次后台查询。
+        //
+        // cwd 只能靠「问 OS」拿（见上方 doc：PowerShell/cmd 无 OSC 7，
+        // `Set-Location` 不给任何可观测事件）。unix 上这一问是起 lsof
+        // 子进程（几十~几百毫秒），必须 TTL 节流；windows 上只是
+        // OpenProcess + ReadProcessMemory，微秒级——节流换不来什么，
+        // 反而把「cd 后跟随」拖慢到 TTL（prompt 输出到达时 PEB 早已
+        // 更新，立刻查就能拿到新值）。in-flight 防抖保证同时至多一个
+        // 查询，调用再密也只会合并。
+        #[cfg(windows)]
+        let cache_fresh = false;
+        #[cfg(not(windows))]
         let cache_fresh = self
             .process_cwd
             .checked_at
-            .is_some_and(|at| at.elapsed() < TTL);
+            .is_some_and(|at| at.elapsed() < PROCESS_CWD_TTL);
         if cache_fresh || self.process_cwd.refresh_in_flight {
+            // 查询在途时返回旧值（见下）。在途的查询可能在 cd 生效前
+            // 就读走了 PEB，结果会停留在旧目录——排一次「落地后唤醒」
+            // 补查，避免此后再无输出时卡死在旧值。见
+            // `schedule_process_cwd_recheck`。
+            #[cfg(windows)]
+            self.schedule_process_cwd_recheck(cx);
             return self.process_cwd.cwd.clone();
         }
 
@@ -1750,12 +1775,44 @@ impl TerminalView {
                     cwd,
                     checked_at: Some(Instant::now()),
                     refresh_in_flight: false,
+                    // 已排期的「过期后唤醒」可能还在等这次查询落地，别把它清掉
+                    recheck_scheduled: this.process_cwd.recheck_scheduled,
                 };
                 cx.notify();
             });
         })
         .detach();
         self.process_cwd.cwd.clone()
+    }
+
+    /// 查询在途时排一次「落地后唤醒补查」。
+    ///
+    /// windows 上 `local_process_cwd` 每次调用都会派查询（TTL 不再节流），
+    /// 唯一的盲区是「prompt 输出到达时恰有查询在途」：那次查询可能在
+    /// cd 生效前就读走了 PEB，落地结果停在旧目录——此后若再无输出，
+    /// 没有任何东西会再触发查询，标签与文件树就卡死在旧值。这里补一个
+    /// 唤醒：醒来时若查询已落地就立即补派一次（此时 PEB 必然是新值）。
+    ///
+    /// 调用点保证了查询在途（windows 的 `cache_fresh` 恒为 false，
+    /// 走到排程必然是 `refresh_in_flight`），固定短间隔等它落地即可。
+    /// 防抖：同一时刻至多一个唤醒任务（`recheck_scheduled`）；醒来仍在
+    /// 在途就再排一次，落地后的补派会让任务自然终止。
+    #[cfg(windows)]
+    fn schedule_process_cwd_recheck(&mut self, cx: &mut Context<Self>) {
+        if self.process_cwd.recheck_scheduled {
+            return;
+        }
+        self.process_cwd.recheck_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(50))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.process_cwd.recheck_scheduled = false;
+                this.local_process_cwd(cx);
+            });
+        })
+        .detach();
     }
 
     /// 按需后台检测本地前台 agent，结果写回 `Terminal::apply_detected_agent`。
@@ -5613,6 +5670,7 @@ mod tests {
                 cwd: Some(dir.clone()),
                 checked_at: Some(std::time::Instant::now()),
                 refresh_in_flight: false,
+                recheck_scheduled: false,
             };
         });
         let (cwd, _) = view.read_with(cx, |v, cx| v.session_state(cx).file_tree_target());

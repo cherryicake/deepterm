@@ -252,6 +252,60 @@ fn local_shell_name(program: &str) -> Option<&str> {
     Path::new(program).file_name()?.to_str()
 }
 
+/// PowerShell 的 cwd 同步脚本（注入背景见 [`powershell_cwd_sync_args`]）。
+///
+/// 只用单引号、不含双引号：本地终端 `escape_args == false`，参数会被
+/// alacritty 的 `cmdline()` 原样拼进 `CreateProcess` 命令行，外层双引号
+/// 由注入函数自己补，内层也就没有可转义的对象。
+const POWERSHELL_CWD_SYNC_SCRIPT: &str = "$global:__dt_op = $function:prompt; function global:prompt { try { if ($PWD -and $PWD.Provider.Name -eq 'FileSystem') { [System.IO.Directory]::SetCurrentDirectory($PWD.Path) } } catch {}; if ($global:__dt_op) { & $global:__dt_op } else { 'PS ' + $PWD.Path + '> ' } }";
+
+/// Windows 下给 PowerShell 注入 cwd 同步：命中返回注入后的参数，否则返回
+/// [`None`]（调用方保持原样）。
+///
+/// 背景：windows 上本地终端的 cwd 唯一来源是进程 PEB 轮询
+/// （见 `crate::utils::win_process_cwd`）——OSC 7 走不通：alacritty 的
+/// 事件循环独占字节流、没有 `set_current_dir` 处理，PowerShell 自己也不
+/// 发 OSC 7。而 PowerShell 的 `Set-Location` 只改 `$PWD`、**不回写进程
+/// 当前目录**（cmd 的 `cd` 会），于是 PEB 永远停在启动目录：cd 之后 tab
+/// 标签与侧边栏文件树都停在旧路径。修复方式是补 `-NoExit -Command
+/// <脚本>`，把 `prompt` 包一层，每次渲染提示符时用 `$PWD` 回写进程当前
+/// 目录（`[System.IO.Directory]::SetCurrentDirectory` 即 Win32
+/// `SetCurrentDirectoryW`，同步更新 PEB 的 `CurrentDirectory.DosPath`，
+/// 已在真实子进程上实测）。
+///
+/// 包 `prompt` 而不是 `Set-Location`：cd / Push-Location / Pop-Location /
+/// 脚本内切目录，最终都会走到下一次提示符渲染，一处覆盖全部；包 cmdlet
+/// 只能覆盖用户直接调用的那几条。
+///
+/// 已实测的两个顺序前提：`powershell -Command` 时 profile 先加载（我们的
+/// 包装随后覆盖 `prompt`，并把用户的原提示符函数存进
+/// `$global:__dt_op` 继续调用）；非文件系统 provider（`Cert:` 等）与已
+/// 删除目录被 try/catch 吞掉，不会打断提示符。
+fn powershell_cwd_sync_args(program: &str, args: &[String]) -> Option<Vec<String>> {
+    // 仅 windows：unix 的 cwd 由 OSC 7 主动上报，不存在本 bug；不引入
+    // 超出「Windows 兼容」范围的既有行为变更。
+    if !cfg!(windows) {
+        return None;
+    }
+    let name = local_shell_name(program)?;
+    if !matches!(name, "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+        return None;
+    }
+    // 用户已经给了 `-Command` / `-EncodedCommand` / `-File` 时不打扰：
+    // 再追加一份 `-Command` 不是报错就是改变用户意图。
+    if args
+        .iter()
+        .any(|a| matches!(a.as_str(), "-Command" | "-EncodedCommand" | "-File"))
+    {
+        return None;
+    }
+    let mut args = args.to_vec();
+    args.push("-NoExit".to_string());
+    args.push("-Command".to_string());
+    args.push(format!("\"{POWERSHELL_CWD_SYNC_SCRIPT}\""));
+    Some(args)
+}
+
 fn configure_local_shell_integration(
     program: String,
     mut args: Vec<String>,
@@ -260,6 +314,13 @@ fn configure_local_shell_integration(
     let Some(shell_name) = local_shell_name(&program) else {
         return tty::Shell::new(program, args);
     };
+
+    // PowerShell 的 cwd 同步只依赖启动参数、不依赖下面要写的资源文件，
+    // 所以放在资源文件写入之前：写入失败时 zsh/bash 退回默认行为可以
+    // 接受，PowerShell 若跟着退回就又回到「cd 不跟随」的本 bug 了。
+    if let Some(synced) = powershell_cwd_sync_args(&program, &args) {
+        return tty::Shell::new(program, synced);
+    }
 
     let Some(root) = write_local_shell_integration_files() else {
         return tty::Shell::new(program, args);
@@ -1480,10 +1541,16 @@ impl Terminal {
             }
         };
 
+        // 与默认 shell 路径（configure_local_shell_integration）相同的
+        // PowerShell cwd 同步注入（见 powershell_cwd_sync_args）。注入放在
+        // Terminal 层而不是 TerminalView 层：session_state 存的是这里的
+        // 原始 command/args，重连重放时会重新注入一份，不会双重叠加。
+        let args = powershell_cwd_sync_args(command, args).unwrap_or_else(|| args.to_vec());
+
         Self::build_local_terminal(
             cx,
             tty::Options {
-                shell: Some(tty::Shell::new(command.to_string(), args.to_vec())),
+                shell: Some(tty::Shell::new(command.to_string(), args)),
                 working_directory,
                 env: crate::terminal::mappings::default_terminal_env(),
                 ..Default::default()
@@ -7149,5 +7216,72 @@ mod paste_sanitize_tests {
     #[test]
     fn non_ascii_text_is_preserved() {
         assert_eq!(sanitize_pasted_text("中文 ok ✅", false), "中文 ok ✅");
+    }
+}
+
+#[cfg(test)]
+mod powershell_cwd_sync_tests {
+    use super::powershell_cwd_sync_args;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn injects_noexit_command_for_powershell_variants() {
+        for program in [
+            "powershell.exe",
+            "powershell",
+            "pwsh.exe",
+            "pwsh",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+        ] {
+            let out = powershell_cwd_sync_args(program, &[]).expect("PowerShell 应注入 cwd 同步");
+            assert_eq!(out[0], "-NoExit");
+            assert_eq!(out[1], "-Command");
+            // 外层引号必须自带：本地终端 escape_args == false，alacritty 会把
+            // 参数原样拼进 CreateProcess 命令行
+            assert!(
+                out[2].starts_with('"') && out[2].ends_with('"') && out[2].len() > 2,
+                "脚本参数应自带外层双引号"
+            );
+            let script = &out[2][1..out[2].len() - 1];
+            // 脚本内出现双引号会破坏命令行引号结构（无法转义）
+            assert!(!script.contains('"'), "脚本内不能含双引号");
+            assert!(script.contains("SetCurrentDirectory"));
+            assert!(script.contains("function global:prompt"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn leaves_other_shells_and_user_command_args_alone() {
+        assert!(powershell_cwd_sync_args("cmd.exe", &[]).is_none());
+        assert!(powershell_cwd_sync_args("wsl.exe", &[]).is_none());
+        assert!(powershell_cwd_sync_args("bash", &[]).is_none());
+        // 用户自带 -Command / -File 时不打扰
+        assert!(
+            powershell_cwd_sync_args(
+                "powershell.exe",
+                &args(&["-NoProfile", "-Command", "Get-Date"])
+            )
+            .is_none()
+        );
+        assert!(powershell_cwd_sync_args("pwsh.exe", &args(&["-File", "x.ps1"])).is_none());
+        // 无害的用户参数（-NoProfile）仍应注入
+        let out = powershell_cwd_sync_args("powershell.exe", &args(&["-NoProfile"]))
+            .expect("-NoProfile 不该阻止注入");
+        assert_eq!(out[0], "-NoProfile");
+        assert_eq!(out[1], "-NoExit");
+        assert_eq!(out[2], "-Command");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn noop_on_non_windows() {
+        // unix 的 cwd 由 OSC 7 主动上报，注入属于超范围行为变更
+        assert!(powershell_cwd_sync_args("powershell.exe", &[]).is_none());
+        assert!(powershell_cwd_sync_args("pwsh", &[]).is_none());
     }
 }
