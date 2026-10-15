@@ -619,7 +619,7 @@ pub struct InputState {
     ///
     /// 放 `InputState` 而不是 `Editor`：状态栏渲染时从 `file.editor_state`
     /// 读，而进度通知的监听任务也只持有 `Entity<InputState>`。
-    /// `None` = 该文件没有 LSP（远程文件 / 无服务器 / 已禁用）。
+    /// `None` = 这个 tab 不该有 LSP（没有语言、没有可用服务器、或已被禁用）。
     lsp_status: Option<crate::lsp::status::LspStatus>,
     /// 当前 hover 请求代号；见 [`Self::hover_request_generation`]。
     hover_request_generation: u64,
@@ -1244,50 +1244,64 @@ impl InputState {
     ///
     /// 有进行中的进度 → `Working`；全部结束 → 回到 `Ready`
     /// （诊断计数沿用上次 `publishDiagnostics` 的结果）。
+    ///
+    /// 返回 false 表示状态没变（重复送达的同一条进度），调用方据此
+    /// **跳过 `cx.notify()`**：rust-analyzer 索引期每几百毫秒推一条，多数
+    /// 内容不变，而 `notify` 的代价是整棵视图树重建。
     pub fn apply_lsp_progress(
         &mut self,
         token: &lsp_types::ProgressToken,
         value: &lsp_types::WorkDoneProgress,
-    ) {
+    ) -> bool {
         if !self.lsp_progress.apply(token, value) {
-            return;
+            return false;
         }
-        self.refresh_status_from_progress();
-    }
-
-    /// 依据进度表刷新 `lsp_status`。
-    ///
-    /// 保留 `Ready` 上的诊断计数：进度结束不等于诊断清空。
-    fn refresh_status_from_progress(&mut self) {
         use crate::lsp::status::LspStatus;
-
-        if let Some((title, message, percentage)) = self.lsp_progress.representative() {
-            self.lsp_status = Some(LspStatus::Working {
+        let next = match self.lsp_progress.representative() {
+            Some((title, message, percentage)) => Some(LspStatus::Working {
                 title,
                 message,
                 percentage,
-            });
-            return;
-        }
-        // 没有进行中的进度：回到就绪，沿用已有诊断计数。
-        let (errors, warnings) = match self.lsp_status.as_ref() {
-            Some(LspStatus::Ready { errors, warnings }) => (*errors, *warnings),
-            _ => (0, 0),
+            }),
+            // 没有进行中的进度：回到就绪。诊断计数沿用上次 `publishDiagnostics`
+            // 的结果——进度结束不等于诊断清空。
+            None => {
+                let (errors, warnings) = match self.lsp_status.as_ref() {
+                    Some(LspStatus::Ready { errors, warnings }) => (*errors, *warnings),
+                    _ => (0, 0),
+                };
+                Some(LspStatus::Ready { errors, warnings })
+            }
         };
-        self.lsp_status = Some(LspStatus::Ready { errors, warnings });
+        let changed = self.lsp_status != next;
+        if changed {
+            self.lsp_status = next;
+        }
+        changed
     }
 
     /// 记录诊断计数（`Ready` 状态的「实时状态」部分）。
     ///
     /// 正在工作时只记数不切状态——进度条还在跑，不该被诊断覆盖。
-    pub fn set_lsp_diagnostic_counts(&mut self, errors: usize, warnings: usize) {
+    ///
+    /// 返回 false 表示状态没变：计数与上一轮相同（服务器每次改动都重发一遍
+    /// 同样的诊断是常态），或本来就在 `Working` 且没有可覆盖的 `Ready`。
+    /// 调用方据此跳过重绘。
+    pub fn set_lsp_diagnostic_counts(&mut self, errors: usize, warnings: usize) -> bool {
         use crate::lsp::status::LspStatus;
-        if self.lsp_progress.is_empty() {
-            self.lsp_status = Some(LspStatus::Ready { errors, warnings });
-        } else if let Some(LspStatus::Ready { .. }) = self.lsp_status {
-            // 已是 Ready 时补上新计数。
-            self.lsp_status = Some(LspStatus::Ready { errors, warnings });
+        let next = Some(LspStatus::Ready { errors, warnings });
+        // 进度还在跑，且当前态不是 `Ready`（那是 `Working`/`Starting`）：
+        // 只记数不切态，状态一字未动。
+        if !self.lsp_progress.is_empty()
+            && !matches!(self.lsp_status, Some(LspStatus::Ready { .. }))
+        {
+            return false;
         }
+        if self.lsp_status == next {
+            return false;
+        }
+        self.lsp_status = next;
+        true
     }
 
     /// 设置悬浮浮层（锚点 + 内容）。
@@ -4656,6 +4670,16 @@ impl InputState {
             .map(|l| l.line_number_width)
             .unwrap_or(px(0.));
         self.input_bounds.origin.x + gutter
+    }
+
+    /// 这次点击是否落在**正文**上（不在行号栏 / git 色条 / 折叠箭头上）。
+    ///
+    /// 公开给别的使用方：LSP 的 Cmd+Click 跳转要求命中正文，对照 VSCode
+    /// `goToDefinitionAtPosition.ts` 的
+    /// `mouseEvent.target.type === MouseTargetType.CONTENT_TEXT` —— 点在
+    /// gutter 上时那里的语义是「选中整行 / 展开 hunk / 折叠」，不是符号。
+    pub fn click_is_in_text(&self, position: Point<Pixels>) -> bool {
+        self.input_bounds.contains(&position) && position.x >= self.content_left_x()
     }
 
     /// 鼠标位置 → 字节偏移。

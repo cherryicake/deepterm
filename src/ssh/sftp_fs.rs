@@ -287,7 +287,8 @@ impl BlockingSftpSession {
             format!("{path}/")
         };
         self.known_dirs.remove(path);
-        self.known_dirs.retain(|cached| !cached.starts_with(&prefix));
+        self.known_dirs
+            .retain(|cached| !cached.starts_with(&prefix));
     }
 
     pub fn rename(&mut self, from: &str, to: &str) -> anyhow::Result<()> {
@@ -439,13 +440,7 @@ impl BlockingSftpSession {
         cancelled: &AtomicBool,
         progress: Option<&std::sync::atomic::AtomicU64>,
     ) -> anyhow::Result<u64> {
-        self.download_file_with_known_size(
-            remote_path,
-            local_path,
-            None,
-            cancelled,
-            progress,
-        )
+        self.download_file_with_known_size(remote_path, local_path, None, cancelled, progress)
     }
 
     /// 已知源大小的下载入口（跳过阈值判定的 metadata 往返）。
@@ -469,7 +464,13 @@ impl BlockingSftpSession {
             None => self.metadata(remote_path)?.size,
         };
         if size >= Self::PIPELINED_DOWNLOAD_THRESHOLD {
-            return self.download_file_pipelined(remote_path, local_path, size, cancelled, progress);
+            return self.download_file_pipelined(
+                remote_path,
+                local_path,
+                size,
+                cancelled,
+                progress,
+            );
         }
 
         let mut local_file = File::create(local_path)?;
@@ -527,8 +528,8 @@ impl BlockingSftpSession {
         let raw = self.bulk_session()?;
         let config = ParallelTransferConfig::from_env();
         let mut local_file = File::create(local_path)?;
-        let transferred = crate::ssh::shared_runtime::shared_ssh_runtime()
-            .block_on(pipelined_download(
+        let transferred =
+            crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_download(
                 raw,
                 remote_path,
                 size,

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context as _, anyhow};
 
@@ -242,13 +242,8 @@ impl<'a> ParallelUploadPool<'a> {
                 let queue_rx = queue_rx.clone();
                 let done_tx = done_tx.clone();
                 scope.spawn(move || {
-                    let outcome = upload_worker_loop(
-                        index,
-                        &config,
-                        &cancelled,
-                        progress,
-                        &queue_rx,
-                    );
+                    let outcome =
+                        upload_worker_loop(index, &config, &cancelled, progress, &queue_rx);
                     let _ = done_tx.send(outcome);
                 });
             }
@@ -422,7 +417,8 @@ fn upload_worker_inner(
             Err(error) => {
                 // 取消引发的错误不算传输错误（外层统一报取消）：
                 // 先查标志位（结构化判定），字符串比较只作兜底。
-                if cancelled.load(Ordering::Relaxed) || error.to_string() == *TRANSFER_CANCELLED_MSG {
+                if cancelled.load(Ordering::Relaxed) || error.to_string() == *TRANSFER_CANCELLED_MSG
+                {
                     break;
                 }
                 first_error.get_or_insert(error);
@@ -605,12 +601,14 @@ impl DirTransferDriver for RemoteToLocalDirDriver<'_> {
     ) -> anyhow::Result<TransferSummary> {
         // walker 场景：read_dir 条目已带 size，传入后下载函数不再为阈值
         // 判定单独 stat 一次（目录树每文件省一个串行 RTT）。
-        let known = self.current_entry_size.map(|size| sftp_fs::RemoteFileMetadata {
-            kind: RemoteFileKind::File,
-            size,
-            modified_at: None,
-            permissions: None,
-        });
+        let known = self
+            .current_entry_size
+            .map(|size| sftp_fs::RemoteFileMetadata {
+                kind: RemoteFileKind::File,
+                size,
+                modified_at: None,
+                permissions: None,
+            });
         download_remote_file_with_known_metadata(
             self.session,
             source_path,

@@ -36,6 +36,11 @@ polling = "3.11"
 bytes = "1"
 russh-sftp = "2.1.1"
 async-trait = "0.1"
+# 远端 LSP 用：russh channel 的读写是 `tokio::io::AsyncRead/AsyncWrite`，
+# 而 LSP 的帧循环基于 `futures` 的同名 trait。`compat` 提供两个方向的
+# 桥接。该 crate 已在依赖树里（russh-sftp 传递引入），开 feature 不新增
+# 编译单元，只需重编它自己。
+tokio-util = { version = "0.7", features = ["compat"] }
 
 # Credential storage (for secure password/key storage)
 #

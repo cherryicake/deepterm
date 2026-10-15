@@ -15,6 +15,7 @@ pub mod auth;
 pub mod config;
 pub mod host_key;
 pub mod keychain;
+pub mod lsp_channel;
 pub mod platform;
 pub mod port_forward;
 pub mod russh_terminal;

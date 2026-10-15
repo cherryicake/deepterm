@@ -311,6 +311,7 @@ mod tests {
         ServerKey {
             root: std::path::PathBuf::from("/tmp/log-test"),
             language: lang.to_string(),
+            ssh_config: None,
         }
     }
 

@@ -102,6 +102,49 @@ fn first_line_maps_to_line_one() {
     }
 }
 
+/// 用户报的现象：Python 里点 `List[int]` 跳到 `.pyi`，「编辑器不认这个文件」。
+///
+/// `.pyi` 是 Python 的**类型声明存根**（typeshed / stub 包），语法就是 Python。
+/// 语言认不出来（`text`）时掉的不只是高亮：`#` 注释切换没了，LSP 也根本不接
+/// （`start_lsp_for_tab` 见 language 为空/`text` 就 return，连状态栏 chip 都不出现），
+/// 于是跳转的落点看起来像个「打不开的二进制」。
+#[test]
+fn type_stubs_are_python_not_text() {
+    for name in ["typing.pyi", "_collections_abc.pyi", "/x/y/stub.pyi"] {
+        let got = super::guess_language_from_extension(std::path::Path::new(name));
+        assert_eq!(got, "python", "{name} 是 Python 存根，得按 python 打开");
+    }
+    // 反向：`.py` 当然还是 python，别的语言不受影响。
+    assert_eq!(
+        super::guess_language_from_extension(std::path::Path::new("main.py")),
+        "python"
+    );
+    assert_eq!(
+        super::guess_language_from_extension(std::path::Path::new("lib.rs")),
+        "rust"
+    );
+}
+
+/// 跳转归属表的键**含主机**：`/srv/app/main.py` 在两台主机上是两个文件，
+/// 各自的服务器也是两个进程——键撞了就会让一台主机的根把另一台的顶掉。
+/// 这与 `ServerKey` 用 `(root, language, 主机)` 认身份是同一个理由。
+#[test]
+fn jump_root_key_keeps_the_host_in_it() {
+    use crate::ssh::{AuthMethod, SshConnectionConfig};
+    let a = SshConnectionConfig::new("10.0.0.1", "u", AuthMethod::Agent);
+    let b = SshConnectionConfig::new("10.0.0.2", "u", AuthMethod::Agent);
+    let local = super::lsp_jump_root_key("/srv/app/main.py", None);
+    let ka = super::lsp_jump_root_key("/srv/app/main.py", Some(&a));
+    let kb = super::lsp_jump_root_key("/srv/app/main.py", Some(&b));
+    assert_eq!(
+        local,
+        super::lsp_jump_root_key("/srv/app/main.py", None),
+        "本地文件的键要稳定（同一路径命中同一条记录）"
+    );
+    assert_ne!(ka, kb, "同路径不同主机必须是两个键");
+    assert_ne!(ka, local, "远端与本地不能混用一条记录");
+}
+
 // ------------------------------------------------ prepareRename 错误分类
 
 /// 服务器**明确拒绝**重命名时要能识别出来。
@@ -339,4 +382,251 @@ fn same_file_jump_moves_cursor(cx: &mut gpui::TestAppContext) {
             .expect("file must be open");
         assert_eq!(pos.0, 30, "same-file jump must move the cursor to line 30");
     });
+}
+
+/// 跳转必须把**键盘焦点**也带到目标文件上。
+///
+/// 用户报的原话是「直接打开代码文件就完事了，光标焦点也没有跳转过去」。
+/// 光设 `selected_range` 不够：选区与光标的绘制都以 focus 为门
+/// （`components/input/element.rs`），没聚焦的标签里那个选区**根本画不出来**，
+/// 按键也还打到原来那个文件。上面两条断言光标行列的测试早就存在，正是
+/// 因为它们不看焦点，这个缺陷一直隐形。
+///
+/// 对照 VSCode：`openCodeEditor` 不带 `preserveFocus`，目标分组被激活。
+#[gpui::test]
+fn jump_focuses_the_target_editor(cx: &mut gpui::TestAppContext) {
+    super::with_lsp_disabled(|| {
+        let (editor, cx) = editor_ctx(cx);
+        let dir = std::env::temp_dir().join("deepterm-lsp-jump-focus");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 源文件（跳转从这里发起）与目标文件。
+        let source = dir.join("source.rs");
+        std::fs::write(&source, "// from here\n").unwrap();
+        let target = dir.join("defs.rs");
+        let mut body = String::new();
+        for i in 1..=19 {
+            body.push_str(&format!("// filler line {i}\n"));
+        }
+        body.push_str("fn target_function() {}\n");
+        std::fs::write(&target, &body).unwrap();
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.open_file(source.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let location = Location {
+            uri: Url::from_file_path(&target).unwrap(),
+            range: Range::new(Position::new(19, 3), Position::new(19, 18)),
+        };
+        editor.update_in(cx, |editor, window, cx| {
+            editor.open_lsp_location_for_test(&location, window, cx);
+        });
+        cx.run_until_parked();
+
+        let focused = editor.update_in(cx, |editor, window, cx| {
+            editor.is_text_editor_of_path_focused(&target, window, cx)
+        });
+        assert!(focused, "跨文件跳转后焦点必须在目标文件的编辑器上");
+
+        // 源文件的编辑器同时失去焦点（否则「接着敲键打进原文件」还会复现）。
+        let source_focused = editor.update_in(cx, |editor, window, cx| {
+            editor.is_text_editor_of_path_focused(&source, window, cx)
+        });
+        assert!(!source_focused, "跳转后焦点不能还留在发起跳转的文件里");
+    });
+}
+
+// ---------------------------------------------------------------- Cmd+Click
+
+/// 构造一次鼠标按下（只有这里关心的三个维度有意义）。
+fn mouse_down(
+    button: gpui::MouseButton,
+    click_count: usize,
+    modifiers: gpui::Modifiers,
+) -> gpui::MouseDownEvent {
+    gpui::MouseDownEvent {
+        position: gpui::point(gpui::px(40.), gpui::px(40.)),
+        button,
+        click_count,
+        modifiers,
+        first_mouse: false,
+    }
+}
+
+/// Cmd+Click（其余平台 Ctrl+Click）触发跳转定义。
+///
+/// 用 `Modifiers::secondary_key()` 而不是手写字段：gpui 里这个谓词就是
+/// 「macOS 的 Cmd / 其余平台的 Ctrl」，与 VSCode 的触发键一致，测试因此
+/// 在两个平台上都成立。
+#[test]
+fn secondary_click_triggers_goto_definition() {
+    let event = mouse_down(gpui::MouseButton::Left, 1, gpui::Modifiers::secondary_key());
+    assert!(
+        super::is_goto_definition_click(&event),
+        "Cmd/Ctrl + 单次左键按下必须触发跳转"
+    );
+}
+
+/// 普通点击、右键、双击/三击都不触发。
+///
+/// 对照 VSCode `clickLinkGesture`：`isLeftClick` 与 `event.detail <= 1`
+/// ——双击是选词、三击是选行，让它们顺手跳一次转会打断正常选择。
+#[test]
+fn ordinary_clicks_do_not_trigger_goto_definition() {
+    let secondary = gpui::Modifiers::secondary_key();
+    for case in [
+        (
+            "plain left click",
+            mouse_down(gpui::MouseButton::Left, 1, gpui::Modifiers::none()),
+            "没有修饰键的点击只是移动光标",
+        ),
+        (
+            "secondary right click",
+            mouse_down(gpui::MouseButton::Right, 1, secondary.clone()),
+            "右键是上下文菜单",
+        ),
+        (
+            "secondary double click",
+            mouse_down(gpui::MouseButton::Left, 2, secondary.clone()),
+            "双击选词，不该跳转",
+        ),
+        (
+            "secondary triple click",
+            mouse_down(gpui::MouseButton::Left, 3, secondary),
+            "三击选行，不该跳转",
+        ),
+    ] {
+        let (what, event, why) = case;
+        assert!(!super::is_goto_definition_click(&event), "{what}: {why}");
+    }
+}
+
+/// Alt / Shift 单独按住不触发跳转（VSCode 把 Alt+Click 留给 declaration，
+/// 且它的触发键判定只看 Cmd/Ctrl）。
+#[test]
+fn other_modifiers_do_not_trigger_goto_definition() {
+    for modifiers in [gpui::Modifiers::alt(), gpui::Modifiers::shift()] {
+        let event = mouse_down(gpui::MouseButton::Left, 1, modifiers);
+        assert!(
+            !super::is_goto_definition_click(&event),
+            "单按 Alt/Shift 不该跳转定义"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- 状态栏 chip
+
+/// 未启动态必须显示**服务器名**，而不是「未启动」三个字。
+///
+/// 这是「默认关闭 + 可发现开启入口」这个产品决策的测试锚点：默认关闭时
+/// 每个新打开的代码文件都停在这个态，chip 上写什么决定了用户知不知道
+/// 「这个文件本来可以接 rust-analyzer、点它能开」。写成「未启动」用户只
+/// 知道没开，不知道该开什么、更不知道怎么开。
+#[gpui::test]
+fn not_started_chip_shows_the_server_name(_cx: &mut gpui::TestAppContext) {
+    let (label, tone) = super::lsp_chip_content(
+        &crate::lsp::status::LspStatus::NotStarted,
+        Some("rust-analyzer"),
+    );
+    assert_eq!(label, "rust-analyzer");
+    assert_eq!(tone, super::LspChipTone::Dim);
+}
+
+/// 没有可用服务器的语言不该出现「未启动」字样占位。
+///
+/// `start_lsp_for_tab` 只在 `language_has_server_on` 为真时才写 `NotStarted`，
+/// 这条守的是万一那个门控失效时的兜底文案。
+#[gpui::test]
+fn not_started_without_a_server_name_falls_back(_cx: &mut gpui::TestAppContext) {
+    let (label, _) = super::lsp_chip_content(&crate::lsp::status::LspStatus::NotStarted, None);
+    assert_eq!(label, "未启动");
+}
+
+/// 诊断计数要走灯色，不走文字。
+///
+/// 用户扫一眼颜色就知道有没有问题，不用读字——这是 chip 从「就绪」改成
+/// 「服务器名 + 灯」的初衷。断言 tone 而不是渲染结果，是因为 tone 就是
+/// 灯色的唯一来源。
+#[gpui::test]
+fn diagnostic_counts_pick_the_lamp_colour(_cx: &mut gpui::TestAppContext) {
+    let ok = super::lsp_chip_content(
+        &crate::lsp::status::LspStatus::Ready {
+            errors: 0,
+            warnings: 0,
+        },
+        Some("gopls"),
+    );
+    assert_eq!(ok, ("gopls".to_string(), super::LspChipTone::Ok));
+
+    let warn = super::lsp_chip_content(
+        &crate::lsp::status::LspStatus::Ready {
+            errors: 0,
+            warnings: 3,
+        },
+        Some("gopls"),
+    );
+    assert_eq!(warn.1, super::LspChipTone::Warning);
+
+    let err = super::lsp_chip_content(
+        &crate::lsp::status::LspStatus::Ready {
+            errors: 2,
+            warnings: 3,
+        },
+        Some("gopls"),
+    );
+    // 错误优先于警告：有错误时不该显示成「警告」的黄色。
+    assert_eq!(err.1, super::LspChipTone::Error);
+}
+
+/// 失败必须把原因显示出来。
+///
+/// 失败是唯一「用户必须读文字」的态——灯只能表示「坏了」，不能表示
+/// 「为什么坏」。
+#[gpui::test]
+fn failure_shows_its_reason(_cx: &mut gpui::TestAppContext) {
+    let (label, tone) = super::lsp_chip_content(
+        &crate::lsp::status::LspStatus::Failed {
+            reason: "rust-analyzer 启动失败".into(),
+        },
+        Some("rust-analyzer"),
+    );
+    assert!(label.contains("rust-analyzer 启动失败"), "got {label}");
+    assert_eq!(tone, super::LspChipTone::Error);
+}
+
+/// **有错误也点灯**：灯意味着「有个进程活着」，跟诊断计数无关。
+///
+/// 用户报的现象：Rust 文件前有个绿点，Python 文件前什么都没有——而两者
+/// 都在 `Ready`。差别只在诊断计数：`Ready { errors > 0 }` 归到 `Error` 档，
+/// 而 `Error` 档当时顺手关掉了灯。于是最需要被看见的状态反而唯一没有灯，
+/// 看起来就像「Python 的 LSP 根本没起来」（实测 basedpyright 报了 59 条）。
+#[gpui::test]
+fn errors_still_light_the_lamp(_cx: &mut gpui::TestAppContext) {
+    use crate::lsp::status::LspStatus;
+
+    // 有错误：红点，不是没有点。
+    assert!(super::lsp_chip_shows_lamp(&LspStatus::Ready {
+        errors: 59,
+        warnings: 0
+    }));
+    // 干净就绪 / 用户停止：都点灯（颜色不同而已）。
+    assert!(super::lsp_chip_shows_lamp(&LspStatus::Ready {
+        errors: 0,
+        warnings: 0
+    }));
+    assert!(super::lsp_chip_shows_lamp(&LspStatus::Stopped));
+
+    // 不点灯的三种：没有进程（未启动 / 失败），或进程在忙（画转圈）。
+    assert!(!super::lsp_chip_shows_lamp(&LspStatus::NotStarted));
+    assert!(!super::lsp_chip_shows_lamp(&LspStatus::Failed {
+        reason: "x".into()
+    }));
+    assert!(!super::lsp_chip_shows_lamp(&LspStatus::Starting));
+    assert!(!super::lsp_chip_shows_lamp(&LspStatus::Working {
+        title: "Indexing".into(),
+        message: None,
+        percentage: Some(50),
+    }));
 }

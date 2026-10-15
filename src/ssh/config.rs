@@ -292,6 +292,7 @@ impl SshConnectionConfig {
 }
 
 /// 认证方式
+///
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "auth_type", content = "auth_data")]
 #[serde(rename_all = "snake_case")]

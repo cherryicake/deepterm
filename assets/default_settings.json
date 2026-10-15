@@ -31,7 +31,7 @@
     "relative_line_numbers": false
   },
   "lsp": {
-    "enabled": true,
+    "enabled": false,
     "servers": {}
   }
 }

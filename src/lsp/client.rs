@@ -118,15 +118,35 @@ impl LspClient {
         logger: Option<std::sync::Arc<dyn LogSink>>,
     ) -> Result<Self> {
         let conn = Connection::spawn(program, args, logger).await?;
+        Self::handshake(conn, root).await
+    }
+
+    /// 在一条**已就绪的连接**上完成 `initialize` / `initialized` 握手。
+    ///
+    /// 本地（子进程）与远端（SSH channel）共用：握手只关心「怎么把帧发过去、
+    /// 怎么把应答读回来」，不关心底层是管道还是 channel。拆出来正是为了让
+    /// 「拿连接」成为本地与远端唯一的差异点。
+    ///
+    /// `root` 是服务器视角的工作区根：本地是本地路径，远端是**远端**路径
+    /// （`root_uri` 会变成 `file:///remote/...`，服务器那侧读得到）。
+    pub(crate) async fn handshake(conn: Connection, root: PathBuf) -> Result<Self> {
         let conn = Arc::new(conn);
 
         let root_uri = path_to_uri(&root)?;
+        // 远端连接**不报本地 pid**：`processId` 的语义是「父进程 pid」，本地
+        // 那个数在那台机器上要么不存在、要么恰好撞上别人的进程（规范对这个
+        // 情形给的值就是 `null`）。必须在 `conn` 被 move 进 `request` 之前取。
+        let process_id = if conn.is_remote() {
+            None
+        } else {
+            Some(std::process::id())
+        };
         #[allow(deprecated)]
         // `root_uri` 被标为 deprecated（推荐 `workspace_folders`），但大量
         // 现役服务器（gopls 的旧版本、clangd、jdtls）仍只读它——
         // 不给的话它们会退化成「无工作区」而拒绝分析。两个都给。
         let params = InitializeParams {
-            process_id: Some(std::process::id()),
+            process_id,
             root_uri: Some(root_uri.clone()),
             // 部分旧服务器只读 `rootPath`。
             #[allow(deprecated)]
@@ -933,8 +953,59 @@ impl LspClient {
     }
 
     /// 服务器子进程 pid（测试用来确认退出后没有孤儿进程）。
+    ///
+    /// 远端连接返回 `None`：服务器跑在另一台机器上，没有本地 pid 可读，
+    /// 状态栏的「内存占用」一栏对远端服务器因此留空。
     pub fn connection_pid(&self) -> Option<u32> {
         self.conn.child_pid()
+    }
+
+    /// 在远端 SSH 主机上启动语言服务器并完成握手。
+    ///
+    /// 与 [`Self::start`] 的差别只在「连接怎么来」：这里经 SSH 在远端
+    /// `exec` 服务器进程，把它的 stdio 架在 channel 上。握手、文档同步、
+    /// 各类请求与本地完全同一条代码路径。
+    ///
+    /// `root` 是**远端**视角的工作区根（服务器在那台机器上跑，
+    /// 看到的路径就是远端的路径）。
+    ///
+    /// # 失败分级
+    ///
+    /// 三类失败给不同信息，因为对用户的行动指引完全不同：
+    /// 1. 远端找不到服务器命令 → 要去那台机器上装，或配置里给绝对路径；
+    /// 2. SSH 连不上 / 认证失败 → 连接问题，与 LSP 无关；
+    /// 3. 握手超时 → 服务器起来了但不答，多半是 PATH 或工作区根不对。
+    pub(crate) async fn start_remote(
+        config: &crate::ssh::SshConnectionConfig,
+        program: &str,
+        args: &[String],
+        root: PathBuf,
+        logger: Option<std::sync::Arc<dyn LogSink>>,
+    ) -> Result<Self> {
+        // 先把命令解析成远端绝对路径：`channel.exec` 走的是**非登录** shell，
+        // PATH 与用户终端里看到的不一样（rustup 的 ~/.cargo/bin 通常不在其中）。
+        // 不解析的话按名字 exec 会以 127 失败，而用户手敲同一条命令完全正常。
+        let resolved = crate::ssh::lsp_channel::resolve_remote_binary(config, program)?;
+
+        let process = crate::ssh::lsp_channel::RemoteLspProcess::connect(
+            config,
+            &resolved.to_string_lossy(),
+            args,
+        )
+        .await
+        .map_err(|e| {
+            // 连不上 / 起不来 channel 属于「问不到这台机器」，不是「这台机器
+            // 没装服务器」——启动路径靠这个区分决定要不要拉黑（见
+            // `crate::lsp::project::ServerTable::finish_retryable`）。
+            e.context(crate::ssh::lsp_channel::RemoteUnreachable::new(
+                config, program,
+            ))
+        })?;
+
+        // 连接建好后服务器其实已经在远端跑起来了；若握手失败，`Connection` 的
+        // `Drop` 会负责断开，不会留下孤儿 channel。
+        let conn = crate::lsp::jsonrpc::Connection::spawn_over_channel(process, logger)?;
+        Self::handshake(conn, root).await
     }
 }
 
