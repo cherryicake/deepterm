@@ -4984,15 +4984,19 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         _range: Option<std::ops::Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pause_blink(cx);
         self.clear_marked_text(cx);
-        if self.route_text_to_builtin_command(text, cx) {
-            return;
+        if !self.route_text_to_builtin_command(text, cx) {
+            self.commit_text(text, cx);
         }
-        self.commit_text(text, cx);
+        // 对齐上游 zed（TerminalInputHandler::replace_text_in_range）：
+        // 提交后光标已前移，把 IME 坐标刷到新光标处。候选窗跨提交保持
+        // 打开的输入法（如微软拼音连续输入）会复用上一次的位置，不刷
+        // 就会贴回旧光标。
+        window.invalidate_character_coordinates();
     }
 
     /// Called during IME composition to update the pre-edit text.
@@ -5021,8 +5025,15 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // Only return bounds during active IME composition
-        self.ime_state.as_ref()?;
+        // 不能按「ime_state 是否已有值」过滤：Windows 的
+        // `WM_IME_STARTCOMPOSITION` 只在组合开始时**一次性**查询本方法
+        // （gpui_windows：`handle_ime_position` → `ImmSetCandidateWindow`），
+        // 而那时刻第一条 preedit 还没到达、ime_state 必为 None——若在此
+        // 返回 None，候选窗就永远不会被定位，退到 IME 默认的屏幕右下角。
+        // macOS 的 `firstRectForCharacterRange:` 是组合期间反复查询的，
+        // preedit 到达后自然命中，所以同样的门槛在 mac 上看不出问题。
+        // 上游 zed 的 `TerminalInputHandler::bounds_for_range` 同样不设
+        // 门槛，始终返回光标单元格位置。
         self.terminal.update(cx, |terminal, _cx| {
             let content = terminal.last_content();
             let bounds = terminal.terminal_bounds;
@@ -5682,6 +5693,58 @@ mod tests {
             label.contains("dt-ft-cache"),
             "tab 标签应包含 cwd，实际={label:?}"
         );
+    }
+
+    /// 组合尚未开始（`ime_state` 为 None）时，`bounds_for_range` 也必须能给出
+    /// 光标单元格位置——这正是 Windows `WM_IME_STARTCOMPOSITION` 的查询时刻
+    /// （gpui_windows：`handle_ime_position` → `ImmSetCandidateWindow`，全程只查
+    /// 这一次）。若此处返回 None，候选窗就永远不会被定位，退到 IME 默认的
+    /// 屏幕右下角。macOS 的 `firstRectForCharacterRange:` 是组合期间反复查询的，
+    /// preedit 到达后自然命中，所以同样的门槛在 mac 上看不出问题。
+    #[gpui::test]
+    fn ime_bounds_available_before_composition_starts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        let bounds = TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(360.0), px(160.0))),
+        );
+        view.update(cx, |view, cx| {
+            view.terminal.update(cx, |terminal, cx| {
+                terminal.resize(bounds, 1.0, cx);
+            });
+        });
+
+        // 前提：组合尚未开始——复现 WM_IME_STARTCOMPOSITION 的时序。
+        assert!(
+            view.read_with(cx, |v, _| v.ime_state.is_none()),
+            "测试前提：尚无 IME 组合状态"
+        );
+
+        let cursor_bounds = view
+            .downgrade()
+            .update_in(cx, |view, window, cx| {
+                view.bounds_for_range(0..0, Bounds::default(), window, cx)
+            })
+            .expect("窗口上下文应可用")
+            .expect(
+                "组合开始前就应能给出光标位置，否则 Windows 的 ImmSetCandidateWindow \
+                 永远不会被调用，候选窗停留在屏幕右下角",
+            );
+        assert_eq!(
+            cursor_bounds.origin,
+            point(px(0.0), px(0.0)),
+            "光标在网格 (0, 0)，位置即候选窗锚点"
+        );
+        assert_eq!(cursor_bounds.size, size(px(9.0), px(16.0)), "一格单元格");
     }
 
     /// 搜索全链路（输入 → 后台比对 → 回写 → 内容漂移后重算）。
