@@ -45,12 +45,16 @@ const REMOTE_ZSH_INTEGRATION: &str =
     include_str!("../../assets/shell-integration/zsh/deepterm-integration");
 
 fn append_remote_file(script: &mut String, path: &str, marker: &str, content: &str) {
+    // 行尾归一化：Windows（core.autocrlf=true）下 `include_str!` 嵌入的脚本
+    // 可能带 CRLF，直接 heredoc 上传会让远端 bash/zsh 报
+    // `$'\r': command not found`。
+    let content = crate::utils::shell::normalize_line_endings(content);
     script.push_str("cat > ");
     script.push_str(path);
     script.push_str(" <<'");
     script.push_str(marker);
     script.push_str("'\n");
-    script.push_str(content);
+    script.push_str(&content);
     if !content.ends_with('\n') {
         script.push('\n');
     }
@@ -412,6 +416,23 @@ mod tests {
             .find("case \"$__deepterm_shell_name\"")
             .expect("bootstrap 应有 case 分支");
         assert!(at < exec_case, "KITTY_WINDOW_ID 的导出必须发生在 exec 之前");
+    }
+
+    /// 回归：Windows 上 `core.autocrlf=true` 会把 shell integration 资源以
+    /// CRLF 检出，`include_str!` 原样嵌入 bootstrap 后，远端 bash 报
+    /// `$'\r': command not found`。bootstrap 与其中嵌入的脚本必须只有 LF。
+    ///
+    /// 不依赖 `/bin/sh`（Windows 开发机也能跑），与上方 unix-only 的
+    /// `remote_shell_tracking_command_is_posix_shell_parseable` 互补。
+    #[test]
+    fn remote_shell_tracking_command_has_no_carriage_returns() {
+        for cwd in [None, Some("/tmp/deepterm cwd")] {
+            let command = remote_shell_tracking_command(cwd);
+            assert!(
+                !command.contains('\r'),
+                "bootstrap（cwd={cwd:?}）不应包含 CR：CRLF 会破坏远端 shell 解析"
+            );
+        }
     }
 
     #[test]

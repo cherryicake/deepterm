@@ -1,0 +1,6 @@
+# shell 集成资源会被 include_str! 原样嵌入 Rust 二进制，并写入本地临时目录或
+# 通过 heredoc 上传到远端，由本地/远端 Un*x shell 直接解析执行。
+# Windows 上 core.autocrlf=true 会把它们以 CRLF 检出，带 \r 的脚本会让
+# bash/zsh 报 `$'\r': command not found`、`未预期的记号 "$'do\r'"`。
+# 仓库内始终保持 LF，并强制所有平台以 LF 检出。
+assets/shell-integration/** text eol=lf

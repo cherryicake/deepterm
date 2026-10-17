@@ -492,6 +492,10 @@ fn write_local_shell_integration_files() -> Option<PathBuf> {
     ];
 
     for (path, content) in integration_files {
+        // 行尾归一化：Windows（core.autocrlf=true）下 `include_str!` 嵌入的
+        // 脚本可能带 CRLF，本地 git-bash 等 Un*x shell 会报
+        // `$'\r': command not found`（与远端 bootstrap 同一问题）。
+        let content = crate::utils::shell::normalize_line_endings(content);
         // 脚本只允许属主读写（0600），防止被同机其他用户篡改
         #[cfg(unix)]
         {
@@ -508,7 +512,7 @@ fn write_local_shell_integration_files() -> Option<PathBuf> {
                 .ok()?;
         }
         #[cfg(not(unix))]
-        fs::write(&path, content).ok()?;
+        fs::write(&path, content.as_bytes()).ok()?;
     }
 
     Some(root)
