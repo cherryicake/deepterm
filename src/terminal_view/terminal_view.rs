@@ -767,6 +767,37 @@ fn read_installed_state_offline(
     }
 }
 
+/// 「用指定命令（重新）启动本地会话」时，把目标目录翻译成
+/// `(启动参数, 宿主进程 cwd)`。
+///
+/// - 非 WSL：目标目录直接作为新进程的 cwd；`None` 退回家目录（保持
+///   [`TerminalView::new_with_command`] 的历史行为）。
+/// - WSL：目录在 Linux 侧，不能当 Windows 进程 cwd（`CreateProcessW` 收到
+///   `/home/...` 直接失败），翻译成 `wsl.exe --cd <dir>` 参数；拿不到
+///   Linux 路径时保持原参数（picker 写的默认起点 `--cd ~`）。
+///
+/// WSL 分支用 `cfg!(windows)` 把关——见 [`crate::utils::wsl::is_wsl_command`]
+/// 的文档契约：非 Windows 上恰好叫 `wsl` 的程序是普通 shell，给它换 `--cd`
+/// 或丢掉进程 cwd 都是凭空改变行为。
+///
+/// 复制 / 重连本地标签都走这里，保证「新会话起点 = 源标签当前目录」在
+/// 两类会话上语义一致（见 `handle_tab_duplicate` / `reconnect_terminal`）。
+fn plan_local_session_startup(
+    command: &str,
+    args: &[String],
+    working_directory: Option<PathBuf>,
+) -> (Vec<String>, Option<PathBuf>) {
+    if cfg!(windows) && crate::utils::wsl::is_wsl_command(command) {
+        let args = match working_directory.as_deref().and_then(|p| p.to_str()) {
+            Some(cwd) => crate::utils::wsl::args_with_cd(args, cwd),
+            None => args.to_vec(),
+        };
+        (args, None)
+    } else {
+        (args.to_vec(), working_directory.or_else(dirs::home_dir))
+    }
+}
+
 impl TerminalView {
     /// 处理 SSH 连接异常断开事件
     fn handle_ssh_abnormal_disconnect(&self, cx: &mut Context<Self>) {
@@ -1251,22 +1282,25 @@ impl TerminalView {
         )
     }
 
-    /// 使用指定命令创建新的本地终端
+    /// 使用指定命令创建新的本地终端（起点目录可继承：复制 / 重连标签）。
     ///
     /// # 参数
     ///
     /// * `cx` - GPUI 上下文
     /// * `command` - 要执行的命令（如 "powershell.exe", "cmd.exe", "wsl.exe"）
     /// * `args` - 命令参数
-    pub fn new_with_command(cx: &mut App, command: &str, args: &[String]) -> Entity<Self> {
+    /// * `working_directory` - **宿主进程侧**起点目录；`None` 时非 WSL 会话
+    ///   退回用户家目录，WSL 会话保持参数里自己的起点（picker 写的 `--cd ~`）。
+    ///   WSL 的 Linux cwd 由 [`plan_local_session_startup`] 翻译成
+    ///   `wsl.exe --cd` 参数，不会当 Windows 进程 cwd 传给 conpty。
+    pub fn new_with_command(
+        cx: &mut App,
+        command: &str,
+        args: &[String],
+        working_directory: Option<PathBuf>,
+    ) -> Entity<Self> {
         let command_string = command.to_string();
-        let args_vec: Vec<String> = args.to_vec();
-        // WSL 不传递工作目录，让它默认进入 home 目录
-        let working_dir = if command.contains("wsl") {
-            None
-        } else {
-            dirs::home_dir()
-        };
+        let (args_vec, working_dir) = plan_local_session_startup(command, args, working_directory);
         let terminal =
             Terminal::new_with_command(cx, working_dir.clone(), &command_string, &args_vec);
         Self::create_terminal_view(
@@ -5648,6 +5682,48 @@ mod tests {
     use crate::terminal::Terminal;
     use crate::terminal::terminal::TerminalBounds;
     use gpui::{TestAppContext, size};
+
+    /// 复制 / 重连本地标签时，新会话的起点跟着源标签走（见
+    /// [`plan_local_session_startup`]）。
+    ///
+    /// 回归：「复制标签页」对 picker 创建的命令型标签（PowerShell/CMD 等）
+    /// 曾直接丢弃 cwd、固定在家目录启动——`handle_tab_duplicate` 走到了
+    /// 不接收目录的 `create_local_terminal_with_command`。
+    #[test]
+    fn local_restart_plan_keeps_the_source_cwd_for_command_tabs() {
+        let shell_args = vec!["-NoLogo".to_string()];
+        let (args, cwd) = plan_local_session_startup(
+            "powershell.exe",
+            &shell_args,
+            Some(PathBuf::from(r"D:\work\proj")),
+        );
+        assert_eq!(args, shell_args);
+        assert_eq!(cwd.as_deref(), Some(std::path::Path::new(r"D:\work\proj")));
+    }
+
+    /// WSL 会话的目录在 Linux 侧，不能当宿主进程 cwd（`CreateProcessW`
+    /// 收到 `/home/...` 直接失败），翻译进 `wsl.exe --cd`；进程 cwd 必须
+    /// 保持 `None`。WSL 分支只在 Windows 上生效（见 `is_wsl_command` 的
+    /// 文档契约），所以与上一条分开、单独门控——否则 macOS CI 上必挂。
+    #[test]
+    #[cfg(windows)]
+    fn local_restart_plan_translates_wsl_cwd_into_cd_argument() {
+        let to_vec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let wsl_args = to_vec(&["-d", "Ubuntu-24.04", "--cd", "~"]);
+
+        let (args, cwd) =
+            plan_local_session_startup("wsl.exe", &wsl_args, Some(PathBuf::from("/home/you/proj")));
+        assert!(cwd.is_none(), "WSL 的 Linux 路径不能当宿主进程 cwd");
+        assert_eq!(
+            args,
+            to_vec(&["-d", "Ubuntu-24.04", "--cd", "/home/you/proj"])
+        );
+
+        // 拿不到 Linux cwd 时保持 picker 的默认起点参数（--cd ~）。
+        let (args, cwd) = plan_local_session_startup("wsl.exe", &wsl_args, None);
+        assert_eq!(args, wsl_args);
+        assert!(cwd.is_none());
+    }
 
     /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。
     ///

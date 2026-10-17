@@ -379,6 +379,10 @@ impl Panel {
     }
 
     /// Creates a new panel with a terminal view using a specific command.
+    ///
+    /// `working_directory` 是宿主侧起点目录（复制 / 重连标签继承来源标签的
+    /// 当前目录）；WSL 的 Linux cwd 由 [`TerminalView::new_with_command`]
+    /// 翻译成 `wsl.exe --cd` 参数。
     pub fn with_terminal_command(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -386,10 +390,11 @@ impl Panel {
         active_tab_label: Option<SharedString>,
         command: &str,
         args: &[String],
+        working_directory: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = TerminalView::new_with_command(cx, command, args);
+        let terminal_view = TerminalView::new_with_command(cx, command, args, working_directory);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self::new_common(
             panel_id,
@@ -464,7 +469,9 @@ impl Panel {
             TerminalSessionState::Local { cwd, command, args } => {
                 log::info!("重新启动面板 {} 的本地会话", self.panel_id);
                 if let Some(cmd) = command {
-                    TerminalView::new_with_command(cx, cmd, args)
+                    // 命令型标签（picker 选的 PowerShell/CMD/WSL）也要回到当前
+                    // 目录：此前直接走 `new_with_command`，cwd 被丢在家目录。
+                    TerminalView::new_with_command(cx, cmd, args, cwd.clone().map(PathBuf::from))
                 } else {
                     TerminalView::new_with_working_directory(
                         cx,
@@ -515,16 +522,36 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         match &state.content {
-            PanelContentSessionState::Terminal(TerminalSessionState::Local { cwd, .. }) => {
+            PanelContentSessionState::Terminal(TerminalSessionState::Local {
+                cwd,
+                command,
+                args,
+            }) => {
                 let working_directory = cwd.as_ref().map(PathBuf::from);
-                Self::with_terminal_working_directory(
-                    state.id.clone(),
-                    workspace_id,
-                    active_tab_id,
-                    active_tab_label,
-                    working_directory,
-                    cx,
-                )
+                match command {
+                    // 命令型标签（picker 里的 PowerShell / CMD / WSL）：恢复时
+                    // 保持原命令与起点，丢掉它会把 CMD/WSL 标签换成默认 shell；
+                    // WSL 更糟——Linux cwd 会被当 Windows 进程 cwd 交给 conpty，
+                    // 直接起不来（见 `plan_local_session_startup`）。
+                    Some(cmd) => Self::with_terminal_command(
+                        state.id.clone(),
+                        workspace_id,
+                        active_tab_id,
+                        active_tab_label,
+                        cmd,
+                        args,
+                        working_directory,
+                        cx,
+                    ),
+                    None => Self::with_terminal_working_directory(
+                        state.id.clone(),
+                        workspace_id,
+                        active_tab_id,
+                        active_tab_label,
+                        working_directory,
+                        cx,
+                    ),
+                }
             }
             PanelContentSessionState::Terminal(TerminalSessionState::Ssh {
                 remote_cwd, ..

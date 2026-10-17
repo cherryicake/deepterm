@@ -2031,6 +2031,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.create_local_terminal_with_command_and_working_directory(
+            command, args, None, window, cx,
+        );
+    }
+
+    /// 使用指定命令与起始目录创建本地终端Tab（复制 / 重连标签的起点继承）。
+    ///
+    /// `working_directory` 是宿主进程侧目录；WSL 会话的 Linux cwd 由
+    /// [`TerminalView::new_with_command`] 翻译成 `wsl.exe --cd` 参数，
+    /// 不会当 Windows 进程 cwd 传给 conpty。
+    pub fn create_local_terminal_with_command_and_working_directory(
+        &mut self,
+        command: &str,
+        args: &[String],
+        working_directory: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let icon = if command.to_lowercase().contains("wsl") {
             Some(crate::ssh::platform::detect_wsl_os(command, args).icon())
         } else {
@@ -2045,6 +2063,7 @@ impl Workspace {
                 None,
                 command,
                 args,
+                working_directory,
                 cx,
             )
         });
@@ -2412,8 +2431,17 @@ impl Workspace {
                 self.add_terminal_tab(label, panel, None, window, cx);
             }
             TerminalSessionState::Local { cwd, command, args } => {
-                if let Some(_cmd) = command {
-                    self.create_local_terminal_with_command(&_cmd, &args, window, cx);
+                if let Some(cmd) = command {
+                    // 起点继承：命令型本地标签（picker 里的 PowerShell/CMD/WSL）
+                    // 此前丢掉了 cwd，复制出来固定在家目录启动。WSL 的 Linux
+                    // cwd 不能当宿主进程 cwd，由该函数翻译成 `--cd` 参数。
+                    self.create_local_terminal_with_command_and_working_directory(
+                        &cmd,
+                        &args,
+                        cwd.as_ref().map(std::path::PathBuf::from),
+                        window,
+                        cx,
+                    );
                 } else {
                     let workspace_id = self.workspace_id.clone();
                     let panel = cx.new(|cx| {

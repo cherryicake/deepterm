@@ -77,6 +77,35 @@ pub fn distro_from_args(args: &[String]) -> Option<String> {
     None
 }
 
+/// 返回把起始目录改为 `cwd`（**Linux 侧**路径）的 `wsl.exe` 参数。
+///
+/// `--cd` 是 `wsl.exe` 的文档化选项，值由它自己解释、不经 shell。库里生成的
+/// WSL 启动参数一律带 `--cd ~`（见 `ssh_view::picker::wsl_launch_args`），
+/// 这里把那个占位值替换成实际目录，复制/重连 WSL 标签时起点才能落在同一个
+/// Linux 目录。`--cd <dir>` 与 `--cd=<dir>` 两种写法都识别。
+///
+/// 参数里**没有** `--cd` 时原样返回：`wsl.exe [options] [command]` 的
+/// 选项必须在命令之前，在尾部追加会被当成要执行命令的参数，宁可起点退回
+/// 发行版默认目录，也不改变用户命令的语义。
+pub fn args_with_cd(args: &[String], cwd: &str) -> Vec<String> {
+    let mut out = args.to_vec();
+    let mut index = 0;
+    while index < out.len() {
+        if out[index] == "--cd" {
+            if index + 1 < out.len() {
+                out[index + 1] = cwd.to_string();
+            }
+            break;
+        }
+        if out[index].starts_with("--cd=") {
+            out[index] = format!("--cd={cwd}");
+            break;
+        }
+        index += 1;
+    }
+    out
+}
+
 /// `\\wsl$\<distro>` 根。
 pub fn unc_distro_root(distro: &str) -> PathBuf {
     PathBuf::from(format!("{WSL_UNC_PREFIX}{distro}"))
@@ -365,6 +394,30 @@ mod tests {
         // 默认发行版：没有 -d
         assert_eq!(a(&["~"]), None);
         assert_eq!(a(&[]), None);
+    }
+
+    /// 复制 / 重连 WSL 标签时把 Linux cwd 灌回 `--cd` 值。
+    #[test]
+    fn replaces_existing_cd_argument_with_actual_directory() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // picker 生成的形态（`wsl.exe -d <distro> --cd ~`）：占位 `~` 被替换。
+        assert_eq!(
+            args_with_cd(
+                &args(&["-d", "Ubuntu-24.04", "--cd", "~"]),
+                "/home/you/project"
+            ),
+            args(&["-d", "Ubuntu-24.04", "--cd", "/home/you/project"])
+        );
+        // `--cd=` 连写形态同样识别。
+        assert_eq!(
+            args_with_cd(&args(&["--cd=~"]), "/home/you/project"),
+            args(&["--cd=/home/you/project"])
+        );
+        // 没有 `--cd`：原样返回（args 里可能带要执行的命令，追加选项会改变语义）。
+        assert_eq!(
+            args_with_cd(&args(&["-d", "Ubuntu-24.04", "bash"]), "/home/you"),
+            args(&["-d", "Ubuntu-24.04", "bash"])
+        );
     }
 
     #[test]
