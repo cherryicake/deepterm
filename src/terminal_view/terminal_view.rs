@@ -103,6 +103,12 @@ actions!(
     [Copy, Paste, Clear, SelectAll, StartSearch, DismissSearch]
 );
 const CONTEXT: &str = "Terminal";
+/// 有选区时的终端上下文（**绑定侧**字符串）。
+///
+/// 由 `KeyBindingContextPredicate` 解析（支持 `&&`），只在 render 把
+/// `selection` 追加进元素上下文时命中；挂到元素上的上下文走的是另一套
+/// 解析器（`KeyContext::parse`），所以那里不能直接复用这个字符串。
+const SELECTION_CONTEXT: &str = "Terminal && selection";
 
 /// Cursor blink policy. Mirrors Zed's `TerminalBlink` setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -155,33 +161,61 @@ const SEARCH_DEBOUNCE_MS: u64 = 150;
 /// 避免每帧调度堆积出几十个后台扫描任务（Task drop 不会取消已排队的任务）。
 const SEARCH_DRIFT_THROTTLE_MS: u64 = 400;
 
+/// 终端视图的键位表。
+///
+/// 抽成独立函数：`init` 之外，测试也要按同一张表断言 Ctrl+C / Ctrl+V 的
+/// 平台语义（见本文件测试 `ctrl_c_copies_only_with_selection`）。
+fn terminal_key_bindings() -> Vec<KeyBinding> {
+    let mut bindings = vec![
+        KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
+        KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
+        // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell
+        // 的行首快捷键，不能占用）。
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
+        #[cfg(target_os = "windows")]
+        KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
+        #[cfg(not(target_os = "windows"))]
+        KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
+        // 回滚区搜索：macOS 用 cmd-f，其他平台 ctrl-shift-f
+        //（ctrl-f 是 shell 的 forward-char，不能占用）。
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-f", StartSearch, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-f", StartSearch, Some(CONTEXT)),
+        // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
+        KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
+    ];
+
+    // Windows / Linux：Windows Terminal 惯用组合键。
+    //
+    // 平台修饰键语义：`cmd` 在 Windows / Linux 上解析为平台键（⊞ / Super），
+    // 只有 macOS 的键盘才真的产出 `cmd`。此前只有上面的 `cmd-c` / `cmd-v`，
+    // 于是在 Windows 上 Ctrl+C / Ctrl+V 从来没有命中的绑定：Ctrl+C 落到
+    // `on_key_down` → `to_esc_str`（发 0x03 能中断进程，但没有复制选区的
+    // 快捷键），Ctrl+V 发的是 0x16（SYN，任何 shell 都不会把它当粘贴）。
+    //
+    // `ctrl-c` 刻意只挂在 `Terminal && selection`：有选区才复制；无选区时
+    // 没有绑定命中，按键继续走 `on_key_down` → `to_esc_str` → `0x03` 中断
+    // 前台进程。若在这里无条件绑定 Copy，Ctrl+C 将永远无法中断进程。
+    #[cfg(not(target_os = "macos"))]
+    {
+        bindings.push(KeyBinding::new("ctrl-c", Copy, Some(SELECTION_CONTEXT)));
+        bindings.push(KeyBinding::new("ctrl-shift-c", Copy, Some(CONTEXT)));
+        bindings.push(KeyBinding::new("ctrl-insert", Copy, Some(CONTEXT)));
+        bindings.push(KeyBinding::new("ctrl-v", Paste, Some(CONTEXT)));
+        bindings.push(KeyBinding::new("ctrl-shift-v", Paste, Some(CONTEXT)));
+        bindings.push(KeyBinding::new("shift-insert", Paste, Some(CONTEXT)));
+    }
+
+    bindings
+}
+
 pub fn init(cx: &mut App) {
     // Bind keyboard shortcuts
-    crate::keymap::bind(
-        cx,
-        [
-            KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
-            KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
-            // 全选：macOS 用 cmd-a；其他平台用 ctrl-shift-a（ctrl-a 是 shell
-            // 的行首快捷键，不能占用）。
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-a", SelectAll, Some(CONTEXT)),
-            #[cfg(target_os = "windows")]
-            KeyBinding::new("ctrl-k", ShowSshPicker, Some(CONTEXT)),
-            #[cfg(not(target_os = "windows"))]
-            KeyBinding::new("cmd-k", ShowSshPicker, Some(CONTEXT)),
-            // 回滚区搜索：macOS 用 cmd-f，其他平台 ctrl-shift-f
-            //（ctrl-f 是 shell 的 forward-char，不能占用）。
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-f", StartSearch, Some(CONTEXT)),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-f", StartSearch, Some(CONTEXT)),
-            // Escape 关闭搜索浮层（仅在搜索激活时消费，其余时候传播给 shell）
-            KeyBinding::new("escape", DismissSearch, Some(CONTEXT)),
-        ],
-    );
+    crate::keymap::bind(cx, terminal_key_bindings());
 
     // Windows：把「默认发行版名」提前在后台问好。
     //
@@ -4808,7 +4842,19 @@ impl TerminalView {
     pub fn copy(&mut self, cx: &mut Context<Self>) {
         self.terminal.update(cx, |terminal, cx| {
             terminal.copy(cx);
+            // 复制动作收尾时收起选区（鼠标松手时的 copy-on-select 不走
+            // 这里，拖选高亮保持原样）。
+            //
+            // 目的有二：
+            // 1. 有可见反馈。deepterm 已有 copy-on-select，复制前后剪贴板
+            //    内容一致时「无任何变化」看起来就是「Ctrl+C 没反应」；
+            // 2. 让 Ctrl+C 能中断进程。有选区时 ctrl-c 命中复制绑定（不发
+            //    0x03）；若选区不清，下一次 Ctrl+C 只会再复制一遍——想停止
+            //    进程得先点一下鼠标。清掉后：第一次 Ctrl+C 复制并收起
+            //    选区，第二次 Ctrl+C 走 to_esc_str → 0x03 中断前台进程。
+            terminal.clear_selection();
         });
+        cx.notify();
     }
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
@@ -5261,11 +5307,24 @@ impl Render for TerminalView {
             CursorStyle::IBeam
         };
 
+        // 键位上下文：有选区时追加 `selection`，让 `ctrl-c` 命中复制绑定；
+        // 无选区时 `ctrl-c` 不命中任何绑定，按键继续走 on_key_down →
+        // `to_esc_str` → `0x03`（中断前台进程）。
+        //
+        // 上下文必须手工构造：`Element::key_context` 收字符串时走
+        // `KeyContext::parse`，它只认「标识符 + `key = value`」，不解析
+        // `&&` 谓词（绑定侧才走 `KeyBindingContextPredicate`）。
+        let mut key_context = gpui::KeyContext::new_with_defaults();
+        key_context.add(CONTEXT);
+        if self.terminal.read(cx).last_content().selection_range.is_some() {
+            key_context.add("selection");
+        }
+
         div()
             .id("terminal-view")
             .size_full()
             .track_focus(&self.focus_handle)
-            .key_context(CONTEXT)
+            .key_context(key_context)
             .cursor(cursor_style)
             .on_action(cx.listener(|this, _: &Copy, _window, cx| {
                 this.copy(cx);
@@ -6394,5 +6453,114 @@ mod tests {
             resolved.use_system_proxy,
             "重启恢复后仍须经系统代理（用户点的就是这个）"
         );
+    }
+
+    /// Windows / Linux 的 Ctrl+C / Ctrl+V 绑定语义。
+    ///
+    /// 回归：`cmd-c` / `cmd-v` 在 Windows 上解析成 ⊞+C / ⊞+V（平台键），
+    /// 终端里按 Ctrl+C / Ctrl+V 从来没有命中的绑定；Ctrl+V 落到 `to_esc_str`
+    /// 发出的是 0x16（SYN）——「不能粘贴」的直接原因。
+    ///
+    /// 关键约束：无选区时 `ctrl-c` **必须没有绑定**——空手让它落到
+    /// `on_key_down` → `to_esc_str` → `0x03`；一旦在这里命中 Copy，
+    /// Ctrl+C 会永远无法中断前台进程。
+    #[gpui::test]
+    fn ctrl_c_copies_only_with_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            // 单独注册终端键位表而不是调 `init`：后者在 Windows 上会预热
+            // `wsl.exe`，测试调度器下会被判为不确定。
+            crate::keymap::bind(cx, terminal_key_bindings());
+
+            let resolve = |key: &str, stack: &[gpui::KeyContext]| -> Option<String> {
+                let keys = vec![gpui::Keystroke::parse(key).unwrap()];
+                let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, stack);
+                bindings.first().map(|b| b.action().name().to_string())
+            };
+
+            let context = |with_selection: bool| {
+                let mut context = gpui::KeyContext::new_with_defaults();
+                context.add(CONTEXT);
+                if with_selection {
+                    context.add("selection");
+                }
+                [context]
+            };
+
+            let with_selection = context(true);
+            let without_selection = context(false);
+
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(
+                    resolve("cmd-c", &without_selection).as_deref(),
+                    Some("terminal::Copy")
+                );
+                assert_eq!(
+                    resolve("cmd-v", &without_selection).as_deref(),
+                    Some("terminal::Paste")
+                );
+                // macOS 保留 Ctrl+C = SIGINT 语义（复制走 cmd-c）。
+                assert_eq!(resolve("ctrl-c", &with_selection), None);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                assert_eq!(
+                    resolve("ctrl-c", &with_selection).as_deref(),
+                    Some("terminal::Copy"),
+                    "有选区时 Ctrl+C 应复制"
+                );
+                assert_eq!(
+                    resolve("ctrl-c", &without_selection),
+                    None,
+                    "无选区时 Ctrl+C 不能命中任何绑定，必须留给 to_esc_str 发 0x03"
+                );
+                assert_eq!(
+                    resolve("ctrl-v", &without_selection).as_deref(),
+                    Some("terminal::Paste"),
+                    "Ctrl+V 必须命中粘贴"
+                );
+                assert_eq!(
+                    resolve("ctrl-shift-v", &without_selection).as_deref(),
+                    Some("terminal::Paste")
+                );
+                assert_eq!(
+                    resolve("ctrl-shift-c", &without_selection).as_deref(),
+                    Some("terminal::Copy")
+                );
+            }
+        });
+    }
+
+    /// 复制动作收尾必须收起选区——这是「两次 Ctrl+C」工作流的一半：
+    /// 第一次复制并清掉选区，第二次没有绑定命中，Ctrl+C 变成 0x03 中断进程。
+    /// 若这里不清，有选区时 Ctrl+C 会永远停在复制上，进程停不下来。
+    #[gpui::test]
+    fn copy_action_clears_the_selection(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        view.update(cx, |view, cx| {
+            view.select_all(cx);
+            assert!(
+                view.terminal.read(cx).last_content().selection_range.is_some(),
+                "前提：全选后有选区"
+            );
+
+            view.copy(cx);
+            assert!(
+                view.terminal.read(cx)
+                    .last_content()
+                    .selection_range
+                    .is_none(),
+                "复制后选区必须清空，否则下一次 Ctrl+C 仍只会复制"
+            );
+        });
     }
 }
