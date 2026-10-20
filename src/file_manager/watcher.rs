@@ -401,6 +401,20 @@ impl FsWatcher {
 /// Remote polling interval (reduced from 2s to lower SFTP load).
 const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
+/// 远程 metadata/read_dir/read_file_bytes 都是同步 SFTP RPC。生产环境把它们
+/// 放到 smol 阻塞线程池，避免占满 GPUI 共享后台 worker（见下方轮询处注释）。
+///
+/// GPUI 的 `TestScheduler` 不允许工作线程唤醒测试线程，所以单测里直接同步执行。
+#[cfg(not(test))]
+async fn run_blocking_io<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    smol::unblock(f).await
+}
+
+#[cfg(test)]
+async fn run_blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -574,19 +588,27 @@ impl RemoteFsWatcher {
                         let bg = bg.clone();
                         async move {
                             bg.spawn(async move {
-                                let meta = fs.metadata(&path);
-                                let (entries, content_hash) = match &meta {
-                                    Ok(m) if m.is_dir => (fs.read_dir(&path).ok(), None),
-                                    Ok(_) => (
-                                        None,
-                                        fs.read_file_bytes(&path)
-                                            .ok()
-                                            .flatten()
-                                            .map(|bytes| hash_bytes(&bytes)),
-                                    ),
-                                    Err(_) => (None, None),
-                                };
-                                (path, server, meta, entries, content_hash)
+                                // 远程后端的 metadata/read_dir 是同步 SFTP RPC。
+                                // 每轮最多 8 路并发，若直接跑在 GPUI 共享后台
+                                // worker 上，网络稍慢就会占满线程池，把文件树
+                                // 的根目录读取饿死。交给阻塞线程池，worker 只
+                                // 负责等待结果。
+                                run_blocking_io(move || {
+                                    let meta = fs.metadata(&path);
+                                    let (entries, content_hash) = match &meta {
+                                        Ok(m) if m.is_dir => (fs.read_dir(&path).ok(), None),
+                                        Ok(_) => (
+                                            None,
+                                            fs.read_file_bytes(&path)
+                                                .ok()
+                                                .flatten()
+                                                .map(|bytes| hash_bytes(&bytes)),
+                                        ),
+                                        Err(_) => (None, None),
+                                    };
+                                    (path, server, meta, entries, content_hash)
+                                })
+                                .await
                             })
                             .await
                         }
@@ -1137,6 +1159,25 @@ mod tests {
             .collect()
     }
 
+    /// 测试时钟推进后，轮询任务仍需被 executor 实际跑完才发事件。
+    fn wait_for_events(
+        cx: &mut gpui::TestAppContext,
+        events: &Arc<StdMutex<Vec<FsChangeEvent>>>,
+        predicate: impl Fn(&[FsChangeEvent]) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if predicate(&events.lock().unwrap()) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// 轮询链路端到端测试：被 watch 目录内删除文件 → 下一轮轮询应发出携带新 entries 的 Modify 事件
     #[gpui::test]
     fn remote_watcher_emits_modify_with_entries_on_delete(cx: &mut gpui::TestAppContext) {
@@ -1150,7 +1191,11 @@ mod tests {
         // 首轮轮询：目录首次轮询会发一次携带真实 entries 的同步事件（幂等，
         // 订阅方对比后无变化则无事发生）
         cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
-        cx.run_until_parked();
+        wait_for_events(cx, &events, |received| {
+            received
+                .iter()
+                .any(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify)
+        });
         {
             let received = events.lock().unwrap();
             let sync = received
@@ -1176,7 +1221,11 @@ mod tests {
         // 模拟终端里 `rm b.txt`
         fs.remove("b.txt");
         cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
-        cx.run_until_parked();
+        wait_for_events(cx, &events, |received| {
+            received
+                .iter()
+                .any(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify)
+        });
 
         let received = events.lock().unwrap();
         let modify = received
@@ -1214,7 +1263,11 @@ mod tests {
         let fs_a = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
         watcher.update(cx, |w, cx| w.watch(Path::new("/root"), fs_a.clone(), cx));
         cx.executor().advance_clock(REMOTE_POLL_INTERVAL);
-        cx.run_until_parked();
+        wait_for_events(cx, &events, |received| {
+            received
+                .iter()
+                .any(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify)
+        });
         events.lock().unwrap().clear();
 
         // 切换到服务器 B 的终端：新树 watch /root（真实顺序：旧状态还在）
@@ -1232,7 +1285,11 @@ mod tests {
         // 在服务器 B 的终端里 `rm b.txt`
         fs_b.remove("b.txt");
         cx.executor().advance_clock(REMOTE_POLL_INTERVAL * 3);
-        cx.run_until_parked();
+        wait_for_events(cx, &events, |received| {
+            received
+                .iter()
+                .any(|e| e.path == Path::new("/root") && e.kind == FsChangeKind::Modify)
+        });
 
         let received = events.lock().unwrap();
         let modify = received

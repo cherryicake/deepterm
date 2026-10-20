@@ -147,13 +147,15 @@ impl FileTreeLoader {
         }
     }
 
-    /// 刷新失败：从本地缓存中移除该路径，返回 true 表示确实移除了。
+    /// 刷新失败：只清除加载标记，保留上一次成功列出的内容。
+    ///
+    /// 刷新失败通常是瞬时网络/SFTP 错误，并不代表目录已被删除。此前这里会
+    /// 顺手删掉缓存，根目录刷新一旦失败，文件树就会立刻变空；而随后 watcher
+    /// 可能因为基线未变化不再发事件，空树便永久卡住。真正的删除由父目录的
+    /// 刷新结果负责。返回 true 表示仍有一份可展示的旧缓存。
     pub fn fail_refresh(&mut self, path: &Path) -> bool {
-        if self.loading_paths.remove(path) {
-            self.directory_cache.remove(path).is_some()
-        } else {
-            false
-        }
+        self.loading_paths.remove(path);
+        self.directory_cache.contains_key(path)
     }
 
     /// 无条件更新本地缓存（用于后台静默刷新）。
@@ -208,19 +210,20 @@ impl FileTreeLoader {
                 .on_fs_event(config, event);
         }
 
-        // Remote watcher 直接提供了新 entries，直接更新本地缓存
+        // Remote watcher 直接提供了新 entries，直接更新本地缓存。
+        //
+        // 这里**不能**要求该路径此前已缓存或正在加载：初次加载失败时
+        // `fail_load` 已经把 root 从 loading_paths 里移除，而 watcher 的首次
+        // 轮询仍会带着真实 entries 发来 Modify。旧逻辑会把这份唯一可用的数据
+        // 直接丢掉；此后 watcher 基线已经建立，内容不变就再也不会发事件，
+        // 文件树于是永久停在「只有根行、没有子项」的空状态。
         if let Some(ref entries) = event.entries {
-            if self.directory_cache.contains_key(&event.path)
-                || self.loading_paths.contains(&event.path)
-            {
-                if self.directory_cache.get(&event.path) != Some(entries) {
-                    self.loading_paths.remove(&event.path);
-                    self.directory_cache
-                        .insert(event.path.clone(), entries.clone());
-                    return None; // 已直接更新，无需额外刷新
-                }
-                return None;
+            if self.directory_cache.get(&event.path) != Some(entries) {
+                self.loading_paths.remove(&event.path);
+                self.directory_cache
+                    .insert(event.path.clone(), entries.clone());
             }
+            return None; // 已直接更新，无需额外刷新
         }
 
         // Remove 事件：清除该路径及子路径
@@ -229,6 +232,12 @@ impl FileTreeLoader {
             let is_root = removed_path == root_path;
             if is_root {
                 self.keep_root_clear_descendants(removed_path);
+                // 共享缓存对任意 Remove 都会连节点本身一起删除；根目录只是
+                // 暂时不可达（网络抖动），旧条目仍可展示，也是恢复期间唯一的
+                // 内容来源，因此把它写回去，避免切回该树时又变成空目录。
+                if let Some(entries) = self.directory_cache.get(removed_path).cloned() {
+                    self.set_shared_cache(removed_path, entries);
+                }
             } else {
                 self.remove_cached_recursive(removed_path);
             }
@@ -236,23 +245,31 @@ impl FileTreeLoader {
             // 找到最近的已缓存祖先，返回它以便刷新
             let mut ancestor = removed_path.parent();
             while let Some(p) = ancestor {
+                if !p.starts_with(root_path) {
+                    break;
+                }
                 if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
                     return Some(p.to_path_buf());
                 }
                 ancestor = p.parent();
             }
-            return None;
+            return Some(root_path.to_path_buf());
         }
 
-        // Create/Modify 事件：找最近的已缓存祖先
+        // Create/Modify 事件：找最近的已缓存祖先；找不到时退回根目录。
+        // 事件可能指向一个尚未成功列出的深层目录，此时唯一能恢复显示的
+        // 做法就是重新读取根目录（刷新是防抖的，不会造成事件风暴）。
         let mut ancestor = Some(event.path.as_path());
         while let Some(p) = ancestor {
+            if !p.starts_with(root_path) {
+                break;
+            }
             if self.directory_cache.contains_key(p) || self.loading_paths.contains(p) {
                 return Some(p.to_path_buf());
             }
             ancestor = p.parent();
         }
-        None
+        Some(root_path.to_path_buf())
     }
 
     // ── 共享缓存交互 ──
@@ -413,9 +430,9 @@ mod tests {
         assert!(loader.has_cached(Path::new("/root")));
     }
 
-    /// 刷新失败（目录消失）→ 清除 loading 与缓存
+    /// 刷新失败只清除 loading，保留旧内容（瞬时网络错误不应清空文件树）
     #[test]
-    fn fail_refresh_removes_cache_and_loading() {
+    fn fail_refresh_keeps_last_known_entries() {
         let backend = Arc::new(MockFs {
             entries: StdMutex::new(Ok(entries(&["a"]))),
             config: test_config("refresh-fail"),
@@ -427,7 +444,86 @@ mod tests {
         assert!(loader.request_refresh(Path::new("/root")));
         assert!(loader.fail_refresh(Path::new("/root")));
         assert!(!loader.is_loading(Path::new("/root")));
+        assert_eq!(
+            loader.get_cached(Path::new("/root")),
+            Some(&entries(&["a"]))
+        );
+    }
+
+    /// 回归：初次 root read_dir 失败后，watcher 首轮带的 entries 必须能救回空树。
+    /// 旧逻辑只在 cached/loading 时才接收 entries，失败后两者都不成立，
+    /// 唯一一份可用目录数据被丢弃，且 watcher 基线建立后不再发事件。
+    #[test]
+    fn watcher_entries_recover_root_after_initial_load_failure() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Err("connection reset".to_string())),
+            config: test_config("watcher-recover"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+
+        assert!(loader.begin_load(Path::new("/root")));
+        loader.fail_load(Path::new("/root"));
         assert!(!loader.has_cached(Path::new("/root")));
+        assert!(!loader.is_loading(Path::new("/root")));
+
+        let event = FsChangeEvent {
+            path: PathBuf::from("/root"),
+            kind: FsChangeKind::Modify,
+            entries: Some(entries(&["fresh"])),
+            server: None,
+        };
+        assert_eq!(loader.handle_fs_event(Path::new("/root"), &event), None);
+        assert_eq!(
+            loader.get_cached(Path::new("/root")),
+            Some(&entries(&["fresh"]))
+        );
+    }
+
+    /// Create/Modify 在整棵树都没有缓存时也必须返回 root 触发重载，
+    /// 不能一路向上走到树外后返回 None。
+    #[test]
+    fn event_in_uncached_tree_requests_root_reload() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(Vec::new())),
+            config: test_config("uncached-recover"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+
+        let event = FsChangeEvent {
+            path: PathBuf::from("/root/sub/file"),
+            kind: FsChangeKind::Create,
+            entries: None,
+            server: None,
+        };
+        assert_eq!(
+            loader.handle_fs_event(Path::new("/root"), &event),
+            Some(PathBuf::from("/root"))
+        );
+    }
+
+    /// 根目录暂时不可达（watcher 发 Remove）时保留最后一份目录内容，
+    /// 否则恢复前文件树会先被清空。
+    #[test]
+    fn remove_root_keeps_last_known_entries() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("root-remove"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+        loader.begin_load(Path::new("/root"));
+        loader.finish_load(Path::new("/root"), entries(&["a"]));
+
+        let event = FsChangeEvent {
+            path: PathBuf::from("/root"),
+            kind: FsChangeKind::Remove,
+            entries: None,
+            server: None,
+        };
+        assert_eq!(
+            loader.handle_fs_event(Path::new("/root"), &event),
+            Some(PathBuf::from("/root"))
+        );
+        assert!(loader.has_cached(Path::new("/root")));
     }
 
     /// watcher 带 entries 的事件直写缓存并清除 loading，

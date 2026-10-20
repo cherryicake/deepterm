@@ -42,6 +42,9 @@ pub(crate) const INDENT_SIZE: f32 = 14.0;
 const MAX_TREE_DEPTH: usize = 20;
 /// watcher 事件触发目录刷新的防抖间隔，避免事件风暴（如 npm install / git checkout）
 const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(300);
+/// 初次加载/可见目录加载失败后的重试基数，按指数退避到上限。
+const LOAD_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
+const LOAD_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct StickyFolderCandidate {
@@ -85,6 +88,10 @@ pub struct SidebarFileTree {
     scroll_handle: UniformListScrollHandle,
     /// 防抖中的目录刷新任务（按路径去重）
     refresh_debounce: HashMap<PathBuf, Task<()>>,
+    /// 加载失败后的退避重试任务（按路径去重）
+    load_retry_tasks: HashMap<PathBuf, Task<()>>,
+    /// 连续加载失败次数（指数退避用；成功一次即清零）
+    load_failures: HashMap<PathBuf, u32>,
     /// P1 预取任务（hover 预取，去重）
     prefetch_tasks: HashMap<PathBuf, Task<()>>,
     resolving_home: bool,
@@ -147,6 +154,8 @@ impl SidebarFileTree {
             watched_paths: HashSet::new(),
             scroll_handle: UniformListScrollHandle::new(),
             refresh_debounce: HashMap::new(),
+            load_retry_tasks: HashMap::new(),
+            load_failures: HashMap::new(),
             prefetch_tasks: HashMap::new(),
             resolving_home,
             editing: None,
@@ -177,9 +186,11 @@ impl SidebarFileTree {
             let weak = cx.weak_entity();
             let epoch = this.root_epoch;
             cx.spawn(async move |_, cx| {
+                // home_dir 对远程后端是一次同步 SFTP RPC；放进 smol 的阻塞
+                // 线程池，避免占住 GPUI 的共享后台 worker（见 spawn_read_dir）。
                 let home = cx
                     .background_executor()
-                    .spawn(async move { backend.home_dir() })
+                    .spawn(async move { smol::unblock(move || backend.home_dir()).await })
                     .await;
                 let _ = weak.update(cx, |this, cx| {
                     this.resolving_home = false;
@@ -211,14 +222,20 @@ impl SidebarFileTree {
 
         if let Some(path) = path {
             if path == self.root_path {
-                // 终端已给出明确 cwd：取消进行中的 home 解析并确保根目录已加载
+                // 终端已给出明确 cwd：取消进行中的 home 解析并确保根目录已加载。
+                // 同一路径此前加载失败时，这里也必须重新尝试；否则复用文件树的
+                // 路径（切换 tab / 终端重复上报 cwd）会把空树原样保留下来。
                 if self.resolving_home {
                     self.resolving_home = false;
                     self.root_epoch = self.root_epoch.wrapping_add(1);
-                    let root = self.root_path.clone();
-                    self.load_directory(root, cx);
-                    cx.notify();
                 }
+                if !self.loader.has_cached(&self.root_path)
+                    && !self.loader.is_loading(&self.root_path)
+                {
+                    self.clear_load_failure(&path);
+                    self.load_directory(path, cx);
+                }
+                cx.notify();
                 return;
             }
             self.root_path = path;
@@ -248,6 +265,8 @@ impl SidebarFileTree {
         self.close_context_menu(cx);
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
+        self.load_retry_tasks.clear();
+        self.load_failures.clear();
         self.prefetch_tasks.clear();
         self.scroll_handle = UniformListScrollHandle::new();
         let root = self.root_path.clone();
@@ -421,9 +440,8 @@ impl SidebarFileTree {
         let affected = self.loader.handle_fs_event(&self.root_path, event);
 
         // Remote watcher 直接提供了新 entries → loader 已直接更新本地缓存
-        if event.entries.is_some()
-            && (self.loader.has_cached(&event.path) || self.loader.is_loading(&event.path))
-        {
+        if event.entries.is_some() && self.loader.has_cached(&event.path) {
+            self.clear_load_failure(&event.path);
             self.invalidate_flat_cache();
             cx.notify();
             return;
@@ -496,6 +514,63 @@ impl SidebarFileTree {
         self.refresh_debounce.insert(key, task);
     }
 
+    /// 可见目录加载失败后按指数退避重试。
+    ///
+    /// 只在目录仍然可见（根目录或已展开目录）时保留任务；收起、换根或成功
+    /// 加载都会取消它。远程连接抖动时，watcher 的事件可能也被同一次故障吞掉，
+    /// 不能把恢复完全寄托在下一次文件变化上。
+    fn schedule_load_retry(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.load_retry_tasks.contains_key(&path) {
+            return;
+        }
+        let attempt = {
+            let count = self.load_failures.entry(path.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        let exponent = attempt.saturating_sub(1).min(5);
+        let delay = std::cmp::min(
+            LOAD_RETRY_BASE_DELAY * 2u32.pow(exponent),
+            LOAD_RETRY_MAX_DELAY,
+        );
+        let root = self.root_path.clone();
+        let retry_path = path.clone();
+        let weak = cx.weak_entity();
+        let task = cx.spawn(async move |_, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = weak.update(cx, |this, cx| {
+                this.load_retry_tasks.remove(&retry_path);
+                if this.root_path != root {
+                    this.load_failures.remove(&retry_path);
+                    return;
+                }
+                let visible =
+                    retry_path == this.root_path || this.expanded_folders.contains(&retry_path);
+                if !visible {
+                    this.load_failures.remove(&retry_path);
+                    return;
+                }
+                if this.loader.is_loading(&retry_path) {
+                    return;
+                }
+                if this.loader.has_cached(&retry_path) {
+                    // 刷新失败会保留旧缓存，重试必须走 refresh 而不是被
+                    // `has_cached` 直接挡掉。
+                    this.refresh_directory(retry_path, cx);
+                } else {
+                    this.load_directory(retry_path, cx);
+                }
+            });
+        });
+        self.load_retry_tasks.insert(path, task);
+    }
+
+    /// 加载/刷新成功（或收到了 watcher 的完整目录内容）后重置退避状态。
+    fn clear_load_failure(&mut self, path: &Path) {
+        self.load_failures.remove(path);
+        self.load_retry_tasks.remove(path);
+    }
+
     /// 停止使用该文件树：保存展开状态、释放 watcher 与订阅。
     /// 共享缓存引用由 loader 的 `Drop` 归还，归零后缓存进入保温期。
     pub fn cleanup(&mut self, cx: &mut Context<Self>) {
@@ -515,6 +590,8 @@ impl SidebarFileTree {
         self.close_context_menu(cx);
         self.loader.clear_pending_refresh();
         self.refresh_debounce.clear();
+        self.load_retry_tasks.clear();
+        self.load_failures.clear();
         self.prefetch_tasks.clear();
     }
 
@@ -583,6 +660,7 @@ impl SidebarFileTree {
         if let Some(entries) = self.loader.get_shared_cache(&path) {
             let is_fresh = self.loader.is_shared_cache_fresh(&path);
             self.loader.finish_load(&path, entries);
+            self.clear_load_failure(&path);
             self.invalidate_flat_cache();
             cx.notify();
             if !is_fresh {
@@ -607,6 +685,7 @@ impl SidebarFileTree {
                             this.loader
                                 .set_shared_cache(&path_for_loading, entries.clone());
                             this.loader.finish_load(&path_for_loading, entries);
+                            this.clear_load_failure(&path_for_loading);
                             this.invalidate_flat_cache();
                             cx.notify();
                             // P1: 目录加载完成后预取前3个小文件
@@ -619,6 +698,7 @@ impl SidebarFileTree {
                                 e
                             );
                             this.loader.fail_load(&path_for_loading);
+                            this.schedule_load_retry(path_for_loading.clone(), cx);
                             cx.notify();
                         }
                     }
@@ -682,6 +762,7 @@ impl SidebarFileTree {
                                 this.invalidate_flat_cache();
                                 cx.notify();
                             }
+                            this.clear_load_failure(&path_for_refresh);
                         }
                         Err(e) => {
                             log::warn!(
@@ -689,19 +770,19 @@ impl SidebarFileTree {
                                 path_for_refresh.display(),
                                 e
                             );
-                            if this.loader.fail_refresh(&path_for_refresh) {
-                                // 从共享缓存中也移除
-                                this.loader.remove_shared_cache(&path_for_refresh);
+                            // 刷新失败不加区分地删缓存会让瞬时网络抖动直接清空
+                            // 文件树；保留旧内容，同时安排重试。
+                            let had_cache = this.loader.fail_refresh(&path_for_refresh);
+                            if had_cache {
                                 this.invalidate_flat_cache();
                                 cx.notify();
-                                // The path is gone; refresh the parent so it disappears from the
-                                // parent's listing too.
-                                if let Some(parent) = path_for_refresh.parent() {
-                                    if this.loader.has_cached(parent)
-                                        || this.loader.is_loading(parent)
-                                    {
-                                        this.schedule_refresh(parent.to_path_buf(), cx);
-                                    }
+                            }
+                            this.schedule_load_retry(path_for_refresh.clone(), cx);
+                            // 目录确实消失时，父目录的刷新会让它从列表里消失。
+                            if let Some(parent) = path_for_refresh.parent() {
+                                if this.loader.has_cached(parent) || this.loader.is_loading(parent)
+                                {
+                                    this.schedule_refresh(parent.to_path_buf(), cx);
                                 }
                             }
                         }
@@ -727,12 +808,13 @@ impl SidebarFileTree {
                 .spawn({
                     let backend = backend.clone();
                     let path = path.clone();
-                    async move { backend.read_dir(&path) }
+                    async move { smol::unblock(move || backend.read_dir(&path)).await }
                 })
                 .await;
             if let Ok(entries) = result {
                 let _ = weak.update(cx, |this, cx| {
                     this.loader.set_shared_cache(&path, entries.clone());
+                    this.clear_load_failure(&path);
                     if this.loader.update_cached(&path, entries) {
                         this.invalidate_flat_cache();
                         cx.notify();
@@ -750,8 +832,13 @@ impl SidebarFileTree {
     ) -> Task<Result<Vec<FileEntry>, String>> {
         let path = path.to_path_buf();
         let backend = self.loader.backend().clone();
+        // 远程 read_dir 内部是同步 SFTP RPC。直接放在 GPUI 的共享后台线程池里
+        // 会占住 worker：远端 watcher 每 3s 会并发发起最多 8 个同样的阻塞调用，
+        // 网络一慢就能把 worker 全部占满，根目录读取只能排在后面（最坏等到
+        // SFTP 的 300s 超时），表现就是文件树长时间空白。smol::unblock 使用
+        // 独立的阻塞线程池，等待结果时 worker 仍然可以调度其他任务。
         cx.background_executor()
-            .spawn(async move { backend.read_dir(&path) })
+            .spawn(async move { smol::unblock(move || backend.read_dir(&path)).await })
     }
 
     pub(crate) fn invalidate_flat_cache(&mut self) {
@@ -813,9 +900,11 @@ impl SidebarFileTree {
     pub(crate) fn toggle_folder_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.expanded_folders.contains(&path) {
             self.expanded_folders.remove(&path);
-            // 清除 pending refresh 与防抖任务
+            // 清除 pending refresh、防抖任务与失败重试
             self.loader.clear_pending_refresh_for(&path);
             self.refresh_debounce.retain(|p, _| !p.starts_with(&path));
+            self.load_retry_tasks.retain(|p, _| !p.starts_with(&path));
+            self.load_failures.retain(|p, _| !p.starts_with(&path));
             if !self.loader.is_local() {
                 // Unwatch this folder and any nested folders that are still being watched.
                 let to_unwatch: Vec<PathBuf> = self
@@ -833,6 +922,7 @@ impl SidebarFileTree {
         } else {
             self.expanded_folders.insert(path.clone());
             self.refresh_debounce.remove(&path);
+            self.clear_load_failure(&path);
             if self.loader.has_cached(&path) {
                 if !self.loader.is_shared_cache_fresh(&path) {
                     self.spawn_background_refresh(path.clone(), cx);
@@ -971,7 +1061,10 @@ impl SidebarFileTree {
                     let path = task_path.clone();
                     // 关键性能：用 `read_preview_bytes(128KB)` 替代全量读，
                     // 先 metadata 预检，超限直接跳过，避免大文件浪费 IO/RTT。
-                    async move { backend.read_preview_bytes(&path, 128 * 1024) }
+                    // 同样是同步 SFTP，挪到阻塞线程池执行。
+                    async move {
+                        smol::unblock(move || backend.read_preview_bytes(&path, 128 * 1024)).await
+                    }
                 })
                 .await;
             if let Ok(Some(bytes)) = result {
@@ -1687,6 +1780,8 @@ impl Render for SidebarFileTree {
         };
 
         let is_directory_loaded = self.loader.has_cached(&directory);
+        let root_is_loading = self.loader.is_loading(&directory);
+        let root_failed = self.load_failures.contains_key(&directory);
         let root_expanded = self.root_expanded;
 
         let rows_element: gpui::AnyElement = if !root_expanded {
@@ -1698,6 +1793,34 @@ impl Render for SidebarFileTree {
                 .flex()
                 .flex_col()
                 .child(self.render_root_row(cx))
+                .into_any_element()
+        } else if !is_directory_loaded {
+            // 加载中/失败重试中必须给出反馈。旧实现这里直接画一个空列表，
+            // 与「空文件夹」视觉上没有区别，用户只能看到一棵不出内容的树。
+            let status = if root_is_loading {
+                "正在加载目录…"
+            } else if root_failed {
+                "目录加载失败，正在重试…"
+            } else {
+                "正在加载目录…"
+            };
+            div()
+                .id("sidebar-file-tree")
+                .w_full()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .child(self.render_root_row(cx))
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(8.0))
+                        .pt(px(12.0))
+                        .text_sm()
+                        .text_color(theme.text_subtle)
+                        .child(status),
+                )
                 .into_any_element()
         } else if is_directory_loaded && flat_count == 0 {
             div()

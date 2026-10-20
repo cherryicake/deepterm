@@ -564,16 +564,18 @@ impl RemoteFileTreeCache {
                     tree.nodes.retain(|p, _| !p.starts_with(&event.path));
                 }
                 _ => {
+                    // watcher 送来的就是刚刚列出的真实目录内容。即使这个节点
+                    // 此前不在共享缓存里（例如首次加载失败），也应该写入：
+                    // 否则下一次挂载同一棵文件树时仍只能重新发起一次可能失败
+                    // 的 SFTP 读取。
                     if let Some(ref entries) = event.entries {
-                        if tree.nodes.contains_key(&event.path) {
-                            tree.nodes.insert(
-                                event.path.clone(),
-                                DirNode {
-                                    entries: std::sync::Arc::from(entries.clone()),
-                                    loaded_at: Instant::now(),
-                                },
-                            );
-                        }
+                        tree.nodes.insert(
+                            event.path.clone(),
+                            DirNode {
+                                entries: std::sync::Arc::from(entries.clone()),
+                                loaded_at: Instant::now(),
+                            },
+                        );
                     }
                 }
             }
