@@ -5,7 +5,18 @@
 //! compiler `file:line:col`, `grep -n` output). Callers resolve candidates
 //! against the shell cwd (`PathResolver`) and validate with the filesystem
 //! before navigating, so false positives never open anything.
+//!
+//! Two rules keep the candidate list small enough that the filesystem check is
+//! the *last* word instead of the only one:
+//!
+//! - **形态先筛**：URI 一律排除；`.`/`..`/`~` 这类「到处都能解析」的裸标记
+//!   不算路径；纯 ASCII 的裸词必须有像样的扩展名（或在无扩展名白名单里），
+//!   否则正文里的 `src`/`target`/`index` 会因为恰好是当前目录下的同名条目
+//!   而全变成链接。
+//! - **命中区按裁剪结果算**：括号、引号、图标这类被剥掉的前后缀不参与
+//!   命中区；宽字符占两格，右半格同样可点（见 `row_text`）。
 
+use crate::terminal::row_text::WrappedText;
 use crate::terminal::terminal::IndexedCell;
 
 /// A file candidate found in terminal text.
@@ -17,6 +28,10 @@ pub struct FileHit {
     pub path: String,
     pub line: Option<u32>,
     pub col: Option<u32>,
+    /// Row index inside the text passed to `detect_files_in_rows` (soft-wrap
+    /// continuations get their own index, so a wrapped path is hittable on
+    /// both of its halves).
+    pub row: usize,
     /// Column range in terminal grid coordinates (end exclusive).
     pub start_col: usize,
     pub end_col: usize,
@@ -29,17 +44,64 @@ const TRAILING_PUNCT: &[char] = &[
     '）', '」', '』',
 ];
 
+/// Leading openers mirrored by `TRAILING_PUNCT` (`(src/main.rs)`,
+/// `[foo.ts]:12`, `<bar.rs>`, `'baz.rs'`).
+const LEADING_OPENERS: &[char] = &['(', '[', '{', '<', '"', '\'', '‘', '“', '（', '「', '『'];
+
 /// Returns true for Nerd-Font / icon glyphs (`eza --icons`, `ls --icon`)
 /// that prefix filenames. Private-use area + common symbol blocks.
 fn is_icon_noise(ch: char) -> bool {
     matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
-        || matches!(ch, '📁' | '📄' | '📦' | '🦀' | '' | '├' | '└' | '│' | '─')
+        || matches!(
+            ch,
+            '📁' | '📄' | '📦' | '🦀' | '\u{F680}' | '├' | '└' | '│' | '─'
+        )
         || ('\u{2500}'..='\u{257F}').contains(&ch)
 }
+
+/// 裸词里几乎不会出现、出现即说明这是正文/命令而非路径的字符。
+const NOT_PATH_CHARS: &[char] = &[
+    '%', '=', '*', '^', '$', '&', '|', ';', '<', '>', '?', '!', '`', ',', '\'', '"', '\\', '+',
+    '@', '「', '」', '『', '』', '，', '。', '、', '；', '：', '！', '？', '（', '）',
+];
+
+/// 无扩展名但确实是文件的常见名字（大小写不敏感）。
+///
+/// 刻意**不含** `src` / `target` / `index` / `main`：它们既是 `ls` 输出里的
+/// 目录名，也是终端正文里最高频的普通词，按「谁更常出现在正文」取舍。
+const NO_EXTENSION_ALLOWLIST: &[&str] = &[
+    "makefile",
+    "readme",
+    "license",
+    "licence",
+    "copying",
+    "notice",
+    "authors",
+    "changelog",
+    "changes",
+    "contributing",
+    "codeowners",
+    "dockerfile",
+    "procfile",
+    "justfile",
+    "rakefile",
+    "gemfile",
+    "brewfile",
+    "podfile",
+    "vagrantfile",
+    "jenkinsfile",
+    "caddyfile",
+    "cargo.lock",
+    "cargo.toml",
+];
 
 /// Strip `:line` / `:line:col` suffix. Returns `(path, line, col)`.
 /// Unlike the first version of `PathCompletionEngine::parse_line_column`,
 /// a non-numeric tail is never dropped: `a:b` stays `a:b`.
+///
+/// 这里**不设数值上限**：`grep -n` / 编译器诊断会给出六位以上的行号
+/// （生成代码、日志文件），一刀切会把这些输出打成不可点的残片；时间戳
+/// 之类的误报由调用方的形态检查（`looks_like_path`）负责拒掉。
 pub fn split_line_column(raw: &str) -> (String, Option<u32>, Option<u32>) {
     // Find up to two trailing `:digits` segments.
     let mut rest = raw;
@@ -60,6 +122,9 @@ pub fn split_line_column(raw: &str) -> (String, Option<u32>, Option<u32>) {
         let Ok(num) = tail.parse::<u32>() else {
             break;
         };
+        if num == 0 {
+            break;
+        }
         suffixes.push(num);
         rest = &rest[..idx];
     }
@@ -69,48 +134,77 @@ pub fn split_line_column(raw: &str) -> (String, Option<u32>, Option<u32>) {
     match suffixes.len() {
         0 => (raw.to_string(), None, None),
         1 => (rest.to_string(), Some(suffixes[0]), None),
-        _ => (rest.to_string(), Some(suffixes[1]), Some(suffixes[0])),
+        _ => {
+            let (line, col) = (suffixes[1], suffixes[0]);
+            if col == 0 {
+                (raw.to_string(), None, None)
+            } else {
+                (rest.to_string(), Some(line), Some(col))
+            }
+        }
     }
 }
 
-fn trim_trailing_punct(s: &str) -> &str {
-    let mut end = s.len();
-    for (idx, ch) in s.char_indices().rev() {
+/// 剥掉尾部标点，返回裁剪后的相对结束偏移（开区间）。
+fn trim_trailing(mut end: usize, s: &str) -> usize {
+    for ch in s[..end].chars().rev() {
         if TRAILING_PUNCT.contains(&ch) {
-            end = idx;
+            end -= ch.len_utf8();
         } else {
             break;
         }
     }
-    &s[..end]
+    end
 }
 
-fn trim_leading_noise(s: &str) -> &str {
-    let mut start = 0;
-    for (idx, ch) in s.char_indices() {
-        if is_icon_noise(ch) || ch == '*' {
-            start = idx + ch.len_utf8();
+/// 剥掉前导图标与开括号，返回裁剪后的相对起始偏移。
+fn trim_leading(mut start: usize, s: &str) -> usize {
+    for ch in s[start..].chars() {
+        if is_icon_noise(ch) || ch == '*' || LEADING_OPENERS.contains(&ch) {
+            start += ch.len_utf8();
         } else {
             break;
         }
     }
-    &s[start..]
+    start
 }
 
-/// Leading openers mirrored by `TRAILING_PUNCT` (`(src/main.rs)`,
-/// `[foo.ts]:12`, `<bar.rs>`, `'baz.rs'`).
-const LEADING_OPENERS: &[char] = &['(', '[', '{', '<', '"', '\'', '‘', '“', '（', '「', '『'];
-
-fn trim_leading_openers(s: &str) -> &str {
-    let mut start = 0;
-    for (idx, ch) in s.char_indices() {
-        if LEADING_OPENERS.contains(&ch) {
-            start = idx + ch.len_utf8();
-        } else {
-            break;
-        }
+/// token 是否带 URI scheme（`https://`、`ssh://`、`git@…`…）。
+///
+/// `C:\…` / `c:/…` 是 Windows 路径，不是 URI。
+fn has_uri_scheme(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return false;
     }
-    &s[start..]
+    let Some(idx) = path.find(':') else {
+        return false;
+    };
+    let scheme = &path[..idx];
+    !scheme.is_empty()
+        && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+/// 扩展名是否像文件名扩展名（`rs`/`toml`/`gz`），而不是 `1.2.3` 里的 `3`
+/// 或 `file.2024` 里的年份。
+fn has_plausible_extension(path: &str) -> bool {
+    let Some((stem, ext)) = path.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !ext.is_empty()
+        && ext.len() <= 10
+        && ext.starts_with(|c: char| c.is_alphabetic())
+        && ext
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '+' || c == '-')
 }
 
 /// Whether a cleaned token is worth a filesystem check.
@@ -118,44 +212,75 @@ fn looks_like_path(path: &str) -> bool {
     if path.is_empty() || path.len() > 4096 {
         return false;
     }
-    let lower = path.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.") {
+    // 任何 URI 形态都交给链接识别，文件解析器不掺和。
+    if has_uri_scheme(path) {
         return false;
     }
-    // Absolute / home / explicit relative prefixes are always candidates.
+    // `git@host:owner/repo.git` 这类远端地址本地永远不存在，别浪费一次 stat。
+    if let Some(at) = path.find('@')
+        && path[..at]
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    // `.` / `..` / `~` 在几乎每个 cwd 下都能解析：一旦算路径，终端里到处
+    // 都是「点一下就打开当前目录」的假链接。
+    if matches!(path, "." | ".." | "~" | "./" | "../" | ".//") {
+        return false;
+    }
+    // 显式前缀：绝对路径 / 家目录 / 显式相对。
     if path.starts_with('/')
         || path.starts_with("~/")
-        || path == "~"
         || path.starts_with("./")
         || path.starts_with("../")
     {
-        return path.len() > 1 || path == "~";
+        return true;
     }
-    // Otherwise require a slash, a dot-extension, or a bare word that could
-    // be an `ls` entry (validated by existence check downstream).
+    // Windows 盘符：`C:\Users\me\a.rs`
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[1] == b':'
+        && bytes[0].is_ascii_alphabetic()
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+    // 含分隔符的交给下游存在性检查裁决：`src/terminal` 会中，正文里的
+    // `and/or`、`输入/输出` 不会（对应路径不存在）。
     if path.contains('/') {
         return true;
     }
-    if path.starts_with('.') && path.len() > 1 {
-        return true;
-    }
-    // `name.ext`, `Makefile`, `src`, `foo-bar_baz` — reject pure prose.
-    let mut chars = path.chars();
-    let first = chars.next().unwrap_or('\0');
-    if !(first.is_alphanumeric() || first == '_' || first == '.' || first == '~') {
+    // 裸词。文件名里不会出现这些符号；出现即说明这是正文/命令。
+    if path.chars().any(|c| NOT_PATH_CHARS.contains(&c)) || path.len() > 255 {
         return false;
     }
-    if path.contains('.') {
-        return true;
+    let Some(first) = path.chars().next() else {
+        return false;
+    };
+    // 隐藏文件 / 目录：`.gitignore`、`.cargo`
+    if first == '.' {
+        return path.len() > 1;
     }
-    // Bare word (possible directory from `ls`): allow, existence check decides.
-    path.len() <= 255 && !path.contains(char::is_whitespace)
+    // 非 ASCII 裸词（中文、日文文件名）放行：这些文字没有词间空格，正文里
+    // 的整句都会被切成一个长 token，靠下游存在性检查过滤即可；而它们又几乎
+    // 不可能是「纯 ASCII 目录名」那种高频误报。
+    if !path.is_ascii() {
+        return first.is_alphanumeric();
+    }
+    // ASCII 裸词：必须看起来像文件名，否则 `src`/`target`/`index` 这类
+    // 正文高频词会因为「恰好存在」而变成链接。
+    if !(first.is_alphabetic() || first == '_') {
+        return false;
+    }
+    has_plausible_extension(path)
+        || NO_EXTENSION_ALLOWLIST
+            .iter()
+            .any(|w| path.eq_ignore_ascii_case(w))
 }
 
 /// Parse plain text (already joined, e.g. with soft-wrap continuation) into
-/// candidates with byte ranges. `byte_to_col` maps each byte to a grid column
-/// for the *first* row; bytes beyond the first row reuse the last column and
-/// are filtered by the caller via `first_row_bytes`.
+/// candidates with byte ranges.
 pub fn parse_file_candidates(text: &str) -> Vec<(usize, usize, String)> {
     // Tokenize respecting single/double quotes and backslash escapes.
     // A quote only opens quoting when a matching close exists ahead;
@@ -165,8 +290,10 @@ pub fn parse_file_candidates(text: &str) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        // Skip whitespace.
-        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        // Skip whitespace. 只按 ASCII 空白断词：非 ASCII 字节（≥0x80）一律
+        // 不是空白——多字节字符的续字节里可能有 0x85（NEL）/0xA0（NBSP），
+        // 按 `char::is_whitespace`（字节转 char）判会从 CJK 词中间断开 token。
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
         if i >= bytes.len() {
@@ -183,20 +310,17 @@ pub fn parse_file_candidates(text: &str) -> Vec<(usize, usize, String)> {
             }
             // 已在引用内：配对引号无条件闭合；未在引用内：仅当远处存在
             // 闭合引号时才开启（`don't` 的撇号视为普通字符）。
-            if b == b'\'' && !in_double {
-                if in_single || has_close_quote(bytes, i, b'\'') {
-                    in_single = !in_single;
-                    i += 1;
-                    continue;
-                }
-            } else if b == b'"' && !in_single {
-                if in_double || has_close_quote(bytes, i, b'"') {
-                    in_double = !in_double;
-                    i += 1;
-                    continue;
-                }
+            if b == b'\'' && !in_double && (in_single || has_close_quote(bytes, i, b'\'')) {
+                in_single = !in_single;
+                i += 1;
+                continue;
             }
-            if (b as char).is_whitespace() && !in_single && !in_double {
+            if b == b'"' && !in_single && (in_double || has_close_quote(bytes, i, b'"')) {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if bytes[i].is_ascii_whitespace() && !in_single && !in_double {
                 break;
             }
             i += 1;
@@ -237,116 +361,91 @@ fn has_close_quote(bytes: &[u8], pos: usize, quote: u8) -> bool {
 
 /// Detect file candidates in one viewport row's cells.
 pub fn detect_files_in_line(cells: &[IndexedCell]) -> Vec<FileHit> {
-    let mut text = String::new();
-    let mut byte_to_col: Vec<usize> = Vec::new();
-    for cell in cells {
-        let ch = cell.cell.c;
-        if ch == '\0' {
-            continue;
-        }
-        let col = cell.point.column.0;
-        let len = ch.len_utf8();
-        for _ in 0..len {
-            byte_to_col.push(col);
-        }
-        text.push(ch);
-    }
-    if text.trim().is_empty() {
+    detect_files_in_rows([cells])
+}
+
+/// Detect file candidates in a row and (optionally) its soft-wrap
+/// continuations. A candidate that spans a wrap yields one hit per row, so
+/// either half of a long path is clickable.
+pub fn detect_files_in_rows<'a>(rows: impl IntoIterator<Item = &'a [IndexedCell]>) -> Vec<FileHit> {
+    let joined = WrappedText::from_rows(rows);
+    if joined.text.trim().is_empty() {
         return Vec::new();
     }
-    map_candidates(&text, &byte_to_col)
-}
-
-/// Detect in joined text (for soft-wrapped rows). `first_row_bytes` is the
-/// byte length of the first physical row; only hits overlapping it are kept
-/// so hover on row N never highlights row N+1's text.
-pub fn detect_files_in_joined_text(
-    joined: &str,
-    first_row_byte_to_col: &[usize],
-    first_row_bytes: usize,
-) -> Vec<FileHit> {
     let mut hits = Vec::new();
-    for (bstart, bend, tok) in parse_file_candidates(joined) {
-        if bstart >= first_row_bytes {
-            continue;
-        }
-        let clamped_end = bend.min(first_row_bytes);
-        if clamped_end <= bstart {
-            continue;
-        }
-        if let Some(hit) = to_file_hit(&tok, bstart, clamped_end, first_row_byte_to_col) {
-            hits.push(hit);
-        }
+    for (bstart, _, tok) in parse_file_candidates(&joined.text) {
+        hits.extend(to_file_hits(&tok, bstart, &joined));
     }
     hits
 }
 
-fn map_candidates(text: &str, byte_to_col: &[usize]) -> Vec<FileHit> {
-    let mut hits = Vec::new();
-    for (bstart, bend, tok) in parse_file_candidates(text) {
-        if let Some(hit) = to_file_hit(&tok, bstart, bend, byte_to_col) {
-            hits.push(hit);
-        }
-    }
-    hits
-}
+/// 把一个 token 变成命中，列区间按**裁剪后**的字节窗口计算。
+///
+/// `c_start`/`c_end` 始终是相对 `tok` 起点的字节偏移：引号、图标、包裹
+/// 括号、`:` 行号后缀每剥掉一层就同步收缩窗口，所以点不到多余符号。
+fn to_file_hits(tok: &str, bstart: usize, joined: &WrappedText) -> Vec<FileHit> {
+    let mut c_start = 0usize;
+    let mut c_end = tok.len();
 
-fn to_file_hit(tok: &str, bstart: usize, bend: usize, byte_to_col: &[usize]) -> Option<FileHit> {
-    // Strip surrounding quotes first (`"my file.ts"`), keep inner content.
-    let mut cleaned = tok.trim();
-    if cleaned.len() >= 2 {
-        let b = cleaned.as_bytes();
+    // 剥掉成对引号：`"my file.ts"`
+    if tok.len() >= 2 {
+        let b = tok.as_bytes();
         if (b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\'') {
-            cleaned = &cleaned[1..cleaned.len() - 1];
+            c_start += 1;
+            c_end -= 1;
         }
     }
-    cleaned = trim_leading_noise(cleaned.trim_start());
-    // Iteratively strip wrapping punctuation (`(foo.rs)`, `[a.ts]:12`):
-    // leading openers and trailing closers mirror each other.
+    // 剥图标与包裹括号（`(src/main.rs)`），最多 4 轮：前后配对逐层收敛。
     for _ in 0..4 {
-        let before = cleaned;
-        cleaned = trim_leading_openers(cleaned.trim_start());
-        cleaned = trim_trailing_punct(cleaned.trim_end());
-        if cleaned == before {
+        let start = trim_leading(c_start, tok);
+        let end = trim_trailing(c_end, tok);
+        if start == c_start && end == c_end {
             break;
         }
+        c_start = start;
+        c_end = end;
     }
-    // Unescape `\ ` (shell-escaped spaces) for the path; display keeps raw.
-    let unescaped = cleaned.replace("\\ ", " ");
-    let cleaned = unescaped.trim();
-    if cleaned.is_empty() {
-        return None;
+    if c_start >= c_end {
+        return Vec::new();
     }
-    let (path, line, col) = split_line_column(cleaned);
-    // 后缀前的闭合符（如 `[foo.ts]:12` 的 `]`）在首轮 trim 时够不着，
-    // 拆出行列号后再剥一次。
-    let path = trim_trailing_punct(path.trim()).trim();
-    // If stripping left an empty path (`:12`), the token was not a path.
-    if path.is_empty() || !looks_like_path(path) {
-        return None;
+
+    // 拆 `:line:col` 后缀并收掉窗口尾部。
+    let window = &tok[c_start..c_end];
+    let (path, line, col) = split_line_column(window);
+    if path.len() < window.len() {
+        c_end = c_start + path.len();
     }
-    let start_col = byte_to_col.get(bstart).copied().unwrap_or(0);
-    let end_col = bend
-        .checked_sub(1)
-        .and_then(|last| byte_to_col.get(last).copied())
-        .map(|c| c + 1)
-        .unwrap_or(start_col + 1);
-    if end_col <= start_col {
-        return None;
+    // `[foo.ts]:12` 的 `]` 在首轮够不着，拆出行列号后再剥一次。
+    c_end = trim_trailing(c_end, tok);
+    if c_start >= c_end {
+        return Vec::new();
     }
-    Some(FileHit {
-        raw: tok.to_string(),
-        path: path.to_string(),
-        line,
-        col,
-        start_col,
-        end_col,
-    })
+    let path = &tok[c_start..c_end];
+    if !looks_like_path(path) {
+        return Vec::new();
+    }
+    // 反转义 `\ `（shell 转义空格）只影响路径值，不影响命中区。
+    let path = path.replace("\\ ", " ");
+
+    joined
+        .span_rows(bstart + c_start, bstart + c_end)
+        .into_iter()
+        .map(|(row, start_col, end_col)| FileHit {
+            raw: tok.to_string(),
+            path: path.clone(),
+            line,
+            col,
+            row,
+            start_col,
+            end_col,
+        })
+        .collect()
 }
 
-/// Find the candidate under a grid column.
-pub fn file_hit_at_col<'a>(hits: &'a [FileHit], col: usize) -> Option<&'a FileHit> {
-    hits.iter().find(|h| col >= h.start_col && col < h.end_col)
+/// Find the candidate under a grid column of a specific row.
+pub fn file_hit_at_col(hits: &[FileHit], row: usize, col: usize) -> Option<&FileHit> {
+    hits.iter()
+        .find(|h| h.row == row && col >= h.start_col && col < h.end_col)
 }
 
 #[cfg(test)]
@@ -368,6 +467,52 @@ mod tests {
     }
 
     #[test]
+    fn timestamp_and_version_tokens_never_become_links() {
+        // 时间戳/端口：`:30` 会被当成行号，但剩下的路径部分必须被形态筛掉
+        let (path, ..) = split_line_column("12:30:45");
+        assert!(!looks_like_path(&path), "{path} must not be a path");
+        let (path, ..) = split_line_column("0.0.0.0:8080");
+        assert!(!looks_like_path(&path), "{path} must not be a path");
+        // 版本号
+        assert!(!looks_like_path("1.2.3"));
+        // 行号从 1 开始：`foo:0` 不拆，整体带 scheme 形态同样被排除
+        assert_eq!(
+            split_line_column("foo:0"),
+            ("foo:0".to_string(), None, None)
+        );
+        assert!(!looks_like_path("foo:0"));
+    }
+
+    #[test]
+    fn large_line_and_column_numbers_still_parse() {
+        // 六位以上行号（生成代码 / 日志文件的 `grep -n` 输出）曾经撞上限被
+        // 拆错或整段不可拆；上限移除后必须完整解析。
+        assert_eq!(
+            split_line_column("src/gen.cc:150342:10"),
+            ("src/gen.cc".to_string(), Some(150342), Some(10))
+        );
+        assert_eq!(
+            split_line_column("src/gen.cc:120:20000"),
+            ("src/gen.cc".to_string(), Some(120), Some(20000))
+        );
+        assert_eq!(
+            split_line_column("app.log:1234567"),
+            ("app.log".to_string(), Some(1234567), None)
+        );
+    }
+
+    #[test]
+    fn cjk_continuation_bytes_do_not_break_tokens() {
+        // `呅`（U+5445）的最后一个 UTF-8 字节是 0x85：按「字节转 char」判空白
+        // 会把它当成 NEL 换行，从词中间切断 token（整词甚至因非法 UTF-8 被丢）。
+        let toks: Vec<String> = parse_file_candidates("呅呅 foo.rs")
+            .into_iter()
+            .map(|(_, _, tok)| tok)
+            .collect();
+        assert_eq!(toks, vec!["呅呅".to_string(), "foo.rs".to_string()]);
+    }
+
+    #[test]
     fn parses_ls_tokens() {
         let toks = parse_file_candidates("src/ foo.rs  Cargo.toml");
         assert_eq!(toks.len(), 3);
@@ -383,18 +528,59 @@ mod tests {
     #[test]
     fn filters_urls() {
         assert!(!looks_like_path("https://example.com/a"));
+        assert!(!looks_like_path("ssh://git@host/repo.git"));
+        assert!(!looks_like_path("git@github.com:zed/z.git"));
         assert!(looks_like_path("./src/main.rs"));
         assert!(looks_like_path("/abs/path"));
         assert!(looks_like_path("~/x"));
         assert!(looks_like_path("foo.rs"));
-        assert!(looks_like_path("src"));
+        assert!(looks_like_path("src/main.rs"));
+        assert!(looks_like_path("Cargo.toml"));
+        assert!(looks_like_path(".gitignore"));
+        assert!(looks_like_path("C:\\Users\\me\\a.rs"));
     }
 
     #[test]
-    fn trims_punct() {
-        assert_eq!(trim_trailing_punct("(main.rs),"), "(main.rs");
-        // Inner paren kept, trailing stripped by caller layers.
-        assert_eq!(trim_trailing_punct("foo.ts..."), "foo.ts");
+    fn rejects_prose_words_and_markers() {
+        // 高频正文词不再因为「恰好是当前目录下的条目」而变成链接
+        for word in ["src", "target", "index", "main", "error", "lib"] {
+            assert!(!looks_like_path(word), "{word} should not be a path");
+        }
+        // 版本号、IP、纯数字
+        for tok in ["1.2.3", "0.0.0.0", "2024", "12:30"] {
+            assert!(!looks_like_path(tok), "{tok} should not be a path");
+        }
+        // 到处都能解析的裸标记
+        for tok in [".", "..", "~", "./", "../"] {
+            assert!(!looks_like_path(tok), "{tok} should not be a path");
+        }
+        // 命令与 URL 残片
+        for tok in ["cargo", "rm", "--verbose", "https:"] {
+            assert!(!looks_like_path(tok), "{tok} should not be a path");
+        }
+    }
+
+    #[test]
+    fn separator_bearing_tokens_defer_to_existence_check() {
+        // 含 `/` 的候选交给下游存在性检查裁决：`src/terminal` 是真路径，
+        // 正文里的 `and/or` 对应文件不存在，不会被打开。
+        assert!(looks_like_path("src/terminal"));
+        assert!(looks_like_path("and/or"));
+        assert!(!looks_like_path("git@github.com:zed/z.git"));
+    }
+
+    #[test]
+    fn accepts_allowlisted_and_non_ascii_bare_words() {
+        assert!(looks_like_path("Makefile"));
+        assert!(looks_like_path("dockerfile"));
+        assert!(looks_like_path("文档"));
+        assert!(looks_like_path("src/terminal"));
+    }
+
+    #[test]
+    fn trims_punct_with_offsets() {
+        let s = "(main.rs),";
+        assert_eq!(&s[trim_leading(0, s)..trim_trailing(s.len(), s)], "main.rs");
     }
 
     #[test]
@@ -402,24 +588,5 @@ mod tests {
         // `don't` 的 `'` 无配对闭合引号，必须视为普通字符。
         let toks = parse_file_candidates("don't forget src/main.rs");
         assert!(toks.iter().any(|(_, _, t)| t == "src/main.rs"));
-    }
-
-    #[test]
-    fn wrapped_parens_hit_resolves() {
-        // `(src/main.rs)` / `[foo.ts]:12` 经 to_file_hit 应得干净路径。
-        let text = "(src/main.rs) [foo.ts]:12";
-        let mut byte_to_col = Vec::new();
-        for (col, ch) in text.chars().enumerate() {
-            for _ in 0..ch.len_utf8() {
-                byte_to_col.push(col);
-            }
-        }
-        let cells_text = text;
-        let hits = map_candidates(cells_text, &byte_to_col);
-        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
-        assert!(paths.contains(&"src/main.rs"), "got {paths:?}");
-        assert!(paths.contains(&"foo.ts"), "got {paths:?}");
-        let foo = hits.iter().find(|h| h.path == "foo.ts").unwrap();
-        assert_eq!(foo.line, Some(12));
     }
 }

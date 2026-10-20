@@ -88,7 +88,7 @@ use crate::ssh::config::SshGlobalConfig;
 use crate::ssh_view::SshConnectView;
 use crate::ssh_view::picker::ShowSshPicker;
 use crate::terminal::mappings::keys::to_esc_str;
-use crate::terminal::terminal::{Event as TerminalEvent, Terminal};
+use crate::terminal::terminal::{Event as TerminalEvent, LinkHits, Terminal};
 use crate::terminal_view::blink_cursor::BlinkCursor;
 use crate::terminal_view::terminal_element::{
     FlattenedRenderCache, RowRenderCache, TerminalElement,
@@ -322,6 +322,21 @@ pub enum HoveredLinkKind {
     FilePath,
 }
 
+/// 链接命中测试的「上一格」记忆：同一格、且终端内容/视口/布局都没变时，
+/// 直接复用上一次的三种链接候选，避免每次 mousemove 都重建软换行链。
+struct LinkHitMemo {
+    row: usize,
+    col: usize,
+    /// 终端内容代次（有输出即 +1）。
+    generation: u64,
+    /// 视口滚动偏移：滚动不改内容，但同一 (row, col) 下的网格行会整体平移。
+    display_offset: usize,
+    /// 布局尺寸：resize 会重排网格，命中必须跟着失效。
+    cols: usize,
+    rows: usize,
+    hits: LinkHits,
+}
+
 fn decode_pct_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -528,6 +543,8 @@ pub struct TerminalView {
     pending_remote_cwd_restore: Option<String>,
     /// 当前鼠标悬停的可点击链接（仅在按住 Cmd/Ctrl 时有效）
     pub hovered_link: Option<HoveredLink>,
+    /// 最近一次链接命中测试的输入与结果（见 [`LinkHitMemo`]）。
+    link_hit_memo: Option<LinkHitMemo>,
     /// 滚动区搜索状态（Cmd-F 激活）
     pub search: TerminalSearchState,
     /// 搜索输入框实体（打开搜索时创建；None = 从未打开）
@@ -549,10 +566,6 @@ pub struct TerminalView {
     /// 都调度，会堆积出几十个全量扫描任务。这里对内容变化路径做节流：
     /// 用户改词则立即调度（见 `schedule_search_recompute` 的调用处重置）。
     search_last_schedule: Option<Instant>,
-    /// Whether the link-hover modifier (Cmd/Ctrl) was held at the last mouse
-    /// move. Transitions are forwarded to `Terminal::set_link_hover_active`
-    /// so URL detection runs only while links are actually hoverable.
-    link_modifier_held: bool,
     /// 文件悬停的存在性校验缓存：`Cmd` 按住划过同一文件时避免每个
     /// mousemove 都做一次 `metadata` syscall。短 TTL（新建/删除文件后
     /// 最多延迟片刻即刷新），有界防止无限增长。
@@ -1223,6 +1236,7 @@ impl TerminalView {
             foreground_agent: ForegroundAgentCache::default(),
             pending_remote_cwd_restore: None,
             hovered_link: None,
+            link_hit_memo: None,
             search: TerminalSearchState::default(),
             search_input: None,
             _search_input_subscription: None,
@@ -1230,7 +1244,6 @@ impl TerminalView {
             search_request_id: 0,
             search_generation: 0,
             search_last_schedule: None,
-            link_modifier_held: false,
             file_hover_stat_cache: std::collections::HashMap::new(),
             row_render_cache: Vec::new(),
             flattened_render_cache: FlattenedRenderCache::default(),
@@ -1488,6 +1501,7 @@ impl TerminalView {
                 foreground_agent: ForegroundAgentCache::default(),
                 pending_remote_cwd_restore: None,
                 hovered_link: None,
+                link_hit_memo: None,
                 search: TerminalSearchState::default(),
                 search_input: None,
                 _search_input_subscription: None,
@@ -1495,7 +1509,6 @@ impl TerminalView {
                 search_request_id: 0,
                 search_generation: 0,
                 search_last_schedule: None,
-                link_modifier_held: false,
                 file_hover_stat_cache: std::collections::HashMap::new(),
                 row_render_cache: Vec::new(),
                 flattened_render_cache: FlattenedRenderCache::default(),
@@ -1960,8 +1973,8 @@ impl TerminalView {
             .or_else(|| self.pending_remote_cwd_restore.clone())
     }
 
-    /// Hover at a view position: ensure link ranges are maintained, map the
-    /// pixels to a grid cell, hit-test, and refresh `hovered_link`.
+    /// Hover at a view position: map the pixels to a grid cell, hit-test
+    /// against the live snapshot, and refresh `hovered_link`.
     /// Shared by mouse-move hover and mouse-down click (click must not rely
     /// on a possibly stale/missing hover cache).
     fn hover_at_position(
@@ -1969,12 +1982,6 @@ impl TerminalView {
         position: gpui::Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> Option<HoveredLink> {
-        if !self.link_modifier_held {
-            self.link_modifier_held = true;
-            self.terminal.update(cx, |terminal, _cx| {
-                terminal.set_link_hover_active(true);
-            });
-        }
         let (row, col) = {
             let terminal = self.terminal.read(cx);
             let rel = position - terminal.terminal_bounds.bounds.origin;
@@ -2056,24 +2063,19 @@ impl TerminalView {
     /// Each terminal read is scoped so the `&mut self` file-hit below never
     /// aliases a live borrow.
     fn hit_test_link(&mut self, row: usize, col: usize, cx: &App) -> Option<HoveredLink> {
+        // 三种候选一次命中测试拿全（见 `link_hits_at` 的同格记忆）。
+        let hits = self.link_hits_at(row, col, cx);
         // 1. Explicit OSC8 hyperlink (highest priority).
-        let osc = self
-            .terminal
-            .read(cx)
-            .hyperlink_range_at_viewport_position(row, col);
-        if let Some((uri, _id, start_col, end_col)) = osc
-            && let Some(link) = self.hovered_for_osc_uri(&uri, row, col, start_col, end_col, cx)
+        if let Some((uri, _id, start_col, end_col)) = hits.hyperlink.as_ref()
+            && let Some(link) =
+                self.hovered_for_osc_uri(uri, row, *start_col, *end_col, hits.file.as_ref())
         {
             return Some(link);
         }
         // Unknown scheme: fall through to URL/file detection on the
         // display text (the visible filename may still be clickable).
         // 2. Regex URL.
-        let url = self
-            .terminal
-            .read(cx)
-            .url_range_at_viewport_position(row, col);
-        if let Some((url, start_col, end_col)) = url {
+        if let Some((url, start_col, end_col)) = hits.url {
             return Some(HoveredLink {
                 kind: HoveredLinkKind::Url,
                 url,
@@ -2087,21 +2089,56 @@ impl TerminalView {
             });
         }
         // 3. Inferred file path.
-        let hit = self
+        let hit = hits.file?;
+        self.hovered_for_file_hit(&hit, row, cx)
+    }
+
+    /// 命中测试的取数层：同一格、且终端内容/视口/布局都没变时复用上次结果，
+    /// 否则现算并写回记忆（见 [`LinkHitMemo`]）。
+    fn link_hits_at(&mut self, row: usize, col: usize, cx: &App) -> LinkHits {
+        let (generation, display_offset, cols, rows) = {
+            let terminal = self.terminal.read(cx);
+            let content = terminal.last_content();
+            (
+                terminal.content_generation,
+                content.display_offset,
+                content.cols,
+                content.rows,
+            )
+        };
+        if let Some(memo) = &self.link_hit_memo
+            && memo.row == row
+            && memo.col == col
+            && memo.generation == generation
+            && memo.display_offset == display_offset
+            && memo.cols == cols
+            && memo.rows == rows
+        {
+            return memo.hits.clone();
+        }
+        let hits = self
             .terminal
             .read(cx)
-            .file_hit_at_viewport_position(row, col)?;
-        self.hovered_for_file_hit(&hit, row, cx)
+            .link_hits_at_viewport_position(row, col);
+        self.link_hit_memo = Some(LinkHitMemo {
+            row,
+            col,
+            generation,
+            display_offset,
+            cols,
+            rows,
+            hits: hits.clone(),
+        });
+        hits
     }
 
     fn hovered_for_osc_uri(
         &mut self,
         uri: &str,
         row: usize,
-        col: usize,
         start_col: usize,
         end_col: usize,
-        cx: &App,
+        file_hit: Option<&crate::terminal::file_link_detector::FileHit>,
     ) -> Option<HoveredLink> {
         let trimmed = uri.trim();
         let lower = trimmed.to_ascii_lowercase();
@@ -2120,11 +2157,9 @@ impl TerminalView {
         }
         if lower.starts_with("file://") {
             // Display text may carry `:line:col` (e.g. `foo.rs:12` linked to
-            // `file:///abs/foo.rs`); reuse the file detector for the suffix.
-            let (line, col_num) = self
-                .terminal
-                .read(cx)
-                .file_hit_at_viewport_position(row, col)
+            // `file:///abs/foo.rs`); the hit test already ran the file
+            // detector on the same cell, reuse that result.
+            let (line, col_num) = file_hit
                 .map(|h| (h.line, h.col))
                 .unwrap_or((None, None));
             let is_remote = self.ssh_config.is_some();
@@ -5443,14 +5478,11 @@ impl Render for TerminalView {
 
                 // Link hover detection (only when modifier is held).
                 // Priority: OSC8 hyperlink > URL regex > inferred file path.
-                // `hover_at_position` 负责修饰键按下沿的 ranges 激活与 hover 刷新。
+                // 命中测试按需从当前快照现算，不需要「修饰键按下沿」的预热。
                 if modifiers_pressed {
                     this.hover_at_position(event.position, cx);
                 } else if this.hovered_link.take().is_some() {
                     // 修饰键松开：清除悬停（hover_at_position 只负责置位）。
-                    this.terminal.update(cx, |terminal, _cx| {
-                        terminal.set_link_hover_active(false);
-                    });
                     cx.notify();
                 }
 
@@ -5550,10 +5582,6 @@ impl Render for TerminalView {
                 // in-view mouse move (e.g. after moving to the sidebar while
                 // holding Cmd).
                 if !*hovered && this.hovered_link.take().is_some() {
-                    this.link_modifier_held = false;
-                    this.terminal.update(cx, |terminal, _cx| {
-                        terminal.set_link_hover_active(false);
-                    });
                     cx.notify();
                 }
             }))

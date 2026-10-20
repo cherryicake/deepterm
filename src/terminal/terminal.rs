@@ -48,10 +48,9 @@ use crate::ssh::{
     keychain::{PreferredSshTransport, preferred_ssh_transport},
     platform::RemoteOS,
 };
-use crate::terminal::file_link_detector::{FileHit, detect_files_in_joined_text};
+use crate::terminal::file_link_detector::FileHit;
 use crate::terminal::kitty::scanner::ReplySink;
 use crate::terminal::kitty::storage::Storage as KittyStorage;
-use crate::terminal::link_detector::{HyperlinkRange, UrlRange};
 use crate::terminal::mappings::mouse::{
     alt_scroll, grid_point, grid_point_and_side, mouse_button_report, mouse_moved_report,
     scroll_report,
@@ -718,12 +717,6 @@ pub struct TerminalContent {
     pub total_lines: usize,
     /// Visible viewport lines (cached to avoid extra mutex lock)
     pub viewport_lines: usize,
-    /// Per-row URL ranges detected in the current content.
-    pub url_ranges: Vec<Vec<UrlRange>>,
-    /// Per-row OSC8 hyperlink ranges (preserved from `CellExtra::hyperlink`).
-    /// Same lazy lifecycle as `url_ranges`: only maintained while the
-    /// link-hover modifier is held. See `set_link_hover_active`.
-    pub hyperlink_ranges: Vec<Vec<HyperlinkRange>>,
     /// Current selection range, resolved while the term lock is already held
     /// in `update_last_content`. Read by the render hot path so it does not
     /// need to acquire the `FairMutex<Term>` a second time per frame.
@@ -747,11 +740,48 @@ impl Default for TerminalContent {
             rows: 24,
             total_lines: 24,
             viewport_lines: 24,
-            url_ranges: Vec::new(),
-            hyperlink_ranges: Vec::new(),
             selection_range: None,
             palette: Default::default(),
         }
+    }
+}
+
+/// 软换行链一次最多拼多少行（见 [`Terminal::link_row_chain`]）。
+///
+/// 上限由「向上回溯」决定：`cat 巨大单行文件` 会让几百上千行都带 `WRAPLINE`，
+/// 无上限回溯等于每次 hover 都重扫整段输出。URL/路径长到这个量级也不像人手输
+/// 的，撞到上限就当没有链接 —— 只会「不认」，不会「认错」。
+const MAX_LINK_CHAIN_ROWS: usize = 64;
+
+/// 一次命中测试的完整结果：三种链接各自在**被点行**上的命中。
+///
+/// hover 的优先级（OSC8 > URL > 文件路径）由消费方决定；一次性给出全部
+/// 候选，好让一次鼠标移动只重建一次软换行链（见
+/// [`Terminal::link_hits_at_viewport_position`]）。
+#[derive(Clone, Debug, Default)]
+pub struct LinkHits {
+    /// OSC8 显式链接：`(uri, id, start_col, end_col)`。
+    pub hyperlink: Option<(String, String, usize, usize)>,
+    /// 正则识别出的 URL：`(url, start_col, end_col)`。
+    pub url: Option<(SharedString, usize, usize)>,
+    /// 推断出的文件路径候选（含 `:line:col` 拆分结果）。
+    pub file: Option<FileHit>,
+}
+
+/// 被点行所在的软换行链：`clicked_row` 是被点行在 `rows` 里的下标。
+///
+/// 行按文本顺序排列：视口内的行借用 `last_content` 的切片，链首越过视口
+/// 顶端时补进来的 scrollback 行只能自持（见
+/// [`Terminal::scrollback_rows_above_viewport`]）。
+struct LinkChain<'a> {
+    clicked_row: usize,
+    rows: Vec<Cow<'a, [IndexedCell]>>,
+}
+
+impl LinkChain<'_> {
+    /// `detect_*_in_rows` 消费的行切片迭代器。
+    fn row_slices(&self) -> impl Iterator<Item = &[IndexedCell]> + '_ {
+        self.rows.iter().map(|row| &row[..])
     }
 }
 
@@ -1081,12 +1111,6 @@ pub struct Terminal {
     /// otherwise applications receive an unpaired release (or never see the
     /// button go up and treat all later motion as a drag).
     mouse_report_active: bool,
-    /// Whether the link-hover modifier (Cmd on macOS / Ctrl elsewhere) is
-    /// currently held. URL detection for the viewport costs one regex scan
-    /// plus two allocations per dirty row on every frame, but its only
-    /// consumer is hover hit-testing — so it is maintained lazily only while
-    /// this flag is set. See `set_link_hover_active`.
-    link_hover_active: bool,
     last_mouse_position: Option<Point<Pixels>>,
     /// MOUSE_MOTION 模式下最近一次已上报的网格坐标（行,列）。
     /// 移动事件可达数百 Hz，同一 cell 内的重复移动不再向 PTY 发报文
@@ -1208,7 +1232,6 @@ impl Terminal {
             terminal_bounds: default_bounds,
             selection_phase: SelectionPhase::Ended,
             mouse_report_active: false,
-            link_hover_active: false,
             last_mouse_position: None,
             last_reported_mouse_cell: None,
             scroll_px: px(0.0),
@@ -1457,7 +1480,6 @@ impl Terminal {
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
-                link_hover_active: false,
                 last_mouse_position: None,
                 last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
@@ -1629,7 +1651,6 @@ impl Terminal {
             terminal_bounds: TerminalBounds::default(),
             selection_phase: SelectionPhase::Ended,
             mouse_report_active: false,
-            link_hover_active: false,
             last_mouse_position: None,
             last_reported_mouse_cell: None,
             scroll_px: px(0.0),
@@ -1952,7 +1973,6 @@ impl Terminal {
                 terminal_bounds: default_bounds,
                 selection_phase: SelectionPhase::Ended,
                 mouse_report_active: false,
-                link_hover_active: false,
                 last_mouse_position: None,
                 last_reported_mouse_cell: None,
                 scroll_px: px(0.0),
@@ -3567,49 +3587,9 @@ impl Terminal {
         self.last_content.palette =
             crate::terminal::mappings::colors::TerminalPalette::from_colors(term.colors());
 
-        // URL + OSC8 ranges are only consumed by link hover hit-testing.
-        // Skip the per-row scans while the hover modifier is not held.
-        let rebuild_all_links = self.link_hover_active
-            && (force_full_damage
-                || self.last_content.url_ranges.len() != row_ranges.len()
-                || self.last_content.hyperlink_ranges.len() != row_ranges.len());
-        if !self.link_hover_active {
-            self.last_content.url_ranges.clear();
-            self.last_content.hyperlink_ranges.clear();
-        } else if rebuild_all_links {
-            self.last_content.url_ranges.clear();
-            self.last_content.hyperlink_ranges.clear();
-            self.last_content.url_ranges.reserve(row_ranges.len());
-            self.last_content.hyperlink_ranges.reserve(row_ranges.len());
-            for (start, end) in row_ranges.iter() {
-                let row_cells = &cells[*start..*end];
-                self.last_content.url_ranges.push(
-                    crate::terminal::link_detector::detect_urls_in_line(row_cells),
-                );
-                self.last_content.hyperlink_ranges.push(
-                    crate::terminal::link_detector::detect_hyperlinks_in_line(row_cells),
-                );
-            }
-        } else {
-            for (row_idx, dirty) in self.dirty_rows.iter().copied().enumerate() {
-                if !dirty {
-                    continue;
-                }
-                let Some((start, end)) = row_ranges.get(row_idx).copied() else {
-                    continue;
-                };
-                if row_idx < self.last_content.url_ranges.len() {
-                    self.last_content.url_ranges[row_idx] =
-                        crate::terminal::link_detector::detect_urls_in_line(&cells[start..end]);
-                }
-                if row_idx < self.last_content.hyperlink_ranges.len() {
-                    self.last_content.hyperlink_ranges[row_idx] =
-                        crate::terminal::link_detector::detect_hyperlinks_in_line(
-                            &cells[start..end],
-                        );
-                }
-            }
-        }
+        // 链接（URL / OSC8 / 文件路径）不再随每帧输出维护缓存：
+        // 消费方只有 hover 命中测试，按需用 `last_content.cells` 现算，
+        // 既不会因为「缓存由过期快照重建」而认错，也省掉了每帧扫描。
 
         // 快照已与本帧的网格对齐（调用方据此清除 `content_dirty`）。
         true
@@ -4115,49 +4095,6 @@ impl Terminal {
         scanner.set_geometry(self.terminal_bounds.term_geometry(self.display_scale));
     }
 
-    /// Enable or disable lazy link-range maintenance (URL regex + OSC8).
-    ///
-    /// While enabled (link-hover modifier held), `update_last_content` keeps
-    /// `last_content.url_ranges` / `hyperlink_ranges` fresh for dirty rows.
-    /// While disabled, all link work is skipped entirely: the ranges are only
-    /// consumed by hover hit-testing, so maintaining them on every output
-    /// frame is wasted scanning and allocation churn.
-    ///
-    /// Turning the flag on rebuilds all rows immediately from the cached
-    /// content snapshot — no term lock is needed because `last_content` is
-    /// owned by `Self` (hyperlinks are preserved per-cell, see `IndexedCell`).
-    pub fn set_link_hover_active(&mut self, active: bool) {
-        if self.link_hover_active == active {
-            return;
-        }
-        self.link_hover_active = active;
-        if active {
-            let TerminalContent {
-                cells,
-                row_ranges,
-                url_ranges,
-                hyperlink_ranges,
-                ..
-            } = &mut self.last_content;
-            url_ranges.clear();
-            hyperlink_ranges.clear();
-            url_ranges.reserve(row_ranges.len());
-            hyperlink_ranges.reserve(row_ranges.len());
-            for (start, end) in row_ranges.iter() {
-                let row_cells = &cells[*start..*end];
-                url_ranges.push(crate::terminal::link_detector::detect_urls_in_line(
-                    row_cells,
-                ));
-                hyperlink_ranges.push(crate::terminal::link_detector::detect_hyperlinks_in_line(
-                    row_cells,
-                ));
-            }
-        } else {
-            self.last_content.url_ranges.clear();
-            self.last_content.hyperlink_ranges.clear();
-        }
-    }
-
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
     }
@@ -4190,48 +4127,142 @@ impl Terminal {
         out
     }
 
-    /// Find a URL at the given viewport position.
-    /// Returns (url, start_col, end_col) if found.
-    pub fn url_range_at_viewport_position(
-        &self,
-        viewport_row: usize,
-        col: usize,
-    ) -> Option<(SharedString, usize, usize)> {
+    /// 取出 `viewport_row` 所在的软换行链（见 [`LinkChain`]）。
+    ///
+    /// 软换行在网格里是多行、在文本上是一个 token。长链接/长路径常被折断，
+    /// 只看被点的那一行会把它腰斩成假链接（`https://exa` + `mple.com`，
+    /// 或者后半截 `le.com/x` 被当成独立域名），所以识别必须按整条链拼起来
+    /// 算，命中区再按行切开。
+    ///
+    /// **向前回溯是必须的**：续行的前半截在上一行，不回溯就等于拿残缺的一
+    /// 半去做词法分析 —— 那正是「识别错误」的主要来源。链首贴着视口顶端
+    /// 时，前半截还可能落在视口上方的 scrollback 里，能补则补；补不到就
+    /// 保持「不认」，绝不「认错」。
+    fn link_row_chain(&self, viewport_row: usize) -> LinkChain<'_> {
         let content = &self.last_content;
-        if viewport_row >= content.url_ranges.len() {
-            return None;
+        if content.row_ranges.get(viewport_row).is_none() {
+            return LinkChain {
+                clicked_row: 0,
+                rows: Vec::new(),
+            };
         }
-        for range in &content.url_ranges[viewport_row] {
-            if col >= range.start_col && col < range.end_col {
-                return Some((range.url.clone().into(), range.start_col, range.end_col));
+        // 向上回溯：上一行带 WRAPLINE ⟹ 它的内容是被点这行接续的。
+        let mut first = viewport_row;
+        while first > 0
+            && viewport_row - first < MAX_LINK_CHAIN_ROWS
+            && self.viewport_row_wrapped(first - 1)
+        {
+            first -= 1;
+        }
+        // 视口内的行已经占掉多少链预算，剩下的留给 scrollback 前缀。
+        let prefix = if first == 0 {
+            let budget = MAX_LINK_CHAIN_ROWS.saturating_sub(viewport_row - first + 1);
+            self.scrollback_rows_above_viewport(budget)
+        } else {
+            Vec::new()
+        };
+        let prefix_len = prefix.len();
+        let mut rows: Vec<Cow<'_, [IndexedCell]>> = prefix.into_iter().map(Cow::Owned).collect();
+        let mut cursor = first;
+        while let Some((start, end)) = content.row_ranges.get(cursor).copied() {
+            rows.push(Cow::Borrowed(&content.cells[start..end]));
+            // 只有「已越过被点的行」之后，链的终点才由 WRAPLINE 决定。
+            if cursor >= viewport_row && !self.viewport_row_wrapped(cursor) {
+                break;
             }
+            if rows.len() >= MAX_LINK_CHAIN_ROWS || cursor + 1 >= content.row_ranges.len() {
+                break;
+            }
+            cursor += 1;
         }
-        None
+        LinkChain {
+            clicked_row: prefix_len + (viewport_row - first),
+            rows,
+        }
     }
 
-    /// Find an OSC8 hyperlink at the given viewport position.
-    /// Returns (uri, id, start_col, end_col) if found. Highest hit-test
-    /// priority: explicit links beat regex-guessed URLs/paths.
-    pub fn hyperlink_range_at_viewport_position(
-        &self,
-        viewport_row: usize,
-        col: usize,
-    ) -> Option<(String, String, usize, usize)> {
-        let content = &self.last_content;
-        if viewport_row >= content.hyperlink_ranges.len() {
-            return None;
+    /// 从视口上方最近的一行开始向上收集连续的 `WRAPLINE` 行（最多 `limit`
+    /// 行），按文本顺序（旧→新）返回。
+    ///
+    /// 只有 hover 命中测试才走这里，而且只在链首贴着视口顶端（`first == 0`）
+    /// 时；拿不到 `term` 锁就直接放弃 —— 宁可少认，也不能让鼠标移动被锁卡住。
+    /// 到历史顶或遇到不带 `WRAPLINE` 的行即停：越界会读到压缩缓冲区的垃圾。
+    fn scrollback_rows_above_viewport(&self, limit: usize) -> Vec<Vec<IndexedCell>> {
+        if limit == 0 {
+            return Vec::new();
         }
-        for range in &content.hyperlink_ranges[viewport_row] {
-            if col >= range.start_col && col < range.end_col {
-                return Some((
-                    range.uri.clone(),
-                    range.id.clone(),
-                    range.start_col,
-                    range.end_col,
-                ));
+        let Some(term) = self.term.try_lock_unfair() else {
+            return Vec::new();
+        };
+        let grid = term.grid();
+        let display_offset = grid.display_offset();
+        if display_offset == 0 {
+            return Vec::new();
+        }
+        // 视口第 0 行是 `Line(-display_offset)`，它上面一行再减一。
+        let mut line = Line(-(display_offset as i32) - 1);
+        let oldest = Line(-(grid.history_size() as i32));
+        let mut out: Vec<Vec<IndexedCell>> = Vec::new();
+        while out.len() < limit && line >= oldest {
+            let row = &grid[line];
+            let wrapped = row.into_iter().any(|c| {
+                c.flags
+                    .contains(alacritty_terminal::term::cell::Flags::WRAPLINE)
+            });
+            if !wrapped {
+                break;
             }
+            let mut cells = Vec::with_capacity(row.len());
+            for (col, cell) in row.into_iter().enumerate() {
+                cells.push(IndexedCell {
+                    point: AlacPoint::new(line, Column(col)),
+                    cell: PackedCell::from(cell),
+                    zerowidth: packed_zerowidth(cell),
+                    hyperlink: cell.hyperlink(),
+                });
+            }
+            out.push(cells);
+            line -= 1;
         }
-        None
+        out.reverse();
+        out
+    }
+
+    /// 命中测试：被点 viewport 位置在软换行链上的三种链接候选。
+    ///
+    /// 按需从 `last_content.cells` 现算（不缓存）：hover 是唯一消费方，
+    /// 每帧为没人看的行做扫描纯属浪费，而缓存又会因为「重建时快照已过期」
+    /// 而认错链接。三种识别共用同一条链；消费方（`TerminalView`）负责按
+    /// `(行, 列, 内容代次, …)` 记住上一格的结果。
+    ///
+    /// 识别范围是被点行所在的整条软换行链（前后都算），但每种命中都只返回
+    /// 被点那一行上的区间：hover 高亮不该跑到相邻行去。
+    pub fn link_hits_at_viewport_position(&self, viewport_row: usize, col: usize) -> LinkHits {
+        use crate::terminal::file_link_detector::{detect_files_in_rows, file_hit_at_col};
+        let chain = self.link_row_chain(viewport_row);
+        if chain.rows.is_empty() {
+            return LinkHits::default();
+        }
+        let fits =
+            |row: usize, start_col: usize, end_col: usize| row == chain.clicked_row && col >= start_col && col < end_col;
+        let hyperlink =
+            crate::terminal::link_detector::detect_hyperlinks_in_rows(chain.row_slices())
+                .into_iter()
+                .find(|(row, range)| fits(*row, range.start_col, range.end_col))
+                .map(|(_, range)| (range.uri, range.id, range.start_col, range.end_col));
+        let url = crate::terminal::link_detector::detect_urls_in_rows(chain.row_slices())
+            .into_iter()
+            .find(|(row, range)| fits(*row, range.start_col, range.end_col))
+            .map(|(_, range)| (range.url.into(), range.start_col, range.end_col));
+        let file = {
+            let hits = detect_files_in_rows(chain.row_slices());
+            file_hit_at_col(&hits, chain.clicked_row, col).cloned()
+        };
+        LinkHits {
+            hyperlink,
+            url,
+            file,
+        }
     }
 
     /// Whether the viewport row is soft-wrapped onto the next row.
@@ -4248,54 +4279,6 @@ impl Terminal {
                 .flags
                 .contains(alacritty_terminal::term::cell::Flags::WRAPLINE)
         })
-    }
-
-    /// File-path candidate under a viewport position (for `Cmd+Click`).
-    /// Handles soft-wrapped rows by joining the continuation row, but only
-    /// returns hits overlapping the *clicked* row so hover never highlights
-    /// the next row's text.
-    pub fn file_hit_at_viewport_position(
-        &self,
-        viewport_row: usize,
-        col: usize,
-    ) -> Option<FileHit> {
-        use crate::terminal::file_link_detector::{detect_files_in_line, file_hit_at_col};
-        let content = &self.last_content;
-        let (start, end) = content.row_ranges.get(viewport_row).copied()?;
-        let row_cells = &content.cells[start..end];
-        // Fast path: no wrap continuation.
-        if !self.viewport_row_wrapped(viewport_row) || viewport_row + 1 >= content.row_ranges.len()
-        {
-            let hits = detect_files_in_line(row_cells);
-            return file_hit_at_col(&hits, col).cloned();
-        }
-        // Wrapped: join current + next row text; column mapping only covers
-        // the first row (detect_files_in_joined_text filters by byte len).
-        let (nstart, nend) = content.row_ranges.get(viewport_row + 1).copied()?;
-        let mut joined = String::new();
-        for cell in row_cells.iter().chain(content.cells[nstart..nend].iter()) {
-            let ch = cell.cell.c;
-            if ch == '\0' {
-                continue;
-            }
-            joined.push(ch);
-        }
-        let mut first_text = String::new();
-        let mut first_map: Vec<usize> = Vec::new();
-        for cell in row_cells {
-            let ch = cell.cell.c;
-            if ch == '\0' {
-                continue;
-            }
-            let c = cell.point.column.0;
-            for _ in 0..ch.len_utf8() {
-                first_map.push(c);
-            }
-            first_text.push(ch);
-        }
-        let first_row_bytes = first_text.len();
-        let hits = detect_files_in_joined_text(&joined, &first_map, first_row_bytes);
-        file_hit_at_col(&hits, col).cloned()
     }
 
     /// Get the total number of lines in the terminal including scrollback history
@@ -6290,6 +6273,212 @@ mod tests {
         )
     }
 
+    /// 构造一个 `cols×rows` 的终端，把 `text` 当作 PTY 输出喂进去并刷新快照，
+    /// 返回可以直接做命中测试的实体。
+    ///
+    /// 走真实的 `vte` 解析 + `update_last_content` 快照，因此宽字符占位格、
+    /// `WRAPLINE`、行尾空格这些「网格事实」都在里面 —— 单元测试里手工拼
+    /// `IndexedCell` 是拼不出这些的。
+    fn link_probe_terminal(
+        cx: &mut TestAppContext,
+        cols: usize,
+        rows: usize,
+        text: &str,
+    ) -> Entity<Terminal> {
+        let bounds = bounds_for(cols, rows);
+        let text = text.to_string();
+        let terminal = cx.new(|_| Terminal::create_error_terminal());
+        terminal.update(cx, |t, cx| {
+            t.resize(bounds, 1.0, cx);
+            t.process_pty_data(text.as_bytes(), false, cx);
+            t.update_last_content(true);
+            assert_eq!(grid_size(t), (cols, rows), "网格尺寸应等于测试请求的尺寸");
+        });
+        terminal
+    }
+
+    /// 命中测试的简写：`(url, start_col, end_col)`。
+    fn url_at(t: &Terminal, row: usize, col: usize) -> Option<(String, usize, usize)> {
+        t.link_hits_at_viewport_position(row, col)
+            .url
+            .map(|(u, s, e)| (u.to_string(), s, e))
+    }
+
+    /// 整行逐格命中测试：哪些列上有链接。
+    fn url_cols(t: &Terminal, row: usize, cols: usize) -> Vec<usize> {
+        (0..cols).filter(|c| url_at(t, row, *c).is_some()).collect()
+    }
+
+    #[gpui::test]
+    fn hit_url_after_wide_chars(cx: &mut TestAppContext) {
+        // 「见」占两格：URL 起点必须落在第 3 列，而不是被占位格顶偏一列。
+        let terminal = link_probe_terminal(cx, 40, 3, "见 https://example.com/a");
+        terminal.update(cx, |t, _| {
+            assert_eq!(grid_size(t), (40, 3));
+            assert_eq!(
+                url_at(t, 0, 3),
+                Some(("https://example.com/a".into(), 3, 24)),
+                "URL 命中区必须是 3..24（21 个字符）"
+            );
+            // 「见」的右半格（第 1 列）与它前面的空格都不是链接
+            assert!(url_at(t, 0, 0).is_none());
+            assert!(url_at(t, 0, 1).is_none());
+            assert!(url_at(t, 0, 2).is_none());
+            // 末列之后是行尾填充空格
+            assert!(url_at(t, 0, 24).is_none());
+            assert_eq!(url_cols(t, 0, 40), (3..24).collect::<Vec<_>>());
+        });
+    }
+
+    #[gpui::test]
+    fn hit_url_split_by_soft_wrap(cx: &mut TestAppContext) {
+        // 20 列窄终端：链接被软换行折成两半，两半都必须指向**同一个**完整
+        // 地址。旧实现两半都不认（前半截 `https://example.` 被截断、后半截
+        // `com/long/path` 没有锚点）。
+        let terminal = link_probe_terminal(cx, 20, 4, "see https://example.com/long/path");
+        terminal.update(cx, |t, _| {
+            let url = "https://example.com/long/path".to_string();
+            // 第 0 行：`see ` 之后是 URL 的前 16 个字符，占满 4..20
+            assert_eq!(url_at(t, 0, 4), Some((url.clone(), 4, 20)));
+            assert_eq!(url_cols(t, 0, 20), (4..20).collect::<Vec<_>>());
+            // 第 1 行：URL 剩下的 `com/long/path`（13 列）
+            assert_eq!(url_at(t, 1, 0), Some((url.clone(), 0, 13)));
+            assert_eq!(url_at(t, 1, 12), Some((url, 0, 13)));
+            assert_eq!(url_cols(t, 1, 20), (0..13).collect::<Vec<_>>());
+            // 「see 」不带链接
+            assert!(url_at(t, 0, 0).is_none());
+            assert!(url_at(t, 0, 3).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn hit_wrapped_osc8_link(cx: &mut TestAppContext) {
+        // OSC8 显式链接被折行后，后半截仍必须解析到**同一个** uri（而不是
+        // 掉到正则分支被当成裸域名）。
+        let uri = "https://example.com/very/long/target";
+        let text = format!("\x1b]8;id=link1;{uri}\x07{uri}\x1b]8;;\x07");
+        let terminal = link_probe_terminal(cx, 20, 4, &text);
+        terminal.update(cx, |t, _| {
+            assert_eq!(
+                t.link_hits_at_viewport_position(0, 0).hyperlink,
+                Some((uri.to_string(), "link1".into(), 0, 20))
+            );
+            assert_eq!(
+                t.link_hits_at_viewport_position(1, 15).hyperlink,
+                Some((uri.to_string(), "link1".into(), 0, 16)),
+                "续行仍应命中同一个 OSC8 链接"
+            );
+            // 第 1 行第 16 列之后是空白填充，不该命中
+            assert!(t.link_hits_at_viewport_position(1, 16).hyperlink.is_none());
+            // 正则分支此时也能认出同一条完整 URL（优先 OSC8 还是 URL 是
+            // `terminal_view::hit_test_link` 的事，两条路径都得给全地址）。
+            assert_eq!(url_at(t, 1, 0), Some((uri.to_string(), 0, 16)));
+        });
+    }
+
+    #[gpui::test]
+    fn hit_url_not_truncated_at_viewport_top(cx: &mut TestAppContext) {
+        // 19 列：`see https://a.exam` 折行后滚出视口，视口第 0 行只剩
+        // `ple.com/long/path`。旧实现只看视口内的行，会把后半截（前半截在
+        // scrollback 里）当成完整的裸域名；新实现从 grid 补回前缀行。
+        let terminal = link_probe_terminal(
+            cx,
+            19,
+            3,
+            "see https://a.example.com/long/path\r\n1\r\n2\r\n3\r\n",
+        );
+        terminal.update(cx, |t, cx| {
+            // 滚到 offset=2：视口第 0 行 = 内容第 1 行（URL 的后半截）。
+            t.set_display_offset(2, cx);
+            t.update_last_content(true);
+            assert_eq!(
+                t.link_hits_at_viewport_position(0, 0).url,
+                Some(("https://a.example.com/long/path".into(), 0, 16)),
+                "scrollback 里的前半截必须接回来"
+            );
+            // 视口第 1 行是内容行 `1`，不带链接。
+            assert!(t.link_hits_at_viewport_position(1, 0).url.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn hit_path_with_wide_chars_is_one_token(cx: &mut TestAppContext) {
+        // 旧实现把 `~/项目/src/main.rs` 按宽字符占位格切成 `~/项`、`目`、
+        // `/src/main.rs` 三个 token（真实路径永远命不中），尾部还会退化成
+        // 绝对路径 `/src/main.rs`。
+        let terminal = link_probe_terminal(cx, 40, 3, "~/项目/src/main.rs");
+        terminal.update(cx, |t, _| {
+            assert_eq!(
+                t.link_hits_at_viewport_position(0, 0).file.unwrap().path,
+                "~/项目/src/main.rs"
+            );
+            let hits: Vec<_> = (0..40)
+                .filter_map(|c| {
+                    t.link_hits_at_viewport_position(0, c)
+                        .file
+                        .map(|h| (c, h.path.clone()))
+                })
+                .collect();
+            assert_eq!(
+                hits,
+                (0..18)
+                    .map(|c| (c, "~/项目/src/main.rs".to_string()))
+                    .collect::<Vec<_>>(),
+                "整条路径应当是一个 token，且每列（含宽字符右半格）都命中它"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn hit_path_range_excludes_wrapping_punct(cx: &mut TestAppContext) {
+        let terminal = link_probe_terminal(cx, 40, 3, "(src/main.rs)");
+        terminal.update(cx, |t, _| {
+            let hit = t
+                .link_hits_at_viewport_position(0, 1)
+                .file
+                .expect("路径应可命中");
+            assert_eq!(hit.path, "src/main.rs");
+            // `(` 在第 0 列，路径占 1..=11，`)` 在第 12 列
+            assert_eq!((hit.start_col, hit.end_col), (1, 12));
+            assert!(
+                t.link_hits_at_viewport_position(0, 0).file.is_none(),
+                "`(` 不该可点"
+            );
+            assert!(
+                t.link_hits_at_viewport_position(0, 12).file.is_none(),
+                "`)` 不该可点"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn hit_prose_words_are_not_paths(cx: &mut TestAppContext) {
+        // 正文高频词 + 版本号 + 时间戳不再变成链接
+        let terminal = link_probe_terminal(
+            cx,
+            60,
+            3,
+            "error in src target index main v1.2.3 12:30:45\r\nmain.rs",
+        );
+        terminal.update(cx, |t, _| {
+            for col in 0..60 {
+                let hit = t.link_hits_at_viewport_position(0, col).file;
+                assert!(
+                    hit.is_none(),
+                    "第 {col} 列不该是可点击路径：{:?}",
+                    hit.map(|h| h.raw.clone())
+                );
+            }
+            // 下一行里真正的文件名仍然可点
+            assert_eq!(
+                t.link_hits_at_viewport_position(1, 0)
+                    .file
+                    .map(|h| h.path.clone()),
+                Some("main.rs".to_string())
+            );
+        });
+    }
+
     /// 构造一个无 PTY、但带记录型 `remote_resize_callback` 的终端，
     /// 以便观察「窗口尺寸通知」的下发次数与内容（含缩放）。
     fn resize_test_terminal(
@@ -7121,8 +7310,6 @@ mod tests {
             rows: 4,
             total_lines: 4,
             viewport_lines: 4,
-            url_ranges: Vec::new(),
-            hyperlink_ranges: Vec::new(),
             selection_range: None,
             palette: Default::default(),
         };
