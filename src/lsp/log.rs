@@ -18,7 +18,7 @@
 //! 只在主线程可见，从那些地方 `try_global` 拿不到东西。日志又必须跨线程写、
 //! 主线程读，所以用最朴素的 `OnceLock<Mutex<..>>`。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 use crate::lsp::project::ServerKey;
@@ -40,6 +40,17 @@ const MAX_JSON_CHARS: usize = 120;
 fn logs() -> &'static Mutex<HashMap<ServerKey, ServerLog>> {
     static LOGS: OnceLock<Mutex<HashMap<ServerKey, ServerLog>>> = OnceLock::new();
     LOGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 已被显式回收的桶：这些 key 的报文**不再重建桶**。
+///
+/// Stop 的回收与关闭握手是并发的：`shutdown` 请求与 `exit` 通知在
+/// `remove_server` 之后才写日志，而 `record` 用 `entry().or_default()` 建桶
+/// ——删掉立刻又被建回来，桶数照样无界增长。这里记下「用户已经关掉它」，
+/// 让迟到的关闭报文静默丢弃；同一 key 再次启动时由 [`sink_for`] 解封。
+fn purged_keys() -> &'static Mutex<HashSet<ServerKey>> {
+    static PURGED: OnceLock<Mutex<HashSet<ServerKey>>> = OnceLock::new();
+    PURGED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// 报文的流向。
@@ -130,6 +141,16 @@ impl LogSink for KeyedSink {
         // 锁中毒（另一线程 push 时 panic）不该把发送路径带崩：
         // `if let Ok` 静默丢弃这一次记录。
         if let Ok(mut servers) = logs().lock() {
+            // 锁序固定成 logs → purged（与 `remove_server` 一致）：否则
+            // 「查封条」和「写桶」之间会被 remove 插队，迟到的报文会把桶
+            // 重新建出来，用户的「回收日志」就白做了。
+            if let Ok(purged) = purged_keys().lock()
+                && purged.contains(&self.key)
+            {
+                // 桶已被用户显式回收（Stop）。关闭握手的报文是它的余波，
+                // 重建桶等于让回收失效。
+                return;
+            }
             servers.entry(self.key.clone()).or_default().push(message);
         }
     }
@@ -140,6 +161,10 @@ impl LogSink for KeyedSink {
 /// 按需建桶：没有该服务器的日志时（还没发过任何消息）不预建条目，
 /// 免得表里堆满从未通信过的 key。
 pub fn sink_for(key: &ServerKey) -> std::sync::Arc<dyn LogSink> {
+    // 同一个 key 再次启动：解除回收标记，否则新会话的报文全被丢掉。
+    if let Ok(mut purged) = purged_keys().lock() {
+        purged.remove(key);
+    }
     std::sync::Arc::new(KeyedSink { key: key.clone() })
 }
 
@@ -157,21 +182,33 @@ pub fn messages(key: &ServerKey) -> Vec<LogMessage> {
 }
 
 /// 清空某服务器的日志。
+///
+/// 不重建桶：桶不存在就是「没有日志」，凭空建一个空桶只会让表里多一项。
 pub fn clear(key: &ServerKey) {
-    if let Ok(mut servers) = logs().lock() {
-        servers.entry(key.clone()).or_default().messages.clear();
+    if let Ok(mut servers) = logs().lock()
+        && let Some(log) = servers.get_mut(key)
+    {
+        log.messages.clear();
     }
 }
 
 /// 移除某服务器的日志桶（用户显式停止该服务器时调用）。
 ///
 /// 单桶有界（`MAX_MESSAGES`），但**桶的数量**没有：键空间 = 会话中启动过
-/// 的每个 (项目根, 语言)。停止/崩溃的服务器其桶会永久驻留（`clear` 甚至
-/// 会用 `or_default()` 重建空桶），多仓库会话下持续累积。启动失败的桶
-/// **不**在此移除——那正是用户排障「服务器为什么没起来」的唯一证据。
+/// 的每个 (项目根, 语言)。停止/崩溃的服务器其桶会永久驻留，多仓库会话下
+/// 持续累积。启动失败的桶**不**在此移除——那正是用户排障「服务器为什么没起来」
+/// 的唯一证据。
+///
+/// 删除的同时**封住这个 key**：关闭握手（`shutdown` / `exit`）的报文在
+/// 这之后才到达，`record` 若照常 `or_default()` 会立刻把桶建回来。封条在
+/// 该 key 下次 `sink_for`（重新启动服务器）时解除。封条本身很小（一个 key），
+/// 且只随「回收过的服务器数」增长。
 pub fn remove_server(key: &ServerKey) {
     if let Ok(mut servers) = logs().lock() {
         servers.remove(key);
+    }
+    if let Ok(mut purged) = purged_keys().lock() {
+        purged.insert(key.clone());
     }
 }
 
@@ -496,5 +533,76 @@ mod tests {
         assert_eq!(messages(&b).len(), 0);
         assert_eq!(messages(&a)[0].method, "a-method");
         clear(&a);
+    }
+
+    /// 回归：Stop 之后的迟到报文不能把已回收的桶重建回来。
+    ///
+    /// 关闭握手（`shutdown` / `exit`）与 `remove_server` 是并发的，旧 sink 在
+    /// 回收之后仍可能写一帧。若 `record` 照常 `or_default()` 建桶，回收就白做
+    /// 了——桶数照样随「启动过多少个 (根, 语言)」无界增长。
+    #[test]
+    fn late_frames_do_not_resurrect_a_removed_bucket() {
+        let k = key("purge-late-frames");
+        let old_sink = sink_for(&k);
+        old_sink.record(message(
+            Direction::Outgoing,
+            MessageKind::Request,
+            "initialize",
+            Some(1),
+            None,
+        ));
+        assert_eq!(messages(&k).len(), 1);
+
+        remove_server(&k);
+        assert!(messages(&k).is_empty());
+
+        // 迟到的关闭报文：桶已回收，静默丢弃。
+        old_sink.record(message(
+            Direction::Incoming,
+            MessageKind::Response,
+            "",
+            Some(1),
+            None,
+        ));
+        assert!(
+            messages(&k).is_empty(),
+            "已回收的桶不该被迟到的关闭报文重建"
+        );
+
+        // 同一 key 再次启动：封条解除，新会话的报文正常记录。
+        sink_for(&k).record(message(
+            Direction::Outgoing,
+            MessageKind::Request,
+            "initialize",
+            Some(2),
+            None,
+        ));
+        assert_eq!(messages(&k).len(), 1);
+        clear(&k);
+    }
+
+    /// 回收之后再 `clear` 也不能把桶建回来。
+    ///
+    /// `clear` 以前用 `or_default()`，等于凭空造一个空桶；桶的数量是
+    /// 「启动过多少个 (根, 语言)」，多仓库会话下会持续累积。
+    #[test]
+    fn clearing_a_removed_bucket_does_not_recreate_it() {
+        let k = key("purge-clear");
+        let sink = sink_for(&k);
+        sink.record(message(
+            Direction::Outgoing,
+            MessageKind::Request,
+            "initialize",
+            Some(1),
+            None,
+        ));
+        remove_server(&k);
+        clear(&k);
+        assert!(messages(&k).is_empty());
+        // 桶真的不在表里（而不是空桶）。
+        assert!(
+            logs().lock().unwrap().get(&k).is_none(),
+            "回收后不该留下空桶"
+        );
     }
 }

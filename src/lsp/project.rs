@@ -126,6 +126,21 @@ pub fn remote_project_root(config: &crate::ssh::SshConnectionConfig, path: &str)
         return dir;
     }
 
+    // 同一目录只允许一次探测在飞。后来者在这里等：前一个探测无论成功
+    // （写根）还是失败（写时间戳）都会留下结论，下面复查一遍就能直接返回，
+    // 不必再打一趟 SSH。等待发生在后台线程（调用方都已改成后台探测）。
+    let probe_lock = root_probe_lock(&key);
+    let _probing = probe_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = root_cache_lock().get(&key).cloned() {
+        return hit;
+    }
+    if root_probe_failures_lock()
+        .get(&key)
+        .is_some_and(|at| at.elapsed() < ROOT_PROBE_RETRY)
+    {
+        return dir;
+    }
+
     let probed = crate::ssh::sftp_fs::with_cached_session(config, |session| {
         session.execute_command_bytes(&root_probe_script(&dir), 15)
     });
@@ -209,6 +224,35 @@ fn root_probe_failures_lock() -> std::sync::MutexGuard<'static, HashMap<String, 
 /// 缓存同一个口径：两台机器的同名目录是两个不同的根。
 fn root_cache_key(config: &crate::ssh::SshConnectionConfig, dir: &Path) -> String {
     format!("{}|{}", config.connection_string(), dir.display())
+}
+
+/// 正在探测中的根（按 `root_cache_key` 串行化）。
+///
+/// 同一目录下的 N 个标签会各自发起探测（`pending_root_attach` 只按 tab id
+/// 去重，同一目录的不同文件仍是不同 tab），而每次探测都是一次 SSH 往返。
+/// 让后来者在同一把锁上等：前一个探完把结果（根或失败时间戳）写进缓存，
+/// 后来者拿到锁后走「复查缓存」直接返回，不再多打一趟。
+///
+/// 表里只存 `Weak`：最后一个持有者释放后条目就是死引用，下次插入时清掉。
+/// 常态下这张表是空的，不会随目录数增长。
+fn root_probe_locks()
+-> &'static std::sync::Mutex<HashMap<String, std::sync::Weak<std::sync::Mutex<()>>>> {
+    use std::sync::{Mutex, OnceLock, Weak};
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取某个目录的探测锁（没有就建一个）。
+fn root_probe_lock(key: &str) -> Arc<std::sync::Mutex<()>> {
+    let mut locks = root_probe_locks().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = locks.get(key).and_then(std::sync::Weak::upgrade) {
+        return existing;
+    }
+    // 顺手回收死引用，表的大小跟着「同时探测的目录数」走。
+    locks.retain(|_, weak| weak.strong_count() > 0);
+    let lock = Arc::new(std::sync::Mutex::new(()));
+    locks.insert(key.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 fn root_cache_lock() -> std::sync::MutexGuard<'static, HashMap<String, PathBuf>> {
@@ -783,6 +827,19 @@ impl LspManager {
     ) -> Vec<String> {
         let settings = lsp_settings(cx);
         crate::lsp::registry::pending_chain_probe(language, &settings, ssh_config)
+    }
+
+    /// 冷却期里最早还有多久可以重问（远端专用）。
+    ///
+    /// 待探列表为空**不等于**不用探：主机不可达时那 30 秒的退避窗口内候选
+    /// 不会被列出，于是没人再去问。编辑器据此排一次延迟重试。
+    pub fn chain_probe_cooldown(
+        cx: &App,
+        language: &str,
+        ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+    ) -> Option<std::time::Duration> {
+        let settings = lsp_settings(cx);
+        crate::lsp::registry::chain_probe_cooldown(language, &settings, ssh_config)
     }
 
     /// 这门语言**有**可用的服务器吗（不关心此刻起没起），候选链在**目标主机**上问。

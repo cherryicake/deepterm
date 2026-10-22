@@ -636,6 +636,13 @@ pub struct TerminalView {
     info_toast: Option<(String, String)>,
     /// 信息 Toast 自动隐藏任务
     info_toast_hide_task: Option<Task<()>>,
+    /// agent 计时器：驱动打断宽限窗与静默过期（见
+    /// `Terminal::settle_agent_interrupt` / `expire_stale_agent`）。
+    ///
+    /// 只在有待办事项时存在（`Terminal::has_pending_agent_timers`），到点跑完
+    /// 就清掉自己；静止的 agent 不会让渲染循环空转。第二个字段是**计划醒来的
+    /// 时刻**：更早的待办（比如用户按了 Esc）出现时要撤掉旧任务重排。
+    agent_timer_task: Option<(Task<()>, Instant)>,
     // ── Bell visual flash ─────────────────────────────────────────────────
     /// 最近一次 BEL 到达时刻：驱动视区边缘的短促视觉闪烁。
     /// `None` 或距今超过 [`BELL_FLASH_MS`] 时不绘制。
@@ -1189,6 +1196,13 @@ impl TerminalView {
                     cx.emit(Event::AgentChanged);
                     cx.notify();
                     this.maybe_prompt_hook_install(cx);
+                    // 状态可能变成 Working/打断待决：把计时器拉起来。
+                    this.ensure_agent_timer(cx);
+                }
+                // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent，
+                // 不等 TTL。远程路径在这里早退（见 refresh_foreground_agent）。
+                TerminalEvent::ForegroundGroupChanged => {
+                    this.refresh_foreground_agent_now(cx);
                 }
             },
         );
@@ -1268,6 +1282,7 @@ impl TerminalView {
             toast_hide_task: None,
             info_toast: None,
             info_toast_hide_task: None,
+            agent_timer_task: None,
             bell_flash_at: None,
             bell_flash_task: None,
             last_bell_at: None,
@@ -1454,6 +1469,12 @@ impl TerminalView {
                         cx.emit(Event::AgentChanged);
                         cx.notify();
                         this.maybe_prompt_hook_install(cx);
+                        // 状态可能变成 Working/打断待决：把计时器拉起来。
+                        this.ensure_agent_timer(cx);
+                    }
+                    // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
+                    TerminalEvent::ForegroundGroupChanged => {
+                        this.refresh_foreground_agent_now(cx);
                     }
                 },
             );
@@ -1533,6 +1554,7 @@ impl TerminalView {
                 toast_hide_task: None,
                 info_toast: None,
                 info_toast_hide_task: None,
+                agent_timer_task: None,
                 bell_flash_at: None,
                 bell_flash_task: None,
                 last_bell_at: None,
@@ -1641,6 +1663,12 @@ impl TerminalView {
                     cx.emit(Event::AgentChanged);
                     cx.notify();
                     this.maybe_prompt_hook_install(cx);
+                    // 状态可能变成 Working/打断待决：把计时器拉起来。
+                    this.ensure_agent_timer(cx);
+                }
+                // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
+                TerminalEvent::ForegroundGroupChanged => {
+                    this.refresh_foreground_agent_now(cx);
                 }
             },
         )
@@ -1909,13 +1937,41 @@ impl TerminalView {
     ///
     /// 远程终端直接返回：远程的 `1337;Proc=` 已在 `Terminal` 侧同步检测过了。
     ///
+    /// # 为什么要 `now`
+    ///
+    /// 纯 TTL 轮询有一个等不到的盲区：agent 画完首屏就坐下等按键，此后 pty
+    /// 不再有输出 → 没有 `Wakeup` → 没有调用点 → 图标要么延迟到下一次任意
+    /// 输出，要么永远不出现。tty7 的解法是在读线程里按「提示符标记」与
+    /// 「前台组变化」两个**事件**驱动探测（`daemon/pane.rs` 的 `poll_now`），
+    /// 间隔只是兜底。这里用 OSC 133 提示符标记做同一个信号：shell 画完
+    /// 提示符意味着上一条命令结束，此刻前台是 agent 还是 shell 正好要重新
+    /// 判一次。
+    ///
     /// 仅 unix：本地检测要 `tcgetpgrp`（无 fd 的平台上不存在这个概念）与
     /// `/proc`（Linux）/ `KERN_PROCARGS2`（macOS），`Terminal::detect_agent_for_local`
     /// 本身就是 `#[cfg(unix)]`。非 unix 保留空实现而不是删掉调用点——调用点在
     /// `do_check_tab_label_changed` 里，与平台无关。
     #[cfg(unix)]
     fn refresh_foreground_agent(&mut self, cx: &mut Context<Self>) {
-        const TTL: Duration = Duration::from_secs(2);
+        self.refresh_foreground_agent_inner(false, cx);
+    }
+
+    /// 同上，但**绕过 TTL**：由 OSC 133 提示符标记（[`crate::terminal::Event`]
+    /// 的 `ForegroundGroupChanged`）触发。
+    ///
+    /// 仍然受 in-flight 防抖约束——上一发还没回来就不重复派，否则一次
+    /// `cd` 引发的连串提示符重绘会攒出多个后台任务。
+    #[cfg(unix)]
+    fn refresh_foreground_agent_now(&mut self, cx: &mut Context<Self>) {
+        self.refresh_foreground_agent_inner(true, cx);
+    }
+
+    #[cfg(unix)]
+    fn refresh_foreground_agent_inner(&mut self, force: bool, cx: &mut Context<Self>) {
+        // 兜底间隔。事件驱动（提示符标记）负责「及时」，这个间隔只负责
+        // 「没集成 shell 时也不会完全瞎」。从 2s 降到 500ms：识别滞后是用户
+        // 明确抱怨的症状，而检测本身只是两次 syscall + 一次 `/proc` 读。
+        const TTL: Duration = Duration::from_millis(500);
 
         if self.is_remote(cx) {
             return;
@@ -1925,7 +1981,10 @@ impl TerminalView {
             .foreground_agent
             .checked_at
             .is_some_and(|at| at.elapsed() < TTL);
-        if cache_fresh || self.foreground_agent.refresh_in_flight {
+        if !force && cache_fresh {
+            return;
+        }
+        if self.foreground_agent.refresh_in_flight {
             return;
         }
 
@@ -1960,6 +2019,66 @@ impl TerminalView {
     /// `Terminal::try_handle_osc_sequence` 里，与平台无关。
     #[cfg(not(unix))]
     fn refresh_foreground_agent(&mut self, _cx: &mut Context<Self>) {}
+
+    /// 非 unix：同上，无本地检测可做（见 unix 版文档）。
+    #[cfg(not(unix))]
+    fn refresh_foreground_agent_now(&mut self, _cx: &mut Context<Self>) {}
+
+    /// 确保 agent 计时器在跑（打断宽限窗 / 静默过期）。
+    ///
+    /// 只在有待办事项时排一次，到点跑完就清掉自己，所以静止的 agent 不会让
+    /// 渲染循环空转。
+    ///
+    /// 轮询间隔取「离下一件待办还有多久」的一半：宽限窗未过时是亚秒级，
+    /// 只剩静默过期时是分钟级——一个 30 分钟的等待不该变成上千次唤醒。
+    /// 期限提前了（比如用户按了 Esc）就撤掉旧任务重排，否则打断的结算会被
+    /// 静默过期的长定时器拖到几十分钟以后。
+    fn ensure_agent_timer(&mut self, cx: &mut Context<Self>) {
+        let delay = {
+            let term = self.terminal.read(cx);
+            if !term.has_pending_agent_timers() {
+                // 没有待办：在途的定时器醒来也只是空跑，撤掉。
+                self.agent_timer_task = None;
+                return;
+            }
+            term.agent_timer_delay(Duration::from_millis(250))
+        };
+        let deadline = Instant::now() + delay;
+        // 已有在途任务且它醒得不比新的晚 → 什么都不用做。
+        if let Some((_, scheduled)) = &self.agent_timer_task {
+            if *scheduled <= deadline {
+                return;
+            }
+        }
+        // 期限提前了：撤掉旧任务（drop 即取消）重排一个。
+        self.agent_timer_task = None;
+        let terminal = self.terminal.clone();
+        self.agent_timer_task = Some((
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                let _ = this.update(cx, |this, cx| {
+                    // 只有还是我们这个任务时才清掉并重排——期间可能已经换成了
+                    // 一个期限更早的新任务。
+                    let ours = this
+                        .agent_timer_task
+                        .as_ref()
+                        .is_some_and(|(_, scheduled)| *scheduled == deadline);
+                    if ours {
+                        this.agent_timer_task = None;
+                    }
+                    terminal.update(cx, |term, cx| {
+                        term.settle_agent_interrupt(cx);
+                        term.expire_stale_agent(cx);
+                    });
+                    if ours {
+                        // 还有没办完的（例如仍在 Working、静默计时没到）就再排一轮。
+                        this.ensure_agent_timer(cx);
+                    }
+                });
+            }),
+            deadline,
+        ));
+    }
 
     fn current_remote_working_directory(&self, cx: &App) -> Option<String> {
         self.cached_working_directory
@@ -2159,9 +2278,7 @@ impl TerminalView {
             // Display text may carry `:line:col` (e.g. `foo.rs:12` linked to
             // `file:///abs/foo.rs`); the hit test already ran the file
             // detector on the same cell, reuse that result.
-            let (line, col_num) = file_hit
-                .map(|h| (h.line, h.col))
-                .unwrap_or((None, None));
+            let (line, col_num) = file_hit.map(|h| (h.line, h.col)).unwrap_or((None, None));
             let is_remote = self.ssh_config.is_some();
             if is_remote {
                 let remote_path = parse_file_uri_remote_path(trimmed)?;
@@ -4829,6 +4946,9 @@ impl TerminalView {
         self.terminal.update(cx, |terminal, _| {
             terminal.write(data);
         });
+        // 打断键会开一个宽限窗（见 `Terminal::note_interrupt_key`），把计时器
+        // 拉起来；其它按键下 `ensure_agent_timer` 自己判断有没有待办。
+        self.ensure_agent_timer(cx);
         // 如果有广播回调，调用它来广播输入
         if let Some(ref callback) = self.broadcast_callback {
             callback(BroadcastMsg::Raw(data.to_vec()));
@@ -5351,7 +5471,13 @@ impl Render for TerminalView {
         // `&&` 谓词（绑定侧才走 `KeyBindingContextPredicate`）。
         let mut key_context = gpui::KeyContext::new_with_defaults();
         key_context.add(CONTEXT);
-        if self.terminal.read(cx).last_content().selection_range.is_some() {
+        if self
+            .terminal
+            .read(cx)
+            .last_content()
+            .selection_range
+            .is_some()
+        {
             key_context.add("selection");
         }
 
@@ -6088,7 +6214,7 @@ mod tests {
 
     /// 检测**查不了**时不能清掉 hook 上报的会话状态。
     ///
-    /// 检测是每 2 秒一次的轮询，它会因为「没有 pty fd」这类原因查不出东西。
+    /// 检测是每 500 毫秒一次的轮询，它会因为「没有 pty fd」这类原因查不出东西。
     /// 早期实现把所有 `None` 都当成「agent 退出了」，于是 agent 正在干活、
     /// 状态点刚变成 Working，一次检测抖动就让状态点凭空消失，而且**不会
     /// 自己回来**——hook 要等下一个回合事件才再报一次。
@@ -6343,6 +6469,11 @@ mod tests {
     }
 
     /// 没有上游 hook 适配的 agent 不弹安装窗。
+    ///
+    /// Cursor **不在**这个名单里：它有 `~/.cursor/hooks.json`（扁平形状，
+    /// 见 `agent::hooks::adapter_events` 的 Cursor 分支）。早先它在这里，
+    /// 理由是「没有 terminalSequence 也没有插件机制」——那个判断落后于
+    /// Cursor 自己的 hook 支持，tty7 早就适配了。
     #[test]
     fn other_agents_are_not_prompted() {
         use crate::agent::CLIAgent;
@@ -6350,9 +6481,10 @@ mod tests {
 
         for agent in [
             CLIAgent::Aider,
-            CLIAgent::Cursor,
             CLIAgent::Hermes,
             CLIAgent::Vibe,
+            CLIAgent::Amp,
+            CLIAgent::Auggie,
         ] {
             assert!(
                 !should_prompt_hook_install(Some(agent), false, false),
@@ -6577,13 +6709,18 @@ mod tests {
         view.update(cx, |view, cx| {
             view.select_all(cx);
             assert!(
-                view.terminal.read(cx).last_content().selection_range.is_some(),
+                view.terminal
+                    .read(cx)
+                    .last_content()
+                    .selection_range
+                    .is_some(),
                 "前提：全选后有选区"
             );
 
             view.copy(cx);
             assert!(
-                view.terminal.read(cx)
+                view.terminal
+                    .read(cx)
                     .last_content()
                     .selection_range
                     .is_none(),

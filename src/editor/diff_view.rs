@@ -1423,6 +1423,15 @@ impl DiffView {
         self.recompute(cx);
     }
 
+    /// 是否有未保存修改。
+    ///
+    /// 供编辑器做**淘汰保护**：diff 标签的未保存内容只活在这个实体里
+    /// （右栏 `InputState` + `saved_text` 基线），文件树状态被淘汰时整实体
+    /// 一起丢掉，切回只能从 git 重载——用户的编辑静默消失。
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
     /// Save the working-tree file through the repository backend.
     ///
     /// 走与普通编辑器一致的 `save_text_to_file`：按磁盘原编码写回并保留行尾

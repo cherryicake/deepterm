@@ -578,6 +578,165 @@ mod tests {
         cond()
     }
 
+    /// 端到端：PTY 里跑一个真的会调上报脚本的假 agent，验证 hook 事件从
+    /// 「子进程写 /dev/tty」一路走到读线程的 OSC 摘出。
+    ///
+    /// 这条补的是**接缝**覆盖：上报脚本是生成的 shell、OSC 要穿过 PTY 与
+    /// 扫描器、payload 要能原样取出。上面那些单测各自验证一段（脚本语法、
+    /// payload 形状、解析器），没有一条真的让一个子进程往 pty 里写。
+    ///
+    /// 之所以用记录型 scanner 而不是 `KittyGraphicsScanner`：这里要断言的
+    /// 是「OSC 有没有被摘出来、内容对不对」，与 kitty 图形的部分无关。
+    #[test]
+    fn a_real_pty_agent_hook_reaches_the_scanner() {
+        struct OscRecorder {
+            osc: Arc<StdMutex<Vec<Vec<u8>>>>,
+        }
+        impl PtyScanner for OscRecorder {
+            fn scan(
+                &mut self,
+                data: &[u8],
+                pending: &mut Vec<u8>,
+                emit: &mut dyn FnMut(&[u8]),
+                _grid: &mut dyn FnMut() -> GridState,
+            ) {
+                // 只摘 OSC 777：其余原样透传，让提示符/回显照常进 vte。
+                let mut rest = data;
+                while let Some(at) = memchr::memmem::find(rest, b"\x1b]777;") {
+                    let before = &rest[..at];
+                    if !before.is_empty() {
+                        emit(before);
+                    }
+                    match crate::terminal::escape_scan::extract_osc(&rest[at..]) {
+                        crate::terminal::escape_scan::Extract::Complete { len, content } => {
+                            self.osc.lock().unwrap().push(content.to_vec());
+                            rest = &rest[at + len..];
+                        }
+                        _ => {
+                            // 不完整：交给 pending 等下一块。
+                            let _ = pending;
+                            return;
+                        }
+                    }
+                }
+                emit(rest);
+            }
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("deepterm-local-pty-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 上报脚本与 agent 本体都临时生成。
+        let reporter = dir.join("agent-report.sh");
+        std::fs::write(&reporter, crate::agent::hooks::agent_report_script()).unwrap();
+        // 真实安装路径会置执行位（`HookInstallPlan::executable`）；漏了它
+        // 脚本只会 Permission denied，而 agent 侧看不到任何错误——事件全部
+        // 静默消失，正是这条用例要防的失败模式。
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&reporter, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = dir.join("empryo");
+        std::fs::write(
+            &agent,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "export DEEPTERM=1\n",
+                    "R=\"{reporter}\"\n",
+                    "\"$R\" empryo session-start <<'EOF'\n",
+                    "{{\"session_id\":\"e2e-1\",\"cwd\":\"/tmp\"}}\n",
+                    "EOF\n",
+                    "\"$R\" empryo permission-request <<'EOF'\n",
+                    "{{\"session_id\":\"e2e-1\",\"message\":\"Bash(rm -rf /tmp/x)\"}}\n",
+                    "EOF\n",
+                    "\"$R\" empryo stop <<'EOF'\n",
+                    "{{\"session_id\":\"e2e-1\"}}\n",
+                    "EOF\n",
+                    "printf 'SENTINEL\\n'\n",
+                ),
+                reporter = reporter.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let bounds = crate::terminal::TerminalBounds::default();
+        let options = alacritty_terminal::tty::Options {
+            shell: Some(alacritty_terminal::tty::Shell::new(
+                agent.to_string_lossy().into_owned(),
+                Vec::new(),
+            )),
+            working_directory: Some(dir.clone()),
+            drain_on_exit: true,
+            env: crate::terminal::mappings::default_terminal_env(),
+        };
+        let pty = alacritty_terminal::tty::new(&options, bounds.into(), 0).expect("创建 PTY 失败");
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let listener = ZedListener(events_tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &bounds,
+            listener.clone(),
+        )));
+        let osc = Arc::new(StdMutex::new(Vec::new()));
+        let parts = LocalReader::spawn(
+            pty,
+            term.clone(),
+            listener,
+            Box::new(OscRecorder { osc: osc.clone() }),
+            bounds.into(),
+        )
+        .expect("启动读线程失败");
+
+        // 先确认 agent 真的跑完了（脚本自身失败与协议失败是两回事）。
+        // 15s 而不是 5s：全量跑时同批有多个 PTY 测试在抢调度，5s 偶发不够
+        // （与 `grok_overlay_shaped_stream_reaches_render_plan` 同源的基建竞态）。
+        assert!(
+            wait_until(
+                || grid_text(&term).contains("SENTINEL"),
+                Duration::from_secs(15)
+            ),
+            "假 agent 没跑到 SENTINEL：脚本本身失败"
+        );
+
+        let events = osc.lock().unwrap();
+        let decoded: Vec<String> = events
+            .iter()
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .collect();
+        assert_eq!(
+            decoded.len(),
+            3,
+            "三条 hook 事件都必须被摘出来，实际：{decoded:?}"
+        );
+        // 逐条解析：这验证的是「子进程写进 pty 的字节」与「解析器读的载荷」
+        // 两端严格对齐——错一位整条事件就没了，而失败是静默的。
+        let mut kinds = Vec::new();
+        for raw in &decoded {
+            let payload = crate::agent::parse_agent_event(raw.as_bytes())
+                .unwrap_or_else(|| panic!("OSC 载荷解析失败：{raw}"));
+            assert_eq!(payload.agent, Some(crate::agent::CLIAgent::Empryo));
+            assert_eq!(payload.session_id.as_deref(), Some("e2e-1"));
+            kinds.push(payload.kind);
+        }
+        assert_eq!(
+            kinds,
+            vec![
+                crate::agent::AgentEventKind::SessionStart,
+                crate::agent::AgentEventKind::PermissionRequest,
+                crate::agent::AgentEventKind::Stop,
+            ],
+            "事件种类与顺序必须与脚本里调用的次序一致"
+        );
+        // 第一条带 cwd。
+        let first = crate::agent::parse_agent_event(decoded[0].as_bytes()).unwrap();
+        assert_eq!(first.cwd.as_deref(), Some(std::path::Path::new("/tmp")));
+
+        drop(parts);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 端到端验证：本地 PTY 中 `printf` 出来的 APC 序列能到达扫描器。
     ///
     /// 这是整个 Kitty 图形协议实现的前提——若 APC 无法到达应用层，

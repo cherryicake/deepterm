@@ -615,6 +615,8 @@ impl ServerFileCache {
     /// （hover / 目录预取产生的 transient 副本），没有非持久化条目才淘汰最旧
     /// 的持久化条目（用户显式打开过的文件）。
     ///
+    /// 同键覆盖视作「刚用过」：移到队尾，而不是保留原来的位置。
+    ///
     /// 刚插入的条目不参与淘汰：缓存已满且全是持久化条目时，新来的
     /// `persist: false` 副本是唯一的非持久化条目，会被自己这一步选走并删掉，
     /// 于是 hover/目录预取静默失效（插进去就没了）。超出预算时改为淘汰最旧
@@ -627,6 +629,10 @@ impl ServerFileCache {
         if let Some(previous) = self.files.insert(path.clone(), entry) {
             // 同键覆盖：旧条目的字节先扣掉，否则 `bytes` 会只增不减地虚高。
             self.bytes -= previous.content.len();
+            // 覆盖也要刷新 FIFO 位置：刚重新加载的条目最可能马上再被用到，
+            // 停在队首会让它成为下一个淘汰目标（缓存刚写好就丢）。
+            self.order.retain(|p| p != &path);
+            self.order.push_back(path.clone());
         } else {
             self.order.push_back(path.clone());
         }
@@ -754,5 +760,29 @@ mod tests {
         for config in &configs[1..] {
             assert!(cache.get(config, Path::new("/root")).is_some());
         }
+    }
+
+    fn file_entry(content: &str, persist: bool) -> FileContentEntry {
+        FileContentEntry {
+            content: content.to_string(),
+            encoding: FileEncoding::Utf8,
+            loaded_at: Instant::now(),
+            persist,
+        }
+    }
+
+    /// 同键覆盖要刷新 FIFO 位置：刚重新加载的条目最可能马上再被用到，
+    /// 停在队首会让它成为下一个淘汰目标（缓存刚写好就丢）。
+    #[test]
+    fn overwriting_a_key_moves_it_to_the_back() {
+        let mut cache = ServerFileCache::new();
+        cache.insert_bounded(PathBuf::from("/a"), file_entry("a", true));
+        cache.insert_bounded(PathBuf::from("/b"), file_entry("b", true));
+        // 重新加载 /a：字节数按新旧差值更新，顺序移到队尾。
+        cache.insert_bounded(PathBuf::from("/a"), file_entry("aa", true));
+
+        let order: Vec<&Path> = cache.order.iter().map(PathBuf::as_path).collect();
+        assert_eq!(order, vec![Path::new("/b"), Path::new("/a")]);
+        assert_eq!(cache.bytes, "aa".len() + "b".len());
     }
 }

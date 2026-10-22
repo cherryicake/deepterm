@@ -820,7 +820,11 @@ impl Editor {
     }
 
     /// 获取打开文件的基本信息列表，用于标签页组切换
-    pub fn get_open_files_info(&self) -> Vec<EditorOpenFileInfo> {
+    ///
+    /// `dirty` 必须**当场从实体读**（diff tab 的编辑状态不在 `EditorFile.dirty`
+    /// 上：那个字段由 `InputState` 的文本变化驱动，而 diff tab 的占位
+    /// `InputState` 永远是空的）。淘汰保护只看这份快照，读错就等于丢编辑。
+    pub fn get_open_files_info(&self, cx: &App) -> Vec<EditorOpenFileInfo> {
         self.open_files
             .iter()
             .map(|f| EditorOpenFileInfo {
@@ -836,7 +840,10 @@ impl Editor {
                 },
                 encoding: f.encoding,
                 read_only: f.read_only,
-                dirty: f.dirty,
+                dirty: match f.diff.as_ref() {
+                    Some(diff) => diff.read(cx).is_dirty(),
+                    None => f.dirty,
+                },
                 diff_repo: f.diff_repo.clone(),
             })
             .collect()
@@ -877,7 +884,7 @@ impl Editor {
         // 切标签页组会缓存影子 InputState：先把防抖中的 live 文本落盘，
         // 否则切回来会看到滞后的内容。
         self.flush_all_live_shadows(cx);
-        let open_files_info = self.get_open_files_info();
+        let open_files_info = self.get_open_files_info(cx);
         let cached_editor_states = self.take_cached_editor_states();
         let cached_diff_views = self.take_cached_diff_views();
         let active_file_id = self.active_file_id.clone();
@@ -1626,6 +1633,11 @@ impl Editor {
         self.active_file_id = None;
         self.loading_gens.clear();
         self.editor_state_subscriptions.clear();
+        // 挂起表里存的是 tab id，标签都没了就没有意义。清掉后，重新打开的
+        // 同一路径（id 相同）会自己发起探测，而不是命中 `start_lsp_for_tab`
+        // 的「已有探测在飞」早退、把接入托付给一次属于旧标签的回调。
+        // 根探测已按目录去重（见 `remote_project_root`），重复发起不会多打一趟。
+        self.pending_root_attach.clear();
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.clear_tabs(cx);
         });
@@ -1952,10 +1964,12 @@ impl Editor {
 
     /// 捕获当前会话的跳转归属（必须在发请求**之前**调，理由见 [`LspJumpOrigin`]）。
     fn lsp_jump_origin(&self) -> Option<LspJumpOrigin> {
+        let tab_id = self.active_file_id.clone();
         self.active_lsp_session().map(|s| LspJumpOrigin {
             uri: s.uri().clone(),
             ssh_config: s.ssh_config().cloned(),
             root: s.server_root().map(|r| r.to_path_buf()),
+            tab_id,
         })
     }
 
@@ -1988,7 +2002,18 @@ impl Editor {
                 log::debug!("lsp: cannot open non-file location {}", location.uri);
             }
             LspJumpAction::JumpInPlace { line, col } => {
-                if let Some(tab_id) = self.active_file_id.clone() {
+                // 跳到**发起请求的那个标签**，不是此刻活动的标签。
+                //
+                // `same_file` 是用请求前捕获的 `origin` 算的，用户在这段
+                // 等待里切了标签时，两者会指向不同文件：按活动标签跳会把
+                // 光标打进一个毫不相干的文件。发起标签已关闭时才退回活动
+                // 标签（此时没有更好的落点）。
+                let tab_id = active
+                    .as_ref()
+                    .and_then(|o| o.tab_id.clone())
+                    .filter(|id| self.open_files.iter().any(|f| &f.id == id))
+                    .or_else(|| self.active_file_id.clone());
+                if let Some(tab_id) = tab_id {
                     self.jump_to_line_col(&tab_id, line, Some(col), window, cx);
                 }
             }
@@ -2916,7 +2941,7 @@ impl Editor {
         });
         if let Some((language, ssh_config)) = active {
             if !language.is_empty() {
-                self.warm_lsp_chain(&language, ssh_config.as_ref(), cx);
+                self.warm_lsp_chain(&language, ssh_config.as_ref(), true, cx);
             }
         }
 
@@ -2959,10 +2984,15 @@ impl Editor {
     ///
     /// 只在「开标签 / 点开菜单」这类事件上调，不在 `render` 里调：待探列表
     /// 本身只是缓存读，但每帧 spawn 一个后台任务毫无意义。
+    ///
+    /// `allow_cooldown_retry` 只给「用户触发」的那次调用：冷却期结束后自动
+    /// 补探一次，**只补一次**。不设上限的话，一次失败会变成每 30 秒一轮的
+    /// 自我永续——每轮都是一次连不上主机的 SSH 超时。
     fn warm_lsp_chain(
         &mut self,
         language: &str,
         ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+        allow_cooldown_retry: bool,
         cx: &mut Context<Self>,
     ) {
         // 本机不需要探（`command_exists` 在 UI 线程上也就是一次子进程，
@@ -2972,10 +3002,46 @@ impl Editor {
         };
         let pending = crate::lsp::LspManager::pending_chain_probe(cx, language, Some(&ssh));
         if pending.is_empty() {
+            // 待探列表为空也可能是「主机不可达，正在 30 秒冷却期里」——那之后
+            // 没人会再去问一次，chip 会一直停在「还不知道」。排一次延迟重试。
+            if !allow_cooldown_retry {
+                return;
+            }
+            let Some(delay) =
+                crate::lsp::LspManager::chain_probe_cooldown(cx, language, Some(&ssh))
+            else {
+                return;
+            };
+            // 守卫在这里就占住：冷却期里只允许存在一个重试定时器。
+            let Some(guard) = crate::lsp::registry::begin_chain_probe(language, Some(&ssh)) else {
+                return;
+            };
+            let language = language.to_string();
+            cx.spawn(async move |this, cx| {
+                let _guard = guard;
+                cx.background_executor().timer(delay).await;
+                // 释放占用，让真正的探测能拿到守卫。
+                drop(_guard);
+                if let Some(entity) = this.upgrade() {
+                    entity.update(cx, |editor, cx| {
+                        // 补探只补一次：这次再失败就等下一次用户触发。
+                        editor.warm_lsp_chain(&language, Some(&ssh), false, cx);
+                    });
+                }
+            })
+            .detach();
             return;
         }
+        // 同一 (主机, 语言) 只允许一个探测任务在飞：连开 N 个远端文件不该
+        // 叠出 N 个把同一串超时各撞一遍的任务。守卫随任务移动，任务结束
+        // （或被取消）时自动注销。
+        let Some(guard) = crate::lsp::registry::begin_chain_probe(language, Some(&ssh)) else {
+            return;
+        };
         log::debug!("lsp(remote): warming probe cache for {language}: {pending:?}");
         cx.spawn(async move |this, cx| {
+            // 守卫活到任务结束：提前 drop 会让并发的另一次调用立刻再起一个。
+            let _guard = guard;
             cx.background_spawn(async move {
                 crate::lsp::registry::probe_commands_pending(&pending, Some(&ssh));
             })
@@ -2985,6 +3051,34 @@ impl Editor {
             }
         })
         .detach();
+    }
+
+    /// 一个标签归属的服务器根：**只读已知信息，绝不联网**。
+    ///
+    /// 优先级：
+    /// 1. 会话已有的根（连上过，或跳转打开时显式指定）。它是进程身份的权威
+    ///    ——跳进 typeshed / 依赖源码的标签挂在发起跳转的那个项目上，按落点
+    ///    路径重算会算出另一个 `ServerKey`，菜单于是显示「未启动」，点 Start
+    ///    还会在存根目录旁另起一个进程。
+    /// 2. 远端且根还没探到 → `None`。此时任何 `root_for` 调用都是一次最长
+    ///    15s 的同步 SSH 往返，而这两个调用方（菜单快照、按 key 找标签）都
+    ///    跑在 UI 线程上。根没探到也意味着这个标签的 `start_lsp_for_tab`
+    ///    还挂在 `pending_root_attach` 里、没有会话可操作，跳过它是安全的。
+    /// 3. 其余走 [`crate::lsp::project::root_for`]：本地是一次 `Path::exists`
+    ///    遍历，远端是缓存命中（`remote_root_is_known` 已保证）。
+    fn tab_server_root(&self, file: &EditorFile) -> Option<PathBuf> {
+        if let Some(root) = file.lsp.as_ref().and_then(|s| s.server_root()) {
+            return Some(root.to_path_buf());
+        }
+        if let Some(ssh) = file.ssh_config.as_ref()
+            && !crate::lsp::project::remote_root_is_known(ssh, &file.path)
+        {
+            return None;
+        }
+        Some(crate::lsp::project::root_for(
+            Path::new(&file.path),
+            file.ssh_config.as_ref(),
+        ))
     }
 
     /// 当前活动 tab 对应的服务器快照（没有服务器时为 `None`）。
@@ -3016,11 +3110,17 @@ impl Editor {
             // 纯文本、没有语言：这门语言压根没有可接的服务器，菜单没什么可开的。
             return None;
         }
-        // 根按归属算：远端标签在那台主机上探测（一次 SFTP 往返，只在
-        // 用户点开菜单时发生），本地标签走本地探测。口径统一由
-        // `lsp::project::root_for` 提供——编辑器里各写各的回退曾经算出过
-        // 两个不同的键，菜单操作落到不存在的进程上。
-        let root = crate::lsp::project::root_for(Path::new(&file.path), file.ssh_config.as_ref());
+        // 根按归属算，但**不在 UI 线程上联网**：会话已有的根优先（跳转打开
+        // 的文件挂的是发起方的根），远端根还没探到时直接放弃这次开菜单——
+        // 那个标签此时还没有会话，chip 也不会显示，重试一次即可。
+        // 口径统一由 [`Self::tab_server_root`] 提供。
+        let Some(root) = self.tab_server_root(file) else {
+            log::debug!(
+                "lsp: skip menu, remote project root not known yet for {}",
+                file.path
+            );
+            return None;
+        };
         let key = crate::lsp::project::ServerKey {
             root,
             language,
@@ -3089,11 +3189,10 @@ impl Editor {
     /// 判定用 `language` + 项目根一致：进程的唯一标识就是
     /// (项目根, 语言)，多个标签共享同一个进程（同一门语言开十个文件）。
     ///
-    /// 根的比较按**标签自己的归属**算：远端标签的项目根要在那台主机上探测
-    /// （`remote_project_root`），本地标签走本地 `project_root`。混用会让
-    /// 「远端项目根」与「本地碰巧存在的同名目录」互相错配。口径取自
-    /// `lsp::project::root_for`，与 `active_lsp_snapshot`、服务器表键
-    /// 完全同源——否则这里判定的归属与菜单操作的 key 会错开。
+    /// 根的比较按**标签自己的归属**算，且**不在 UI 线程上联网**：会话已有
+    /// 的根优先，远端根还没探到的标签直接跳过（它们此刻还没有会话，见
+    /// [`Self::tab_server_root`]）。口径与 `active_lsp_snapshot`、服务器表键
+    /// 同源——否则这里判定的归属与菜单操作的 key 会错开。
     fn tabs_for_server_key(&self, key: &crate::lsp::project::ServerKey, cx: &App) -> Vec<String> {
         self.open_files
             .iter()
@@ -3109,18 +3208,24 @@ impl Editor {
                 {
                     return false;
                 }
-                let root = crate::lsp::project::root_for(Path::new(&f.path), f.ssh_config.as_ref());
+                let Some(root) = self.tab_server_root(f) else {
+                    // 远端根还没探到：这个标签还没有会话（见
+                    // `start_lsp_for_tab` 的挂起分支），不属于任何 key。
+                    return false;
+                };
                 root == key.root && f.lsp_language_matches(&key.language, cx)
             })
             .map(|f| f.id.to_string())
             .collect()
     }
 
-    /// 断开某个 key 的所有会话（`didClose` + 回收子进程）。
+    /// 断开某个 key 的所有会话（只发 `didClose`，进程由调用方回收）。
     ///
-    /// `LspManager` 那半件事在调用方，这里只处理编辑器侧持有的 client——
-    /// 不这么做的话，编辑器还攥着已经死掉的 client 继续发请求，刷一片失败
-    /// 日志。
+    /// **不在这里 `session.stop()`**：两个调用方（Stop / Restart）都已经先让
+    /// `LspManager` 把进程关掉了。再对每个标签调一次 `stop()` 就是对同一个
+    /// 共享 client 并发 N+1 次 `shutdown`——每个克隆都可能在别人 `take()`
+    /// 之前看到「进程还在」，于是各发一遍 `shutdown`/`exit` 并各等到超时。
+    /// 这里只摘掉编辑器手里的 client 并发 `didClose`，不再重复关进程。
     fn stop_sessions_for_key(&mut self, key: &crate::lsp::project::ServerKey, cx: &App) {
         for tab_id in self.tabs_for_server_key(key, cx) {
             let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
@@ -3128,7 +3233,7 @@ impl Editor {
             };
             if let Some(session) = self.open_files[idx].lsp.as_mut() {
                 log::debug!("lsp: closing session for {} ({})", tab_id, key.language);
-                session.stop();
+                session.close();
             }
         }
     }
@@ -4916,7 +5021,7 @@ impl Editor {
         // 远端标签：把这台主机的候选链交给后台探一次（见 `warm_lsp_chain`）。
         // 本函数跑在 UI 线程，而下面紧接着要判「该不该给 chip 占位」——那里
         // 只读缓存，第一次多半还不知道，占位先挂着，探完 notify 再补名字。
-        self.warm_lsp_chain(&language, ssh_config.as_ref(), cx);
+        self.warm_lsp_chain(&language, ssh_config.as_ref(), true, cx);
         // 跳转打开的文件（`.pyi` 存根、依赖源码……）该挂哪个根**已经知道**了：
         // 用发起跳转的那个会话的根，别让落点自己另算一个（见 `lsp_jump_roots`）。
         let jump_root = self
@@ -4942,9 +5047,13 @@ impl Editor {
         // 已经带着根来的（`jump_root`）不在这条路上：既不用探，也就不会挂起。
         if jump_root.is_none() {
             if let Some(ssh) = ssh_config.as_ref() {
-                if !crate::lsp::project::remote_root_is_known(ssh, &self.open_files[idx].path)
-                    && !self.pending_root_attach.iter().any(|t| t == tab_id)
-                {
+                if !crate::lsp::project::remote_root_is_known(ssh, &self.open_files[idx].path) {
+                    // 已经有一次探测在飞：等它落地后由那边的回调重走本函数。
+                    // **不能落到下面的 `connect`**——那里的 `key_for_file` 会在
+                    // UI 线程上做同一趟同步往返，正是这条挂起逻辑要避免的。
+                    if self.pending_root_attach.iter().any(|t| t == tab_id) {
+                        return;
+                    }
                     self.pending_root_attach.push(tab_id.to_string());
                     let path_for_probe = self.open_files[idx].path.clone();
                     let ssh_for_probe = ssh.clone();
@@ -6841,6 +6950,13 @@ struct LspJumpOrigin {
     ///
     /// `None` = 会话还没连上（`connect` 之后才有根），退回按路径自己算。
     root: Option<PathBuf>,
+    /// 发起请求时活动标签的 id。
+    ///
+    /// 「同文件原地跳」必须落回**这个**标签：`same_file` 是用上面的 uri 算
+    /// 的，而用户在等待响应期间可以切走。没有它就只能跳当前活动标签，光标
+    /// 会进错文件（`uri` 无法反查出标签：同一文件在远端/本地、或两个文件树
+    /// 分组里可以有多个 id）。
+    tab_id: Option<SharedString>,
 }
 
 /// [`Editor::lsp_jump_roots`] 的键：目标文件路径 + 它所在的主机（本地为 `None`）。

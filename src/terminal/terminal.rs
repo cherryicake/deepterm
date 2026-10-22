@@ -82,6 +82,21 @@ const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(8);
 /// 渲染层在两次应用之间始终使用「已应用」的尺寸。
 const RESIZE_COALESCE_DELAY: Duration = Duration::from_millis(25);
 
+/// 用户按下打断键后，等多久才允许推断「回合已结束」。
+///
+/// 多数 agent 在 <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd> 取消回合时不发 hook
+/// （Claude 的 `Stop` 明确跳过用户中断），但少数会——Kimi 的 `Interrupt`、
+/// 与按键赛跑的 `Stop`——而且都远在这个窗内。没有这个宽限，那些 agent 的
+/// 回合会被过早判成结束，然后被自己随后的事件翻回去，图标抖一下。
+pub const AGENT_INTERRUPT_SETTLE: Duration = Duration::from_millis(1000);
+
+/// 一个回合可以多久不出任何 hook 事件，之后放弃它、状态落回 `Idle`。
+///
+/// 取 30 分钟：远大于任何真实回合的安静段（Claude 最长的单次工具调用上限
+/// 十分钟），而每个工具跑完、每次权限询问都会把计时重置。它的作用是兜住
+/// 「`Stop` 丢了」——否则状态点会永远停在蓝色。
+pub const AGENT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
+
 /// 终端类型 - 区分本地和远程终端
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalType {
@@ -160,6 +175,18 @@ pub enum Event {
     /// `remote_process_name` 就是这个模式），把状态塞进变体会复制一份并迫使
     /// 每次 emit 都 `Clone`。与既有的 `TitleChanged` 等保持一致。
     AgentChanged,
+    /// 前台进程组可能换了人：shell 刚画完提示符（OSC 133;A/B）或刚收回前台。
+    ///
+    /// 这是给**本地** agent 探测用的触发信号，载荷无关，订阅方收到即重查
+    /// （见 `TerminalView::refresh_foreground_agent`）。它替代的是纯 TTL 轮询
+    /// 等满 2 秒的那段等待：agent 画完首屏就坐下等按键时不再有输出，TTL
+    /// 轮询永远等不到下一个 Wakeup。
+    ///
+    /// 只由 OSC 133 分支发：那是 shell 集成标记「命令结束、提示符重绘」的
+    /// 唯一时刻，与「agent 刚退出、shell 回到前台」严格对应。远程路径同样
+    /// 会收到它（远程集成 shell 也发 133;A/B），但远程检测走
+    /// `1337;Proc=`，早退。
+    ForegroundGroupChanged,
     /// 端口转发的建立结果到达（见 [`Terminal::port_forward_status`]）。
     PortForwardChanged,
 }
@@ -990,6 +1017,14 @@ pub struct Terminal {
     /// - 装了 hook 但进程检测认不出（agent 被包装器裹着）：靠事件里的 agent 兜底建 session。
     /// - 没装 hook：检测出身份、session 为 `None`，界面显示品牌图标 + Idle，绝不误报 Working。
     agent_session: Option<AgentSessionState>,
+    /// 用户按下的「打断」键是否还在等宽限窗（见 [`Self::note_interrupt_key`]）。
+    ///
+    /// 存在的理由：多数 agent 在用户打断回合时不发 hook，但少数会（Kimi 的
+    /// `Interrupt`、与按键赛跑的 `Stop`）。宽限窗让后者先说话，避免把还在
+    /// 跑的回合过早判成结束。
+    agent_interrupt_pending: Option<std::time::Instant>,
+    /// 最近一次 agent 事件（或 session 重置）的时刻，用于放弃静默过久的回合。
+    agent_last_event: Option<std::time::Instant>,
     window_title: Option<String>,
     /// 本地终端的事件循环发送器（仅 Windows：conpty 无裸 fd，沿用 alacritty EventLoop）
     sender: Option<EventLoopSender>,
@@ -1191,6 +1226,8 @@ impl Terminal {
             port_forward_status: None,
             foreground_agent: None,
             agent_session: None,
+            agent_interrupt_pending: None,
+            agent_last_event: None,
             window_title: None,
             sender: None,
             #[cfg(unix)]
@@ -1432,6 +1469,8 @@ impl Terminal {
                 port_forward_status: None,
                 foreground_agent: None,
                 agent_session: None,
+                agent_interrupt_pending: None,
+                agent_last_event: None,
                 window_title: None,
                 // unix 的本地终端走自建读线程（`local_sender`）；windows 走
                 // alacritty `EventLoop`，输入/尺寸/关闭都走 `sender`。
@@ -1610,6 +1649,8 @@ impl Terminal {
             port_forward_status: None,
             foreground_agent: None,
             agent_session: None,
+            agent_interrupt_pending: None,
+            agent_last_event: None,
             window_title: None,
             sender: None,
             #[cfg(unix)]
@@ -1918,6 +1959,8 @@ impl Terminal {
                 port_forward_status: None,
                 foreground_agent: None,
                 agent_session: None,
+                agent_interrupt_pending: None,
+                agent_last_event: None,
                 window_title: None,
                 sender: None,
                 #[cfg(unix)]
@@ -2488,6 +2531,10 @@ impl Terminal {
                 session.apply_event(event);
             }
         }
+        // 事件到了：静默计时重置，宽限窗里等的那个中断也不需要再猜了——
+        // 这条事件本身就是 agent 对那个按键的回应（或与它无关的新活动）。
+        self.agent_last_event = Some(std::time::Instant::now());
+        self.agent_interrupt_pending = None;
 
         // 两个判定**不可合并**：agent 身份可能单独变化而 session 全等。
         // 例如 session_id 已经设好、status 已经是 Idle 时再收一条 `SessionStart`，
@@ -2534,7 +2581,7 @@ impl Terminal {
     /// 进程检测结果的写入路径。
     ///
     /// 与 [`Self::set_foreground_agent`] 的区别在于**`NoAgent` 与 `Unavailable`
-    /// 被区别对待**：检测是每 2 秒一次的轮询，它「查不了」和「查了、前台不是
+    /// 被区别对待**：检测是每 500 毫秒一次的轮询，它「查不了」和「查了、前台不是
     /// agent」是两件事，混为一谈会让图标乱闪。
     ///
     /// - [`LocalAgentProbe::Agent`]：认出来了，更新身份。
@@ -2549,7 +2596,7 @@ impl Terminal {
     /// 身份清掉，tab 上的图标就会闪一下再回来，而 hook 报的状态点更是会
     /// 直接消失且**不会自己恢复**——hook 要等下一个回合事件才再报一次。
     ///
-    /// 取舍是「宁可多留一会儿」而不是「宁可闪一下」：图标多留 2 秒是轻微
+    /// 取舍是「宁可多留一会儿」而不是「宁可闪一下」：图标多留一会儿是轻微
     /// 的信息滞后，闪一下则是明显的视觉噪声。
     pub fn apply_detected_agent(&mut self, probe: LocalAgentProbe, cx: &mut Context<Self>) {
         match probe {
@@ -2996,6 +3043,8 @@ impl Terminal {
 
         if Self::matches_osc_prefix(osc_content, "133;A") {
             self.remote_shell_ready = true;
+            // shell 接管前台（刚画完提示符）→ 前台组可能刚从 agent 变回 shell。
+            cx.emit(Event::ForegroundGroupChanged);
             return true;
         }
 
@@ -3017,6 +3066,9 @@ impl Terminal {
                 }
             };
             self.input_area_start = Some(point);
+            // 提示符画完 = 上一条命令（含 agent）已结束。此时重查前台的代价
+            // 最低、收益最高：agent 若已退出，图标此刻就该落回去。
+            cx.emit(Event::ForegroundGroupChanged);
             return true;
         }
 
@@ -3809,6 +3861,150 @@ impl Terminal {
         delay
     }
 
+    /// 一次输入写入是否是用户在要求 agent 停下：裸 <kbd>Esc</kbd> 或
+    /// <kbd>Ctrl+C</kbd>，含 kitty 键盘协议与 xterm `modifyOtherKeys` 编码
+    /// （TUI 常把终端切到那两种模式）。
+    ///
+    /// 只有**整段写入**都恰好是这个键才算——按键总是单独到达，而一次粘贴
+    /// 里恰好含 `0x03` 不是按键。
+    ///
+    /// Grok Build 是例外：它的 Esc 会让回合继续跑，把它当中断会把还在工作的
+    /// 回合判成结束。
+    fn is_interrupt_write(&self, data: &[u8]) -> bool {
+        let Some(agent) = self.foreground_agent else {
+            return false;
+        };
+        match data {
+            // 裸 Esc。
+            b"\x1b" => return agent != CLIAgent::Grok,
+            // 裸 Ctrl+C：legacy 编码或 kitty 的 Ctrl+C（CSI 99;5u 的简写形式）。
+            b"\x03" | b"\x1b[27;5;99~" => return true,
+            _ => {}
+        }
+        // kitty 键盘协议 / modifyOtherKeys：CSI <code>;<mods>[:<event>]u。
+        let Some(body) = data
+            .strip_prefix(b"\x1b[")
+            .and_then(|b| b.strip_suffix(b"u"))
+            .and_then(|b| std::str::from_utf8(b).ok())
+        else {
+            return false;
+        };
+        let mut fields = body.split(';');
+        let code = fields
+            .next()
+            .and_then(|f| f.split(':').next())
+            .and_then(|c| c.parse::<u32>().ok());
+        let mut modifiers = fields.next().unwrap_or("1").split(':');
+        let mods = modifiers
+            .next()
+            .and_then(|m| m.parse::<u32>().ok())
+            .unwrap_or(1);
+        // 只认按下（event 1）；缺失视为按下。
+        let event = modifiers.next().map_or(Some(1), |e| e.parse::<u32>().ok());
+        if event != Some(1) {
+            return false;
+        }
+        // Caps Lock / Num Lock 搭在掩码里但不改变按键本身。
+        const LOCKS: u32 = 64 | 128;
+        match (code, mods.saturating_sub(1) & !LOCKS) {
+            (Some(27), 0) => agent != CLIAgent::Grok,
+            (Some(99), 4) => true,
+            _ => false,
+        }
+    }
+
+    /// 记下用户按了打断键，等待一个宽限窗再下结论。
+    ///
+    /// 真报了中断的 agent（Kimi 的 `Interrupt`、与按键赛跑的 `Stop`）会在窗内
+    /// 发事件，那时 [`Self::apply_agent_events`] 会清掉这个 pending；窗过了还
+    /// 没事件，才由 [`Self::settle_agent_interrupt`] 推断回合结束。
+    fn note_interrupt_key(&mut self) {
+        self.agent_interrupt_pending = Some(std::time::Instant::now());
+    }
+
+    /// 宽限窗过后仍无事件：把回合判成已结束。
+    ///
+    /// 由 `TerminalView` 的定时器驱动（见 [`AGENT_INTERRUPT_SETTLE`]）。
+    pub fn settle_agent_interrupt(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.agent_interrupt_pending else {
+            return;
+        };
+        if pending.elapsed() < AGENT_INTERRUPT_SETTLE {
+            return;
+        }
+        self.agent_interrupt_pending = None;
+        let before = self.agent_session.clone();
+        if let Some(session) = self.agent_session.as_mut() {
+            session.assume_interrupted();
+        }
+        if self.agent_session != before {
+            cx.emit(Event::AgentChanged);
+        }
+    }
+
+    /// 放弃一个静默过久的回合（见 [`AgentSessionState::assume_stale`]）。
+    ///
+    /// 同样由 `TerminalView` 的定时器驱动。阈值远大于任何真实回合的安静
+    /// 段：每个工具跑完、每次权限询问都会重置计时。
+    pub fn expire_stale_agent(&mut self, cx: &mut Context<Self>) {
+        let working = self
+            .agent_session
+            .as_ref()
+            .is_some_and(|s| s.status == crate::agent::AgentStatus::Working);
+        if !working {
+            return;
+        }
+        let Some(since) = self.agent_last_event else {
+            // 从未收到过事件（跨视图带入的 session）：从现在起算，给一次机会。
+            self.agent_last_event = Some(std::time::Instant::now());
+            return;
+        };
+        if since.elapsed() < AGENT_STALE_AFTER {
+            return;
+        }
+        let before = self.agent_session.clone();
+        if let Some(session) = self.agent_session.as_mut() {
+            session.assume_stale();
+        }
+        if self.agent_session != before {
+            cx.emit(Event::AgentChanged);
+        }
+    }
+
+    /// 是否有待处理的 agent 计时器工作（宽限窗或静默过期）。
+    ///
+    /// 供 `TerminalView` 决定要不要起定时器：两者都没有时不空转。
+    pub fn has_pending_agent_timers(&self) -> bool {
+        self.agent_interrupt_pending.is_some()
+            || self
+                .agent_session
+                .as_ref()
+                .is_some_and(|s| s.status == crate::agent::AgentStatus::Working)
+    }
+
+    /// 下一次 agent 计时器该在多久后醒来：离最近的待办还有一半时间。
+    ///
+    /// 宽限窗未过时是亚秒级；只剩静默过期时是分钟级。下限 `min` 防止 0 间隔
+    /// busy-loop，上限是静默过期本身的 30 分钟天花板。
+    pub fn agent_timer_delay(&self, min: Duration) -> Duration {
+        let mut wait = AGENT_STALE_AFTER;
+        if let Some(pending) = self.agent_interrupt_pending {
+            wait = wait.min(AGENT_INTERRUPT_SETTLE.saturating_sub(pending.elapsed()));
+        }
+        if let Some(since) = self.agent_last_event {
+            wait = wait.min(AGENT_STALE_AFTER.saturating_sub(since.elapsed()));
+        } else if self
+            .agent_session
+            .as_ref()
+            .is_some_and(|s| s.status == crate::agent::AgentStatus::Working)
+        {
+            // 从没收到过事件：先醒一次，把静默计时的起点定下来。
+            wait = Duration::ZERO;
+        }
+        // 留一半余量：事件可能比预期早到，早醒一次比晚醒一次好。
+        (wait / 2).max(min).min(AGENT_STALE_AFTER)
+    }
+
     pub fn write(&mut self, data: &[u8]) {
         // 用户输入即将进入 PTY：维护输入区锚点（见 input_area_start 文档）。
         // - shell 前台且尚无锚点 → 以当前光标（提示符末尾）为锚点；
@@ -3819,6 +4015,11 @@ impl Terminal {
         self.observe_input_state();
         if memchr::memchr2(b'\r', b'\n', data).is_some() {
             self.input_area_start = None;
+        }
+
+        // 打断键：起宽限窗，让 agent 有机会先自己报中断。
+        if self.is_interrupt_write(data) {
+            self.note_interrupt_key();
         }
 
         #[cfg(unix)]
@@ -4243,8 +4444,9 @@ impl Terminal {
         if chain.rows.is_empty() {
             return LinkHits::default();
         }
-        let fits =
-            |row: usize, start_col: usize, end_col: usize| row == chain.clicked_row && col >= start_col && col < end_col;
+        let fits = |row: usize, start_col: usize, end_col: usize| {
+            row == chain.clicked_row && col >= start_col && col < end_col
+        };
         let hyperlink =
             crate::terminal::link_detector::detect_hyperlinks_in_rows(chain.row_slices())
                 .into_iter()
@@ -5399,6 +5601,49 @@ mod tests {
                 "windows 本地终端必须持有 EventLoop 的 channel，否则输入被静默丢弃"
             );
         });
+    }
+
+    /// 计时器的等待时间必须按「离待办还有多久」算。
+    ///
+    /// 以前写成 `elapsed - deadline`：到期前恒为 0，agent 干活时每 250ms 醒
+    /// 一次，最长持续 30 分钟——正是文档里承诺「分钟级」的反面。
+    #[test]
+    fn agent_timer_delay_counts_down_to_the_deadline() {
+        use crate::agent::{AgentSessionState, AgentStatus};
+        use std::time::Instant;
+
+        let min = Duration::from_millis(250);
+        let mut term = Terminal::create_error_terminal();
+
+        // 打断宽限窗：1 秒后结算，醒来必须在这一秒之内。
+        term.agent_interrupt_pending = Some(Instant::now());
+        let delay = term.agent_timer_delay(min);
+        assert!(
+            delay <= super::AGENT_INTERRUPT_SETTLE && delay >= min,
+            "打断宽限窗的等待时间不对：{delay:?}"
+        );
+
+        // 静默过期：离到期还有 2 秒 → 一半时间醒来。
+        term.agent_interrupt_pending = None;
+        term.agent_session = Some(AgentSessionState {
+            status: AgentStatus::Working,
+            ..Default::default()
+        });
+        term.agent_last_event =
+            Some(Instant::now() - (super::AGENT_STALE_AFTER - Duration::from_secs(2)));
+        let delay = term.agent_timer_delay(min);
+        assert!(
+            delay <= Duration::from_secs(2) && delay >= min,
+            "静默过期的等待时间不对：{delay:?}"
+        );
+
+        // 刚收到事件：离到期还早，不该被 250ms 的下限拖着空转。
+        term.agent_last_event = Some(Instant::now());
+        let delay = term.agent_timer_delay(min);
+        assert!(
+            delay > Duration::from_secs(60),
+            "回合刚开始时不该频繁醒来：{delay:?}"
+        );
     }
 
     /// OSC 终止符落在下一个 chunk 时应被拼接重扫，而不是永久丢失。

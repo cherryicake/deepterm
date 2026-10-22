@@ -68,8 +68,9 @@ pub enum HookPlanError {
 ///
 /// # 为什么是这几个
 ///
-/// - `PreToolUse` **刻意不装**：每次工具调用都会触发，只会让状态点在
-///   Waiting/Working 之间抖，而它携带的信息量并不比 `PostToolUse` 多。
+/// - `PreToolUse` 装，但脚本里手写分支：只有 `AskUserQuestion` 上报成
+///   `question-asked`，普通工具调用直接丢掉。它是唯一不进权限提示的提问
+///   通道，漏了它 tab 会一直显示"工作中"而 agent 其实在等用户回答。
 /// - `StopFailure` 必须装：用户按 Esc 打断时 Claude 发的是它而不是 `Stop`，
 ///   不装的话状态点会**永远卡在 Working/蓝色**，看起来就是个 bug。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,37 +88,23 @@ pub struct HookEventSpec {
     pub kind: AgentEventKind,
 }
 
+impl HookEventSpec {
+    const fn plain(claude_event: &'static str, kind: AgentEventKind) -> Self {
+        Self { claude_event, kind }
+    }
+}
+
 /// deepterm 为 Claude Code 安装的全部 hook 事件。
 pub const CLAUDE_HOOK_EVENTS: &[HookEventSpec] = &[
-    HookEventSpec {
-        claude_event: "SessionStart",
-        kind: AgentEventKind::SessionStart,
-    },
-    HookEventSpec {
-        claude_event: "UserPromptSubmit",
-        kind: AgentEventKind::PromptSubmit,
-    },
-    HookEventSpec {
-        claude_event: "PermissionRequest",
-        kind: AgentEventKind::PermissionRequest,
-    },
-    HookEventSpec {
-        claude_event: "PostToolUse",
-        kind: AgentEventKind::ToolComplete,
-    },
-    HookEventSpec {
-        claude_event: "Stop",
-        kind: AgentEventKind::Stop,
-    },
+    HookEventSpec::plain("SessionStart", AgentEventKind::SessionStart),
+    HookEventSpec::plain("UserPromptSubmit", AgentEventKind::PromptSubmit),
+    HookEventSpec::plain("PermissionRequest", AgentEventKind::PermissionRequest),
+    HookEventSpec::plain("PreToolUse", AgentEventKind::QuestionAsked),
+    HookEventSpec::plain("PostToolUse", AgentEventKind::ToolComplete),
+    HookEventSpec::plain("Stop", AgentEventKind::Stop),
     // 用户按 Esc 打断。没有它，状态点会卡在蓝色不归位。
-    HookEventSpec {
-        claude_event: "StopFailure",
-        kind: AgentEventKind::Stop,
-    },
-    HookEventSpec {
-        claude_event: "SessionEnd",
-        kind: AgentEventKind::SessionEnd,
-    },
+    HookEventSpec::plain("StopFailure", AgentEventKind::Stop),
+    HookEventSpec::plain("SessionEnd", AgentEventKind::SessionEnd),
 ];
 
 /// 哪些 agent 支持「装一个东西就能上报状态」。
@@ -131,7 +118,7 @@ pub const CLAUDE_HOOK_EVENTS: &[HookEventSpec] = &[
 ///   （[`agent_report_script`]）完成——纯 shell、本地/远端同一份，
 ///   不要求 `deepterm` 在 PATH 里。
 ///
-/// 与 tty7 的 15 个 hook 适配器一致；识别支持不代表存在状态事件源。
+/// 与 tty7 的 hook 适配器一致；识别支持不代表存在状态事件源。
 pub const INSTALLABLE_AGENTS: &[CLIAgent] = &[
     CLIAgent::Claude,
     CLIAgent::Codex,
@@ -147,7 +134,11 @@ pub const INSTALLABLE_AGENTS: &[CLIAgent] = &[
     CLIAgent::Goose,
     CLIAgent::Kimi,
     CLIAgent::QoderCLI,
+    CLIAgent::QoderCLICn,
     CLIAgent::Crush,
+    CLIAgent::Empryo,
+    CLIAgent::Cursor,
+    CLIAgent::Jcode,
 ];
 
 /// 该不该弹「装 hook」的窗。
@@ -215,12 +206,30 @@ pub fn hook_install_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
 fn adapter_events(agent: CLIAgent) -> &'static [(&'static str, &'static str)] {
     use CLIAgent::*;
     match agent {
+        // Codex 的 `PermissionRequest` 无输出应答时会落进它自己的审批提示，
+        // 于是"在等用户"这件事能被报出来而不替它做决定。`PostToolUse` 负责
+        // 把授权通过后的状态从 Waiting 拉回 Working；`PreToolUse` 兜住
+        // `request_user_input`——那个工具不走权限审批。
         Codex => &[
             ("SessionStart", "session-start"),
             ("UserPromptSubmit", "prompt-submit"),
+            ("PermissionRequest", "permission-request"),
+            ("PreToolUse", "tool-start"),
+            ("PostToolUse", "tool-complete"),
             ("Stop", "stop"),
         ],
-        TraeCode | Qwen => &[
+        TraeCode => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PermissionRequest", "permission-request"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        // Qwen 是唯一有一等权限事件的 agent，所以既不需要 `Notification` 嗅探、
+        // 也**不该**装 `Notification`——那只会把专属事件已经精确报出的状态搅浑。
+        // 早先它与 TraeCode 共用一张表，白白多了一条噪音源。
+        Qwen => &[
             ("SessionStart", "session-start"),
             ("UserPromptSubmit", "prompt-submit"),
             ("PermissionRequest", "permission-request"),
@@ -261,16 +270,7 @@ fn adapter_events(agent: CLIAgent) -> &'static [(&'static str, &'static str)] {
             ("StopFailure", "stop"),
             ("SessionEnd", "session-end"),
         ],
-        QoderCLI => &[
-            ("SessionStart", "session-start"),
-            ("UserPromptSubmit", "prompt-submit"),
-            ("PermissionRequest", "permission-request"),
-            ("Elicitation", "question-asked"),
-            ("PostToolUse", "tool-complete"),
-            ("Stop", "stop"),
-            ("StopFailure", "stop"),
-            ("SessionEnd", "session-end"),
-        ],
+        QoderCLI => QODER_EVENTS,
         Crush => &[("PreToolUse", "tool-complete")],
         Copilot => &[
             ("sessionStart", "session-start"),
@@ -279,9 +279,62 @@ fn adapter_events(agent: CLIAgent) -> &'static [(&'static str, &'static str)] {
             ("sessionEnd", "session-end"),
             ("notification", "notification"),
         ],
+        // 中国大陆版 Qoder 与国际版同一套 hook 形状，只是配置目录不同
+        // （`~/.qoder-cn`），事件表完全共用。
+        QoderCLICn => QODER_EVENTS,
+        // Cursor 的 hooks.json 是扁平的（`command`/`matcher` 在顶层，不嵌套
+        // `hooks` 数组），且事件名是小驼峰。`stop` 的载荷带 `status`
+        // （completed/aborted/error），三种都算回合结束。
+        //
+        // 打印模式（`cursor-agent -p`）不发 `beforeSubmitPrompt` 也不发
+        // `stop`（Cursor 官方确认的缺口），所以 `-p` 会话能记下 session id
+        // 但没有状态点。
+        Cursor => &[
+            ("sessionStart", "session-start"),
+            ("beforeSubmitPrompt", "prompt-submit"),
+            ("postToolUse", "tool-complete"),
+            ("stop", "stop"),
+            ("sessionEnd", "session-end"),
+        ],
+        // Empryo 用 Claude 兼容的生命周期钩子（同款事件名、同款
+        // `~/.empryo/hooks.json`）。`StopFailure` 必须装：不装的话出错的
+        // 回合会把状态点永久留在蓝色。
+        Empryo => &[
+            ("SessionStart", "session-start"),
+            ("UserPromptSubmit", "prompt-submit"),
+            ("PostToolUse", "tool-complete"),
+            ("Stop", "stop"),
+            ("StopFailure", "stop"),
+            ("SessionEnd", "session-end"),
+        ],
+        // jcode 的钩子是 `~/.jcode/config.toml` 里 `[hooks]` 下的条目，
+        // 事件名是蛇形；它以分离的观察者身份跑钩子，事件描述走
+        // `JCODE_HOOK_*` 环境变量而不是 stdin。
+        Jcode => &[
+            ("session_start", "session-start"),
+            ("turn_start", "prompt-submit"),
+            ("post_tool", "tool-complete"),
+            ("turn_end", "stop"),
+            ("session_end", "session-end"),
+        ],
         _ => &[],
     }
 }
+
+/// Qoder 国际版与中国大陆版共用的 hook 事件表。
+///
+/// `Elicitation` 映射成 `question-asked`：一个已授权的 MCP 工具仍可能在
+/// 调用中途停下问用户，那不是权限问题，是提问。
+const QODER_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "prompt-submit"),
+    ("PermissionRequest", "permission-request"),
+    ("Elicitation", "question-asked"),
+    ("PostToolUse", "tool-complete"),
+    ("Stop", "stop"),
+    ("StopFailure", "stop"),
+    ("SessionEnd", "session-end"),
+];
 
 fn adapter_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
     use CLIAgent::*;
@@ -299,20 +352,30 @@ fn adapter_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
         Goose => ".agents/plugins/deepterm/hooks/hooks.json",
         Kimi => ".kimi-code/config.toml",
         QoderCLI => ".qoder/settings.json",
+        QoderCLICn => ".qoder-cn/settings.json",
         Crush => ".config/crush/crush.json",
+        Empryo => ".empryo/hooks.json",
+        Cursor => ".cursor/hooks.json",
+        Jcode => ".jcode/config.toml",
         _ => return None,
     };
     let content = if agent == OhMyPi {
         pi_extension_for("omp", "@oh-my-pi/pi-coding-agent")
     } else if agent == Kimi {
         merge_kimi_hooks("", "").expect("empty TOML is valid")
+    } else if agent == Jcode {
+        merge_jcode_hooks("").expect("empty TOML is valid")
     } else {
+        // Cursor 的 hooks.json 是扁平的：`command`/`matcher` 直接在条目顶层，
+        // 不嵌套 `hooks` 数组（Crush 也是这个形状）。它还会忽略没有
+        // `"version": 1` 根键的文件，所以必须补上。
+        let flat = matches!(agent, Cursor | Crush);
         let mut hooks = serde_json::Map::new();
         for &(event, wire) in adapter_events(agent) {
             let command = reporter_command(agent.slug(), wire);
             let entry = if agent == Copilot {
                 serde_json::json!({"type": "command", "bash": command, "timeoutSec": if event == "agentStop" { 10 } else { 5 }})
-            } else if agent == Crush {
+            } else if flat {
                 serde_json::json!({"command": command})
             } else {
                 let mut group =
@@ -328,7 +391,8 @@ fn adapter_plan(agent: CLIAgent) -> Option<HookInstallPlan> {
             hooks.insert(event.into(), serde_json::json!([entry]));
         }
         let mut root = serde_json::json!({"hooks": hooks});
-        if agent == Copilot {
+        // Cursor 要求 version 字段；Copilot 的 hooks.json 同样带 version。
+        if matches!(agent, Cursor | Copilot) {
             root["version"] = 1.into();
         }
         serde_json::to_string_pretty(&root).expect("hook JSON serializes")
@@ -350,7 +414,10 @@ fn uses_shared_json(agent: CLIAgent) -> bool {
             | CLIAgent::Droid
             | CLIAgent::Qwen
             | CLIAgent::QoderCLI
+            | CLIAgent::QoderCLICn
             | CLIAgent::Crush
+            | CLIAgent::Empryo
+            | CLIAgent::Cursor
     )
 }
 
@@ -372,6 +439,9 @@ pub fn merge_bridge_config(
             &legacy,
         );
     }
+    if agent == CLIAgent::Jcode {
+        return merge_jcode_hooks(std::str::from_utf8(existing).map_err(|e| e.to_string())?);
+    }
     if !uses_shared_json(agent) {
         return Ok(plan.content.clone());
     }
@@ -380,6 +450,15 @@ pub fn merge_bridge_config(
     } else {
         serde_json::from_slice(existing).map_err(|e| format!("配置不是合法 JSON：{e}"))?
     };
+    let generated: serde_json::Value =
+        serde_json::from_str(&plan.content).map_err(|e| e.to_string())?;
+    // Cursor 会**整个忽略**没有根级 `version` 的 hooks.json，所以合并时必须
+    // 把 version 补上（哪怕是首次安装、配置原本是空的）。
+    if let Some(version) = generated.get("version").cloned() {
+        root.as_object_mut()
+            .ok_or("配置顶层不是对象")?
+            .insert("version".into(), version);
+    }
     let hooks = root
         .as_object_mut()
         .ok_or("配置顶层不是对象")?
@@ -409,8 +488,6 @@ pub fn merge_bridge_config(
             true
         });
     }
-    let generated: serde_json::Value =
-        serde_json::from_str(&plan.content).map_err(|e| e.to_string())?;
     for (event, entries) in generated["hooks"]
         .as_object()
         .ok_or("生成的 hooks 不是对象")?
@@ -462,6 +539,86 @@ fn merge_kimi_hooks(existing: &str, legacy: &str) -> Result<String, String> {
     Ok(doc.to_string())
 }
 
+/// jcode 的钩子合并：`[hooks]` 下的**键值对**，每个键的值是一条命令或
+/// 一个命令列表（与 Kimi 的 `[[hooks]]` 表数组是两种形状）。
+///
+/// jcode 以分离的观察者身份跑这些钩子，事件描述走 `JCODE_HOOK_*` 环境变量
+/// 而不是 stdin，所以上报脚本的 stdin 读取会自然落空——载荷由环境变量补，
+/// 这件事在 `agent_report_script` 侧处理。
+fn merge_jcode_hooks(existing: &str) -> Result<String, String> {
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("配置不是合法 TOML：{e}"))?;
+    let table = doc
+        .entry("hooks")
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
+        .ok_or("hooks 不是 TOML 表")?;
+    let is_ours = |s: &str| s.contains(REPORTER_MARKER) || s.contains(LEGACY_CLI_PREFIX);
+    // 清掉我们自己的旧条目，保留用户与第三方的。
+    //
+    // `toml_edit` 把 TOML 数组也归到 `Item::Value`（`Value::Array`），而 jcode
+    // 对「一条命令或一个命令列表」两种形态都接受。字符串直接删键；数组只删
+    // 我们那几个元素，删空了的键才整个删掉——否则会把用户并排挂的第三方
+    // 通知一起抹掉。
+    let stale: Vec<String> = table
+        .iter()
+        .filter(|(_, value)| {
+            let toml_edit::Item::Value(v) = value else {
+                return false;
+            };
+            match v {
+                toml_edit::Value::String(s) => is_ours(s.value()),
+                toml_edit::Value::Array(arr) => arr
+                    .iter()
+                    .any(|item| matches!(item, toml_edit::Value::String(s) if is_ours(s.value()))),
+                _ => false,
+            }
+        })
+        .map(|(k, _)| k.to_string())
+        .collect();
+    for key in stale {
+        let keep_foreign = table
+            .get(&key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|item| !matches!(item, toml_edit::Value::String(s) if is_ours(s.value())))
+            });
+        if keep_foreign {
+            // 只摘掉我们的元素，保留其余。
+            if let Some(arr) = table.get_mut(&key).and_then(|v| v.as_array_mut()) {
+                arr.retain(
+                    |item| !matches!(item, toml_edit::Value::String(s) if is_ours(s.value())),
+                );
+            }
+        } else {
+            table.remove(&key);
+        }
+    }
+    for &(event, wire) in adapter_events(CLIAgent::Jcode) {
+        // 键已存在时**追加**，别把用户/第三方的命令覆盖掉：数组直接追加元素，
+        // 字符串则升级成「用户命令 + 我方命令」的数组（jcode 两种形态都接受）。
+        let command = reporter_command("jcode", wire);
+        match table.get(event).cloned() {
+            Some(toml_edit::Item::Value(toml_edit::Value::Array(mut arr))) => {
+                arr.push(toml_edit::Value::from(command));
+                table[event] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            }
+            Some(toml_edit::Item::Value(toml_edit::Value::String(old))) => {
+                let mut arr = toml_edit::Array::new();
+                arr.push(toml_edit::Value::String(old));
+                arr.push(toml_edit::Value::from(command));
+                table[event] = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            }
+            _ => {
+                table[event] = toml_edit::value(command);
+            }
+        }
+    }
+    Ok(doc.to_string())
+}
+
 /// 与 tty7 相同的本地配置目录覆盖；远端不使用本机环境变量。
 pub fn local_bridge_path(agent: CLIAgent, home: &std::path::Path, rel: &str) -> std::path::PathBuf {
     let value = |key| {
@@ -497,6 +654,9 @@ pub fn bridge_installed(agent: CLIAgent, plan: &HookInstallPlan, existing: &[u8]
         return merge_kimi_hooks(text, &format!("{} kimi", LEGACY_CLI_PREFIX))
             .is_ok_and(|merged| merged == text);
     }
+    if agent == CLIAgent::Jcode {
+        return jcode_hooks_present(text);
+    }
     if !uses_shared_json(agent) {
         return text == plan.content;
     }
@@ -506,15 +666,45 @@ pub fn bridge_installed(agent: CLIAgent, plan: &HookInstallPlan, existing: &[u8]
     let Ok(expected) = serde_json::from_str::<serde_json::Value>(&plan.content) else {
         return false;
     };
-    expected["hooks"].as_object().is_some_and(|hooks| {
-        hooks.iter().all(|(event, entries)| {
-            root["hooks"][event].as_array().is_some_and(|actual| {
-                entries
-                    .as_array()
-                    .is_some_and(|wanted| wanted.iter().all(|entry| actual.contains(entry)))
+    // Cursor 会忽略没有根级 `version` 的 hooks.json，所以版本也是完整性的一部分。
+    let version_ok = expected
+        .get("version")
+        .is_none_or(|wanted| root.get("version") == Some(wanted));
+    version_ok
+        && expected["hooks"].as_object().is_some_and(|hooks| {
+            hooks.iter().all(|(event, entries)| {
+                root["hooks"][event].as_array().is_some_and(|actual| {
+                    entries
+                        .as_array()
+                        .is_some_and(|wanted| wanted.iter().all(|entry| actual.contains(entry)))
+                })
             })
         })
-    })
+}
+
+/// jcode 的完整性检测：只要我们的事件命令都还在就算装好了。
+///
+/// 不能整段文本比较——用户的 `config.toml` 里还有自己的模型/权限设置，
+/// 合并结果必然不同于我们生成的模板。
+fn jcode_hooks_present(text: &str) -> bool {
+    let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+        return false;
+    };
+    let Some(hooks) = doc.get("hooks").and_then(|v| v.as_table()) else {
+        return false;
+    };
+    adapter_events(CLIAgent::Jcode)
+        .iter()
+        .all(|&(event, wire)| {
+            let wanted = reporter_command("jcode", wire);
+            match hooks.get(event).and_then(|v| v.as_value()) {
+            Some(toml_edit::Value::String(s)) => s.value().as_str() == wanted.as_str(),
+            Some(toml_edit::Value::Array(arr)) => arr.iter().any(|item| {
+                matches!(item, toml_edit::Value::String(s) if s.value().as_str() == wanted.as_str())
+            }),
+            _ => false,
+        }
+        })
 }
 
 /// 「装 hook」系统弹窗里显示的**精简文案**。
@@ -756,7 +946,8 @@ pub fn hook_script() -> String {
     // `Stop` **必须排除**：它在下面脚本模板里已经手写了一个带
     // `background_tasks` 判定的分支。再生成一个就成了重复的 case 模式，
     // 后一个永远不可达，而且会让 `case "^Stop$"` 的语义变得依赖顺序。
-    let hand_written = ["Stop"];
+    // `PreToolUse` 同理：它要按工具名挑，只有提问才上报。
+    let hand_written = ["Stop", "PreToolUse"];
     for spec in CLAUDE_HOOK_EVENTS {
         if hand_written.contains(&spec.claude_event) {
             continue;
@@ -836,12 +1027,25 @@ case "$event" in
     esac
     emit '{stop_payload}'
     ;;
+  PreToolUse)
+    # 只有 AskUserQuestion 会挡住 agent 等用户回答，而且它**不走权限提示**，
+    # 所以它是唯一能告诉我们「在等提问」的事件。别的工具调用只是中间态，
+    # 直接丢掉，否则状态点会在 Working/Waiting 之间乱抖。
+    # 先删掉所有空白再匹配，以兼容 pretty-printed JSON。
+    compact=$(printf '%s' "$input" | tr -d ' \t\n')
+    case "$compact" in
+      *'"tool_name":"AskUserQuestion"'*) emit '{question_payload}' ;;
+      *) exit 0 ;;
+    esac
+    ;;
 {cases}  *)
     # 未知事件（例如 Claude Code 新加的事件被这里漏掉）静默忽略。
     ;;
 esac
 "#,
         stop_payload = esc_for_shell_single_quoted(&claude_terminal_sequence(AgentEventKind::Stop)),
+        question_payload =
+            esc_for_shell_single_quoted(&claude_terminal_sequence(AgentEventKind::QuestionAsked),),
         cases = cases,
     )
 }
@@ -891,11 +1095,11 @@ event="$2"
 # Unknown slugs/events are silently ignored: agent upgrades add new event
 # names, and an old reporter must stay quiet rather than error out.
 case "$event" in
-  session-start|prompt-submit|permission-request|question-asked|tool-complete|notification|stop|session-end) ;;
+  session-start|prompt-submit|permission-request|question-asked|tool-complete|notification|stop|session-end|tool-start) ;;
   *) exit 0 ;;
 esac
 case "$agent" in
-  codex|traecli|copilot|opencode|pi|grok|omp|gemini|droid|qwen|goose|kimi|qodercli|crush) ;;
+  codex|traecli|copilot|opencode|pi|grok|omp|gemini|droid|qwen|goose|kimi|qodercli|qoderclicn|crush|empryo|cursor|jcode) ;;
   *) exit 0 ;;
 esac
 
@@ -908,7 +1112,39 @@ else
   input=$(head -c 65536 2>/dev/null)
 fi
 
+# jcode leaves stdin closed and describes the event in the environment
+# instead: the JSON mirror it exports as JCODE_HOOK_PAYLOAD (session_id, cwd,
+# and the event's own fields). Reading stdin would block forever, so the
+# payload comes from there.
+case "$agent:$event" in
+  jcode:*)
+    case "$input" in
+      "") input="${{JCODE_HOOK_PAYLOAD:-}}" ;;
+    esac
+    ;;
+esac
+
 # Event routing that used to live in the `deepterm agent-hook` binary.
+#
+# Codex's request_user_input stops a turn to ask the user something without
+# going through a permission prompt, so `tool-start` is the only sign the turn
+# is now waiting on the user. Without this the tab stays on "working" while
+# the agent sits blocked on a question. (Claude's AskUserQuestion is handled
+# in Claude's own hook script, which never reaches this one.)
+#
+# Every other tool drops the event entirely: `tool-start` is an intermediate,
+# not a status, and `parse_agent_event` refuses it by design — emitting it
+# unchanged would leave a payload the terminal cannot read.
+case "$agent:$event" in
+  codex:tool-start)
+    compact=$(printf '%s' "$input" | tr -d ' \t\n')
+    case "$compact" in
+      *'"tool_name":"request_user_input"'*) event="question-asked" ;;
+      *) exit 0 ;;
+    esac
+    ;;
+esac
+
 case "$agent:$event" in
   qodercli:session-start)
     # Context compaction also fires SessionStart; it is not a new session.
@@ -1731,6 +1967,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// jcode 关着 stdin 跑钩子，事件描述放在 `JCODE_HOOK_PAYLOAD` 里。
+    ///
+    /// 读 stdin 会永久阻塞，所以脚本必须从这个环境变量取载荷。这条守的是
+    /// 「装了 hook 但状态点永远不亮」——那种失败在用户机器上是静默的。
+    #[test]
+    #[cfg(unix)]
+    fn jcode_reports_from_its_environment_payload() {
+        let dir = std::env::temp_dir().join(format!("deepterm-jcode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("agent-report.sh");
+        let target = dir.join("osc.out");
+        std::fs::write(&script, agent_report_script()).unwrap();
+        let _ = std::fs::remove_file(&target);
+
+        let output = Command::new("/bin/sh")
+            .arg(&script)
+            .args(["jcode", "prompt-submit"])
+            .env("DEEPTERM", "true")
+            .env(
+                "JCODE_HOOK_PAYLOAD",
+                r#"{"session_id":"jc-1","cwd":"/repo"}"#,
+            )
+            .env("DEEPTERM_REPORT_TARGET", &target)
+            // stdin 关掉：真实环境里 jcode 就是这么跑的。
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("上报脚本必须能被 /bin/sh 执行");
+        assert!(
+            output.status.success(),
+            "脚本必须以 0 退出：{:?}",
+            output.stderr
+        );
+
+        let bytes = std::fs::read(&target).expect("OSC 必须写到目标文件");
+        let parsed = crate::agent::parse_agent_event(osc_content(&bytes))
+            .expect("脚本产出的序列必须能被解析器读回");
+        assert_eq!(parsed.kind, AgentEventKind::PromptSubmit);
+        assert_eq!(
+            parsed.agent,
+            Some(CLIAgent::Jcode),
+            "事件必须归属到 jcode，否则 tab 上认不出这个 agent"
+        );
+        assert_eq!(parsed.session_id.as_deref(), Some("jc-1"));
+        assert_eq!(parsed.cwd.as_deref(), Some(std::path::Path::new("/repo")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `json_str` 对嵌不进载荷的值（引号/反斜杠/控制字节/缺失）必须返回非零，
     /// 对干净值原样输出——否则整条序列会被终端解析器丢弃，事件全部丢失。
     #[test]
@@ -1865,6 +2148,32 @@ mod tests {
             run("copilot", "notification", "ToolPermission"),
             None,
             "ToolPermission 只对 gemini 有意义"
+        );
+
+        // `tool-start` 是 PreToolUse 的中间态：只有问用户问题的工具才转成
+        // question-asked，其余整个丢掉——所以装 PreToolUse 不会让状态点抖。
+        assert_eq!(
+            run(
+                "codex",
+                "tool-start",
+                r#"{"tool_name":"request_user_input"}"#
+            ),
+            Some(QuestionAsked),
+            "Codex 的 request_user_input 是提问，必须点亮等待"
+        );
+        assert_eq!(
+            run(
+                "codex",
+                "tool-start",
+                "{\n  \"tool_name\": \"request_user_input\"\n}"
+            ),
+            Some(QuestionAsked),
+            "pretty-printed 的载荷也要认出来"
+        );
+        assert_eq!(
+            run("codex", "tool-start", r#"{"tool_name":"shell"}"#),
+            None,
+            "普通工具调用必须静默，否则状态点会抖"
         );
 
         // 白名单：未知事件 / 未知 agent / 无 DEEPTERM 一律静默。
@@ -2132,7 +2441,6 @@ mod tests {
             // CodeBuddy 两边都不支持（走解释窗，由调用方处理），
             // 其余 agent 静默——没有可装的机制。
             (Some(CLIAgent::CodeBuddy), false, false, false),
-            (Some(CLIAgent::Cursor), false, false, false),
             (Some(CLIAgent::Codex), false, false, true),
             (Some(CLIAgent::Qwen), false, false, true),
         ];
@@ -2169,10 +2477,161 @@ mod tests {
         }
     }
 
+    /// tty7 有、早先缺失的适配器：装上之后必须真的能产出对应形状的配置。
+    ///
+    /// 这几个的失败模式是静默的——文件写下去了、agent 也读了，但事件名或
+    /// 形状不对，状态点永远不亮，用户只会以为"这东西没用"。
+    #[test]
+    fn the_adapters_added_for_tty7_parity_produce_usable_configs() {
+        // Cursor：扁平形状 + 根级 version。没有 version 它连 hooks 一起忽略。
+        let cursor = hook_install_plan(CLIAgent::Cursor).unwrap();
+        assert_eq!(cursor.rel_path, ".cursor/hooks.json");
+        let doc: serde_json::Value = serde_json::from_str(&cursor.content).unwrap();
+        assert_eq!(doc["version"], 1, "Cursor 会忽略没有 version 的文件");
+        let before = &doc["hooks"]["beforeSubmitPrompt"];
+        assert!(
+            before[0].get("command").is_some() && before[0].get("hooks").is_none(),
+            "Cursor 的条目是扁平的：{before}"
+        );
+
+        // Qoder 中国大陆版：事件表与国际版一致，只是路径不同。
+        let cn = hook_install_plan(CLIAgent::QoderCLICn).unwrap();
+        assert_eq!(cn.rel_path, ".qoder-cn/settings.json");
+        let global = hook_install_plan(CLIAgent::QoderCLI).unwrap();
+        assert_eq!(
+            adapter_events(CLIAgent::QoderCLICn),
+            adapter_events(CLIAgent::QoderCLI),
+            "两个 Qoder 变体必须共用同一张事件表"
+        );
+        assert_ne!(cn.rel_path, global.rel_path);
+
+        // Empryo：Claude 兼容形状，含 StopFailure（否则出错回合卡在 Working）。
+        let empryo = hook_install_plan(CLIAgent::Empryo).unwrap();
+        assert_eq!(empryo.rel_path, ".empryo/hooks.json");
+        let doc: serde_json::Value = serde_json::from_str(&empryo.content).unwrap();
+        assert!(
+            doc["hooks"]["StopFailure"].is_array(),
+            "Empryo 必须装 StopFailure：{}",
+            empryo.content
+        );
+
+        // jcode：TOML 键值对形状，不是表数组。
+        let jcode = hook_install_plan(CLIAgent::Jcode).unwrap();
+        assert_eq!(jcode.rel_path, ".jcode/config.toml");
+        let doc = jcode.content.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc["hooks"]["turn_start"].as_str(),
+            Some(&reporter_command("jcode", "prompt-submit")[..]),
+            "jcode 的钩子是 [hooks] 下的键值对"
+        );
+    }
+
+    /// Cursor 的 hooks.json 必须带根级 `version`——它会**整个忽略**没有
+    /// version 的文件，所以合并时必须把它补上（哪怕是空配置首次安装）。
+    #[test]
+    fn cursor_merge_keeps_the_version_key() {
+        let plan = hook_install_plan(CLIAgent::Cursor).unwrap();
+        let merged = merge_bridge_config(CLIAgent::Cursor, &plan, b"").unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            doc["version"], 1,
+            "Cursor 会忽略没有 version 的文件：{merged}"
+        );
+        assert!(
+            bridge_installed(CLIAgent::Cursor, &plan, merged.as_bytes()),
+            "装完必须被认成已安装"
+        );
+
+        // 已有第三方条目时也要补上 version，且不能动别人的条目。
+        let existing = br#"{"hooks":{"beforeSubmitPrompt":[{"command":"third-party"}]}}"#;
+        let merged = merge_bridge_config(CLIAgent::Cursor, &plan, existing).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(doc["version"], 1);
+        assert!(
+            doc["hooks"]["beforeSubmitPrompt"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|e| e["command"] == "third-party")),
+            "第三方条目必须保留：{merged}"
+        );
+        // 没有 version 就不算装好（Cursor 不会读这种文件）。
+        let broken = merged.replace("\"version\": 1", "\"version\": 2");
+        assert!(
+            !bridge_installed(CLIAgent::Cursor, &plan, broken.as_bytes()),
+            "version 对不上就不算装好"
+        );
+    }
+
+    /// jcode 合并必须保留用户与第三方条目，且对字符串和字符串数组两种
+    /// 命令形态都能清掉我们自己的旧条目（`toml_edit` 把数组也归到 `Value`）。
+    ///
+    /// 完整性检测也必须是**语义**的：用户的 `config.toml` 里还有自己的模型
+    /// 设置，合并结果永远不等于我们生成的模板，整段比较会永远判成「没装」。
+    #[test]
+    fn jcode_merge_preserves_foreign_entries_and_clears_ours() {
+        let plan = hook_install_plan(CLIAgent::Jcode).unwrap();
+        let ours = reporter_command("jcode", "stop");
+        let existing = format!(
+            "model = 'fixture'\n\n[hooks]\nturn_start = '{ours}'\n\
+             post_tool = ['{ours}', 'third-party-notify']\nturn_end = 'third-party-stop'\n\
+             my_own = 'keep-me'\n"
+        );
+        assert!(
+            !bridge_installed(CLIAgent::Jcode, &plan, existing.as_bytes()),
+            "合并前当然不算已安装"
+        );
+        let merged = merge_bridge_config(CLIAgent::Jcode, &plan, existing.as_bytes()).unwrap();
+        let doc = merged.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("fixture"));
+        assert_eq!(doc["hooks"]["my_own"].as_str(), Some("keep-me"));
+        let post_tool = &doc["hooks"]["post_tool"];
+        assert!(
+            post_tool
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("third-party-notify"))),
+            "第三方命令必须留在原数组里：{post_tool}"
+        );
+        // 用户自己在同一个事件键上挂的字符串命令不能被覆盖：升级成数组，
+        // 第三方在前、我们在后。
+        let turn_end = &doc["hooks"]["turn_end"];
+        assert!(
+            turn_end
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v.as_str() == Some("third-party-stop"))
+                    && a.iter().any(|v| v.as_str() == Some(&ours[..]))),
+            "字符串形态的第三方命令必须保留：{turn_end}"
+        );
+        // 装完就算装好了——哪怕配置里还有用户自己的内容。
+        assert!(
+            bridge_installed(CLIAgent::Jcode, &plan, merged.as_bytes()),
+            "合并后的配置必须被认成已安装"
+        );
+        // 少一个事件就不算装好。
+        let broken = merged.replace(&ours, "gone");
+        assert!(
+            !bridge_installed(CLIAgent::Jcode, &plan, broken.as_bytes()),
+            "缺了事件命令就不算装好"
+        );
+        // 幂等：再合一次不变。
+        assert_eq!(
+            merge_bridge_config(CLIAgent::Jcode, &plan, merged.as_bytes()).unwrap(),
+            merged
+        );
+    }
+
     /// 不可安装的 agent 不该算出计划——否则调用方会写一个没有意义的文件。
     #[test]
     fn non_installable_agents_have_no_plan() {
-        for agent in [CLIAgent::CodeBuddy, CLIAgent::Cursor, CLIAgent::Aider] {
+        for agent in [
+            CLIAgent::CodeBuddy,
+            CLIAgent::Aider,
+            CLIAgent::Amp,
+            CLIAgent::Auggie,
+            CLIAgent::Hermes,
+            CLIAgent::Vibe,
+            CLIAgent::Antigravity,
+            CLIAgent::PrimeAgent,
+            CLIAgent::Muse,
+        ] {
             assert!(
                 hook_install_plan(agent).is_none(),
                 "{agent:?} 不该有安装计划"
@@ -2198,15 +2657,20 @@ mod tests {
         assert_ne!(spec.kind, AgentEventKind::Notification);
     }
 
-    /// `PreToolUse` 刻意不装：每调用一次工具就发一次，纯噪声。
+    /// `PreToolUse` 只在 `AskUserQuestion` 时上报成 `question-asked`，
+    /// 其余工具调用整个丢掉——它是中间态，不是状态。
     #[test]
-    fn pre_tool_use_is_deliberately_not_installed() {
-        assert!(
-            !CLAUDE_HOOK_EVENTS
-                .iter()
-                .any(|s| s.claude_event == "PreToolUse"),
-            "PreToolUse 会让状态点在 Waiting/Working 之间抖"
-        );
+    fn pre_tool_use_reports_only_questions() {
+        let spec = claude_pre_tool_use_spec();
+        assert_eq!(spec.kind, AgentEventKind::QuestionAsked);
+    }
+
+    fn claude_pre_tool_use_spec() -> HookEventSpec {
+        CLAUDE_HOOK_EVENTS
+            .iter()
+            .copied()
+            .find(|s| s.claude_event == "PreToolUse")
+            .expect("PreToolUse 必须装上")
     }
 
     /// **端到端**：把生成的脚本喂给真实的 `sh` 执行，确认它输出的字节能被
@@ -2238,11 +2702,11 @@ mod tests {
                 .expect("chmod");
         }
 
-        // 每个事件跑一遍，确认都能产出可解析的载荷。
-        for spec in CLAUDE_HOOK_EVENTS {
+        // 跑一次脚本，拿 stdout。
+        let run = |event: &str, input: &str| -> String {
             let mut child = Command::new("sh")
                 .arg(&script_path)
-                .arg(spec.claude_event)
+                .arg(event)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -2252,17 +2716,29 @@ mod tests {
                 .stdin
                 .as_mut()
                 .expect("stdin")
-                .write_all(br#"{"session_id":"s-1","cwd":"/tmp"}"#)
+                .write_all(input.as_bytes())
                 .expect("写 stdin");
             let out = child.wait_with_output().expect("等 sh");
             assert!(
                 out.status.success(),
-                "{} 退出码非零：{:?}",
-                spec.claude_event,
+                "{event} 退出码非零：{:?}",
                 String::from_utf8_lossy(&out.stderr)
             );
+            String::from_utf8(out.stdout).expect("stdout 是 UTF-8")
+        };
 
-            let stdout = String::from_utf8(out.stdout).expect("stdout 是 UTF-8");
+        // 每个事件跑一遍，确认都能产出可解析的载荷。
+        for spec in CLAUDE_HOOK_EVENTS {
+            let stdout = run(spec.claude_event, r#"{"session_id":"s-1","cwd":"/tmp"}"#);
+            // `PreToolUse` 只在提问时上报（下面单独验证），普通工具调用无输出。
+            if spec.claude_event == "PreToolUse" {
+                assert!(
+                    stdout.trim().is_empty(),
+                    "{} 不该上报普通工具调用：{stdout:?}",
+                    spec.claude_event
+                );
+                continue;
+            }
             // 真实场景里 Claude Code 解析的是这行 JSON。
             let wrapper: serde_json::Value =
                 serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
@@ -2320,26 +2796,43 @@ mod tests {
             assert_eq!(event.session_id, None);
         }
 
+        // `PreToolUse` 只在 AskUserQuestion 时上报成 question-asked——它是不走
+        // 权限提示的提问通道，漏了它 tab 会一直显示"工作中"。
+        for input in [
+            r#"{"tool_name":"AskUserQuestion"}"#,
+            "{\n  \"tool_name\": \"AskUserQuestion\"\n}",
+        ] {
+            let stdout = run("PreToolUse", input);
+            let wrapper: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|e| panic!("PreToolUse 的输出不是合法 JSON（{e}）：{stdout:?}"));
+            let seq = wrapper["terminalSequence"]
+                .as_str()
+                .expect("缺 terminalSequence 字段");
+            let inner = seq
+                .strip_prefix("\u{1b}]")
+                .and_then(|s| s.strip_suffix('\u{7}'))
+                .expect("剥 OSC 引导符与终止符");
+            let event = parse_agent_event(inner.as_bytes()).expect("载荷应当可解析");
+            assert_eq!(event.kind, AgentEventKind::QuestionAsked);
+            assert_eq!(event.agent, Some(CLIAgent::Claude));
+        }
+        // 别的工具调用只是中间态，直接丢掉。
+        assert!(
+            run("PreToolUse", r#"{"tool_name":"Bash"}"#)
+                .trim()
+                .is_empty(),
+            "普通工具调用不该上报"
+        );
+
         // subagent 仍在跑时，`Stop` 必须**什么都不输出**——否则主 agent 每次
         // 让出都会点亮一次绿点（每个 subagent 一次）。
-        let mut child = Command::new("sh")
-            .arg(&script_path)
-            .arg("Stop")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("起 sh");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin")
-            .write_all(br#"{"background_tasks":[{"type":"subagent","status":"running"}]}"#)
-            .expect("写 stdin");
-        let out = child.wait_with_output().expect("等 sh");
         assert!(
-            out.stdout.is_empty(),
-            "subagent 还在跑时 Stop 不该上报，实际输出了：{:?}",
-            String::from_utf8_lossy(&out.stdout)
+            run(
+                "Stop",
+                r#"{"background_tasks":[{"type":"subagent","status":"running"}]}"#
+            )
+            .is_empty(),
+            "subagent 还在跑时 Stop 不该上报"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

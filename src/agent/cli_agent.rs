@@ -44,11 +44,16 @@ pub enum CLIAgent {
     QoderCLI,
     Crush,
     CodeBuddy,
+    Empryo,
+    PrimeAgent,
+    QoderCLICn,
+    Muse,
+    Jcode,
 }
 
 impl CLIAgent {
     /// 全部 agent，顺序即 UI 列表顺序。
-    pub const ALL: [CLIAgent; 23] = [
+    pub const ALL: [CLIAgent; 28] = [
         CLIAgent::Claude,
         CLIAgent::Codex,
         CLIAgent::TraeCode,
@@ -72,6 +77,11 @@ impl CLIAgent {
         CLIAgent::QoderCLI,
         CLIAgent::Crush,
         CLIAgent::CodeBuddy,
+        CLIAgent::Empryo,
+        CLIAgent::PrimeAgent,
+        CLIAgent::QoderCLICn,
+        CLIAgent::Muse,
+        CLIAgent::Jcode,
     ];
 
     /// 各 agent 在进程名 / 命令名上出现过的全部拼写。
@@ -110,12 +120,22 @@ impl CLIAgent {
             // 会话，因为 pty 看到的是那个转发器。代价是 IDE 启动也会被认成
             // CLI——在转发器退出前它会一直挂着 CLI 的头像。
             CLIAgent::QoderCLI => &["qoder", "qodercli"],
+            // Qoder 的中国大陆构建：同一厂商、独立安装、状态放在 `~/.qoder-cn`。
+            // 它同样发「转发器 + CLI」一对二进制，只是名字带 `-cn` 后缀，
+            // 所以三个拼写都认。裸 `qoder` 仍归国际版。
+            CLIAgent::QoderCLICn => &["qodercn", "qoderclicn", "qoder-cn"],
             // Charm 的终端 agent。一个二进制，PATH 上的名字就是它的启动名。
             CLIAgent::Crush => &["crush"],
             // 腾讯云代码助手。npm 包 `@tencent-ai/codebuddy-code` 装的命令是
             // `codebuddy`；Homebrew（`brew install codebuddy-code`）与原生二进制
-            // 安装脚本还额外提供 `codebuddy-code`。两个都认。
-            CLIAgent::CodeBuddy => &["codebuddy", "codebuddy-code"],
+            // 安装脚本还额外提供 `codebuddy-code`。三个都认——`cbc` 与 COIN-OR
+            // 求解器同名，求解器跑着的时候会顶着 CLI 的头像，这是为了兜住
+            // 这个短名付出的代价（与 tty7 同一取舍）。
+            CLIAgent::CodeBuddy => &["codebuddy", "codebuddy-code", "cbc"],
+            CLIAgent::Empryo => &["empryo"],
+            CLIAgent::PrimeAgent => &["prime-agent"],
+            CLIAgent::Muse => &["muse"],
+            CLIAgent::Jcode => &["jcode"],
         }
     }
 
@@ -145,6 +165,11 @@ impl CLIAgent {
             CLIAgent::QoderCLI => "qodercli",
             CLIAgent::Crush => "crush",
             CLIAgent::CodeBuddy => "codebuddy",
+            CLIAgent::Empryo => "empryo",
+            CLIAgent::PrimeAgent => "prime-agent",
+            CLIAgent::QoderCLICn => "qoderclicn",
+            CLIAgent::Muse => "muse",
+            CLIAgent::Jcode => "jcode",
         }
     }
 
@@ -178,6 +203,11 @@ impl CLIAgent {
             CLIAgent::QoderCLI => "Qoder CLI",
             CLIAgent::Crush => "Crush",
             CLIAgent::CodeBuddy => "CodeBuddy",
+            CLIAgent::Empryo => "Empryo",
+            CLIAgent::PrimeAgent => "Prime Agent",
+            CLIAgent::QoderCLICn => "Qoder CN CLI",
+            CLIAgent::Muse => "Muse Code",
+            CLIAgent::Jcode => "jcode",
         }
     }
 
@@ -235,6 +265,15 @@ impl CLIAgent {
             CLIAgent::Crush => 0x6B50FF,
             // codebuddy.cn 官方渐变 #6C4DFF → #583ED3，取亮端。
             CLIAgent::CodeBuddy => 0x6C4DFF,
+            // 以下五个没有可核验的官方品牌色（官网无 logo 资源、npm 包内
+            // 无图标）。取 tty7 用的同一组值，保证两端头像一致；将来核到
+            // 官方色再改，`black_branded_avatars_keep_their_brand_field`
+            // 会拦住「改成近黑却忘了描边」这类疏漏。
+            CLIAgent::Empryo => 0xE8663D,
+            CLIAgent::PrimeAgent => 0x111111,
+            CLIAgent::QoderCLICn => 0x0F0D0C,
+            CLIAgent::Muse => 0x0866FF,
+            CLIAgent::Jcode => 0x111111,
         }
     }
 
@@ -278,7 +317,12 @@ impl CLIAgent {
             | CLIAgent::Auggie
             | CLIAgent::Hermes
             | CLIAgent::Vibe
-            | CLIAgent::Antigravity => "icons/bot.svg",
+            | CLIAgent::Antigravity
+            | CLIAgent::Empryo
+            | CLIAgent::PrimeAgent
+            | CLIAgent::QoderCLICn
+            | CLIAgent::Muse
+            | CLIAgent::Jcode => "icons/bot.svg",
         }
     }
 
@@ -309,6 +353,19 @@ impl CLIAgent {
         if let Some(agent) = custom
             .get(&launcher_stem.to_ascii_lowercase())
             .and_then(|slug| CLIAgent::from_slug(slug))
+        {
+            return Some(agent);
+        }
+
+        // 被解释器或 shell 包着时（`bash ~/bin/cc`、`node ~/bin/cc.js`），
+        // 用户映射的名字是那个**脚本**的，在第一个非 flag 参数里。这里只查
+        // 自定义映射——内置 agent 名由下面那段 argv 扫描负责，两段分工不重叠。
+        if (is_interpreter(launcher_stem) || is_shell(launcher_stem))
+            && let Some(agent) = rest
+                .clone()
+                .find(|a| !a.starts_with('-') && !is_env_assignment(a))
+                .and_then(|script| custom.get(&base_stem(script).to_ascii_lowercase()))
+                .and_then(|slug| CLIAgent::from_slug(slug))
         {
             return Some(agent);
         }
@@ -442,6 +499,21 @@ fn is_interpreter(stem: &str) -> bool {
     )
 }
 
+/// 判断一个 token 是不是 shell。
+///
+/// 与 [`is_interpreter`] 的用途不同：解释器后面翻 argv 找内置 agent 名，
+/// shell 后面**只**查用户自定义映射。`bash ~/bin/cc` 这种包装脚本在 pty 上
+/// 就是 `bash` 加脚本路径，不认 shell 就完全看不出用户在跑什么。
+///
+/// 之所以不给 shell 开 argv 扫描：`bash script.sh` 的脚本内容才是关键，
+/// 而 argv 里只有路径，翻它只会把 `bash deploy.sh` 里的 `sh` 误判一番。
+fn is_shell(stem: &str) -> bool {
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+    )
+}
+
 /// agent 事件信道的哨兵标识。
 ///
 /// agent hook 把事件包成 `OSC 777;notify;<sentinel>;<json>` 发回来。
@@ -501,6 +573,15 @@ pub struct AgentSessionState {
     /// 所以单独记一份，不能拿 shell 的 cwd 代替。
     #[serde(default)]
     pub cwd: Option<std::path::PathBuf>,
+    /// 当前状态是**推断**出来的，不是 agent 报的：用户按 Esc/Ctrl+C 打断了
+    /// 回合（[`Self::assume_interrupted`]），或回合静默超过了任何真实回合
+    /// 的安静时长（[`Self::assume_stale`]）。
+    ///
+    /// 存在的理由是让下一条真实事件能纠正猜测：一条迟到的 `ToolComplete`
+    /// 说明回合还在跑，那时要把状态放回 `Working`。没有这个标志，
+    /// 「打断后 agent 又跑了一会儿」会被误显示成已结束。
+    #[serde(default)]
+    pub inferred: bool,
 }
 
 impl AgentSessionState {
@@ -508,11 +589,49 @@ impl AgentSessionState {
         AgentStatus::Idle
     }
 
+    /// 回合是否在飞行中：只有这两种状态是用户打断或丢失 `Stop` 能留下的。
+    pub fn mid_turn(&self) -> bool {
+        matches!(self.status, AgentStatus::Working | AgentStatus::Waiting)
+    }
+
+    /// 结束用户刚打断的那个回合。
+    ///
+    /// 多数 agent 在 <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd> 取消回合时**不发**
+    /// hook——Claude 的 `Stop` 明确跳过用户中断。没有这个推断，状态点会卡在
+    /// 蓝色直到下一条提示词，看起来就是个 bug。
+    ///
+    /// 调用方必须先等过一个宽限窗，让真报了中断的 agent（Kimi 的
+    /// `Interrupt`、与按键赛跑的 `Stop`）先说话。
+    pub fn assume_interrupted(&mut self) {
+        if !self.mid_turn() {
+            return;
+        }
+        self.status = AgentStatus::Done;
+        self.message = None;
+        self.inferred = true;
+    }
+
+    /// 放弃一个静默过久的回合。
+    ///
+    /// 落 `Idle` 而不是 `Done`：没有任何证据说它结束了，只是不再有证据说
+    /// 它还在跑。
+    pub fn assume_stale(&mut self) {
+        if self.status != AgentStatus::Working {
+            return;
+        }
+        self.status = AgentStatus::Idle;
+        self.message = None;
+        self.inferred = true;
+    }
+
     /// 把一条事件并入状态机。
     ///
     /// 状态机的形状是「一次回合」：`PromptSubmit` 起手 → 可能中途 `Waiting`
     /// 等授权 → `ToolComplete` 回到 `Working` → `Stop` 收尾成 `Done`。
     pub fn apply_event(&mut self, ev: &AgentEvent) {
+        // 「推断过」这个标志要留到**真正推翻它**的事件为止：打断之后 agent
+        // 可能先补一条不改状态的通知，随后迟到的工具完成事件仍要能把状态
+        // 放回 Working。所以这里只读不清，清由各分支自己决定。
         if let Some(id) = &ev.session_id {
             self.session_id = Some(id.clone());
         }
@@ -523,38 +642,46 @@ impl AgentSessionState {
             AgentEventKind::SessionStart => {
                 self.status = AgentStatus::Idle;
                 self.message = None;
+                self.inferred = false;
             }
             AgentEventKind::PromptSubmit => {
                 self.status = AgentStatus::Working;
                 self.message = None;
+                self.inferred = false;
             }
             AgentEventKind::PermissionRequest | AgentEventKind::QuestionAsked => {
                 self.status = AgentStatus::Waiting;
                 self.message = ev.message.clone();
+                self.inferred = false;
             }
             AgentEventKind::Notification => {
                 // 只在干活时降级为等待：`Stop` 之后 agent 补发的通知不该把
-                // 已完成的回合又翻回 Waiting。
+                // 已完成的回合又翻回 Waiting。这条事件没有推翻任何推断，
+                // 所以不动 `inferred`。
                 if self.status == AgentStatus::Working {
                     self.status = AgentStatus::Waiting;
                     self.message = ev.message.clone();
                 }
             }
             AgentEventKind::ToolComplete => {
-                // 授权通过后工具继续跑，说明回合重新动起来了。
-                if self.status == AgentStatus::Waiting {
+                // 授权通过后工具继续跑，说明回合重新动起来了。推断出来的
+                // 「已结束」被一条真实工具事件推翻，同理回到 Working。
+                if self.status == AgentStatus::Waiting || self.inferred {
                     self.status = AgentStatus::Working;
                     self.message = None;
+                    self.inferred = false;
                 }
             }
             AgentEventKind::Stop => {
                 self.status = AgentStatus::Done;
                 self.message = ev.message.clone();
+                self.inferred = false;
             }
             AgentEventKind::SessionEnd => {
                 self.status = AgentStatus::Idle;
                 self.message = None;
                 self.cwd = None;
+                self.inferred = false;
             }
         }
     }
@@ -745,6 +872,71 @@ mod tests {
         );
     }
 
+    /// tty7 支持而早先缺失的五个 agent：进程检测漏掉它们时，tab 上既没有
+    /// 头像也没有状态点，用户完全看不出里面跑着一个 agent。
+    #[test]
+    fn detects_the_agents_added_for_tty7_parity() {
+        for (cmd, agent) in [
+            ("empryo", CLIAgent::Empryo),
+            ("prime-agent", CLIAgent::PrimeAgent),
+            ("muse", CLIAgent::Muse),
+            ("jcode", CLIAgent::Jcode),
+            ("/usr/local/bin/empryo", CLIAgent::Empryo),
+            ("/opt/homebrew/bin/prime-agent", CLIAgent::PrimeAgent),
+        ] {
+            assert_eq!(detect(&[cmd]), Some(agent), "cmd {cmd}");
+        }
+        // 中国大陆构建与国际版互不冒充：裸 `qoder` 归国际版。
+        for (cmd, agent) in [
+            ("qodercn", CLIAgent::QoderCLICn),
+            ("qoderclicn", CLIAgent::QoderCLICn),
+            ("qoder-cn", CLIAgent::QoderCLICn),
+            ("/opt/homebrew/bin/qodercn", CLIAgent::QoderCLICn),
+        ] {
+            assert_eq!(detect(&[cmd]), Some(agent), "cmd {cmd}");
+        }
+        assert_eq!(detect(&["qoder"]), Some(CLIAgent::QoderCLI));
+        // CodeBuddy 的短名与 COIN-OR 求解器同名，这是兜住它的代价。
+        assert_eq!(detect(&["cbc"]), Some(CLIAgent::CodeBuddy));
+    }
+
+    /// `bash ~/bin/cc` 这类包装脚本：pty 上看到的是 shell 加脚本路径，
+    /// 不认 shell 就完全看不出用户在跑自己映射的那个 agent。
+    #[test]
+    fn a_shell_wrapper_resolves_through_the_custom_map() {
+        let mut custom = HashMap::new();
+        custom.insert("cc".to_string(), "claude".to_string());
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(&argv(&["bash", "/home/x/bin/cc", "-c"]), &custom),
+            Some(CLIAgent::Claude)
+        );
+        // 解释器同理。
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(&argv(&["node", "/home/x/bin/cc", "--foo"]), &custom),
+            Some(CLIAgent::Claude)
+        );
+        // 没有映射时不猜：`bash deploy.sh` 里的 `sh` 不是 agent。
+        assert_eq!(detect(&["bash", "/home/x/deploy.sh"]), None);
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(&argv(&["zsh", "/home/x/deploy.sh"]), &custom),
+            None
+        );
+    }
+
+    /// 自定义映射只被 shell/解释器分支查一次，不会顺带扫到 argv 里别的 token。
+    #[test]
+    fn shell_wrapper_lookup_skips_flags_and_env_assignments() {
+        let mut custom = HashMap::new();
+        custom.insert("cc".to_string(), "claude".to_string());
+        assert_eq!(
+            CLIAgent::detect_from_argv_with(
+                &argv(&["bash", "-l", "FOO=1", "/home/x/bin/cc"]),
+                &custom
+            ),
+            Some(CLIAgent::Claude)
+        );
+    }
+
     #[test]
     fn detects_node_wrapped_claude_by_package_dir() {
         assert_eq!(
@@ -930,6 +1122,11 @@ mod tests {
             CLIAgent::Hermes,
             CLIAgent::Vibe,
             CLIAgent::Antigravity,
+            CLIAgent::Empryo,
+            CLIAgent::PrimeAgent,
+            CLIAgent::QoderCLICn,
+            CLIAgent::Muse,
+            CLIAgent::Jcode,
         ];
         for agent in CLIAgent::ALL {
             let fallback = agent.icon_path() == "icons/bot.svg";
@@ -1157,6 +1354,35 @@ mod tests {
         s.apply_event(&ev(AgentEventKind::ToolComplete, None));
         assert_eq!(s.status, AgentStatus::Working);
         assert_eq!(s.message, None);
+    }
+
+    /// 打断后的「推断已结束」要留到真正推翻它的事件为止。
+    ///
+    /// agent 被打断后可能先补一条**不改状态**的通知；那条通知不该把推断
+    /// 吃掉，否则随后迟到的工具完成事件无法把状态放回 Working。
+    #[test]
+    fn an_interrupted_turn_revives_on_a_late_tool_complete() {
+        let ev = |kind| AgentEvent {
+            agent: Some(CLIAgent::Claude),
+            kind,
+            session_id: None,
+            message: None,
+            cwd: None,
+            prompt: None,
+        };
+
+        let mut s = AgentSessionState::default();
+        s.apply_event(&ev(AgentEventKind::PromptSubmit));
+        s.assume_interrupted();
+        assert_eq!(s.status, AgentStatus::Done);
+
+        // 不改状态的通知不该吃掉推断。
+        s.apply_event(&ev(AgentEventKind::Notification));
+        assert_eq!(s.status, AgentStatus::Done);
+
+        // 迟到的工具完成说明回合其实还在动 → 回到 Working。
+        s.apply_event(&ev(AgentEventKind::ToolComplete));
+        assert_eq!(s.status, AgentStatus::Working);
     }
 
     /// `Stop` 之后 agent 补发的通知不该把已完成的回合翻回 Waiting——

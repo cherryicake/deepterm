@@ -4,7 +4,7 @@
 //! [`crate::editor::syntax::languages::Language`] 里有 tree-sitter 语法的语言。
 //! 用户可在 `settings.json` 的 `lsp` 段按语言 id 覆盖，或整项禁用。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -466,6 +466,60 @@ fn probe_key(command: &str, ssh_config: Option<&crate::ssh::SshConnectionConfig>
     }
 }
 
+/// 后台探测中的候选链（键 = 主机 + 语言）。
+///
+/// 没有这道闸门时，`warm_lsp_chain` 每被调一次就新起一个任务：一次打开 N 个
+/// 远端文件、或反复点开菜单，就会叠出 N 个任务。主机不可达时每个任务都要把
+/// 候选链撞到超时（每个候选两次 shell 尝试 × 15s），并发任务还会各自新建
+/// SSH 会话——用户看到的是「什么都没发生，但网络一直很忙」。
+fn chain_probes_in_flight() -> &'static std::sync::Mutex<HashSet<String>> {
+    use std::sync::{Mutex, OnceLock};
+    static IN_FLIGHT: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn chain_probe_key(language: &str, ssh_config: Option<&crate::ssh::SshConnectionConfig>) -> String {
+    match ssh_config {
+        Some(c) => format!("{}|{language}", c.connection_string()),
+        None => format!("local|{language}"),
+    }
+}
+
+/// 一次后台候选链探测的占用凭据：存在期间同一 (主机, 语言) 不会重复探测。
+///
+/// 用守卫而不是 `begin`/`end` 两个函数：任务被取消或 panic 时 `Drop` 照样
+/// 注销，否则这个语言在这台主机上会**永久**不再补探（chip 停在语言名）。
+pub struct ChainProbeGuard {
+    key: String,
+}
+
+impl Drop for ChainProbeGuard {
+    fn drop(&mut self) {
+        let mut in_flight = chain_probes_in_flight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        in_flight.remove(&self.key);
+    }
+}
+
+/// 登记一次后台候选链探测；已有任务在飞时返回 `None`。
+///
+/// 调用方拿到 `Some` 后应把守卫一起移进后台任务（`let _guard = guard;`），
+/// 任务结束才注销。
+pub fn begin_chain_probe(
+    language: &str,
+    ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+) -> Option<ChainProbeGuard> {
+    let key = chain_probe_key(language, ssh_config);
+    let mut in_flight = chain_probes_in_flight()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !in_flight.insert(key.clone()) {
+        return None;
+    }
+    Some(ChainProbeGuard { key })
+}
+
 fn probe_cache() -> &'static std::sync::Mutex<HashMap<String, Probe>> {
     use std::sync::Mutex;
     static CACHE: std::sync::OnceLock<Mutex<HashMap<String, Probe>>> = std::sync::OnceLock::new();
@@ -565,8 +619,11 @@ pub fn language_might_have_server_on(
 /// 实体句柄：它只能探测，不能通知界面重画。通知必须由调用方（编辑器）用
 /// `cx.spawn` 做，所以这里先把「要问哪些」交出去。
 ///
-/// 只列**没有确定结论**的候选：已有答案的不再问，冷却期内的 `RetryAt`
-/// 算「待重问」（主机可能刚从不可达恢复）。
+/// 只列**没有确定结论**的候选：已有答案的不再问。
+///
+/// 冷却期内的 `RetryAt` **不算**待重问：那 30 秒就是为「主机不可达」准备的
+/// 退避窗口，冷却期内再问一次只会再撞一轮 15s 超时。等窗口过去，下一次
+/// 调用自然会把它列出来。
 pub fn pending_chain_probe(
     language: &str,
     settings: &LspContent,
@@ -576,6 +633,7 @@ pub fn pending_chain_probe(
     if ssh_config.is_none() || settings.servers.contains_key(language) {
         return Vec::new();
     }
+    let now = std::time::Instant::now();
     builtin_candidates()
         .get(language)
         .map(|candidates| {
@@ -584,13 +642,41 @@ pub fn pending_chain_probe(
                 .filter(
                     |(command, _)| match cached_probe(&probe_key(command, ssh_config)) {
                         Some(Probe::Settled(_)) => false,
-                        _ => true,
+                        // 冷却期内：答案暂时就是「不可用」，别再去问。
+                        Some(Probe::RetryAt(at)) => now >= at,
+                        None => true,
                     },
                 )
                 .map(|(command, _)| command.to_string())
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 冷却期里最早还有多久可以重问（远端专用）。
+///
+/// 「主机不可达」的退避窗口是 30 秒：窗口内 [`pending_chain_probe`] 不列候选，
+/// 于是**没人**会再去问一次——chip 就一直停在「还不知道」，直到用户碰巧又
+/// 开了一个标签。调用方拿这个时长排一次延迟重试，窗口一过就补问。
+pub fn chain_probe_cooldown(
+    language: &str,
+    settings: &LspContent,
+    ssh_config: Option<&crate::ssh::SshConnectionConfig>,
+) -> Option<std::time::Duration> {
+    if ssh_config.is_none() || settings.servers.contains_key(language) {
+        return None;
+    }
+    let now = std::time::Instant::now();
+    builtin_candidates()
+        .get(language)?
+        .iter()
+        .filter_map(
+            |&(command, _)| match cached_probe(&probe_key(command, ssh_config)) {
+                Some(Probe::RetryAt(at)) if at > now => Some(at - now),
+                _ => None,
+            },
+        )
+        .min()
 }
 
 /// 后台线程专用：把交出来的候选探完（**会阻塞**，别在 UI 线程调）。
@@ -862,5 +948,74 @@ mod tests {
         let v: LspContent = serde_json::from_str(r#"{"enabled": false}"#).unwrap();
         assert!(!v.enabled);
         assert!(v.servers.is_empty());
+    }
+
+    fn remote_config(tag: &str) -> crate::ssh::SshConnectionConfig {
+        let mut config = crate::ssh::SshConnectionConfig::local();
+        config.host = format!("registry-test-{tag}");
+        config.username = format!("registry-user-{tag}");
+        config
+    }
+
+    /// 同一个 (主机, 语言) 同时只允许一个后台候选链探测在飞。
+    ///
+    /// 没有这道闸门时，每打开一个远端文件都会叠一个任务；主机不可达时每个
+    /// 任务都要把候选链撞到超时，用户看到的是「什么都没发生，但网络一直忙」。
+    /// 守卫还必须在 Drop 时注销，否则任务 panic 后这门语言永久不再补探。
+    #[test]
+    fn chain_probe_guard_deduplicates_and_releases_on_drop() {
+        let config = remote_config("chain-guard");
+
+        let guard = begin_chain_probe("python", Some(&config)).expect("first probe should start");
+        assert!(
+            begin_chain_probe("python", Some(&config)).is_none(),
+            "同一 (主机, 语言) 不该并发探测两次"
+        );
+        // 不同语言是不同的键，互不阻塞。
+        assert!(begin_chain_probe("rust", Some(&config)).is_some());
+
+        drop(guard);
+        assert!(
+            begin_chain_probe("python", Some(&config)).is_some(),
+            "守卫 Drop 之后必须释放占位"
+        );
+    }
+
+    /// 回归：主机不可达后的 30 秒冷却期不能被 `pending_chain_probe` 绕过。
+    ///
+    /// 冷却期存在的意义就是「别再问」。若这里仍把候选交出去，状态栏每次重建
+    /// 都会重新起一个后台任务，每个任务再撞一轮 15s 超时——UI 线程虽不阻塞，
+    /// 网络与 SSH 会话却被反复占用。
+    #[test]
+    fn pending_chain_probe_respects_unreachable_cooldown() {
+        let config = remote_config("cooldown");
+        let candidates: Vec<String> = builtin_candidates()
+            .get("python")
+            .expect("python must have a builtin chain")
+            .iter()
+            .map(|(command, _)| command.to_string())
+            .collect();
+        let settings = LspContent::default();
+
+        // 全部候选都在冷却中：没有待重问的。
+        let cooldown = std::time::Instant::now() + UNREACHABLE_RETRY;
+        for command in &candidates {
+            record(command, Some(&config), Probe::RetryAt(cooldown));
+        }
+        assert!(
+            pending_chain_probe("python", &settings, Some(&config)).is_empty(),
+            "冷却期内不该再列候选"
+        );
+
+        // 冷却到期：重新列出整条链。
+        let expired = std::time::Instant::now();
+        for command in &candidates {
+            record(command, Some(&config), Probe::RetryAt(expired));
+        }
+        assert_eq!(
+            pending_chain_probe("python", &settings, Some(&config)),
+            candidates,
+            "冷却到期后应重新补探"
+        );
     }
 }
