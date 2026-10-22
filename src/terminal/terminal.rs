@@ -17,7 +17,6 @@ use std::{
 use alacritty_terminal::{
     Term,
     event::{Event as AlacTermEvent, EventListener, WindowSize},
-    event_loop::{EventLoopSender, Msg},
     grid::{Dimensions, Scroll as AlacScroll},
     index::{Column, Line, Point as AlacPoint, Side},
     selection::{Selection, SelectionType},
@@ -29,9 +28,8 @@ use alacritty_terminal::{
         StdSyncHandler,
     },
 };
-// unix 本地终端走自建 `local_pty::LocalReader`，不再构造 alacritty 的 EventLoop。
-#[cfg(not(unix))]
-use alacritty_terminal::event_loop::EventLoop;
+// 本地终端（含 Windows 的 conpty）统一走自建 `local_pty::LocalReader`，
+// 不再构造 alacritty 的 EventLoop——理由见 `local_pty` 模块文档。
 use futures::{
     StreamExt,
     channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
@@ -1026,14 +1024,13 @@ pub struct Terminal {
     /// 最近一次 agent 事件（或 session 重置）的时刻，用于放弃静默过久的回合。
     agent_last_event: Option<std::time::Instant>,
     window_title: Option<String>,
-    /// 本地终端的事件循环发送器（仅 Windows：conpty 无裸 fd，沿用 alacritty EventLoop）
-    sender: Option<EventLoopSender>,
-    /// 本地终端读线程的发送端（仅 unix）。与 `sender` 互斥，两者只会有一个为 `Some`。
-    #[cfg(unix)]
+    /// 本地终端读线程的发送端（输入/尺寸/关闭的唯一通道）。
+    ///
+    /// 本地与远程互斥：本地终端只有这一条输入通道，远程走
+    /// `remote_input_callback` / `remote_resize_callback`。
     local_sender: Option<crate::terminal::local_pty::LocalSender>,
-    /// 本地读线程句柄（仅 unix）。持有它以保证读线程存活至终端析构。
+    /// 本地读线程句柄。持有它以保证读线程存活至终端析构。
     /// 字段本身不被读取，故以下划线前缀标记。
-    #[cfg(unix)]
     _local_reader: Option<crate::terminal::local_pty::LocalReader>,
     /// Kitty 图形协议已存储的图像（本地路径：读线程写入，UI 线程只读渲染）。
     ///
@@ -1094,8 +1091,8 @@ pub struct Terminal {
     /// shell 回显会把光标留在当前行内容的末尾，因此“光标 == 锚点”即输入行为空。
     /// 判定逻辑见 [`Terminal::input_line_blank`]。
     /// - 远程集成 shell：提示符绘制完成时 OSC 133;B 精确设置锚点；
-    /// - 本地 / 无集成 shell：alacritty EventLoop 直接消费 PTY 字节，OSC 133 不可见，
-    ///   退化为 [`Terminal::write`] 时捕获的“首个输入前的光标位置”（即提示符末尾）。
+    /// - 本地未上报 133;B 的 shell（如未注入集成脚本）：退化为
+    ///   [`Terminal::write`] 时捕获的“首个输入前的光标位置”（即提示符末尾）。
     ///
     /// 锚点失效时机：resize / clear（reflow 改变行列）、写入回车（提示符即将重绘）、
     /// shell 重回前台（旧提示符位置作废，如退出编辑器后）。
@@ -1229,10 +1226,7 @@ impl Terminal {
             agent_interrupt_pending: None,
             agent_last_event: None,
             window_title: None,
-            sender: None,
-            #[cfg(unix)]
             local_sender: None,
-            #[cfg(unix)]
             _local_reader: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1362,63 +1356,36 @@ impl Terminal {
         // 鼠标报文编码（UI 线程）读。
         let local_mode_1016 = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // 本地终端字节管线：
-        // - unix：自建读线程（`LocalReader`），字节经应用层扫描后再喂 vte，
-        //   这样 APC（Kitty 图形协议）才能被拦截。
-        // - windows：conpty 无裸 fd，沿用 alacritty 的 EventLoop。
-        #[cfg(unix)]
-        let (local_reader, local_notices): (
-            Option<crate::terminal::local_pty::LocalReader>,
-            Option<async_channel::Receiver<crate::terminal::local_pty::LocalNotice>>,
-        ) = {
-            // 初始几何由 `LocalReader::spawn` 统一注入（见其
-            // `initial_geometry` 参数），这里只需构造扫描器并交出 1016 的
-            // 共享状态句柄（鼠标报文在 UI 线程按该状态编码）。
-            let scanner = crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage(
-                images.storage(),
-                KITTY_IMAGE_LIMIT > 0,
-                Box::new(KittyReplySink {
-                    replies: kitty_replies.clone(),
-                    changed: kitty_images_dirty.clone(),
-                }),
-            )
-            .with_mode_1016_shared(local_mode_1016.clone());
-            match crate::terminal::local_pty::LocalReader::spawn(
-                pty,
-                term.clone(),
-                listener,
-                Box::new(scanner),
-                default_bounds.into(),
-            ) {
-                Ok(parts) => (Some(parts.reader), Some(parts.notices)),
-                Err(e) => {
-                    log::error!("Failed to spawn local PTY reader: {e}");
-                    return cx.new(|_cx| Self::create_error_terminal());
-                }
+        // 本地终端字节管线：自建读线程（`LocalReader`），字节经应用层扫描后
+        // 再喂 vte，这样 APC（Kitty 图形协议）才能被拦截。Windows 的 conpty
+        // 同样走这条管线（`Pty` 抽象已覆盖平台差异），扫描器不再是 unix 独占。
+        // 系统 conhost 的 ConPTY 会丢 APC，Windows 上必须同时分发 WT 的
+        // `conpty.dll`（见 `local_pty` 模块文档）。
+        //
+        // 初始几何由 `LocalReader::spawn` 统一注入（见其 `initial_geometry`
+        // 参数），这里只需构造扫描器并交出 1016 的共享状态句柄（鼠标报文在
+        // UI 线程按该状态编码）。
+        let scanner = crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage(
+            images.storage(),
+            KITTY_IMAGE_LIMIT > 0,
+            Box::new(KittyReplySink {
+                replies: kitty_replies.clone(),
+                changed: kitty_images_dirty.clone(),
+            }),
+        )
+        .with_mode_1016_shared(local_mode_1016.clone());
+        let (local_reader, local_notices) = match crate::terminal::local_pty::LocalReader::spawn(
+            pty,
+            term.clone(),
+            listener,
+            Box::new(scanner),
+            default_bounds.into(),
+        ) {
+            Ok(parts) => (Some(parts.reader), Some(parts.notices)),
+            Err(e) => {
+                log::error!("Failed to spawn local PTY reader: {e}");
+                return cx.new(|_cx| Self::create_error_terminal());
             }
-        };
-        // windows：conpty 无裸 fd，字节流交给 alacritty 的 `EventLoop`。
-        //
-        // **必须**在 spawn 之前取走它的 channel（`EventLoop::spawn` 消费
-        // self）并存进 `Terminal::sender`：用户输入、`Msg::Resize`、以及
-        // 关闭时的 `Msg::Shutdown` 全部只走这一条通道。
-        //
-        // 为什么这条接线值得单独盯：`EventLoop` 自己照常解析 PTY 字节，
-        // 所以丢掉 sender 时**输出完全正常**——提示符、目录、命令回显都在，
-        // 唯独 `Terminal::write` 找不到投递通道，把每个按键静默丢弃。症状
-        // 表现为「终端能打开，但打不进任何字」，很容易被误判成焦点问题。
-        #[cfg(not(unix))]
-        let event_loop_sender = {
-            let event_loop = match EventLoop::new(term.clone(), listener, pty, true, false) {
-                Ok(event_loop) => event_loop,
-                Err(e) => {
-                    log::error!("Failed to create terminal EventLoop: {e}");
-                    return cx.new(|_cx| Self::create_error_terminal());
-                }
-            };
-            let sender = event_loop.channel();
-            let _ = event_loop.spawn();
-            Some(sender)
         };
 
         cx.new(|cx| {
@@ -1433,11 +1400,8 @@ impl Terminal {
                 }
             });
 
-            // unix：把读线程的通知（重绘 / 子进程退出）泵到 UI 线程。
+            // 把读线程的通知（重绘 / 子进程退出 / OSC 旁路）泵到 UI 线程。
             // 读线程自身只做 vte 解析，凡需要 `Context` 的副作用都在这里完成。
-            //
-            // windows 走 alacritty 的 `EventLoop`（无自建读线程），没有通知可泵。
-            #[cfg(unix)]
             let reader_notice_task = local_notices.map(|notices| {
                 cx.spawn(async move |this, cx| {
                     while let Ok(notice) = notices.recv().await {
@@ -1450,8 +1414,6 @@ impl Terminal {
                     }
                 })
             });
-            #[cfg(not(unix))]
-            let reader_notice_task: Option<Task<()>> = None;
 
             Self {
                 term: term_clone,
@@ -1472,15 +1434,7 @@ impl Terminal {
                 agent_interrupt_pending: None,
                 agent_last_event: None,
                 window_title: None,
-                // unix 的本地终端走自建读线程（`local_sender`）；windows 走
-                // alacritty `EventLoop`，输入/尺寸/关闭都走 `sender`。
-                #[cfg(unix)]
-                sender: None,
-                #[cfg(not(unix))]
-                sender: event_loop_sender,
-                #[cfg(unix)]
                 local_sender: local_reader.as_ref().map(|r| r.sender()),
-                #[cfg(unix)]
                 _local_reader: local_reader,
                 images,
                 kitty_replies,
@@ -1652,10 +1606,7 @@ impl Terminal {
             agent_interrupt_pending: None,
             agent_last_event: None,
             window_title: None,
-            sender: None,
-            #[cfg(unix)]
             local_sender: None,
-            #[cfg(unix)]
             _local_reader: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1962,10 +1913,7 @@ impl Terminal {
                 agent_interrupt_pending: None,
                 agent_last_event: None,
                 window_title: None,
-                sender: None,
-                #[cfg(unix)]
                 local_sender: None,
-                #[cfg(unix)]
                 _local_reader: None,
                 // 复用上面交给扫描器的那三份共享句柄：扫描器（写）与渲染/
                 // 应答路径（读）必须是**同一个** `Arc`，否则 SSH 下图像永远
@@ -2390,7 +2338,7 @@ impl Terminal {
         self.content_dirty = true;
         self.content_generation += 1;
 
-        // 远程路径没有 alacritty EventLoop，也不发 AlacTermEvent::Wakeup，
+        // 远程路径不走本地读线程（`local_pty`），也不发 AlacTermEvent::Wakeup，
         // 在这里比对焦点上报模式位（本地终端的同类检查在 process_event）。
         self.check_focus_mode_enabled();
     }
@@ -2426,7 +2374,6 @@ impl Terminal {
     /// 副作用统一回到 UI 线程在这里完成。
     /// `pub(crate)` 而非私有：测试要能灌一条 OSC 走**本地**这条真实入口
     /// （远程那条是 `handle_remote_data`，两者在 OSC 处理上并不等价）。
-    #[cfg(unix)]
     pub(crate) fn handle_local_notice(
         &mut self,
         notice: crate::terminal::local_pty::LocalNotice,
@@ -2436,7 +2383,9 @@ impl Terminal {
         match notice {
             LocalNotice::Wakeup => {
                 // 字节已被读线程解析进 `term`，这里只负责触发重绘。
-                // 但协议应答必须由 UI 线程回写（读线程不能写 PTY）。
+                // 协议应答的常规回写由读线程取走并直写 PTY；这里的
+                // `flush_kitty_replies` 只兜底 UI 侧扫描产生的应答
+                // （两条路径靠 `mem::take` 互斥，见 `KittyReplySink`）。
                 self.flush_kitty_replies();
                 self.sync_kitty_state();
                 self.content_generation += 1;
@@ -2489,7 +2438,6 @@ impl Terminal {
     /// 必须解析为**本机**才采信。远程路径传 `false`（host 属于远端，不该拿
     /// 本机 hostname 比对）。这正是两条管线共用 `try_handle_osc_sequence` 时
     /// 唯一需要区分的语义。
-    #[cfg(unix)]
     fn handle_local_osc(
         &mut self,
         content: &[u8],
@@ -2668,11 +2616,6 @@ impl Terminal {
         }
         self.kitty_generation = self.images.generation();
     }
-
-    /// Windows / headless 占位：本地通知任务仅 unix 存在。
-    #[cfg(not(unix))]
-    #[allow(dead_code)]
-    fn handle_local_notice(&mut self, _cx: &mut Context<Self>) {}
 
     /// 把一段字节喂给 vte 解析器（作用于 term）。空段直接跳过。
     fn advance_vte(&mut self, bytes: &[u8]) {
@@ -3310,7 +3253,7 @@ impl Terminal {
                 self.content_dirty = true;
                 cx.emit(Event::Wakeup);
                 // 数据刚被 vte 处理：捕获应用 DECSET ?1004h 的开启时机
-                // （本地终端的解析发生在 alacritty EventLoop 线程，远程在
+                // （本地终端的解析发生在 `local_pty` 读线程，远程在
                 // handle_pty_data；两种路径处理完都会到达这里或那里）。
                 self.check_focus_mode_enabled();
             }
@@ -4010,8 +3953,8 @@ impl Terminal {
         // - shell 前台且尚无锚点 → 以当前光标（提示符末尾）为锚点；
         // - 写入回车 → 提示符即将重绘，锚点失效，等待重新捕获。
         //
-        // 本地终端看不到 OSC 133;B（alacritty EventLoop 直接消费 PTY 字节），
-        // 这条回显锚点路径就是本地空行判定的唯一依据。
+        // 若 shell 没有上报 OSC 133;B（未注入集成脚本），这条回显锚点路径
+        // 就是本地空行判定的唯一依据。
         self.observe_input_state();
         if memchr::memchr2(b'\r', b'\n', data).is_some() {
             self.input_area_start = None;
@@ -4022,15 +3965,8 @@ impl Terminal {
             self.note_interrupt_key();
         }
 
-        #[cfg(unix)]
         if let Some(ref sender) = self.local_sender {
             sender.input(data.to_vec());
-            return;
-        }
-
-        if let Some(ref sender) = self.sender {
-            let msg = Msg::Input(Cow::Owned(data.to_vec()));
-            let _ = sender.send(msg);
             return;
         }
 
@@ -4048,14 +3984,8 @@ impl Terminal {
     /// 误清锚点并把锚点重捕到程序输出末尾，使 `input_line_blank` 在非空行上
     /// 误报 true，导致 `/` 前缀被错误拦截进内建命令。
     pub fn write_raw(&mut self, data: &[u8]) {
-        #[cfg(unix)]
         if let Some(ref sender) = self.local_sender {
             sender.input(data.to_vec());
-            return;
-        }
-        if let Some(ref sender) = self.sender {
-            let msg = Msg::Input(Cow::Owned(data.to_vec()));
-            let _ = sender.send(msg);
             return;
         }
         if let Some(ref callback) = self.remote_input_callback {
@@ -4110,19 +4040,14 @@ impl Terminal {
 
     /// 显式终止底层进程/连接，避免终端实体被替换或关闭后造成资源泄漏。
     ///
-    /// - 本地 PTY：向 alacritty 事件循环发送 `Msg::Shutdown`，触发 PTY / 子 shell 回收。
+    /// - 本地 PTY：向读线程发送 `Shutdown`，读线程退出并释放 `Pty`（回收 shell 子进程）。
     /// - russh 远程：发送 `InputMsg::Close`（连接任务仅在收到 Close 或发送端断开时退出；
     ///   仅 drop `RusshTerminal` 无法终止连接，因为 `state` 被任务自身持有）。
     /// - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，随 `Terminal` 析构自动释放。
     pub fn kill(&mut self) {
-        // 本地终端（unix）：通知读线程退出，释放 PTY / 回收 shell 子进程。
-        #[cfg(unix)]
+        // 本地终端：通知读线程退出，释放 PTY / 回收 shell 子进程。
         if let Some(sender) = &self.local_sender {
             sender.shutdown();
-        }
-        // 本地终端（windows）：通知底层事件循环关闭（会回收 shell 子进程）
-        if let Some(sender) = &self.sender {
-            let _ = sender.send(Msg::Shutdown);
         }
         // russh 远程：显式关闭 SSH 连接
         if let Some(russh) = &self.russh_handle {
@@ -4184,12 +4109,7 @@ impl Terminal {
 
         // deepterm 特有：headless / 错误终端没有子进程可同步，立即应用以保持
         // 测试与基准确定性（ghostty 无此形态）。
-        // 本地终端：读线程 / EventLoop 都没有子进程可同步时（headless、错误终端），
-        // 立即应用以保持测试与基准确定性。
-        #[cfg(unix)]
         let has_local_sink = self.local_sender.is_some() || self.remote_resize_callback.is_some();
-        #[cfg(not(unix))]
-        let has_local_sink = self.sender.is_some() || self.remote_resize_callback.is_some();
         if !has_local_sink {
             self.apply_pending_resize(false, cx);
             return;
@@ -4249,14 +4169,10 @@ impl Terminal {
         // 注意：不能因 cols/rows 未变就跳过下面的通知。跨显示器拖动只改 DPI、
         // 不改网格，此时 PTY 的 `ws_xpixel` 与读线程扫描器的几何都必须刷新。
         //
-        // 本地终端：通过 sender 发送 resize 消息（cell 尺寸已按显示缩放
-        // 换算成物理像素，读线程据此填扫描器几何）。
-        #[cfg(unix)]
+        // 本地终端：通过读线程发送 resize 消息（cell 尺寸已按显示缩放换算成
+        // 物理像素，读线程据此填扫描器几何并转给 PTY/ConPTY）。
         if let Some(ref sender) = self.local_sender {
             sender.resize(bounds.window_size(self.display_scale));
-        }
-        if let Some(ref sender) = self.sender {
-            let _ = sender.send(Msg::Resize(bounds.window_size(self.display_scale)));
         }
         // 远程终端：通过回调通知 SSH 通道调整窗口大小（带上缩放，理由见回调类型）
         if let Some(ref callback) = self.remote_resize_callback {
@@ -5049,8 +4965,9 @@ impl EventEmitter<Event> for Terminal {}
 impl Drop for Terminal {
     fn drop(&mut self) {
         // 终端被丢弃时显式回收底层资源：
-        // - 本地 PTY：`sender` 断开会让 alacritty 事件循环退出并回收 shell；此处再补发
-        //   `Msg::Shutdown` 以确保即使仍被短暂引用也能及时关闭。
+        // - 本地 PTY：仅 drop `local_sender` 只关闭通道，读线程还阻塞在
+        //   `Poller::wait` 上；必须显式发 `Shutdown` 让它退出并释放 `Pty`
+        //   （触发 SIGHUP / `ClosePseudoConsole`，回收 shell 子进程）。
         // - russh 远程：连接任务仅在收到 `InputMsg::Close`（或发送端断开）时退出，
         //   仅 drop `RusshTerminal` 无法终止连接，必须显式 `close()`。
         // - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，会随 `Terminal` 析构释放。
@@ -5221,8 +5138,7 @@ mod tests {
         IndexedCell, PackedCell, RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalContent,
         TerminalType, packed_zerowidth,
     };
-    /// 本地路径的 OSC 通知类型（仅 unix：`local_pty` 模块本身是 `#[cfg(unix)]`）。
-    #[cfg(unix)]
+    /// 本地路径的 OSC 通知类型。
     use crate::terminal::local_pty::LocalNotice;
     use alacritty_terminal::term::test::mock_term;
     use alacritty_terminal::vte::ansi::Handler;
@@ -5572,33 +5488,23 @@ mod tests {
         });
     }
 
-    /// 回归：新建的本地终端必须持有**一条**输入通道，否则用户打的每个字符
-    /// 都被 `Terminal::write` 静默丢弃。
+    /// 回归：新建的本地终端必须持有输入通道（`local_sender`），否则用户打的
+    /// 每个字符都被 `Terminal::write` 静默丢弃。
     ///
     /// 症状极具迷惑性：终端能打开、提示符照常出现（输出侧正常，因为解析
-    /// PTY 字节的读线程 / `EventLoop` 都在跑），但**打不进任何字**。
+    /// PTY 字节的读线程在跑），但**打不进任何字**。
     ///
-    /// 根因是平台相关的接线漏了一条：unix 走自建读线程的 `local_sender`，
-    /// windows 走 alacritty `EventLoop` 的 `sender`——而
-    /// `EventLoop::spawn` 会消费 self，channel 必须在 spawn **之前**取走。
-    /// 漏掉时同一根因还顺带废掉了 `Msg::Resize` 与 `kill()` 的
-    /// `Msg::Shutdown`（两者都只走 `sender`）。
-    ///
-    /// 这类「只在一半平台接线」的缺陷正是 macOS-only 的 CI 看不见的，所以
-    /// 用例不按平台裁剪：两条分支都断言。
+    /// 历史上这是平台接线漏了一条的 bug：unix 走 `local_sender`、windows 走
+    /// alacritty `EventLoop` 的 `sender`，而 `EventLoop::spawn` 会消费 self，
+    /// channel 必须在 spawn **之前**取走。现在两条平台统一走 `LocalReader`，
+    /// 这条不变量照着钉：本地终端必有 `local_sender`。
     #[gpui::test]
     fn local_terminal_keeps_an_input_channel(cx: &mut TestAppContext) {
         let terminal = cx.update(|cx| Terminal::new(cx, None));
         terminal.update(cx, |t, _| {
-            #[cfg(unix)]
             assert!(
                 t.local_sender.is_some(),
-                "unix 本地终端必须持有 LocalReader 的 sender，否则输入被静默丢弃"
-            );
-            #[cfg(not(unix))]
-            assert!(
-                t.sender.is_some(),
-                "windows 本地终端必须持有 EventLoop 的 channel，否则输入被静默丢弃"
+                "本地终端必须持有 LocalReader 的 sender，否则输入被静默丢弃"
             );
         });
     }
@@ -5723,19 +5629,17 @@ mod tests {
         );
     }
 
-    // ===== 本地路径 OSC 拦截测试（仅 unix）=====
+    // ===== 本地路径 OSC 拦截测试 =====
     //
     // 与上面几条的分工：那些走 `handle_pty_data`（远程/UI 线程内的就地判定），
     // 这些走 `handle_local_osc`（读线程旁路通知后由 UI 线程判定，本地路径）。
     // 两条路径的处理函数相同，差异只在入口与 `require_local_osc7_host`。
-    //
-    // 整段都是 `#[cfg(unix)]`：`local_pty`（`LocalNotice` 的来源）只在 unix 存在。
+    // 不摘除 `LocalNotice` 的构造：读线程通知这一跳正是被测对象。
 
     /// 本地路径的 OSC 133;B 必须被消费并设置输入区锚点。
     ///
     /// 这条锁住的是"读线程旁路通知 → LocalNotice::Osc → UI 线程判定"整条链：
     /// 修补前本地 shell 的提示符标记全部石沉大海（vte 没有 133 分支）。
-    #[cfg(unix)]
     #[gpui::test]
     fn local_osc133_b_sets_input_area_anchor(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
@@ -5761,7 +5665,6 @@ mod tests {
     /// 发通知，若 UI 线程现读 `Term` 的光标，拿到的是行尾（回显之后）而不是
     /// 锚点，`input_line_blank` 就会把有内容的行误判为空行——`/` 前缀会被
     /// 错误拦截成内建命令。
-    #[cfg(unix)]
     #[gpui::test]
     fn local_osc133_b_anchor_ignores_trailing_echo(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
@@ -5936,7 +5839,6 @@ mod tests {
     ///
     /// 这条专门锁住 `handle_local_notice` 里 agent 判定**先于** `handle_local_osc`
     /// 的排序——写反的话事件会落进 `parse_notification_osc`，session 建不起来。
-    #[cfg(unix)]
     #[gpui::test]
     fn local_agent_sentinel_builds_session_without_notification(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
@@ -5977,7 +5879,6 @@ mod tests {
     /// 本地路径的普通通知仍然照常派发，别被 agent 判定顺手吃掉。
     ///
     /// 这条是上一条的对照：agent 判定只该拿走 sentinel，其余一切照旧。
-    #[cfg(unix)]
     #[gpui::test]
     fn local_plain_notification_still_delivered(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
@@ -6413,7 +6314,6 @@ mod tests {
     ///
     /// 远程路径传 `false`（host 属于远端，拿本机 hostname 比对必然失败）。
     /// 若本地误传 `false`，伪造的 host 会被当成合法 cwd 写进来。
-    #[cfg(unix)]
     #[gpui::test]
     fn local_osc7_rejects_foreign_host(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());

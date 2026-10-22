@@ -536,8 +536,10 @@ fn not_started_chip_shows_the_server_name(_cx: &mut gpui::TestAppContext) {
 
 /// 没有可用服务器的语言不该出现「未启动」字样占位。
 ///
-/// `start_lsp_for_tab` 只在 `language_has_server_on` 为真时才写 `NotStarted`，
-/// 这条守的是万一那个门控失效时的兜底文案。
+/// `start_lsp_for_tab` 只在 `language_has_server_on` 为真时才写 `NotStarted`：
+/// 本机候选链还没探过时它会先答「有」（占位先挂），探明一个都没有后由
+/// `reconcile_lsp_placeholder` 收回；这条守的是万一那个门控失效、占位去掉
+/// 了但状态还留着时的兜底文案。
 #[gpui::test]
 fn not_started_without_a_server_name_falls_back(_cx: &mut gpui::TestAppContext) {
     let (label, _) = super::lsp_chip_content(&crate::lsp::status::LspStatus::NotStarted, None);

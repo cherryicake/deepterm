@@ -2913,10 +2913,14 @@ impl LiveMarkdownView {
             if revealed || self.mermaid.is_showing_code(block_id) {
                 continue;
             }
-            let source = (open_pi + 1..=last_code)
+            // 这条路径是光标禁区判定（低频），没有 geometry 的 Arc 可用，
+            // 现场 join 后转 `Arc<str>` 供 `body` 查询（`From<String>` 直接
+            // 接管缓冲区，不多一次整块拷贝）。
+            let source: Arc<str> = (open_pi + 1..=last_code)
                 .map(|pi| self.buffer.line(rows[pi].line).unwrap_or(""))
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join("\n")
+                .into();
             if matches!(self.mermaid.body(&source), MermaidBody::Image { .. }) {
                 let end = close_pi.unwrap_or(last_code);
                 out.push((rows[open_pi].line, rows[end].line));

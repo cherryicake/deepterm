@@ -106,6 +106,10 @@ pub fn builtin_candidates() -> &'static HashMap<&'static str, Vec<Candidate>> {
 }
 
 /// 命令是否可用（在 PATH 里，或本身是绝对路径且存在）。
+///
+/// **会起子进程**：只允许从后台探测路径进来（UI 线程一律只读缓存，
+/// 见 [`command_availability_cached`]）。曾经 UI 路径也内联调它，结果
+/// 冷机器上第一次打开代码文件的整帧被一个数秒级的进程冷启动吞掉。
 fn command_exists(command: &str) -> bool {
     // 绝对路径：直接看文件在不在，不必过 PATH。
     if command.starts_with('/') {
@@ -114,13 +118,28 @@ fn command_exists(command: &str) -> bool {
     // `--version` 而不是 `--help`：前者短、退出快、且不读 stdin。
     // rustup 的代理存根在组件缺失时会以非零退出（见 `integration_tests`
     // 里 `has_server` 的注释），这里沿用同一判定。
-    std::process::Command::new(command)
-        .arg("--version")
+    let started = std::time::Instant::now();
+    let mut cmd = std::process::Command::new(command);
+    cmd.arg("--version")
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .stderr(std::process::Stdio::null());
+    // Windows 上不给 `CREATE_NO_WINDOW`：控制台程序会附带一个新分配的控制台
+    // 窗口，冷启动时要额外花时间，任务栏还会闪一下黑框。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let hit = cmd.status().map(|s| s.success()).unwrap_or(false);
+    // 正常一次几十毫秒（探过的缓存另算，见 `probe_cache`）；上到百毫秒乃至
+    // 数秒说明赶上了进程冷启动（安全软件扫描新二进制、代理存根初始化……）。
+    // 只在慢时打日志：卡顿现场排查时这是第一条线索，平时不刷屏。
+    let elapsed = started.elapsed();
+    if elapsed > std::time::Duration::from_millis(200) {
+        log::warn!("lsp: probing `{command} --version` took {elapsed:?} (available={hit})");
+    }
+    hit
 }
 
 /// `settings.json` 里的 `lsp` 段。
@@ -564,25 +583,26 @@ fn record(command: &str, ssh_config: Option<&crate::ssh::SshConnectionConfig>, p
     guard.insert(key, probe);
 }
 
-/// UI 线程专用的判定：**远端绝不做 I/O**。
+/// UI 线程专用的判定：**任何主机都不做 I/O**。
 ///
-/// `Some(true/false)` 是缓存里的确定答案；`None` 是「还不知道」——远端从没
-/// 探过，或上次问不到且冷却期已过。调用方（状态栏 chip、菜单）据此显示占位
+/// `Some(true/false)` 是缓存里的确定答案；`None` 是「还不知道」——从没探过，
+/// 或上次问不到且冷却期已过。调用方（状态栏 chip、菜单）据此显示占位
 /// 并交给后台补探（见 [`pending_chain_probe`]）。
 ///
-/// 本机一侧不存在 `None`：`command_exists` 是本地的一个 `--version` 子进程，
-/// 便宜且按命令名缓存一次即可，不值得为它多一层异步。
+/// 本机一侧曾经在这里内联探测（`command_exists` 的一次 `--version` 子进程），
+/// 理由写在旧注释里：「便宜且按命令名缓存一次即可」。这个假设在冷机器上
+/// 不成立——代理存根 + 安全软件环境下实测 5s+，而这个函数在状态栏**每帧**
+/// 的渲染路径上。现在本机与远端同一条规矩：缓存未命中就答「不知道」，
+/// 由后台补探填充（本机探测的子进程成本与远端往返同级）。
 fn command_availability_cached(
     command: &str,
     ssh_config: Option<&crate::ssh::SshConnectionConfig>,
 ) -> Option<bool> {
     let key = probe_key(command, ssh_config);
-    if let Some(Probe::Settled(hit)) = cached_probe(&key) {
-        return Some(hit);
-    }
-    match ssh_config {
-        None => Some(settle_probe(command, None) == Probe::Settled(true)),
-        Some(_) => None,
+    match cached_probe(&key) {
+        Some(Probe::Settled(hit)) => Some(hit),
+        // `RetryAt`（远端问不到、冷却中）与「从没探过」对 UI 是同一件事。
+        _ => None,
     }
 }
 
@@ -613,7 +633,7 @@ pub fn language_might_have_server_on(
         .any(|(command, _)| command_availability_cached(command, ssh_config) != Some(false))
 }
 
-/// 还没探过的候选（远端专用；本机与用户显式配置都返回空）。
+/// 还没探过的候选（本机与远端共用；用户显式配置时返回空）。
 ///
 /// 拆成「谁去问」与「谁来起后台任务」两半，是因为 registry 拿不到 gpui 的
 /// 实体句柄：它只能探测，不能通知界面重画。通知必须由调用方（编辑器）用
@@ -629,8 +649,8 @@ pub fn pending_chain_probe(
     settings: &LspContent,
     ssh_config: Option<&crate::ssh::SshConnectionConfig>,
 ) -> Vec<String> {
-    // 本机不需要；用户显式配了命令也不需要（那条命令不经候选链）。
-    if ssh_config.is_none() || settings.servers.contains_key(language) {
+    // 用户显式配了命令就不经候选链（那条命令由启动路径自己探）。
+    if settings.servers.contains_key(language) {
         return Vec::new();
     }
     let now = std::time::Instant::now();
@@ -1017,5 +1037,41 @@ mod tests {
             candidates,
             "冷却到期后应重新补探"
         );
+    }
+
+    /// 回归：本机缓存未命中时，UI 路径**只答「不知道」**，不得就地探测。
+    ///
+    /// 守的是「第一次打开代码文件整帧被吞 5s+」的故障：状态栏 chip 在
+    /// `render` 里每帧问一次服务器名，旧实现（本机）缓存未命中就内联起一个
+    /// `--version` 子进程，冷机器上进程冷启动实测数秒。现在本机与远端同一
+    /// 条规矩——UI 只读缓存，未命中答 `None`，由后台补探填充。
+    ///
+    /// 用「必然不存在的唯一命令名」而不是慢速假二进制：不必动 PATH（进程级
+    /// 全局状态，与并行测试互扰），而且足以区分新旧行为——旧实现会当场落下
+    /// `Settled(false)` 并返回 `Some(false)`；新实现返回 `None`，且缓存里
+    /// 不留任何记录（留记录 = 起过子进程）。
+    #[test]
+    fn local_cache_miss_reports_unknown_without_probing() {
+        // 唯一性靠 pid + 名字本身：缓存是按命令名的进程级静态表，同一进程
+        // 里只有本测试用这个名字。
+        let name = format!("deepterm-test-missing-cmd-{}", std::process::id());
+        let key = probe_key(&name, None);
+        assert!(
+            cached_probe(&key).is_none(),
+            "唯一命令名不该有缓存记录（前置条件）"
+        );
+        assert_eq!(
+            command_availability_cached(&name, None),
+            None,
+            "本机未命中必须答「不知道」，不能就地探测成 Settled"
+        );
+        assert!(
+            cached_probe(&key).is_none(),
+            "只读路径不得写探测缓存（写缓存等于起过子进程）"
+        );
+        // 后台补探才是允许落缓存的路径：探完 chip 那边就能从占位转成
+        // 确定答案（这里是「确定没有」）。
+        probe_commands_pending(&[name.clone()], None);
+        assert_eq!(command_availability_cached(&name, None), Some(false));
     }
 }

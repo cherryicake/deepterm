@@ -422,7 +422,13 @@ impl SimpleHighlighter {
             else {
                 continue;
             };
-            let Ok(sub_query) = Query::new(&config.language, &config.highlights) else {
+            // 每帧/每键重编译 Query 纯属浪费：查询文本是静态的，走与宿主
+            // query 同款的全局编译缓存（`compiled_query`），未命中才真正
+            // `Query::new` —— 此前这条注入路径绕开了缓存，每次重算可见区
+            // 样式都要对每个注入层全量编译一次。
+            let Some(sub_query) =
+                compiled_query(&layer.language_name, &config.language, &config.highlights)
+            else {
                 continue;
             };
 

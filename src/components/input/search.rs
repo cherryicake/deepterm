@@ -409,6 +409,13 @@ impl InputState {
         let Some(search_panel) = self.search_panel.as_ref() else {
             return;
         };
+        // 面板关闭时不同步：`SearchMatcher::update` 会对全文做相等比较，
+        // 残留 query 时还会全文 `to_string` + 重扫 —— 一旦用过一次搜索
+        // （面板已创建），此后每个击键都要付这份成本。关闭期间跳过，
+        // 重新打开时 `on_action_search` / `show` 会用最新文本做一次同步。
+        if !search_panel.read(cx).is_open() {
+            return;
+        }
 
         let text = self.text.clone();
         search_panel.update(cx, |this, _| {

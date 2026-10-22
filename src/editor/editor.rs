@@ -1051,8 +1051,10 @@ impl Editor {
             .original_content
             .clone()
             .unwrap_or_else(|| content.clone());
-        let is_dirty = content.as_str() != original_content.as_str();
         let is_live = file_info.id.as_ref().ends_with(Self::MARKDOWN_LIVE_SUFFIX);
+        // live 标签的影子文本已按模型口径剥掉 `\r`，与保留原始行尾的基线
+        // 比较必须同口径，否则 CRLF 文件恢复回来就会被误标为「已修改」。
+        let is_dirty = !content_matches_baseline(&content, &original_content, is_live);
         let is_markdown = path_str.ends_with(".md")
             && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX)
             && !is_live;
@@ -1337,6 +1339,19 @@ impl Editor {
                     let path_for_task = path.clone();
                     cx.background_executor()
                         .spawn(async move {
+                            // 与打开路径同规：先 stat 粗筛。磁盘上持续增长的
+                            // 大文件（如日志）在外部变更重载时若直接全量读，
+                            // 会把整个文件拉进内存（打开时的 20MB 限制
+                            // 管不到这条重载路径）。
+                            if let Ok(meta) =
+                                crate::ssh::sftp_fs::metadata(&config, &path_for_task)
+                                && meta.size > MAX_EDITOR_FILE_BYTES as u64
+                            {
+                                return Err(format!(
+                                    "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制，已跳过重载",
+                                    meta.size / (1024 * 1024)
+                                ));
+                            }
                             let bytes =
                                 crate::ssh::sftp_fs::read_file_bytes(&config, &path_for_task)
                                     .map_err(|e| e.to_string())?
@@ -1351,6 +1366,15 @@ impl Editor {
                     let path_for_task = path.clone();
                     cx.background_executor()
                         .spawn(async move {
+                            // 同远端分支：先 metadata 粗筛，超限跳过重载。
+                            if let Ok(meta) = std::fs::metadata(&path_for_task)
+                                && meta.len() > MAX_EDITOR_FILE_BYTES as u64
+                            {
+                                return Err(format!(
+                                    "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制，已跳过重载",
+                                    meta.len() / (1024 * 1024)
+                                ));
+                            }
                             let bytes = std::fs::read(&path_for_task).map_err(|e| e.to_string())?;
                             if crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
                                 return Err("内容为二进制".to_string());
@@ -1430,8 +1454,16 @@ impl Editor {
                 .read(cx)
                 .value()
                 .to_string();
-            let no_local_edits = current == self.open_files[file_ix].original_content;
-            let disk_matches_editor = content == current;
+            // live 标签的影子文本是归一化（剥 `\r`）的，而磁盘内容与基线保留
+            // 原始行尾：比较必须同口径，否则 CRLF 文件在没有本地修改时也会被
+            // 误判成「有本地修改」→ 明明只是外部保存，却弹冲突确认。
+            let is_live = self.open_files[file_ix].live.is_some();
+            let no_local_edits = content_matches_baseline(
+                &current,
+                &self.open_files[file_ix].original_content,
+                is_live,
+            );
+            let disk_matches_editor = content_matches_baseline(&content, &current, is_live);
 
             if no_local_edits || disk_matches_editor {
                 // 分支 1+2：直接采用磁盘内容，同步基线/编码/标签。
@@ -2927,9 +2959,10 @@ impl Editor {
             }
         }
 
-        // 点开菜单是「用户正在等一个答案」的时刻，而远端候选链很可能还没探过
-        // （UI 路径一律只读缓存）。先交给后台补探：探完 `notify`，菜单与 chip
-        // 上的名字会从语言名补成真正的命令名。
+        // 点开菜单是「用户正在等一个答案」的时刻，而候选链很可能还没探过
+        // （UI 路径一律只读缓存：远端是网络往返，本机是子进程冷启动）。先交给
+        // 后台补探：探完 `notify`，菜单与 chip 上的名字会从语言名补成真正的
+        // 命令名。
         let active = self.open_files.iter().find(|f| f.id == tab_id).map(|f| {
             let language = f
                 .lsp
@@ -2973,14 +3006,15 @@ impl Editor {
         cx.notify();
     }
 
-    /// 让这台主机的候选链在后台探完，探完再重画一次状态栏。
+    /// 让这台主机（本机或远端）的候选链在后台探完，探完再重画一次状态栏。
     ///
-    /// UI 侧读的全是 `registry` 的缓存，且**绝不发网络请求**（见
+    /// UI 侧读的全是 `registry` 的缓存，且**绝不做 I/O**（见
     /// [`crate::lsp::LspManager::configured_command_on`]）——远端探测是一次
-    /// 同步 SSH 往返，而 chip 每帧都要问一次服务器名，放在渲染路径上等于
-    /// 「主机不可达时每帧冻 15 秒」。代价是第一次打开远程文件时「还不知道」，
-    /// chip 只能退回语言名。这里把那次往返交给后台线程：结果落回同一个缓存，
-    /// 任务完成时 `notify` 一次，chip 自己就补上真正的命令名。
+    /// 同步 SSH 往返，本机探测是一次子进程冷启动（冷机器上实测 5s+），而
+    /// chip 每帧都要问一次服务器名，放在渲染路径上就等于把这些成本按帧交。
+    /// 代价是第一次打开文件时「还不知道」，chip 只能退回语言名/「未启动」。
+    /// 这里把探测交给后台线程：结果落回同一个缓存，任务完成时 `notify`
+    /// 一次，chip 自己就补上真正的命令名。
     ///
     /// 只在「开标签 / 点开菜单」这类事件上调，不在 `render` 里调：待探列表
     /// 本身只是缓存读，但每帧 spawn 一个后台任务毫无意义。
@@ -2995,12 +3029,9 @@ impl Editor {
         allow_cooldown_retry: bool,
         cx: &mut Context<Self>,
     ) {
-        // 本机不需要探（`command_exists` 在 UI 线程上也就是一次子进程，
-        // 且早已按命令名缓存）。
-        let Some(ssh) = ssh_config.cloned() else {
-            return;
-        };
-        let pending = crate::lsp::LspManager::pending_chain_probe(cx, language, Some(&ssh));
+        let pending = crate::lsp::LspManager::pending_chain_probe(cx, language, ssh_config);
+        // 探测任务要活到后台线程结束，先把配置拷成自己的。
+        let ssh = ssh_config.cloned();
         if pending.is_empty() {
             // 待探列表为空也可能是「主机不可达，正在 30 秒冷却期里」——那之后
             // 没人会再去问一次，chip 会一直停在「还不知道」。排一次延迟重试。
@@ -3008,12 +3039,13 @@ impl Editor {
                 return;
             }
             let Some(delay) =
-                crate::lsp::LspManager::chain_probe_cooldown(cx, language, Some(&ssh))
+                crate::lsp::LspManager::chain_probe_cooldown(cx, language, ssh.as_ref())
             else {
                 return;
             };
             // 守卫在这里就占住：冷却期里只允许存在一个重试定时器。
-            let Some(guard) = crate::lsp::registry::begin_chain_probe(language, Some(&ssh)) else {
+            let Some(guard) = crate::lsp::registry::begin_chain_probe(language, ssh.as_ref())
+            else {
                 return;
             };
             let language = language.to_string();
@@ -3025,7 +3057,7 @@ impl Editor {
                 if let Some(entity) = this.upgrade() {
                     entity.update(cx, |editor, cx| {
                         // 补探只补一次：这次再失败就等下一次用户触发。
-                        editor.warm_lsp_chain(&language, Some(&ssh), false, cx);
+                        editor.warm_lsp_chain(&language, ssh.as_ref(), false, cx);
                     });
                 }
             })
@@ -3035,19 +3067,22 @@ impl Editor {
         // 同一 (主机, 语言) 只允许一个探测任务在飞：连开 N 个远端文件不该
         // 叠出 N 个把同一串超时各撞一遍的任务。守卫随任务移动，任务结束
         // （或被取消）时自动注销。
-        let Some(guard) = crate::lsp::registry::begin_chain_probe(language, Some(&ssh)) else {
+        let Some(guard) = crate::lsp::registry::begin_chain_probe(language, ssh.as_ref()) else {
             return;
         };
-        log::debug!("lsp(remote): warming probe cache for {language}: {pending:?}");
+        log::debug!("lsp: warming probe cache for {language}: {pending:?}");
         cx.spawn(async move |this, cx| {
             // 守卫活到任务结束：提前 drop 会让并发的另一次调用立刻再起一个。
             let _guard = guard;
             cx.background_spawn(async move {
-                crate::lsp::registry::probe_commands_pending(&pending, Some(&ssh));
+                crate::lsp::registry::probe_commands_pending(&pending, ssh.as_ref());
             })
             .await;
             if let Some(entity) = this.upgrade() {
-                entity.update(cx, |_, cx| cx.notify());
+                entity.update(cx, |editor, cx| {
+                    editor.reconcile_lsp_placeholder(cx);
+                    cx.notify();
+                });
             }
         })
         .detach();
@@ -3079,6 +3114,42 @@ impl Editor {
             Path::new(&file.path),
             file.ssh_config.as_ref(),
         ))
+    }
+
+    /// 补探落空后，把「未启动」占位收回来。
+    ///
+    /// 占位是在「还不知道」时就挂上的：宁可先给一个能点的入口，也别把唯一
+    /// 的开启入口藏起来。补探结束后若这门语言在这台主机上确实一个候选都
+    /// 没有，占位就该收回——这正是同步探测时代 `language_has_server_on`
+    /// 当场答 `false` 的效果。不补这一步，一台什么都没装的机器会留下一盏
+    /// 点不动的灯，用户点「启动」只会失败（本地与远端同一逻辑）。
+    ///
+    /// 只动 `NotStarted`：真的起过进程的标签有自己的状态机（`Starting` /
+    /// `Failed`……），那些是「用户已授权的操作」的结果，不该被这里抹掉。
+    fn reconcile_lsp_placeholder(&mut self, cx: &mut Context<Self>) {
+        for file in &self.open_files {
+            let (language, is_placeholder) = {
+                let state = file.editor_state.read(cx);
+                (
+                    state.language().map(|l| l.to_string()).unwrap_or_default(),
+                    state.lsp_status() == Some(&crate::lsp::status::LspStatus::NotStarted),
+                )
+            };
+            if language.is_empty() || !is_placeholder {
+                continue;
+            }
+            // 还有候选没探完时 `true`（保持占位）；全部探明且都没有才 `false`。
+            if crate::lsp::LspManager::language_has_server_on(
+                cx,
+                &language,
+                file.ssh_config.as_ref(),
+            ) {
+                continue;
+            }
+            file.editor_state.update(cx, |state, _| {
+                state.set_lsp_status(None);
+            });
+        }
     }
 
     /// 当前活动 tab 对应的服务器快照（没有服务器时为 `None`）。
@@ -4403,7 +4474,13 @@ impl Editor {
                         let should_update = !file.is_loading
                             && !file.dirty
                             && file.original_content != fresh_text
-                            && file.editor_state.read(cx).value() == file.original_content;
+                            // 影子文本与基线同口径比较（live 标签剥 `\r`），
+                            // 否则 CRLF 的 md 永远命中不了这条「陈旧缓存刷新」。
+                            && content_matches_baseline(
+                                &file.editor_state.read(cx).value(),
+                                &file.original_content,
+                                file.live.is_some(),
+                            );
                         if should_update {
                             file.original_content = fresh_text.clone();
                             file.encoding = fresh_enc;
@@ -5018,9 +5095,10 @@ impl Editor {
         let path = PathBuf::from(&self.open_files[idx].path);
         // 远端主机的配置：None 表示本地文件。
         let ssh_config = self.open_files[idx].ssh_config.clone();
-        // 远端标签：把这台主机的候选链交给后台探一次（见 `warm_lsp_chain`）。
+        // 把这台主机（本机或远端）的候选链交给后台探一次（见 `warm_lsp_chain`）。
         // 本函数跑在 UI 线程，而下面紧接着要判「该不该给 chip 占位」——那里
-        // 只读缓存，第一次多半还不知道，占位先挂着，探完 notify 再补名字。
+        // 只读缓存，第一次多半还不知道，占位先挂着，探完 notify 再补名字；
+        // 探完若发现一个候选都没有，`reconcile_lsp_placeholder` 会把占位收回。
         self.warm_lsp_chain(&language, ssh_config.as_ref(), true, cx);
         // 跳转打开的文件（`.pyi` 存根、依赖源码……）该挂哪个根**已经知道**了：
         // 用发起跳转的那个会话的根，别让落点自己另算一个（见 `lsp_jump_roots`）。
@@ -5212,7 +5290,13 @@ impl Editor {
 
     /// 判断文件当前是否有未保存的修改（编辑器文本 vs 磁盘基线）。
     fn file_is_dirty(&self, file: &EditorFile, cx: &mut App) -> bool {
-        file.editor_state.read(cx).value().as_ref() != file.original_content.as_str()
+        // live 标签的影子文本是归一化（剥 `\r`）的，基线保留原始行尾：
+        // 同口径比较，CRLF 的 md 未修改时不得报「已修改」（关闭误弹确认）。
+        !content_matches_baseline(
+            file.editor_state.read(cx).value().as_ref(),
+            &file.original_content,
+            file.live.is_some(),
+        )
     }
 
     /// 同步标签栏的未保存标记。
@@ -5508,7 +5592,9 @@ impl Editor {
             .value()
             .to_string();
         let original = self.open_files[idx].original_content.clone();
-        if text == original {
+        // live 标签的文本按模型口径（剥 `\r`）与基线比较：行尾差异不算修改，
+        // 不该触发一次空写盘。
+        if content_matches_baseline(&text, &original, self.open_files[idx].live.is_some()) {
             // 无修改：无需写入磁盘。
             return;
         }
@@ -6590,6 +6676,18 @@ impl LineEnding {
     }
 }
 
+/// 编辑器文本与磁盘基线是否等价（`file_is_dirty` 等比较的统一口径）。
+///
+/// 普通编辑器保留原始行尾，精确比较即可。live markdown 标签不同：
+/// `markdown_live::model` 的行切分会剥掉所有 `\r`（见 `split_lines`），
+/// 影子 `InputState`（保存 / 关闭确认读的那份）同步的也是归一化文本，
+/// 而 `original_content` 保留磁盘原始行尾。两者直接比较时，Windows 上
+/// CRLF 的 md 文件「打开即已修改」——关闭时弹出未保存确认，实际一个字都没改。
+/// live 标签比较前按模型口径去掉 `\r`，行尾差异不算修改。
+fn content_matches_baseline(text: &str, original: &str, is_live: bool) -> bool {
+    text == original || (is_live && text.replace('\r', "") == original.replace('\r', ""))
+}
+
 /// 保存前的换行统一与还原：
 /// 先把编辑器中可能混用的 `\r\n` 统一为 `\n`，再按文件原始风格还原，
 /// 避免把 `\r\n` 直接 `.replace('\n', "\r\n")` 变成 `\r\r\n`。
@@ -7245,6 +7343,138 @@ mod tests {
                 live_ok,
                 "live tab must keep its LiveMarkdownView after restore"
             );
+        });
+    }
+
+    /// 回归：Windows 上 CRLF 的 md 用 live 模式打开、一字未改，关闭确认
+    /// 不得判为「有未保存的更改」。
+    ///
+    /// live 模型（`split_lines`）会剥掉 `\r`，关闭前把防抖文本落进影子
+    /// `InputState` 时写入的就是 LF 归一化文本；此前它与保留 CRLF 行尾的
+    /// `original_content` 直接字符串比较，未修改也被判脏，弹「有未保存的更改」。
+    #[gpui::test]
+    fn live_tab_with_crlf_content_is_clean_without_edits(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+        // 关掉 LSP 接入：打开文件会尝试连语言服务器（`smol::spawn` 到全局
+        // 执行器），会被 gpui 的 TestScheduler 判为非确定性并 abort 整个测试二进制。
+        with_lsp_disabled(|| {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.open_file_with_content(
+                        "notes.md#live".into(),
+                        "notes.md".into(),
+                        "line1\r\nline2\r\n".to_string(),
+                        std::path::PathBuf::from("notes.md"),
+                        None,
+                        FileEncoding::Utf8,
+                        false,
+                        window,
+                        cx,
+                        false,
+                        false,
+                        false,
+                        true,
+                    );
+                    // `close_file` 的第一步：把防抖中的 live 文本同步进影子
+                    // InputState。正是这次同步把影子文本变成 LF。
+                    editor.flush_all_live_shadows(cx);
+                    let file = editor
+                        .open_files
+                        .iter()
+                        .find(|f| f.id.as_ref() == "notes.md#live")
+                        .expect("live tab should be open");
+                    assert!(
+                        !editor.file_is_dirty(file, cx),
+                        "CRLF md opened in live mode must not read as modified"
+                    );
+                });
+            });
+        });
+    }
+
+    /// 回归：切文件树后恢复 live 草稿，脏状态必须跟着草稿走。
+    /// 磁盘基线是 CRLF、影子草稿是 LF（live 模型归一化后的形态）：
+    /// 只差行尾的草稿不能判脏；有真实编辑的必须判脏（不能被归一化抹平）。
+    #[gpui::test]
+    fn restored_live_tab_crlf_baseline_dirty_state(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct EditorHost(gpui::Entity<Editor>);
+        impl gpui::Render for EditorHost {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) =
+            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+        let mk_info = |id: &str, path: &str| EditorOpenFileInfo {
+            id: id.into(),
+            path: path.into(),
+            label: path.into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("a\r\nb\r\n".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            dirty: false,
+            diff_repo: None,
+        };
+        let clean = mk_info("clean.md#live", "clean.md");
+        let edited = mk_info("edited.md#live", "edited.md");
+        cx.update(|window, cx| {
+            let cached_clean = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("a\nb\n", window, cx);
+                state
+            });
+            let cached_edited = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("a\nX\nb\n", window, cx);
+                state
+            });
+            editor.update(cx, |editor, cx| {
+                editor.restore_file_from_cache(&clean, cached_clean, window, cx);
+                editor.restore_file_from_cache(&edited, cached_edited, window, cx);
+
+                let clean_file = editor
+                    .open_files
+                    .iter()
+                    .find(|f| f.id.as_ref() == "clean.md#live")
+                    .expect("clean tab should be restored");
+                assert!(!clean_file.dirty, "行尾差异不构成未保存修改（tab 标记）");
+                assert!(
+                    !editor.file_is_dirty(clean_file, cx),
+                    "行尾差异不构成未保存修改（关闭确认）"
+                );
+
+                let edited_file = editor
+                    .open_files
+                    .iter()
+                    .find(|f| f.id.as_ref() == "edited.md#live")
+                    .expect("edited tab should be restored");
+                assert!(edited_file.dirty, "真实编辑的草稿必须标脏（tab 标记）");
+                assert!(
+                    editor.file_is_dirty(edited_file, cx),
+                    "真实编辑的草稿必须标脏（关闭确认）"
+                );
+            });
         });
     }
 
@@ -7962,6 +8192,19 @@ mod tests {
             normalize_line_endings("a\nb\nc", LineEnding::Windows),
             "a\r\nb\r\nc"
         );
+    }
+
+    #[test]
+    fn content_matches_baseline_line_ending_rules() {
+        // 完全一致：不论 live 与否。
+        assert!(content_matches_baseline("a\nb", "a\nb", false));
+        assert!(content_matches_baseline("a\r\nb", "a\r\nb", true));
+        // 普通编辑器：行尾不同是真实差异（保存会按原风格写回）。
+        assert!(!content_matches_baseline("a\nb", "a\r\nb", false));
+        // live：模型剥 `\r`，行尾差异不算修改；真实内容差异仍算。
+        assert!(content_matches_baseline("a\nb", "a\r\nb", true));
+        assert!(content_matches_baseline("a\r\nb\r\n", "a\nb\n", true));
+        assert!(!content_matches_baseline("a\nX\nb", "a\r\nb", true));
     }
 
     #[test]

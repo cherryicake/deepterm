@@ -7,13 +7,17 @@
 //! 直接解析字节，应用层完全看不到原始数据；而 `vte-0.15` 的 APC 状态
 //! (`SosPmApcString`) 会把内容直接丢弃，`EventListener` 也没有对应事件。
 //!
+//! Windows 侧注意：系统自带的 conhost ConPTY（`CreatePseudoConsole`）会在
+//! 输出方向**丢弃 APC**，图片字节根本到不了这里。必须与 Windows Terminal
+//! 的 `conpty.dll` + `OpenConsole.exe` 一起分发（alacritty 会优先从 exe
+//! 目录加载 `conpty.dll`，见 `tty::windows::conpty`），TUI 的 kitty 图形
+//! 才能上屏。两个二进制随仓库放在 `windows/conpty/`，由 `build.rs` 拷到
+//! 运行目录，安装包见 `windows/deepterm.iss`。
+//!
 //! 线程模型与 alacritty 保持一致：**解析在读线程**（持有 `Term` 的 lease），
 //! 因此不引入额外的 UI 跃点，`cat` 大文件类负载无吞吐回归。
 
-use std::{
-    io::{Read as _, Write as _},
-    sync::Arc,
-};
+use std::{io::Read as _, sync::Arc};
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener as _, OnResize, WindowSize},
@@ -35,14 +39,66 @@ const READ_BUFFER_SIZE: usize = 0x10_0000;
 /// （对齐 alacritty 的 `MAX_LOCKED_READ`）。
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
 
-/// PTY 读写 fd 的轮询 token。
+/// PTY 读写端点的轮询 token。
 ///
-/// 必须与 `alacritty_terminal::tty::unix` 内部的取值一致（0/1）：该 crate 的
+/// 必须与 `alacritty_terminal::tty` 内部的取值一致：该 crate 的
 /// `Pty::register` 会**覆盖**调用方传入的 `event.key`，因此这里不能自选值，
 /// 否则事件匹配永远落空、本地终端将完全收不到输出。
+///
+/// - unix：`tty::unix` 取 0/1，但两个常量是 `pub(crate)`、上游没有导出，
+///   只能照抄取值（引用的版本是 0.26.0）。
+/// - windows：`tty::windows` 的取值是 `pub` 的，直接引用，避免将来上游
+///   调整时漂移（windows 上读写端点共用一个 token，另加子进程事件 token）。
+#[cfg(unix)]
 const PTY_READ_WRITE_TOKEN: usize = 0;
 /// 子进程 SIGCHLD 通知 fd 的轮询 token（同上，必须与上游一致）。
+#[cfg(unix)]
 const PTY_CHILD_EVENT_TOKEN: usize = 1;
+#[cfg(windows)]
+use alacritty_terminal::tty::{PTY_CHILD_EVENT_TOKEN, PTY_READ_WRITE_TOKEN};
+
+/// 把整段字节写进 PTY，容忍 Windows 侧的暂时性「写不进」。
+///
+/// alacritty 的 `UnblockedWriter` 背后是 1 MiB 的 piper 缓冲（后台写线程负责
+/// 排空）。缓冲满时 `write` 返回 `Ok(0)` 而非 `WouldBlock`，`write_all` 会直接
+/// 以 `WriteZero` 失败——输入/应答就此静默丢失。这两种信号都只是"暂时"，稍等
+/// 缓冲被排空即可继续，因此做有界重试而不是放弃。
+///
+/// `deadline` 取 5 秒：正常负载下管道近似为空、第一次就全部写完；只有病态
+/// 洪泛（粘贴数兆）才可能排队，5 秒足够排空 1 MiB 缓冲的任意现实负载，同时
+/// 保证读线程不会因一个卡死的子进程而永久挂起。
+fn write_all_retry(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + MAX_WAIT;
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]) {
+            Ok(0) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "PTY 写缓冲持续满，放弃本次写入",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Ok(n) => written += n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
 
 /// 全量透传的扫描器：不做任何识别，字节原样交给 vte。
 pub struct PassThroughScanner;
@@ -305,7 +361,7 @@ fn run_loop(
         while let Ok(msg) = rx.try_recv() {
             match msg {
                 LocalMsg::Input(bytes) => {
-                    if let Err(err) = pty.writer().write_all(&bytes) {
+                    if let Err(err) = write_all_retry(pty.writer(), &bytes) {
                         let _ =
                             notice.try_send(LocalNotice::Error(format!("pty write failed: {err}")));
                     }
@@ -387,7 +443,7 @@ fn run_loop(
         // 回写挂在 `if event.readable` 内就会一直攒着不发。
         let replies = scanner.take_replies();
         if !replies.is_empty()
-            && let Err(err) = pty.writer().write_all(&replies)
+            && let Err(err) = write_all_retry(pty.writer(), &replies)
         {
             let _ = notice.try_send(LocalNotice::Error(format!("pty reply write failed: {err}")));
             break 'event_loop;
@@ -541,7 +597,60 @@ fn pty_read(
     Ok(())
 }
 
+/// `NoticeOscSink` 的测试与平台无关（不依赖真实 PTY），单独成模块。
 #[cfg(test)]
+mod sink_tests {
+    use super::*;
+
+    /// sink 必须把内容与**序列时刻光标**原样送进通知通道。
+    ///
+    /// 光标是这里唯一需要从读线程带走的上下文：`133;B` 的语义是"此刻光标即
+    /// 输入区起点"，等 UI 线程处理通知时同一 chunk 的后续字节早已解析完。
+    #[test]
+    fn notice_osc_sink_forwards_payload_and_cursor() {
+        use crate::terminal::kitty::scanner::OscSink;
+
+        let (tx, rx) = async_channel::bounded::<LocalNotice>(4);
+        let mut sink = NoticeOscSink::new(tx);
+
+        sink.osc(b"777;notify;deepterm://cli-agent;{}", (3, 7));
+
+        match rx.try_recv().expect("应收到一条 Osc 通知") {
+            LocalNotice::Osc { content, cursor } => {
+                assert_eq!(content, b"777;notify;deepterm://cli-agent;{}");
+                assert_eq!(cursor, (3, 7), "序列时刻光标必须原样带上来");
+            }
+            other => panic!("通知类型不对：{other:?}"),
+        }
+    }
+
+    /// 通道满时 sink 不 panic、不阻塞：丢一条通知即可。
+    ///
+    /// 字节本身已由扫描器按位置喂给 vte，所以丢通知不影响 vte 侧的那几类
+    /// OSC（标题 / 超链接 / 调色板）；只有应用层的那几种少一次刷新。
+    #[test]
+    fn notice_osc_sink_drops_when_channel_is_full() {
+        use crate::terminal::kitty::scanner::OscSink;
+
+        // 容量 1，且先塞满。
+        let (tx, rx) = async_channel::bounded::<LocalNotice>(1);
+        let mut sink = NoticeOscSink::new(tx.clone());
+        sink.osc(b"0;first", (0, 0));
+        // 此时第二条必然 `try_send` 失败——只要求不 panic、不阻塞。
+        sink.osc(b"0;second", (0, 0));
+
+        let first = rx.try_recv().expect("第一条应已入队");
+        assert!(matches!(first, LocalNotice::Osc { .. }));
+        assert!(
+            rx.try_recv().is_err(),
+            "第二条应被丢弃，而不是挤掉已入队的通知"
+        );
+    }
+}
+
+/// sh 脚本驱动的端到端测试（仅 unix：依赖 `/bin/sh`、`printf`、`cat` 与
+/// tty 行规程回显）。Windows 的对应测试在 `windows_tests`。
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use gpui::{Point, px};
@@ -2303,51 +2412,353 @@ mod tests {
 
         reader.sender().shutdown();
     }
+}
 
-    // ===== NoticeOscSink：读线程把 OSC 旁路通知给 UI 线程 =====
+/// Windows 端到端测试（`cmd.exe` 驱动）。
+///
+/// 覆盖四件事：
+/// 1. 读管线在 Windows 的 conpty 上能跑（子进程输出到达扫描器）；
+/// 2. 输入消息经 `LocalMsg::Input` 真的写进了子进程的 stdin；
+/// 3. APC（kitty 图形协议载体）在**随包分发的** conpty 上原样透传——
+///    这是系统 conhost ConPTY 做不到的那一步；
+/// 4. 协议应答写回 PTY 后能被 conpty 回显，证明应答真的回到子进程输入。
+///
+/// 第 3、4 条在缺 `conpty.dll` 时会跳过（例如直接运行未经 build.rs 拷贝的
+/// 测试二进制）；正常 `cargo test` 下 build.rs 已把 `windows/conpty/` 的
+/// 二进制拷到测试 exe 旁边。
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use std::time::{Duration, Instant};
 
-    /// sink 必须把内容与**序列时刻光标**原样送进通知通道。
-    ///
-    /// 光标是这里唯一需要从读线程带走的上下文：`133;B` 的语义是"此刻光标即
-    /// 输入区起点"，等 UI 线程处理通知时同一 chunk 的后续字节早已解析完。
-    #[test]
-    fn notice_osc_sink_forwards_payload_and_cursor() {
-        use crate::terminal::kitty::scanner::OscSink;
+    /// 记录扫描器收到的全部字节，用于断言字节真的穿过了 conpty。
+    struct RecordingScanner {
+        seen: Arc<StdMutex<Vec<u8>>>,
+    }
 
-        let (tx, rx) = async_channel::bounded::<LocalNotice>(4);
-        let mut sink = NoticeOscSink::new(tx);
-
-        sink.osc(b"777;notify;deepterm://cli-agent;{}", (3, 7));
-
-        match rx.try_recv().expect("应收到一条 Osc 通知") {
-            LocalNotice::Osc { content, cursor } => {
-                assert_eq!(content, b"777;notify;deepterm://cli-agent;{}");
-                assert_eq!(cursor, (3, 7), "序列时刻光标必须原样带上来");
-            }
-            other => panic!("通知类型不对：{other:?}"),
+    impl PtyScanner for RecordingScanner {
+        fn scan(
+            &mut self,
+            data: &[u8],
+            _pending: &mut Vec<u8>,
+            emit: &mut dyn FnMut(&[u8]),
+            _grid: &mut dyn FnMut() -> GridState,
+        ) {
+            self.seen.lock().unwrap().extend_from_slice(data);
+            emit(data);
         }
     }
 
-    /// 通道满时 sink 不 panic、不阻塞：丢一条通知即可。
+    /// 轮询等待条件成立，避免固定 sleep 造成的偶发失败。
+    fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// `cmd.exe` 的 PTY 选项；参数按原样拼进命令行（与 `new_with_command`
+    /// 启动 cmd 的方式一致，不额外加引号）。
+    fn cmd_options(args: &[String]) -> alacritty_terminal::tty::Options {
+        shell_options("cmd.exe", args)
+    }
+
+    /// 任意程序 + 参数的 PTY 选项；参数原样拼进命令行。
+    fn shell_options(program: &str, args: &[String]) -> alacritty_terminal::tty::Options {
+        alacritty_terminal::tty::Options {
+            shell: Some(alacritty_terminal::tty::Shell::new(
+                program.to_string(),
+                args.to_vec(),
+            )),
+            drain_on_exit: true,
+            ..Default::default()
+        }
+    }
+
+    /// 把 PowerShell 脚本编成 `-EncodedCommand` 的载荷。
     ///
-    /// 字节本身已由扫描器按位置喂给 vte，所以丢通知不影响 vte 侧的那几类
-    /// OSC（标题 / 超链接 / 调色板）；只有应用层的那几种少一次刷新。
+    /// 走 `-EncodedCommand` 而不是 `-Command`：脚本含多行与大量引号，
+    /// 而 Windows 的 `CreateProcessW` 命令行是**原样拼接**的（`escape_args`
+    /// 关闭，见 [`shell_options`]），任何转义疏漏都会把脚本拼坏。
+    /// `-EncodedCommand` 是 UTF-16LE 的 base64，只有一个 token，无引号问题。
+    fn encode_powershell_command(script: &str) -> String {
+        let mut utf16 = Vec::with_capacity(script.len() * 2);
+        for unit in script.encode_utf16() {
+            utf16.extend_from_slice(&unit.to_le_bytes());
+        }
+        crate::terminal::kitty::command::encode_base64(&utf16)
+    }
+
+    /// "输出探测负载 → 原始模式读回输入 → 落盘"的子进程脚本。
+    ///
+    /// 为什么不用 `cmd` + tty 回显（unix 测试的手法）：conpty 的控制台输入
+    /// 状态机在 VT 模式下把不认识的 ESC 序列**吞掉**而不是回显（实测
+    /// `\x1b_Gi=4207;OK\x1b\\` 只剩末尾的 `\`），回显不能作为"应答到达子进程"
+    /// 的证据。这里直接把 stdin 置成 raw（关回显/行编辑/预处理，开 VT 输入）
+    /// 读出原始字节——与真实终端应用收应答的方式一致。
+    fn powershell_raw_reader_script(payload_path: &str, out_path: &str) -> String {
+        // 路径里的单引号按 PS 规则翻倍（临时路径实际不会含，但便宜保险）。
+        let quote = |p: &str| p.replace('\'', "''");
+        format!(
+            r#"$ErrorActionPreference = "Stop"
+$inPath = '{in_path}'
+$outPath = '{out_path}'
+$code = @'
+using System;
+using System.Runtime.InteropServices;
+public static class DtPtyChild {{
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetConsoleMode(IntPtr h, out uint mode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetConsoleMode(IntPtr h, uint mode);
+}}
+'@
+Add-Type -TypeDefinition $code
+$h = [DtPtyChild]::GetStdHandle(-10)
+$mode = [uint32]0
+[void][DtPtyChild]::GetConsoleMode($h, [ref]$mode)
+$raw = ($mode -bor 0x200) -band (-bnot (0x1 -bor 0x2 -bor 0x4))
+[void][DtPtyChild]::SetConsoleMode($h, [uint32]$raw)
+$payload = [IO.File]::ReadAllBytes($inPath)
+$out = [Console]::OpenStandardOutput()
+$out.Write($payload, 0, $payload.Length)
+$out.Flush()
+$stdin = [Console]::OpenStandardInput()
+$buf = New-Object byte[] 256
+$n = $stdin.Read($buf, 0, $buf.Length)
+$take = [byte[]]@()
+if ($n -gt 0) {{ $take = $buf[0..($n - 1)] }}
+[IO.File]::WriteAllBytes($outPath, $take)
+Write-Host ("READ[" + [BitConverter]::ToString($take) + "]")
+"#,
+            in_path = quote(payload_path),
+            out_path = quote(out_path),
+        )
+    }
+
+    /// 起一个本地读线程，返回读线程句柄与共享 `Term`。
+    fn spawn_reader(
+        options: alacritty_terminal::tty::Options,
+        scanner: Box<dyn PtyScanner>,
+    ) -> (LocalReader, Arc<FairMutex<Term<ZedListener>>>) {
+        let bounds = crate::terminal::TerminalBounds::default();
+        let pty =
+            alacritty_terminal::tty::new(&options, bounds.into(), 0).expect("创建本地 PTY 失败");
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let listener = ZedListener(events_tx);
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &bounds,
+            listener.clone(),
+        )));
+        let parts = LocalReader::spawn(pty, term.clone(), listener, scanner, bounds.into())
+            .expect("启动读线程失败");
+        (parts.reader, term)
+    }
+
+    /// 读回网格上的可见字符。
+    fn grid_text(term: &Arc<FairMutex<Term<ZedListener>>>) -> String {
+        let t = term.lock();
+        let mut out = String::new();
+        for cell in t.grid().display_iter() {
+            out.push(cell.cell.c);
+        }
+        out
+    }
+
+    /// 临时文件名（测试内唯一即可，不必真随机）。
+    fn temp_path(tag: &str, ext: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "deepterm-{tag}-{}-{nanos}.{ext}",
+            std::process::id()
+        ))
+    }
+
+    /// `conpty.dll` 是否在**当前 exe 目录**——`LoadLibraryW("conpty.dll")`
+    /// 的首选（也是唯一由我们控制的）搜索路径。测试 exe 在
+    /// `target/<profile>/deps/`，app 在 `target/<profile>/`，build.rs 两处
+    /// 都会拷。
+    fn conpty_dll_next_to_exe() -> bool {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("conpty.dll").exists()))
+            .unwrap_or(false)
+    }
+
+    /// 子进程输出经读线程到达扫描器（读管线在本平台可用）。
     #[test]
-    fn notice_osc_sink_drops_when_channel_is_full() {
-        use crate::terminal::kitty::scanner::OscSink;
-
-        // 容量 1，且先塞满。
-        let (tx, rx) = async_channel::bounded::<LocalNotice>(1);
-        let mut sink = NoticeOscSink::new(tx.clone());
-        sink.osc(b"0;first", (0, 0));
-        // 此时第二条必然 `try_send` 失败——只要求不 panic、不阻塞。
-        sink.osc(b"0;second", (0, 0));
-
-        let first = rx.try_recv().expect("第一条应已入队");
-        assert!(matches!(first, LocalNotice::Osc { .. }));
-        assert!(
-            rx.try_recv().is_err(),
-            "第二条应被丢弃，而不是挤掉已入队的通知"
+    fn child_output_reaches_scanner() {
+        let (reader, term) = spawn_reader(
+            cmd_options(&["/c".to_string(), "echo SENTINEL-WINDOWS".to_string()]),
+            Box::new(RecordingScanner {
+                seen: Arc::new(StdMutex::new(Vec::new())),
+            }),
         );
+
+        let got = wait_until(
+            || grid_text(&term).contains("SENTINEL-WINDOWS"),
+            Duration::from_secs(15),
+        );
+        assert!(got, "子进程输出未到达扫描器/网格");
+        reader.sender().shutdown();
+    }
+
+    /// 输入经发送端写入 PTY，被 cmd 读走并落盘——验证 `LocalMsg::Input`
+    /// 在 Windows 的 `UnblockedWriter`（1 MiB piper 缓冲）上真的送达子进程。
+    #[test]
+    fn input_reaches_child() {
+        let out = temp_path("local-pty-input", "txt");
+        let _ = std::fs::remove_file(&out);
+
+        // `!VAR!` + `/v:on`（延迟展开）：`%VAR%` 会在整行解析期就展开，
+        // 那时 `set /p` 还没跑，读到的永远是空串。
+        let script = format!(
+            "set /p DEEPTERM_PROBE=&& echo !DEEPTERM_PROBE!>\"{}\"",
+            out.display()
+        );
+        let (reader, _term) = spawn_reader(
+            cmd_options(&["/v:on".to_string(), "/c".to_string(), script]),
+            Box::new(RecordingScanner {
+                seen: Arc::new(StdMutex::new(Vec::new())),
+            }),
+        );
+
+        reader.sender().input(b"local-pty-input-ok\r\n".to_vec());
+
+        let wrote = wait_until(
+            || {
+                std::fs::read_to_string(&out)
+                    .map(|t| t.contains("local-pty-input-ok"))
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(15),
+        );
+        let _ = std::fs::remove_file(&out);
+        assert!(wrote, "输入未到达子进程（cmd 的 set /p 没有读到该行）");
+        reader.sender().shutdown();
+    }
+
+    /// APC（kitty 图形协议）经**随包分发的** Windows Terminal `conpty.dll`
+    /// 原样透传到扫描器。
+    ///
+    /// 系统自带的 conhost ConPTY 会在输出方向丢弃 APC（探测实验：同一负载
+    /// 下 `\x1b_G...` 全被吞掉、`CSI 16t` 正常），TUI 的图片因此永远显示不
+    /// 出来。这里同时钉住两件事：本进程确实能从 exe 目录加载 `conpty.dll`，
+    /// 且 APC 真的到了扫描器。缺 dll 时跳过——那属于环境问题（未拷贝），
+    /// 不是代码缺陷。
+    #[test]
+    fn apc_bytes_reach_scanner_with_bundled_conpty() {
+        if !conpty_dll_next_to_exe() {
+            eprintln!("跳过：测试 exe 旁没有 conpty.dll（未经 build.rs 拷贝）");
+            return;
+        }
+
+        let payload: &[u8] = b"HELLO\r\n\
+\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\
+AFTER-APC\r\n\
+\x1b[16tEND\r\n";
+        let path = temp_path("local-pty-apc", "bin");
+        std::fs::write(&path, payload).expect("写探测负载失败");
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let (reader, _term) = spawn_reader(
+            cmd_options(&["/c".to_string(), format!("type \"{}\"", path.display())]),
+            Box::new(RecordingScanner { seen: seen.clone() }),
+        );
+
+        let got = wait_until(
+            || {
+                let s = seen.lock().unwrap();
+                memchr::memmem::find(&s, b"\x1b_Gi=4207").is_some()
+            },
+            Duration::from_secs(15),
+        );
+        let raw = seen.lock().unwrap().clone();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            got,
+            "APC 未到达扫描器（conpty.dll 已加载，说明透传失效）。实际收到: {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        reader.sender().shutdown();
+    }
+
+    /// kitty 能力探测的应答写回 PTY 的**输入方向**后，被子进程按原字节读回
+    /// ——证明应答真的回到了子进程可读的那一侧。
+    ///
+    /// 这正是 terminal-browser / grok 判定「本终端支持图像」的那一步：它们发
+    /// `Gi=<id>,a=q` 后等 `Gi=<id>;OK` 的回复。与 unix 版的差异仅在读回方式：
+    /// conhost 的 VT 输入状态机会把不认识的 ESC 序列**吞掉**（实测
+    /// `\x1b_Gi=4207;OK\x1b\\` 当作输入时只剩末尾 `\` 被回显），所以这里不用
+    /// 「靠 tty 回显送进网格」，改让子进程把 stdin 置成 raw 直接读原始字节
+    /// ——与真实终端应用收应答的方式一致。
+    #[test]
+    fn kitty_probe_reply_round_trips_to_child() {
+        if !conpty_dll_next_to_exe() {
+            eprintln!("跳过：测试 exe 旁没有 conpty.dll（未经 build.rs 拷贝）");
+            return;
+        }
+
+        // 与 terminal-browser 的 probeSequence 逐字一致（PROBE_ID = 4207）。
+        let probe: &[u8] = b"\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\";
+        let payload_path = temp_path("local-pty-probe", "bin");
+        let reply_path = temp_path("local-pty-probe-reply", "bin");
+        std::fs::write(&payload_path, probe).expect("写探测负载失败");
+
+        let script = powershell_raw_reader_script(
+            &payload_path.to_string_lossy(),
+            &reply_path.to_string_lossy(),
+        );
+        let encoded = encode_powershell_command(&script);
+        let (reader, _term) = spawn_reader(
+            shell_options(
+                "powershell.exe",
+                &[
+                    "-NoProfile".to_string(),
+                    "-EncodedCommand".to_string(),
+                    encoded,
+                ],
+            ),
+            // 用真实扫描器：应答由它按协议产生、由读线程取走并直写 PTY。
+            Box::new(
+                crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage(
+                    Arc::new(StdMutex::new(
+                        crate::terminal::kitty::storage::Storage::new(1024 * 1024),
+                    )),
+                    true,
+                    Box::new(crate::terminal::kitty::CollectingSink::default()),
+                ),
+            ),
+        );
+
+        let expected: &[u8] = b"\x1b_Gi=4207;OK\x1b\\";
+        let got = wait_until(
+            || {
+                std::fs::read(&reply_path)
+                    .map(|bytes| memchr::memmem::find(&bytes, expected).is_some())
+                    .unwrap_or(false)
+            },
+            Duration::from_secs(20),
+        );
+        let raw = std::fs::read(&reply_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&payload_path);
+        let _ = std::fs::remove_file(&reply_path);
+        assert!(
+            got,
+            "应答未按原字节到达子进程 stdin；期望 {expected:?}，实际读回 {:?}",
+            String::from_utf8_lossy(&raw)
+        );
+        reader.sender().shutdown();
     }
 }

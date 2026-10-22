@@ -3,7 +3,6 @@ pub mod file_link_detector;
 pub mod foreground_argv;
 pub mod kitty;
 pub mod link_detector;
-#[cfg(unix)]
 pub mod local_pty;
 pub mod mappings;
 pub mod row_text;

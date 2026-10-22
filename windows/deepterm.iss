@@ -32,6 +32,12 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
+; Windows Terminal ConPTY（MIT）：系统 conhost 会丢 APC，TUI 的 Kitty 图形
+; 协议必须靠它透传。alacritty 从 exe 目录加载 conpty.dll，必须与 exe 同目录；
+; conpty.dll 会拉起同目录的 OpenConsole.exe，两个文件成对出现（见 README.md）。
+Source: "..\windows\conpty\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\windows\conpty\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\windows\conpty\LICENSE"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

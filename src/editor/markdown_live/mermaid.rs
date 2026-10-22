@@ -523,12 +523,14 @@ impl MermaidState {
     pub(crate) fn ensure(
         &mut self,
         block_id: usize,
-        source: &str,
+        source: &Arc<str>,
         colors: &MermaidColors,
         cx: &mut Context<LiveMarkdownView>,
     ) {
         // 指纹用 `begin_frame` 存下的那份：每块重算 15 字段哈希纯属浪费。
-        let key: MermaidKey = (Arc::from(source), self.theme_fp);
+        // 查询键直接克隆调用方（geometry）缓存的 `Arc<str>`：只加引用计数，
+        // 不再每帧把整块源码 `Arc::from` 拷贝一次。
+        let key: MermaidKey = (source.clone(), self.theme_fp);
         let pos = self.frame_keys.len();
         if self.entries.contains_key(&key) {
             // Already rendered (or in flight): record the frame slot with the
@@ -549,7 +551,9 @@ impl MermaidState {
         let result_task = result.clone();
         // gpui `Hsla` 未实现 `PartialEq`/`Send` 绑定无碍，但颜色需值拷贝进任务
         // （`MermaidColors` 全字段 Copy）。
-        let source_task = source.to_string();
+        // 源码直接共享 `Arc<str>`（引用计数），任务内 `&source_task` 退化为
+        // `&str` 传给 `render_to_image`，也免掉一次整块拷贝。
+        let source_task = source.clone();
         let colors_owned = clone_colors(colors);
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RENDER_DEBOUNCE).await;
@@ -604,10 +608,11 @@ impl MermaidState {
     }
 
     /// 查块渲染体（渲染分支与光标禁区判定共用，保证两者永远一致）。
-    pub(crate) fn body(&self, source: &str) -> MermaidBody {
-        // Probe without allocating: the map's `Hash`/`Eq` for `Arc<str>` works
-        // on the pointed-to string, so a borrowed `&str` key suffices.
-        let Some(entry) = self.entries.get(&(Arc::from(source), self.theme_fp)) else {
+    pub(crate) fn body(&self, source: &Arc<str>) -> MermaidBody {
+        // 查表键克隆调用方的 `Arc<str>`（仅引用计数，不再 `Arc::from(source)`
+        // 拷贝整块源码）；`Hash`/`Eq` 仍按指向的字符串内容比较，与插入时的
+        // key 等价。
+        let Some(entry) = self.entries.get(&(source.clone(), self.theme_fp)) else {
             // pass1 尚未跑过（首帧/异常路径）：按渲染中回退源码。
             return MermaidBody::Source { error: None };
         };
