@@ -7,7 +7,7 @@
 //! Ported from `guise::markdown` (`block`/`layout` verbatim,
 //! `inline` + backslash-escape extension, `model` = guise `EditorModel`
 //! verbatim). Rendering (`element`/`view`) is rewritten for deepterm's
-//! GPUI fork (zed `rev ac099b4`) on top of the existing `MarkdownStyle`,
+//! GPUI fork (zed `rev d25fa01`) on top of the existing `MarkdownStyle`,
 //! `SyntaxHighlighter` and `SelectableText` primitives.
 
 pub mod block;

@@ -321,6 +321,7 @@ pub(crate) fn intercept_for_test(
 ) -> bool {
     let event = gpui::KeystrokeEvent {
         keystroke: keystroke.clone(),
+        input_preference: gpui::InputPreference::KeyBindings,
         action: None,
         context_stack: Vec::new(),
     };
