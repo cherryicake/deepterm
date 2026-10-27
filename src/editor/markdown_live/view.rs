@@ -5862,7 +5862,7 @@ impl Render for LiveMarkdownView {
             let plan = &rows[pi].plan;
             LiveLine::new(
                 ("live-line", rows[pi].line),
-                SharedString::from(plan.visible.clone()),
+                plan.visible.clone(),
                 paint.runs.clone(),
                 rows[pi].line,
                 entity.clone(),
@@ -7386,7 +7386,7 @@ impl Render for LiveMarkdownView {
                                 cell_div = cell_div.child(
                                     LiveLine::new(
                                         ("live-table-cell", start_line + di * 64 + col),
-                                        SharedString::from(plan.visible.clone()),
+                                        plan.visible.clone(),
                                         runs,
                                         row_line,
                                         entity.clone(),
@@ -7454,7 +7454,7 @@ impl Render for LiveMarkdownView {
                                 cell_div = cell_div.child(
                                     LiveLine::new(
                                         ("live-table-cell", start_line + di * 64 + col),
-                                        SharedString::from(plan.visible.clone()),
+                                        plan.visible.clone(),
                                         runs,
                                         row_line,
                                         entity.clone(),
@@ -8361,7 +8361,7 @@ mod live_render_tests {
                     }
                     let line = LiveLine::new(
                         ("live-test-line", pi),
-                        SharedString::from(r.plan.visible.clone()),
+                        r.plan.visible.clone(),
                         runs,
                         r.line,
                         view.clone(),
@@ -8482,7 +8482,7 @@ mod live_render_tests {
                         label,
                         line: LiveLine::new(
                             ("live-showcase-line", pi),
-                            SharedString::from(r.plan.visible.clone()),
+                            r.plan.visible.clone(),
                             runs,
                             r.line,
                             view.clone(),

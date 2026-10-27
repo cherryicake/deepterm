@@ -804,7 +804,7 @@ pub fn strip_callout_prefix(row: &mut PlannedRow, line: &str) {
 
 pub fn strip_plan_prefix(plan: &RowPlan, n_vis: usize, n_src: usize) -> RowPlan {
     let mut out = plan.clone();
-    out.visible = out.visible.get(n_vis..).unwrap_or("").to_string();
+    out.visible = out.visible.get(n_vis..).unwrap_or("").into();
     // Runs: trim n_vis bytes from the front.
     let mut runs = Vec::new();
     let mut drop = n_vis;

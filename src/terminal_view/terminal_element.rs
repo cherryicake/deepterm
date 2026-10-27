@@ -1191,45 +1191,58 @@ impl TerminalElement {
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
     ) -> Option<(usize, usize, Vec<BatchedTextRun>, Vec<DecorationSpan>)> {
-        let (mut rebuild_left, mut rebuild_right) = range;
+        // `cached_runs` is emitted in cell order and kept sorted by `start_col`
+        // by every merge below, so the connected segment around the dirty
+        // range can be found with two monotonic cursors. The previous
+        // fixed-point loop rescanned the whole run list once per expansion,
+        // which is O(runs²) on long styled lines (coloured progress bars,
+        // dense syntax highlighting) and sits on the per-frame path.
+        debug_assert!(
+            cached_runs
+                .windows(2)
+                .all(|pair| pair[0].start_col <= pair[1].start_col),
+            "cached terminal runs must stay sorted by start_col"
+        );
 
-        // Expand the rebuild window to cover the whole contiguous cached run segment
-        // around the dirty range. This prevents incremental updates from leaving
-        // adjacent compatible runs split across the cache boundary.
-        loop {
-            let mut changed = false;
-            for run in cached_runs {
-                let run_start = run.start_col;
-                let run_end = run.start_col + run.cell_count.saturating_sub(1);
-
-                if run_end.saturating_add(1) < rebuild_left
-                    || run_start > rebuild_right.saturating_add(1)
-                {
-                    continue;
-                }
-
-                let next_left = rebuild_left.min(run_start);
-                let next_right = rebuild_right.max(run_end);
-                if next_left != rebuild_left || next_right != rebuild_right {
-                    rebuild_left = next_left;
-                    rebuild_right = next_right;
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                break;
-            }
-        }
-
-        let mut merged_runs: Vec<BatchedTextRun> = Vec::new();
-
-        for run in cached_runs {
-            let run_start = run.start_col;
+        let mut lo = cached_runs.partition_point(|run| {
             let run_end = run.start_col + run.cell_count.saturating_sub(1);
+            run_end.saturating_add(1) < range.0
+        });
+        let mut hi = lo;
+        let mut rebuild_left = range.0;
+        let mut rebuild_right = range.1;
 
-            if run_end < rebuild_left || run_start > rebuild_right {
-                merged_runs.push(run.clone());
+        // Expand to the whole contiguous (gap ≤ 1) run segment. Cursors only
+        // move forward/backward and each run is visited at most once, so the
+        // total work is linear even when left expansion enables more right
+        // expansion.
+        loop {
+            let before = (lo, hi, rebuild_left, rebuild_right);
+
+            while hi < cached_runs.len() {
+                let run = &cached_runs[hi];
+                if run.start_col > rebuild_right.saturating_add(1) {
+                    break;
+                }
+                let run_end = run.start_col + run.cell_count.saturating_sub(1);
+                rebuild_left = rebuild_left.min(run.start_col);
+                rebuild_right = rebuild_right.max(run_end);
+                hi += 1;
+            }
+
+            while lo > 0 {
+                let run = &cached_runs[lo - 1];
+                let run_end = run.start_col + run.cell_count.saturating_sub(1);
+                if run_end.saturating_add(1) < rebuild_left {
+                    break;
+                }
+                rebuild_left = rebuild_left.min(run.start_col);
+                rebuild_right = rebuild_right.max(run_end);
+                lo -= 1;
+            }
+
+            if before == (lo, hi, rebuild_left, rebuild_right) {
+                break;
             }
         }
 
@@ -1248,7 +1261,13 @@ impl TerminalElement {
             palette,
         );
 
+        // Reuse the untouched prefix/suffix instead of filtering every cached
+        // run into a fresh, repeatedly grown vec.
+        let mut merged_runs =
+            Vec::with_capacity(cached_runs.len() - (hi - lo) + dirty_entry.runs.len());
+        merged_runs.extend_from_slice(&cached_runs[..lo]);
         merged_runs.extend(dirty_entry.runs);
+        merged_runs.extend_from_slice(&cached_runs[hi..]);
         merged_runs.sort_by_key(|run| run.start_col);
         Some((
             rebuild_left,
@@ -1634,9 +1653,14 @@ impl Element for TerminalElement {
 
             if is_dirty || row_cache.layout.is_none() {
                 dirty_count += 1;
-                let cached_entry = row_cache.layout.clone();
+                // Take ownership instead of cloning the run/decorations vecs:
+                // on a full-damage frame the cached entry is about to be
+                // replaced, and on a partial update it is consumed in place.
+                let cached_entry = row_cache.layout.take();
                 let dirty_range = dirty_row_bounds.get(row_idx).copied().flatten();
-                let entry = if let (Some(cached_entry), Some(range)) = (cached_entry, dirty_range) {
+                let entry = if let (Some(mut cached_entry), Some(range)) =
+                    (cached_entry, dirty_range)
+                {
                     if let Some((rebuilt_left, rebuilt_right, updated_runs, updated_decorations)) =
                         Self::try_update_runs_in_range(
                             row_idx,
@@ -1653,17 +1677,16 @@ impl Element for TerminalElement {
                         )
                     {
                         partial_run_update_count += 1;
-                        let mut entry = cached_entry;
-                        entry.runs = updated_runs;
+                        cached_entry.runs = updated_runs;
                         // 装饰与文本 run 必须一起增量刷新：丢弃落在重建区间内的旧 span
                         // （区间已扩展到完整 run 段），再并入新 span 并按列排序。
-                        entry.decorations.retain(|span| {
+                        cached_entry.decorations.retain(|span| {
                             span.start_col + span.width <= rebuilt_left
                                 || span.start_col > rebuilt_right
                         });
-                        entry.decorations.extend(updated_decorations);
-                        entry.decorations.sort_by_key(|span| span.start_col);
-                        entry
+                        cached_entry.decorations.extend(updated_decorations);
+                        cached_entry.decorations.sort_by_key(|span| span.start_col);
+                        cached_entry
                     } else {
                         Self::layout_row(
                             row_idx,

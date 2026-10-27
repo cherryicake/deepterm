@@ -12,6 +12,8 @@
 use std::collections::HashMap;
 use std::ops::Range;
 
+use gpui::SharedString;
+
 use super::block::{Block, indent_cols};
 use super::inline::{self, InlineStyle};
 
@@ -79,7 +81,9 @@ pub struct Seg {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowPlan {
     pub kind: RowKind,
-    pub visible: String,
+    /// Shared so the render path can clone a row plan into `LiveLine` in
+    /// O(1) instead of copying the visible text every frame.
+    pub visible: SharedString,
     /// Covers `visible` exactly, in order.
     pub runs: Vec<RunAttrs>,
     /// Covers the source line exactly, in order.
@@ -428,7 +432,7 @@ impl<'a> Builder<'a> {
     fn finish(self, kind: RowKind) -> RowPlan {
         RowPlan {
             kind,
-            visible: self.visible,
+            visible: SharedString::from(self.visible),
             runs: self.runs,
             segs: self.segs,
             links: self.links,

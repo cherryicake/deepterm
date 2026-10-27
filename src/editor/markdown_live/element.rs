@@ -842,7 +842,7 @@ mod tests {
         use crate::editor::markdown_live::layout::plan_cell;
         let line = format!("| {cell} | c |");
         let plan = plan_cell(&line, 2..2 + cell.len(), None, &Default::default());
-        plan.visible
+        plan.visible.to_string()
     }
 
     #[test]
