@@ -2,7 +2,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext, Context, Entity, EventEmitter, Global};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -415,8 +415,26 @@ impl FsWatcher {
     }
 }
 
-/// Remote polling interval (reduced from 2s to lower SFTP load).
-const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// 远程轮询间隔。
+///
+/// 旧值 3s 会让每个 watch 的文件每 3 秒整读一次；远程文件通常只需要
+/// “是否变化”的语义，10s 的延迟对文件树/编辑器足够，同时显著降低
+/// SFTP 小 RPC 数量。
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(10);
+
+/// 文件内容哈希的最短间隔。
+///
+/// 正常情况下用 metadata（size/mtime）判断文件是否变化；只有 metadata
+/// 变化、或距上次内容校验超过该间隔时才整读文件。这样既能把常规轮询的
+/// 读取量降下来，又能兜底“内容变了但 mtime/size 不变”的编辑器写入。
+const REMOTE_CONTENT_HASH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// 允许做内容哈希兜底的最大文件大小。
+///
+/// 超过该大小的文件只依赖 metadata 判断变化：整读成本随文件大小线性增长，
+/// 对大型远程日志/源码反复读取会抵消轮询优化，编辑器自身也会拒绝打开
+/// 超过 20MB 的文本文件。
+const REMOTE_CONTENT_HASH_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// 远程 metadata/read_dir/read_file_bytes 都是同步 SFTP RPC。生产环境把它们
 /// 放到 smol 阻塞线程池，避免占满 GPUI 共享后台 worker（见下方轮询处注释）。
@@ -515,6 +533,8 @@ struct RemoteWatchState {
     last_meta: Option<FileMetadata>,
     last_dir_entries: Option<Vec<FileEntry>>,
     last_content_hash: Option<u64>,
+    /// 上次对文件内容做整读/哈希的时间；用于限制整文件读取频率。
+    last_content_check: Option<Instant>,
     /// 同一路径被多个订阅者监视时的引用计数。
     ref_count: usize,
     /// Set to true after we emit a Remove event due to the path becoming unreachable. When the
@@ -548,6 +568,7 @@ fn watch_increment(
             last_meta: None,
             last_dir_entries: None,
             last_content_hash: None,
+            last_content_check: None,
             ref_count: 1,
             reported_missing: false,
         });
@@ -586,12 +607,26 @@ impl RemoteFsWatcher {
             loop {
                 cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
 
-                // 快照本轮要轮询的 (路径, 服务器, fs)；键必须含服务器标识，
-                // 否则两台服务器同路径时只会轮询到先注册的那台。
-                let to_check: Vec<(PathBuf, String, Arc<dyn FileSystem>)> = {
+                // 快照本轮要轮询的 (路径, 服务器, fs, 上次 metadata, 上次内容校验时间)；
+                // 键必须含服务器标识，否则两台服务器同路径时只会轮询到先注册的那台。
+                let to_check: Vec<(
+                    PathBuf,
+                    String,
+                    Arc<dyn FileSystem>,
+                    Option<FileMetadata>,
+                    Option<Instant>,
+                )> = {
                     let lock = watched_clone.lock();
                     lock.iter()
-                        .map(|(key, s)| (key.path.clone(), key.server.clone(), s.fs.clone()))
+                        .map(|(key, s)| {
+                            (
+                                key.path.clone(),
+                                key.server.clone(),
+                                s.fs.clone(),
+                                s.last_meta.clone(),
+                                s.last_content_check,
+                            )
+                        })
                         .collect()
                 };
 
@@ -601,7 +636,7 @@ impl RemoteFsWatcher {
 
                 let bg = cx.background_executor().clone();
                 let all_results = futures::stream::iter(to_check)
-                    .map(|(path, server, fs)| {
+                    .map(|(path, server, fs, prev_meta, last_content_check)| {
                         let bg = bg.clone();
                         async move {
                             bg.spawn(async move {
@@ -612,18 +647,34 @@ impl RemoteFsWatcher {
                                 // 负责等待结果。
                                 run_blocking_io(move || {
                                     let meta = fs.metadata(&path);
-                                    let (entries, content_hash) = match &meta {
-                                        Ok(m) if m.is_dir => (fs.read_dir(&path).ok(), None),
-                                        Ok(_) => (
-                                            None,
-                                            fs.read_file_bytes(&path)
-                                                .ok()
-                                                .flatten()
-                                                .map(|bytes| hash_bytes(&bytes)),
-                                        ),
-                                        Err(_) => (None, None),
+                                    let (entries, content_hash, content_checked) = match &meta {
+                                        Ok(m) if m.is_dir => (fs.read_dir(&path).ok(), None, false),
+                                        Ok(m) => {
+                                            let hash_candidate =
+                                                m.size <= REMOTE_CONTENT_HASH_MAX_BYTES;
+                                            let meta_changed = prev_meta.as_ref() != Some(m);
+                                            let hash_due = hash_candidate
+                                                && last_content_check.map_or(true, |at| {
+                                                    at.elapsed() >= REMOTE_CONTENT_HASH_INTERVAL
+                                                });
+                                            if hash_candidate && (meta_changed || hash_due) {
+                                                (
+                                                    None,
+                                                    fs.read_file_bytes(&path)
+                                                        .ok()
+                                                        .flatten()
+                                                        .map(|bytes| hash_bytes(&bytes)),
+                                                    true,
+                                                )
+                                            } else {
+                                                // 大文件或还没到内容校验时间：本轮不读文件，
+                                                // 状态更新时沿用旧 hash。
+                                                (None, None, false)
+                                            }
+                                        }
+                                        Err(_) => (None, None, false),
                                     };
-                                    (path, server, meta, entries, content_hash)
+                                    (path, server, meta, entries, content_hash, content_checked)
                                 })
                                 .await
                             })
@@ -634,7 +685,7 @@ impl RemoteFsWatcher {
                     .collect::<Vec<_>>()
                     .await;
 
-                for (path, server, meta, entries, content_hash) in all_results {
+                for (path, server, meta, entries, content_hash, content_checked) in all_results {
                     let watch_key = WatchKey {
                         path: path.clone(),
                         server: server.clone(),
@@ -650,6 +701,7 @@ impl RemoteFsWatcher {
                                         state.last_meta = None;
                                         state.last_dir_entries = None;
                                         state.last_content_hash = None;
+                                        state.last_content_check = None;
                                         true
                                     } else {
                                         false
@@ -695,7 +747,12 @@ impl RemoteFsWatcher {
                             state.reported_missing = false;
                             let prev_meta = state.last_meta.take();
                             let prev_entries = state.last_dir_entries.take();
-                            let prev_hash = state.last_content_hash.take();
+                            let prev_hash = state.last_content_hash;
+
+                            // 本轮可能为了省 SFTP 读取而跳过内容哈希；此时沿用
+                            // 旧 hash，避免把 `None` 误判成“内容变了”而每轮发
+                            // Modify 事件。
+                            let effective_hash = content_hash.or(prev_hash);
 
                             let (emit, kind) = detect_remote_change(
                                 prev_meta.as_ref(),
@@ -703,13 +760,16 @@ impl RemoteFsWatcher {
                                 prev_hash,
                                 &meta,
                                 entries.as_deref(),
-                                content_hash,
+                                effective_hash,
                                 reported_missing,
                             );
 
                             state.last_meta = Some(meta);
                             state.last_dir_entries = entries.clone();
-                            state.last_content_hash = content_hash;
+                            state.last_content_hash = effective_hash;
+                            if content_checked {
+                                state.last_content_check = Some(Instant::now());
+                            }
                             (emit || reported_missing, kind, reported_missing)
                         } else {
                             (false, FsChangeKind::Modify, false)

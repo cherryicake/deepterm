@@ -10,8 +10,9 @@ use std::time::Duration;
 use anyhow::anyhow;
 use russh::client::{self, AuthResult};
 use russh::keys::{PrivateKeyWithHashAlg, PublicKey};
+use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::client::{RawSftpSession, SftpSession};
-use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
@@ -1112,14 +1113,14 @@ struct CacheEntry {
 
 /// 每个主机最多保留的空闲会话数。并行传输期间会临时创建更多连接，用完即弃，
 /// 避免池无限增长；UI 的读目录 / 统计等高频小操作始终能复用池中会话。
-/// P0 优化：2 -> 8，允许目录并行展开 / 轮询 / 文件读取并发执行，避免单会话排队。
-const MAX_IDLE_SESSIONS_PER_HOST: usize = 8;
+///
+/// 之前的 8 会让多个标签页/轮询任务留下大量空闲 SSH/SFTP 会话，长期占用
+/// 本机与服务端资源。目录读取和轮询是串行小操作，2 条空闲连接足够复用。
+const MAX_IDLE_SESSIONS_PER_HOST: usize = 2;
 
-/// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理
-const SFTP_SESSION_IDLE_TIMEOUT: u64 = 1800; // 30 分钟（原 5 分钟，通过心跳减少断连）
-
-/// 空闲超过此时间后，在清理前先尝试 ping 保活
-const SFTP_SESSION_PING_THRESHOLD: u64 = 600; // 10 分钟
+/// 空闲超时时间（秒）：超过此时间未使用的 SFTP 会话将被清理。
+/// 从 30 分钟收紧到 5 分钟，避免低流量标签页长期保留连接。
+const SFTP_SESSION_IDLE_TIMEOUT: u64 = 300;
 
 fn session_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
     static CACHE: OnceLock<Mutex<HashMap<String, CacheEntry>>> = OnceLock::new();
@@ -1128,39 +1129,27 @@ fn session_cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
 
 /// 清理空闲超时的 SFTP 会话
 fn evict_stale_sessions() {
-    let mut cache = session_cache().lock();
-    let now = std::time::Instant::now();
-    let stale_keys: Vec<String> = cache
-        .iter()
-        .filter(|(_, entry)| {
-            now.duration_since(entry.last_access).as_secs() > SFTP_SESSION_IDLE_TIMEOUT
-        })
-        .map(|(key, _)| key.clone())
-        .collect();
-    for key in stale_keys {
-        log::debug!("Evicting stale SFTP session: {}", key);
-        cache.remove(&key);
+    let mut stale_entries = Vec::new();
+    {
+        let mut cache = session_cache().lock();
+        let now = std::time::Instant::now();
+        let stale_keys: Vec<String> = cache
+            .iter()
+            .filter(|(_, entry)| {
+                now.duration_since(entry.last_access).as_secs() > SFTP_SESSION_IDLE_TIMEOUT
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale_keys {
+            log::debug!("Evicting stale SFTP session: {}", key);
+            if let Some(entry) = cache.remove(&key) {
+                stale_entries.push(entry);
+            }
+        }
     }
-}
-
-/// 判断会话空闲状态：是否需要 ping、是否已过期。
-enum IdleCheck {
-    Fresh,
-    NeedsPing,
-    Expired,
-}
-
-fn idle_check(entry: &CacheEntry) -> IdleCheck {
-    let idle = std::time::Instant::now()
-        .duration_since(entry.last_access)
-        .as_secs();
-    if idle < SFTP_SESSION_PING_THRESHOLD {
-        IdleCheck::Fresh
-    } else if idle >= SFTP_SESSION_IDLE_TIMEOUT {
-        IdleCheck::Expired
-    } else {
-        IdleCheck::NeedsPing
-    }
+    // `CacheEntry` 析构会关闭空闲 SFTP/SSH 会话（内部 block_on）；必须在
+    // 释放全局缓存锁之后再做，避免一次慢关闭阻塞其他主机的 SFTP 访问。
+    drop(stale_entries);
 }
 
 /// FNV-1a 64 位哈希：用于 cache_key 中区分密码内容而不驻留明文。
@@ -1235,8 +1224,9 @@ fn get_or_connect_session(
     // 每次获取会话时清理空闲超时的会话
     evict_stale_sessions();
 
-    // 在持锁期间只做轻量判断；网络 ping 放到锁外，避免阻塞其他 SFTP 访问。
-    // 有空闲会话直接取走（独占）。
+    // 空闲会话直接取走（独占）。超过空闲超时的条目已在上面统一清理；
+    // 连接本身的 keepalive 由 `connect_sftp` 的 russh 配置负责，无需在每次
+    // 取用时额外发 SFTP ping。
     {
         let mut cache = session_cache().lock();
         if let Some(entry) = cache.get_mut(key)
@@ -1244,39 +1234,6 @@ fn get_or_connect_session(
         {
             entry.last_access = std::time::Instant::now();
             return Ok(session);
-        }
-    }
-
-    // 没有空闲会话：锁外 ping 保活检查（决定保留还是重建缓存条目）。
-    let session_to_ping: Option<SharedBlockingSftpSession> = {
-        let mut cache = session_cache().lock();
-        match cache.get_mut(key) {
-            Some(entry) => match idle_check(entry) {
-                IdleCheck::Fresh => None,
-                IdleCheck::NeedsPing => entry.idle.last().cloned(),
-                IdleCheck::Expired => {
-                    cache.remove(key);
-                    None
-                }
-            },
-            None => None,
-        }
-    };
-
-    if let Some(session) = session_to_ping {
-        let ping_ok = session.lock().ping().is_ok();
-        let mut cache = session_cache().lock();
-        if let Some(entry) = cache.get_mut(key) {
-            if ping_ok {
-                entry.last_access = std::time::Instant::now();
-                log::debug!("Ping kept session alive: {}", key);
-            } else {
-                log::debug!("Ping failed, session stale: {}", key);
-                entry.idle.retain(|s| !Arc::ptr_eq(s, &session));
-                if entry.idle.is_empty() {
-                    cache.remove(key);
-                }
-            }
         }
     }
 
@@ -1296,8 +1253,9 @@ fn checkin_session(key: &str, session: SharedBlockingSftpSession) {
             entry.last_access = now;
             if entry.idle.len() < MAX_IDLE_SESSIONS_PER_HOST {
                 entry.idle.push(session);
+                return;
             }
-            // 池已满：session 在此 drop 并干净断开。
+            // 池已满：落到函数末尾，在释放缓存锁后再断开。
         }
         None => {
             cache.insert(
@@ -1307,8 +1265,13 @@ fn checkin_session(key: &str, session: SharedBlockingSftpSession) {
                     last_access: now,
                 },
             );
+            return;
         }
     }
+    // `BlockingSftpSession::drop` 内部会 block_on 关闭 SFTP/SSH；必须先把
+    // 全局缓存锁放掉，否则一次连接关闭会卡住其他主机的所有 SFTP 访问。
+    drop(cache);
+    drop(session);
 }
 
 /// 移除指定会话：用于传输失败后剔除疑似损坏的连接（`Drop` 时干净断开）。
@@ -1323,6 +1286,48 @@ fn evict_session(key: &str, session: &SharedBlockingSftpSession) {
     }
 }
 
+/// 判断错误是否属于应用级错误（远端正常返回的业务失败）。
+///
+/// 文件树轮询会频繁访问已经删除的路径，这类 `No such file` 错误非常常见。
+/// 它们的 SSH/SFTP 会话本身仍然健康，不需要额外 `ping()`；识别出来后直接
+/// 归还会话即可，避免每次轮询都产生额外一次 SFTP 往返和一条 debug 日志。
+fn is_application_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(sftp_err) = cause.downcast_ref::<SftpClientError>() {
+            return match sftp_err {
+                SftpClientError::Status(status) => matches!(
+                    status.status_code,
+                    StatusCode::NoSuchFile
+                        | StatusCode::PermissionDenied
+                        | StatusCode::Failure
+                        | StatusCode::OpUnsupported
+                ),
+                // I/O、超时、协议异常可能意味着连接已损坏，保留 ping 检查。
+                _ => false,
+            };
+        }
+    }
+
+    // 少数调用点会把底层错误格式化进字符串，类型信息已经丢失；保留一条
+    // 保守的文本兜底，覆盖最常见的路径/权限错误与用户取消。
+    let text = format!("{err:#}").to_ascii_lowercase();
+    [
+        "no such file",
+        "permission denied",
+        "already exists",
+        "not a directory",
+        "is a directory",
+        "directory not empty",
+        "no space left",
+        "read-only file system",
+        "file name too long",
+        "operation unsupported",
+        TRANSFER_CANCELLED_MSG,
+    ]
+    .iter()
+    .any(|hint| text.contains(*hint))
+}
+
 pub fn with_cached_session<T>(
     config: &SshConnectionConfig,
     mut f: impl FnMut(&mut BlockingSftpSession) -> anyhow::Result<T>,
@@ -1334,10 +1339,17 @@ pub fn with_cached_session<T>(
     let result = match first {
         Ok(result) => Ok(result),
         Err(err) => {
-            // 仅当会话确实失活（连接被服务端/网络中断）时才重连重跑一次；
-            // 会话仍然存活说明是应用级错误（用户取消、路径校验失败、远端
-            // 返回的业务错误等），直接返回，避免非幂等操作（rm/scp/覆盖写）
-            // 被执行两次，也避免取消传输触发一次无意义的重连。
+            // 应用级错误（路径不存在、权限不足、用户取消等）直接归还会话，
+            // 不做 ping。文件树轮询会大量命中已删除路径，旧逻辑每次都要多
+            // 一次 SFTP 往返，并在 debug 级别刷出数十万条日志。
+            if is_application_error(&err) {
+                log::trace!("with_cached_session: 应用级错误，不 ping、不重试: {err:#}");
+                checkin_session(&key, session);
+                return Err(err);
+            }
+            // 未知错误：仅当会话确实失活（连接被服务端/网络中断）时才重连
+            // 重跑一次；会话仍然存活说明是应用级错误，直接返回，避免非幂等
+            // 操作（rm/scp/覆盖写）被执行两次。
             if session.lock().ping().is_ok() {
                 log::debug!("with_cached_session: 会话存活，按应用错误返回（不重试）: {err:#}");
                 checkin_session(&key, session);
@@ -2149,4 +2161,47 @@ pub fn is_binary_bytes(bytes: &[u8]) -> bool {
     }
 
     non_text_like_count * 100 >= limit * 8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use russh_sftp::protocol::Status;
+
+    fn status(code: StatusCode, message: &str) -> anyhow::Error {
+        anyhow::Error::from(SftpClientError::Status(Status {
+            id: 1,
+            status_code: code,
+            error_message: message.to_string(),
+            language_tag: "en".to_string(),
+        }))
+    }
+
+    #[test]
+    fn application_errors_skip_ping() {
+        assert!(is_application_error(&status(
+            StatusCode::NoSuchFile,
+            "No such file"
+        )));
+        assert!(is_application_error(&status(
+            StatusCode::PermissionDenied,
+            "Permission denied"
+        )));
+        assert!(is_application_error(&status(
+            StatusCode::OpUnsupported,
+            "Operation unsupported"
+        )));
+    }
+
+    #[test]
+    fn connection_errors_still_ping() {
+        let err = anyhow::Error::from(SftpClientError::IO("connection reset".to_string()));
+        assert!(!is_application_error(&err));
+    }
+
+    #[test]
+    fn string_wrapped_path_errors_are_detected() {
+        let err = anyhow::anyhow!("open /tmp/missing failed: No such file");
+        assert!(is_application_error(&err));
+    }
 }

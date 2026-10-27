@@ -32,9 +32,11 @@ const LIST_ROW_HEIGHT: f32 = 24.0;
 const REFRESH_DEBOUNCE_DELAY: Duration = Duration::from_millis(150);
 /// Fallback poll for remote git status (now also watches .git/index directly,
 /// so interval can be longer than file watcher but still catch missed events).
-const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+/// 远程 git status 需要一次完整的 SFTP/命令往返；文件系统 watcher 仍会在
+/// 变更时立即触发刷新，因此把兜底轮询从 10s 放宽到 30s，降低后台负载。
+const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// 分支信息（分支名 + ahead/behind）节流间隔。
-/// status 轮询是 10s，这里错开成 30s：两者合并一次后台任务取回。
+/// status 兜底轮询是 30s，这里同样按 30s 节流。
 const BRANCH_INFO_TTL: Duration = Duration::from_secs(30);
 
 /// Git panel events
@@ -657,9 +659,11 @@ impl GitPanel {
                 // 状态列表变了：文件树着色随快照刷新。
                 cx.emit(GitPanelEvent::StatusChanged);
 
-                // Prefetch first few files so the initial click is instant.
+                // Prefetch only the first file for remote repos: each prefetch is a
+                // full file read over SFTP, and the old `take(3)` multiplied the
+                // background traffic on every status poll.
                 if let Some(repo) = this.repo.clone().filter(|r| r.ssh_config().is_some()) {
-                    for entry in this.file_entries.iter().take(3) {
+                    for entry in this.file_entries.iter().take(1) {
                         let repo = repo.clone();
                         let path = entry.path.clone();
                         cx.background_executor()
