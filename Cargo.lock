@@ -1790,7 +1790,6 @@ dependencies = [
  "async-channel",
  "async-lock",
  "async-process",
- "async-trait",
  "bytes",
  "chrono",
  "criterion",

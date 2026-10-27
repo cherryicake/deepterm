@@ -108,6 +108,8 @@ const CONTEXT: &str = "Terminal";
 /// 由 `KeyBindingContextPredicate` 解析（支持 `&&`），只在 render 把
 /// `selection` 追加进元素上下文时命中；挂到元素上的上下文走的是另一套
 /// 解析器（`KeyContext::parse`），所以那里不能直接复用这个字符串。
+/// 仅非 macOS 的 Ctrl+C 绑定使用（macOS 用 `cmd-c` 无条件复制）。
+#[cfg(not(target_os = "macos"))]
 const SELECTION_CONTEXT: &str = "Terminal && selection";
 
 /// Cursor blink policy. Mirrors Zed's `TerminalBlink` setting.
@@ -166,6 +168,8 @@ const SEARCH_DRIFT_THROTTLE_MS: u64 = 400;
 /// 抽成独立函数：`init` 之外，测试也要按同一张表断言 Ctrl+C / Ctrl+V 的
 /// 平台语义（见本文件测试 `ctrl_c_copies_only_with_selection`）。
 fn terminal_key_bindings() -> Vec<KeyBinding> {
+    // macOS 走上面的平台无关绑定，不会向 `bindings` 追加任何项。
+    #[cfg_attr(target_os = "macos", allow(unused_mut))]
     let mut bindings = vec![
         KeyBinding::new("cmd-c", Copy, Some(CONTEXT)),
         KeyBinding::new("cmd-v", Paste, Some(CONTEXT)),
