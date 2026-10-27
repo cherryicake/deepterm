@@ -169,7 +169,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if ret == 0 {
             return Ok(());
         }
-        return Err(std::io::Error::last_os_error());
+        Err(std::io::Error::last_os_error())
     }
 
     #[cfg(not(any(target_vendor = "apple", all(target_os = "linux", target_env = "gnu"))))]

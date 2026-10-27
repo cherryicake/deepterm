@@ -762,7 +762,10 @@ mod tests {
                     "\"$R\" empryo stop <<'EOF'\n",
                     "{{\"session_id\":\"e2e-1\"}}\n",
                     "EOF\n",
+                    // 写完不要立刻退出：session leader 退出会 hangup tty 并
+                    // 丢弃未读数据（与 grok 分片用例同源）。
                     "printf 'SENTINEL\\n'\n",
+                    "sleep 5\n",
                 ),
                 reporter = reporter.display(),
             ),
@@ -801,13 +804,19 @@ mod tests {
         // 先确认 agent 真的跑完了（脚本自身失败与协议失败是两回事）。
         // 15s 而不是 5s：全量跑时同批有多个 PTY 测试在抢调度，5s 偶发不够
         // （与 `grok_overlay_shaped_stream_reaches_render_plan` 同源的基建竞态）。
-        assert!(
-            wait_until(
-                || grid_text(&term).contains("SENTINEL"),
-                Duration::from_secs(15)
-            ),
-            "假 agent 没跑到 SENTINEL：脚本本身失败"
-        );
+        if !wait_until(
+            || grid_text(&term).contains("SENTINEL"),
+            Duration::from_secs(15),
+        ) {
+            let text = grid_text(&term);
+            let mut notices = Vec::new();
+            while let Ok(n) = parts.notices.try_recv() {
+                notices.push(format!("{n:?}"));
+            }
+            panic!(
+                "假 agent 没跑到 SENTINEL：脚本本身失败；终端内容：{text:?}\n读线程通知：{notices:?}"
+            );
+        }
 
         let events = osc.lock().unwrap();
         let decoded: Vec<String> = events
@@ -1417,7 +1426,11 @@ mod tests {
                 script.push_str(&format!("printf '\\033_Gq=2,m={m};{chunk}\\033\\\\'; "));
             }
         }
-        script.push_str("printf SENTINEL");
+        // 子进程写完后**不要立刻退出**：PTY 的 session leader 一退出，
+        // 内核会 hangup 该 tty 并**丢弃尚未读走的数据**。并行跑全量测试时
+        // 读线程可能还没来得及排空缓冲区，最后几 KB（含 `m=0` 尾片和
+        // SENTINEL）就会凭空消失——典型现象是"子进程 exit 0，但终端全空"。
+        script.push_str("printf SENTINEL; sleep 5");
         let chunk_count = b64.len().div_ceil(4096);
 
         let options = alacritty_terminal::tty::Options {
@@ -1479,15 +1492,38 @@ mod tests {
         .expect("启动读线程失败");
 
         // 先确认脚本真的跑完（脚本本身失败与协议失败是两回事）。
+        //
+        // 脚本有 ~76KB（19 个 base64 分片），并行跑全量测试时 /bin/sh 解析 +
+        // PTY 吞吐可能明显变慢；5s 会造成"脚本没跑完"的假失败，给足 20s。
         let ran = wait_until(
             || grid_text(&term).contains("SENTINEL"),
-            Duration::from_secs(5),
+            Duration::from_secs(20),
         );
-        assert!(
-            ran,
-            "子进程未跑到 SENTINEL：脚本本身失败（分片 {} 片）",
-            chunk_count
-        );
+        if !ran {
+            let text = grid_text(&term);
+            let tail: String = text
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            // 读线程的错误/退出原因都在通知通道里（此前被直接丢弃，失败时
+            // 只剩"终端是空的"这一条线索）。
+            let mut notices = Vec::new();
+            while let Ok(n) = parts.notices.try_recv() {
+                notices.push(format!("{n:?}"));
+            }
+            let image = storage
+                .lock()
+                .unwrap()
+                .get(1)
+                .map(|img| format!("placements={}", img.placements.len()));
+            panic!(
+                "子进程未跑到 SENTINEL：脚本本身失败（分片 {chunk_count} 片）\n终端末尾：{tail:?}\n镜像：{image:?}\n读线程通知：{notices:?}"
+            );
+        }
 
         let done = wait_until(
             || {
@@ -1785,7 +1821,9 @@ mod tests {
         script.push_str(&format!(
             "printf '\\033_Ga=T,f=100,t=d,q=2,C=1,z=1,i=1,p=1,c={COLS},r={ROWS},m=0;{b64}\\033\\\\'; "
         ));
-        script.push_str(r"printf '\033[?2026l'; printf SENTINEL");
+        // 末尾 sleep：见 `grok_overlay_shaped_stream_reaches_render_plan`
+        // 里对 tty hangup 丢数据的说明。
+        script.push_str(r"printf '\033[?2026l'; printf SENTINEL; sleep 5");
 
         let options = alacritty_terminal::tty::Options {
             shell: Some(alacritty_terminal::tty::Shell::new(

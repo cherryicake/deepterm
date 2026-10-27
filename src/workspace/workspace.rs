@@ -696,12 +696,11 @@ impl Workspace {
 
     /// 将焦点设置到当前活动 tab 的第一个 panel
     pub fn focus_active_tab_panel(&self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab_info) = self.tabs.get(&self.active_tab_id) {
-            if let Some(panel) = tab_info.container.get_first_panel() {
-                if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
-                    window.focus(&handle, cx);
-                }
-            }
+        if let Some(tab_info) = self.tabs.get(&self.active_tab_id)
+            && let Some(panel) = tab_info.container.get_first_panel()
+            && let Some(handle) = panel.read(cx).active_content_focus_handle(cx)
+        {
+            window.focus(&handle, cx);
         }
     }
 
@@ -960,20 +959,19 @@ impl Workspace {
                         .container
                         .contains_panel(panel_id, cx)
                         .then_some(tab_id.clone())
-                }) {
-                    if let Some(os) = os {
-                        let icon = os.icon();
-                        self.tab_bar.update(cx, |tab_bar, cx| {
-                            tab_bar.modify_tab(
-                                &tab_id,
-                                |tab| {
-                                    tab.icon = Some(icon);
-                                },
-                                cx,
-                            );
-                        });
-                        cx.emit(WorkspaceEvent::TabBarChanged);
-                    }
+                }) && let Some(os) = os
+                {
+                    let icon = os.icon();
+                    self.tab_bar.update(cx, |tab_bar, cx| {
+                        tab_bar.modify_tab(
+                            &tab_id,
+                            |tab| {
+                                tab.icon = Some(icon);
+                            },
+                            cx,
+                        );
+                    });
+                    cx.emit(WorkspaceEvent::TabBarChanged);
                 }
                 // 保存检测到的OS到SSH配置
                 if let (Some(config_id), Some(os)) = (ssh_config_id, os) {
@@ -983,12 +981,11 @@ impl Workspace {
                         .saved_connections
                         .iter_mut()
                         .find(|c| c.id() == *config_id)
+                        && conn.os.as_deref() != Some(os_id)
                     {
-                        if conn.os.as_deref() != Some(os_id) {
-                            conn.os = Some(os_id.to_string());
-                            if let Err(e) = config.save() {
-                                log::warn!("保存 SSH 配置失败: {}", e);
-                            }
+                        conn.os = Some(os_id.to_string());
+                        if let Err(e) = config.save() {
+                            log::warn!("保存 SSH 配置失败: {}", e);
                         }
                     }
                 }
@@ -1711,13 +1708,13 @@ impl Workspace {
 
         // 设置被拖拽的panel的广播状态和workspace_id（与当前Workspace保持一致）
         let workspace_id = self.workspace_id.clone();
-        if let Some(tab_info) = self.tabs.get(&active_tab_id) {
-            if let Some(panel) = tab_info.container.find_panel(&dragged_panel_id, cx) {
-                panel.update(cx, |p, cx| {
-                    p.set_workspace_id(workspace_id.clone());
-                    p.set_broadcast_enabled(broadcast_enabled, cx);
-                });
-            }
+        if let Some(tab_info) = self.tabs.get(&active_tab_id)
+            && let Some(panel) = tab_info.container.find_panel(&dragged_panel_id, cx)
+        {
+            panel.update(cx, |p, cx| {
+                p.set_workspace_id(workspace_id.clone());
+                p.set_broadcast_enabled(broadcast_enabled, cx);
+            });
         }
 
         // 设置被拖拽的panel为选中状态
@@ -2179,17 +2176,18 @@ impl Workspace {
         // undo 栈：有其他 tab 可切回，且终端还在跑才值得恢复
         // （最后一个 tab 关闭即关窗，进程随窗口销毁；已 exit 的终端重开是死壳）
         let has_other_tabs = self.tabs.len() > 1;
-        if has_other_tabs && self.tab_has_live_terminal(tab_id, cx) {
-            if let Some(tab_info) = self.tabs.get(tab_id) {
-                let closed = ClosedTab {
-                    label: tab_info.label.clone(),
-                    tab_type: tab_info.tab_type.clone(),
-                    container: tab_info.container.clone(),
-                    tab_id: tab_id.to_string(),
-                    broadcast_enabled: tab_info.broadcast_enabled,
-                };
-                self.push_closed_tab(closed, cx);
-            }
+        if has_other_tabs
+            && self.tab_has_live_terminal(tab_id, cx)
+            && let Some(tab_info) = self.tabs.get(tab_id)
+        {
+            let closed = ClosedTab {
+                label: tab_info.label.clone(),
+                tab_type: tab_info.tab_type.clone(),
+                container: tab_info.container.clone(),
+                tab_id: tab_id.to_string(),
+                broadcast_enabled: tab_info.broadcast_enabled,
+            };
+            self.push_closed_tab(closed, cx);
         }
 
         self.tabs.remove(tab_id);
@@ -2267,13 +2265,13 @@ impl Workspace {
 
     /// 压入 undo 栈；超过上限时逐出最旧的并 kill 其终端（释放进程与滚动区）。
     fn push_closed_tab(&mut self, closed: ClosedTab, cx: &mut Context<Self>) {
-        if self.closed_tabs.len() >= MAX_CLOSED_TABS {
-            if let Some(oldest) = self.closed_tabs.pop_front() {
-                for panel in oldest.container.collect_panels_vec() {
-                    if let Some(view) = panel.read(cx).content().terminal_view() {
-                        let terminal = view.read(cx).terminal().clone();
-                        terminal.update(cx, |terminal, _| terminal.kill());
-                    }
+        if self.closed_tabs.len() >= MAX_CLOSED_TABS
+            && let Some(oldest) = self.closed_tabs.pop_front()
+        {
+            for panel in oldest.container.collect_panels_vec() {
+                if let Some(view) = panel.read(cx).content().terminal_view() {
+                    let terminal = view.read(cx).terminal().clone();
+                    terminal.update(cx, |terminal, _| terminal.kill());
                 }
             }
         }
@@ -2436,8 +2434,8 @@ impl Workspace {
                     // 此前丢掉了 cwd，复制出来固定在家目录启动。WSL 的 Linux
                     // cwd 不能当宿主进程 cwd，由该函数翻译成 `--cd` 参数。
                     self.create_local_terminal_with_command_and_working_directory(
-                        &cmd,
-                        &args,
+                        cmd,
+                        args,
                         cwd.as_ref().map(std::path::PathBuf::from),
                         window,
                         cx,

@@ -1184,12 +1184,12 @@ impl AppWindow {
         };
 
         // 4. 如果有需要恢复的文件，恢复到编辑器
-        if let Some(state) = file_tree_state {
-            if !state.open_files_info.is_empty() {
-                self.editor.update(cx, |editor, cx| {
-                    editor.restore_from_file_tree_state(state, window, cx);
-                });
-            }
+        if let Some(state) = file_tree_state
+            && !state.open_files_info.is_empty()
+        {
+            self.editor.update(cx, |editor, cx| {
+                editor.restore_from_file_tree_state(state, window, cx);
+            });
         }
     }
 

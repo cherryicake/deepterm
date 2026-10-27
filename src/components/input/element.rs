@@ -179,6 +179,9 @@ pub(crate) struct TextElement {
 /// 悬浮浮层与锚点行之间的间隙（Zed 的 `HOVER_POPOVER_GAP`）。
 const HOVER_POPOVER_GAP: Pixels = px(4.);
 
+/// 浮层与视口边缘之间保留的最小水平间距。
+const POPOVER_VIEWPORT_MARGIN: Pixels = px(8.);
+
 impl TextElement {
     pub(super) fn new(state: Entity<InputState>) -> Self {
         Self {
@@ -932,10 +935,10 @@ impl TextElement {
         let mut rev_line_corners = line_corners.iter().rev().peekable();
         while let Some(corners) = rev_line_corners.next() {
             points.push(corners.top_left);
-            if let Some(next) = rev_line_corners.peek() {
-                if next.top_left.x > corners.top_left.x {
-                    points.push(point(next.top_left.x, corners.top_left.y));
-                }
+            if let Some(next) = rev_line_corners.peek()
+                && next.top_left.x > corners.top_left.x
+            {
+                points.push(point(next.top_left.x, corners.top_left.y));
             }
         }
 
@@ -1041,10 +1044,10 @@ impl TextElement {
         }
 
         let mut selected_range = state.selected_range;
-        if let Some(ime_marked_range) = &state.ime_marked_range {
-            if !ime_marked_range.is_empty() {
-                selected_range = (ime_marked_range.end..ime_marked_range.end).into();
-            }
+        if let Some(ime_marked_range) = &state.ime_marked_range
+            && !ime_marked_range.is_empty()
+        {
+            selected_range = (ime_marked_range.end..ime_marked_range.end).into();
         }
         if selected_range.is_empty() {
             return None;
@@ -1870,25 +1873,25 @@ impl TextElement {
 
             offset_y += line_height * last_layout.git_insert_delta(i) as f32;
 
-            if state.display_map.is_line_folded(buffer_line) {
-                if let Some(placeholder) = placeholders.iter_mut().find(|p| p.row == buffer_line) {
-                    let line = last_layout.lines.get(i);
-                    let wrap_count = line.map(|l| l.wrapped_lines.len()).unwrap_or(1).max(1);
-                    let last_width = line
-                        .and_then(|l| l.wrapped_lines.last())
-                        .map(|l| l.width)
-                        .unwrap_or(px(0.));
-                    let pill_bounds = Bounds::new(
-                        point(
-                            bounds.origin.x + last_layout.line_number_width + last_width,
-                            bounds.origin.y + offset_y + line_height * (wrap_count as f32 - 1.),
-                        ),
-                        size(placeholder.pill_width(), line_height),
-                    );
-                    let hitbox = window.insert_hitbox(pill_bounds, HitboxBehavior::Normal);
-                    placeholder.pill_bounds = Some(pill_bounds);
-                    placeholder.hitbox = Some(hitbox);
-                }
+            if state.display_map.is_line_folded(buffer_line)
+                && let Some(placeholder) = placeholders.iter_mut().find(|p| p.row == buffer_line)
+            {
+                let line = last_layout.lines.get(i);
+                let wrap_count = line.map(|l| l.wrapped_lines.len()).unwrap_or(1).max(1);
+                let last_width = line
+                    .and_then(|l| l.wrapped_lines.last())
+                    .map(|l| l.width)
+                    .unwrap_or(px(0.));
+                let pill_bounds = Bounds::new(
+                    point(
+                        bounds.origin.x + last_layout.line_number_width + last_width,
+                        bounds.origin.y + offset_y + line_height * (wrap_count as f32 - 1.),
+                    ),
+                    size(placeholder.pill_width(), line_height),
+                );
+                let hitbox = window.insert_hitbox(pill_bounds, HitboxBehavior::Normal);
+                placeholder.pill_bounds = Some(pill_bounds);
+                placeholder.hitbox = Some(hitbox);
             }
 
             offset_y += height;
@@ -2595,14 +2598,13 @@ impl TextElement {
 
                 runs.extend(highlight_styles.iter().map(|(range, style)| {
                     let mut run = text_style.clone().highlight(*style).to_run(range.len());
-                    if let Some(ime_marked_range) = &state.ime_marked_range {
-                        if range.start >= ime_marked_range.start
-                            && range.end <= ime_marked_range.end
-                        {
-                            run.color = marked_run.color;
-                            run.strikethrough = marked_run.strikethrough;
-                            run.underline = marked_run.underline;
-                        }
+                    if let Some(ime_marked_range) = &state.ime_marked_range
+                        && range.start >= ime_marked_range.start
+                        && range.end <= ime_marked_range.end
+                    {
+                        run.color = marked_run.color;
+                        run.strikethrough = marked_run.strikethrough;
+                        run.underline = marked_run.underline;
                     }
 
                     run
@@ -3234,26 +3236,27 @@ impl TextElement {
         //   编辑器底色，铺在 `tab_hover_background` 等更亮的输入框容器上
         //   会形成一块色差明显的矩形，导致输入区背景色不一致。
         let single_line = !state.mode.is_multi_line();
-        if focused && !single_line && selected_range.is_empty() {
-            if let Some(&(buffer_line, y, height)) = prepaint
+        if focused
+            && !single_line
+            && selected_range.is_empty()
+            && let Some(&(buffer_line, y, height)) = prepaint
                 .line_geometry
                 .iter()
                 .find(|(buffer_line, _, _)| prepaint.current_row == Some(*buffer_line))
+        {
+            // diff 行的激活底色（加深红/绿）由下方 diff 行背景循环统一
+            // 绘制，这里只处理普通行 —— 同一行不能先后叠两种底色，
+            // 否则激活 diff 行的行首（gutter）与正文深浅不一致。
+            if !state.diff_line_colors.contains_key(&(buffer_line as u32))
+                && let Some(bg_color) = active_line_color
             {
-                // diff 行的激活底色（加深红/绿）由下方 diff 行背景循环统一
-                // 绘制，这里只处理普通行 —— 同一行不能先后叠两种底色，
-                // 否则激活 diff 行的行首（gutter）与正文深浅不一致。
-                if !state.diff_line_colors.contains_key(&(buffer_line as u32)) {
-                    if let Some(bg_color) = active_line_color {
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(input_bounds.origin.x, origin.y + y),
-                                size(bounds.size.width, height),
-                            ),
-                            bg_color,
-                        ));
-                    }
-                }
+                window.paint_quad(fill(
+                    Bounds::new(
+                        point(input_bounds.origin.x, origin.y + y),
+                        size(bounds.size.width, height),
+                    ),
+                    bg_color,
+                ));
             }
         }
 
@@ -3308,10 +3311,10 @@ impl TextElement {
         }
 
         // Paint selections
-        if window.is_window_active() {
-            if let Some(path) = prepaint.selection_path.take() {
-                window.paint_path(path, cx.theme().selection);
-            }
+        if window.is_window_active()
+            && let Some(path) = prepaint.selection_path.take()
+        {
+            window.paint_path(path, cx.theme().selection);
         }
 
         // Selected diff rows keep their identity: overpaint the selection
@@ -3712,7 +3715,7 @@ impl TextElement {
             // 真正的 inlay 插在字符之间，需要把一行切成两段分别 shape 再拼
             // 回去；首版用「行尾追加」这个更简单的形态——类型标注类 hint 的
             // 语义基本保留，而实现成本与改动风险都低一个量级。
-            if let Some(hints) = inlay_hints_by_line.get(&buffer_line) {
+            if let Some(hints) = inlay_hints_by_line.get(buffer_line) {
                 let mut hint_x = p.x + line.longest_width;
                 for hint in hints {
                     let run = window.text_system().shape_line(
@@ -3798,10 +3801,11 @@ impl TextElement {
         //
         // 用 `should_paint_cursor` 而非单纯的 `blink.visible()`：淡入窗口内
         // 后者仍为 false，但透明度已大于 0，必须绘制才不会「到点突然出现」。
-        if paint_cursor && cursor_opacity > 0.0 {
-            if let Some(mut cursor_layout) = prepaint.cursor_bounds_with_scroll() {
-                cursor_layout.paint_with_opacity(cursor_opacity, window, cx);
-            }
+        if paint_cursor
+            && cursor_opacity > 0.0
+            && let Some(mut cursor_layout) = prepaint.cursor_bounds_with_scroll()
+        {
+            cursor_layout.paint_with_opacity(cursor_opacity, window, cx);
         }
 
         // Paint line numbers
@@ -4469,6 +4473,15 @@ impl TextElement {
         // 的约束往下传（`determine_available_space`）。所以短内容仍然只占内容宽；
         // 超宽内容由卡片自己的 `max_w` 夹到上限，同时子内容拿到 `max_w - padding`
         // 的定宽去换行。
+        // 定宽必须同时受视口限制：窗口/编辑区比 `MAX_WIDTH` 窄时，若仍按
+        // 680px 排版，文本会按 680px 折行，卡片右侧连同已折好的文字一起被
+        // 窗口（或卡片的 `overflow_x_hidden`）裁掉——用户看到的就是“这一行
+        // 不换行、后面完全看不见”。先夹出视口内可用的最大宽度，再交给
+        // `layout_as_root`，换行宽度与最终可见宽度才是同一个值。
+        let wrap_at = wrap_at.map(|requested| {
+            let margin = POPOVER_VIEWPORT_MARGIN * 2.;
+            (viewport.size.width - margin).max(px(80.)).min(requested)
+        });
         let size = match wrap_at {
             Some(max_w) => content.layout_as_root(
                 Size {
@@ -4480,6 +4493,14 @@ impl TextElement {
             ),
             None => content.layout_as_root(AvailableSpace::min_size(), window, cx),
         };
+
+        // 水平夹取：浮层锚在靠近右边缘的字符上时，即使宽度已缩到视口内，
+        // 左边缘仍可能把右边缘推出窗口。垂直方向一直由 `popover_y` 夹取，
+        // 水平方向此前完全没做——Zed 的 `layout_hover_popovers` 用
+        // `horizontal_offset = (...).min(0)` 做同一件事。
+        let min_x = viewport.origin.x + POPOVER_VIEWPORT_MARGIN;
+        let max_x = viewport.origin.x + viewport.size.width - size.width - POPOVER_VIEWPORT_MARGIN;
+        let x = x.max(min_x).min(max_x.max(min_x));
 
         // 视口用**未滚动**的 `viewport`：`bounds` 含滚动偏移，拿它算
         // 「上方/下方放得下」会把判定整体平移一个滚动量。

@@ -130,10 +130,10 @@ pub fn runs_for_row(
     hl: &HighlightCache,
     theme: &AppTheme,
 ) -> Vec<TextRun> {
-    if let RowKind::Code { lang: Some(lang) } = &row.kind {
-        if !row.visible.is_empty() {
-            return hl.runs_for(lang, &row.visible, base, theme);
-        }
+    if let RowKind::Code { lang: Some(lang) } = &row.kind
+        && !row.visible.is_empty()
+    {
+        return hl.runs_for(lang, &row.visible, base, theme);
     }
     let mono_block = matches!(
         row.kind,

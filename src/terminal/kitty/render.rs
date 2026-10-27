@@ -531,17 +531,10 @@ pub fn plan_placeholders(
 /// 被释放的纹理交给 `Window::drop_image`，否则每张被替换/删除/换帧的图像
 /// 都会在 Metal 图集里永久留下一块 tile（Apple Silicon 统一内存，直接计入
 /// 进程内存——终端里持续刷新的页面几分钟就能堆出 GB 级常驻）。
+#[derive(Default)]
 pub struct ImageCache {
     /// `(id, storage_generation) -> 纹理`。
     textures: HashMap<(ImageId, u64), Arc<gpui::RenderImage>>,
-}
-
-impl Default for ImageCache {
-    fn default() -> Self {
-        Self {
-            textures: HashMap::new(),
-        }
-    }
 }
 
 impl ImageCache {

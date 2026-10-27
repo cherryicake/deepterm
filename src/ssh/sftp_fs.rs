@@ -973,12 +973,12 @@ impl BlockingSftpSession {
                         Ok(msg) => msg,
                         Err(_elapsed) => {
                             // 200ms 超时：检查取消标志
-                            if let Some(c) = cancelled {
-                                if c.load(Ordering::Relaxed) {
-                                    let _ = channel.eof().await;
-                                    let _ = channel.close().await;
-                                    return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
-                                }
+                            if let Some(c) = cancelled
+                                && c.load(Ordering::Relaxed)
+                            {
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                return Err(anyhow!("{}", TRANSFER_CANCELLED_MSG));
                             }
                             continue;
                         }
@@ -1239,11 +1239,11 @@ fn get_or_connect_session(
     // 有空闲会话直接取走（独占）。
     {
         let mut cache = session_cache().lock();
-        if let Some(entry) = cache.get_mut(key) {
-            if let Some(session) = entry.idle.pop() {
-                entry.last_access = std::time::Instant::now();
-                return Ok(session);
-            }
+        if let Some(entry) = cache.get_mut(key)
+            && let Some(session) = entry.idle.pop()
+        {
+            entry.last_access = std::time::Instant::now();
+            return Ok(session);
         }
     }
 
@@ -1681,19 +1681,18 @@ impl ParallelTransferConfig {
     /// 从环境变量读取覆盖值，便于无需重编译进行调试。
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
-        if let Ok(v) = std::env::var("DEEPTERM_SFTP_PARALLEL") {
-            if let Ok(parsed) = v.parse::<usize>() {
-                if parsed >= 1 {
-                    cfg.parallel = parsed.min(64);
-                }
-            }
+        if let Ok(v) = std::env::var("DEEPTERM_SFTP_PARALLEL")
+            && let Ok(parsed) = v.parse::<usize>()
+            && parsed >= 1
+        {
+            cfg.parallel = parsed.min(64);
         }
-        if let Ok(v) = std::env::var("DEEPTERM_SFTP_CHUNK") {
-            if let Ok(parsed) = v.parse::<usize>() {
-                // 上限贴近 russh-sftp 的 261120，避免触发服务器限流。
-                if (1024..=256 * 1024).contains(&parsed) {
-                    cfg.chunk = parsed;
-                }
+        if let Ok(v) = std::env::var("DEEPTERM_SFTP_CHUNK")
+            && let Ok(parsed) = v.parse::<usize>()
+        {
+            // 上限贴近 russh-sftp 的 261120，避免触发服务器限流。
+            if (1024..=256 * 1024).contains(&parsed) {
+                cfg.chunk = parsed;
             }
         }
         cfg
@@ -1861,7 +1860,7 @@ async fn pipelined_download(
                     ));
                 }
                 // 按实际接收字节数记账（含跨 offset 的进度收敛）。
-                let n = ((offset + data.len() as u64).min(size) - offset) as u64;
+                let n = (offset + data.len() as u64).min(size) - offset;
                 transferred += n;
                 if let Some(p) = progress {
                     p.fetch_add(n, Ordering::Relaxed);

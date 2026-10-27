@@ -525,10 +525,10 @@ impl RemoteFileTreeCache {
     /// 判断目录缓存是否新鲜（在 TTL 内）
     pub fn is_dir_fresh(&self, config: &SshConnectionConfig, path: &Path) -> bool {
         let key = Self::server_key(config);
-        if let Some(tree) = self.servers.get(&key) {
-            if let Some(node) = tree.nodes.get(path) {
-                return node.loaded_at.elapsed() < DIR_TTL;
-            }
+        if let Some(tree) = self.servers.get(&key)
+            && let Some(node) = tree.nodes.get(path)
+        {
+            return node.loaded_at.elapsed() < DIR_TTL;
         }
         false
     }
@@ -536,10 +536,10 @@ impl RemoteFileTreeCache {
     /// 判断文件内容缓存是否新鲜
     pub fn is_file_fresh(&self, config: &SshConnectionConfig, path: &Path) -> bool {
         let key = Self::server_key(config);
-        if let Some(fc) = self.file_caches.get(&key) {
-            if let Some(entry) = fc.files.get(path) {
-                return entry.loaded_at.elapsed() < FILE_TTL;
-            }
+        if let Some(fc) = self.file_caches.get(&key)
+            && let Some(entry) = fc.files.get(path)
+        {
+            return entry.loaded_at.elapsed() < FILE_TTL;
         }
         false
     }
@@ -547,11 +547,11 @@ impl RemoteFileTreeCache {
     /// 移除单个文件的内容缓存
     pub fn remove_file(&mut self, config: &SshConnectionConfig, path: &Path) {
         let key = Self::server_key(config);
-        if let Some(file_cache) = self.file_caches.get_mut(&key) {
-            if file_cache.forget(path) {
-                log::debug!("FileTreeCache remove file: {}:{}", key, path.display());
-                self.schedule_save();
-            }
+        if let Some(file_cache) = self.file_caches.get_mut(&key)
+            && file_cache.forget(path)
+        {
+            log::debug!("FileTreeCache remove file: {}:{}", key, path.display());
+            self.schedule_save();
         }
     }
 
@@ -581,10 +581,10 @@ impl RemoteFileTreeCache {
             }
         }
         // 文件内容缓存失效，避免重新打开文件时看到旧内容
-        if matches!(event.kind, FsChangeKind::Remove | FsChangeKind::Modify) {
-            if let Some(file_cache) = self.file_caches.get_mut(&key) {
-                file_cache.forget(&event.path);
-            }
+        if matches!(event.kind, FsChangeKind::Remove | FsChangeKind::Modify)
+            && let Some(file_cache) = self.file_caches.get_mut(&key)
+        {
+            file_cache.forget(&event.path);
         }
         self.schedule_save();
     }
@@ -663,7 +663,7 @@ impl ServerFileCache {
         let is_candidate = |p: &PathBuf| {
             Some(p.as_path()) != skip && self.files.get(p).is_some_and(|e| !e.persist)
         };
-        if let Some(pos) = self.order.iter().position(|p| is_candidate(p)) {
+        if let Some(pos) = self.order.iter().position(is_candidate) {
             return self.order.remove(pos);
         }
         // 全是持久化条目：从队首跳过 `skip` 与已失效的陈旧键。

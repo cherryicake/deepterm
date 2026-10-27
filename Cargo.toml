@@ -84,6 +84,10 @@ flate2 = "1"
 
 # Markdown
 pulldown-cmark = "0.12"
+# Markdown 远程图片：同步 HTTP(S) 客户端。默认 feature 是 `rustls`（ring 加密
+# 后端 + 内置根证书，纯 Rust，不依赖系统 OpenSSL/SChannel）与 `gzip`。
+# 只用于 markdown 图片加载，不参与启动路径。
+ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
 
 # Utility
 memchr = "2"

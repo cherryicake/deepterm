@@ -197,67 +197,66 @@ fn legacy_esc_sequence(keystroke: &Keystroke, mode: &TermMode) -> Option<Vec<u8>
     }
 
     // Handle function keys F1-F12
-    if let Some(f_num) = key.strip_prefix('f') {
-        if let Ok(n) = f_num.parse::<u8>() {
-            if (1..=12).contains(&n) {
-                // F1-F4 是 SS3 序列，终字符为 P/Q/R/S：
-                // 无修饰键发 `ESC O P`，带修饰键发 `ESC [ 1;<m> P`。
-                // 它们不是 CSI 序列，走 encode_csi 会变成 `ESC[OP`
-                // （应用无法识别）或 `ESC[1;2OP`（多一个 O）。
-                const F1_F4_FINAL: [u8; 4] = *b"PQRS";
-                if n <= 4 {
-                    return Some(encode_ss3_function_key(
-                        F1_F4_FINAL[(n - 1) as usize],
-                        keystroke,
-                    ));
-                }
-                // F5-F12 对齐 xterm：15~ 17~ 18~ 19~ 20~ 21~ 23~ 24~
-                // （16~/22~ 不是标准编码，应用无法识别）
-                const F_SUFFIXES: [&str; 8] = [
-                    "15~", "17~", "18~", "19~", // F5-F8
-                    "20~", "21~", "23~", "24~", // F9-F12
-                ];
-                return Some(encode_csi(F_SUFFIXES[(n - 5) as usize], keystroke, mode));
-            }
+    if let Some(f_num) = key.strip_prefix('f')
+        && let Ok(n) = f_num.parse::<u8>()
+        && (1..=12).contains(&n)
+    {
+        // F1-F4 是 SS3 序列，终字符为 P/Q/R/S：
+        // 无修饰键发 `ESC O P`，带修饰键发 `ESC [ 1;<m> P`。
+        // 它们不是 CSI 序列，走 encode_csi 会变成 `ESC[OP`
+        // （应用无法识别）或 `ESC[1;2OP`（多一个 O）。
+        const F1_F4_FINAL: [u8; 4] = *b"PQRS";
+        if n <= 4 {
+            return Some(encode_ss3_function_key(
+                F1_F4_FINAL[(n - 1) as usize],
+                keystroke,
+            ));
         }
+        // F5-F12 对齐 xterm：15~ 17~ 18~ 19~ 20~ 21~ 23~ 24~
+        // （16~/22~ 不是标准编码，应用无法识别）
+        const F_SUFFIXES: [&str; 8] = [
+            "15~", "17~", "18~", "19~", // F5-F8
+            "20~", "21~", "23~", "24~", // F9-F12
+        ];
+        return Some(encode_csi(F_SUFFIXES[(n - 5) as usize], keystroke, mode));
     }
 
     // Handle regular characters
     let mut chars = key.chars();
-    if let Some(ch) = chars.next() {
-        if chars.next().is_none() {
-            let mut bytes = vec![];
+    if let Some(ch) = chars.next()
+        && chars.next().is_none()
+    {
+        let mut bytes = vec![];
 
-            // Handle Ctrl+key combinations
-            if keystroke.modifiers.control {
-                if ch.is_ascii_alphabetic() {
-                    let lower = ch.to_ascii_lowercase();
-                    bytes.push((lower as u8) & 0x1f);
-                    return Some(bytes);
-                }
-                match ch {
-                    '2' | '@' | ' ' => bytes.push(0),
-                    '3' | '[' => bytes.push(0x1b),
-                    '4' | '\\' => bytes.push(0x1c),
-                    '5' | ']' => bytes.push(0x1d),
-                    '6' | '^' => bytes.push(0x1e),
-                    '7' | '_' | '/' => bytes.push(0x1f),
-                    '8' | '?' => bytes.push(0x7f),
-                    _ => {}
-                }
-                if !bytes.is_empty() {
-                    return Some(bytes);
-                }
-            }
-
-            // Handle Alt+key combinations
-            if keystroke.modifiers.alt {
-                bytes.push(0x1b);
-                let mut buf = [0; 4];
-                ch.encode_utf8(&mut buf);
-                bytes.extend_from_slice(&buf[..ch.len_utf8()]);
+        // Handle Ctrl+key combinations
+        if keystroke.modifiers.control {
+            if ch.is_ascii_alphabetic() {
+                let lower = ch.to_ascii_lowercase();
+                bytes.push((lower as u8) & 0x1f);
                 return Some(bytes);
             }
+            match ch {
+                '2' | '@' | ' ' => bytes.push(0),
+                '3' | '[' => bytes.push(0x1b),
+                '4' | '\\' => bytes.push(0x1c),
+                '5' | ']' => bytes.push(0x1d),
+                '6' | '^' => bytes.push(0x1e),
+                '7' | '_' | '/' => bytes.push(0x1f),
+                '8' | '?' => bytes.push(0x7f),
+                _ => {}
+            }
+            if !bytes.is_empty() {
+                return Some(bytes);
+            }
+        }
+
+        // Handle Alt+key combinations
+        if keystroke.modifiers.alt {
+            bytes.push(0x1b);
+            let mut buf = [0; 4];
+            ch.encode_utf8(&mut buf);
+            bytes.extend_from_slice(&buf[..ch.len_utf8()]);
+            return Some(bytes);
         }
     }
 

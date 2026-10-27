@@ -723,10 +723,10 @@ impl GitRepository {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
         };
-        if let Some((at, cached)) = head_cache().lock().get(self.root.as_str()).cloned() {
-            if at.elapsed() < HEAD_TTL {
-                return cached;
-            }
+        if let Some((at, cached)) = head_cache().lock().get(self.root.as_str()).cloned()
+            && at.elapsed() < HEAD_TTL
+        {
+            return cached;
         }
         let command = format!("cd {} && git rev-parse HEAD", shell_quote(&self.root));
         let result = crate::ssh::sftp_fs::with_cached_session(config, |session| {

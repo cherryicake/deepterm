@@ -508,15 +508,15 @@ impl SidebarFileTree {
             }
         }
         // 选中 / 悬停同步
-        if let Some(selected) = self.selected_path.clone() {
-            if selected.starts_with(from) {
-                self.selected_path = Some(rekey_path(&selected, from, to));
-            }
+        if let Some(selected) = self.selected_path.clone()
+            && selected.starts_with(from)
+        {
+            self.selected_path = Some(rekey_path(&selected, from, to));
         }
-        if let Some(hovered) = self.hovered_path.clone() {
-            if hovered.starts_with(from) {
-                self.hovered_path = Some(rekey_path(&hovered, from, to));
-            }
+        if let Some(hovered) = self.hovered_path.clone()
+            && hovered.starts_with(from)
+        {
+            self.hovered_path = Some(rekey_path(&hovered, from, to));
         }
         // 缓存清理：旧路径及其后代全部失效，改名前展开的目录重新加载
         self.loader.remove_cached_recursive(from);
@@ -861,21 +861,19 @@ impl SidebarFileTree {
         self.context_menu_subscription.take();
         let window_handle = self.context_menu_window.take();
 
-        if restore_focus {
-            if let (Some(menu), Some(handle)) = (menu, window_handle) {
-                let menu_focus = menu.focus_handle(cx).clone();
-                let tree_focus = self.focus_handle.clone();
-                cx.spawn(async move |_, cx| {
-                    let _ = cx.update_window(handle, |_, window, cx| {
-                        // 只有焦点还在菜单上（Esc 关闭）才还回去；
-                        // 用户点到了别处（终端 / 编辑器）就绝不能抢焦点。
-                        if menu_focus.is_focused(window) {
-                            window.focus(&tree_focus, cx);
-                        }
-                    });
-                })
-                .detach();
-            }
+        if restore_focus && let (Some(menu), Some(handle)) = (menu, window_handle) {
+            let menu_focus = menu.focus_handle(cx).clone();
+            let tree_focus = self.focus_handle.clone();
+            cx.spawn(async move |_, cx| {
+                let _ = cx.update_window(handle, |_, window, cx| {
+                    // 只有焦点还在菜单上（Esc 关闭）才还回去；
+                    // 用户点到了别处（终端 / 编辑器）就绝不能抢焦点。
+                    if menu_focus.is_focused(window) {
+                        window.focus(&tree_focus, cx);
+                    }
+                });
+            })
+            .detach();
         }
         cx.notify();
     }

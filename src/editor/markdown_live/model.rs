@@ -291,13 +291,11 @@ impl EditorModel {
 
     pub fn move_left(&mut self, extend: bool) {
         self.goal_col = None;
-        if !extend {
-            if let Some((start, _)) = self.selection() {
-                self.coalescing = false;
-                self.anchor = None;
-                self.cursor = start;
-                return;
-            }
+        if !extend && let Some((start, _)) = self.selection() {
+            self.coalescing = false;
+            self.anchor = None;
+            self.cursor = start;
+            return;
         }
         self.start_move(extend);
         self.cursor = self.prev_pos(self.cursor);
@@ -305,13 +303,11 @@ impl EditorModel {
 
     pub fn move_right(&mut self, extend: bool) {
         self.goal_col = None;
-        if !extend {
-            if let Some((_, end)) = self.selection() {
-                self.coalescing = false;
-                self.anchor = None;
-                self.cursor = end;
-                return;
-            }
+        if !extend && let Some((_, end)) = self.selection() {
+            self.coalescing = false;
+            self.anchor = None;
+            self.cursor = end;
+            return;
         }
         self.start_move(extend);
         self.cursor = self.next_pos(self.cursor);

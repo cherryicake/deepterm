@@ -39,22 +39,22 @@ impl TransferRequest {
                 return false;
             }
             // 单源 + rename_to：只有 rename_to 等于源文件名时才可能是 noop
-            if self.sources.len() == 1 {
-                if let Some(rename_to) = self.rename_to.as_deref() {
-                    let src_name = match source {
-                        FileEndpoint::Local { path } => {
-                            path.file_name().map(|n| n.to_string_lossy().into_owned())
-                        }
-                        FileEndpoint::Remote { path, .. } => path
-                            .trim_end_matches('/')
-                            .rsplit('/')
-                            .next()
-                            .filter(|n| !n.is_empty())
-                            .map(|n| n.to_string()),
-                    };
-                    if src_name.as_deref() != Some(rename_to) {
-                        return false;
+            if self.sources.len() == 1
+                && let Some(rename_to) = self.rename_to.as_deref()
+            {
+                let src_name = match source {
+                    FileEndpoint::Local { path } => {
+                        path.file_name().map(|n| n.to_string_lossy().into_owned())
                     }
+                    FileEndpoint::Remote { path, .. } => path
+                        .trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .filter(|n| !n.is_empty())
+                        .map(|n| n.to_string()),
+                };
+                if src_name.as_deref() != Some(rename_to) {
+                    return false;
                 }
             }
             match (source, &self.destination) {

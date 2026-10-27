@@ -34,10 +34,10 @@ impl RemoteOS {
         if let Some(os) = Self::match_distro(id) {
             return os;
         }
-        if let Some(first_word) = id.split_whitespace().next() {
-            if let Some(os) = Self::match_distro(first_word) {
-                return os;
-            }
+        if let Some(first_word) = id.split_whitespace().next()
+            && let Some(os) = Self::match_distro(first_word)
+        {
+            return os;
         }
         RemoteOS::Unknown
     }
@@ -177,16 +177,16 @@ pub fn detect_local_os() -> RemoteOS {
     #[cfg(target_os = "linux")]
     {
         // Try to read /etc/os-release for the specific distro
-        if let Ok(content) = std::fs::read_to_string("/etc/os-release") {
-            if let Some(id_line) = content.lines().find(|l| l.starts_with("ID=")) {
-                let id = id_line.trim_start_matches("ID=").trim_matches('"');
-                let os = RemoteOS::from_id(id);
-                if os != RemoteOS::Unknown {
-                    return os;
-                }
+        if let Ok(content) = std::fs::read_to_string("/etc/os-release")
+            && let Some(id_line) = content.lines().find(|l| l.starts_with("ID="))
+        {
+            let id = id_line.trim_start_matches("ID=").trim_matches('"');
+            let os = RemoteOS::from_id(id);
+            if os != RemoteOS::Unknown {
+                return os;
             }
         }
-        return RemoteOS::Linux;
+        RemoteOS::Linux
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {
@@ -210,18 +210,19 @@ pub fn detect_wsl_os(command: &str, args: &[String]) -> RemoteOS {
     let mut distro_name: Option<&str> = None;
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
-        if arg == "-d" || arg == "--distribution" {
-            if let Some(name) = iter.next() {
-                distro_name = Some(name.as_str());
-                break;
-            }
+        if (arg == "-d" || arg == "--distribution")
+            && let Some(name) = iter.next()
+        {
+            distro_name = Some(name.as_str());
+            break;
         }
         // Handle combined form like "-dUbuntu" but not "--distribution"
-        if let Some(name) = arg.strip_prefix("-d") {
-            if !name.is_empty() && arg.len() > 2 {
-                distro_name = Some(name);
-                break;
-            }
+        if let Some(name) = arg.strip_prefix("-d")
+            && !name.is_empty()
+            && arg.len() > 2
+        {
+            distro_name = Some(name);
+            break;
         }
     }
 

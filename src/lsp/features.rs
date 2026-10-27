@@ -57,21 +57,42 @@ pub fn range_to_bytes(rope: &Rope, range: lsp_types::Range) -> Range<usize> {
 /// 区分开，便于将来在 UI 上标注诊断来源。
 pub fn to_diagnostics(rope: &Rope, lsp: Vec<lsp_types::Diagnostic>) -> Vec<Diagnostic> {
     lsp.into_iter()
-        .filter_map(|d| {
-            let range = range_to_bytes(rope, d.range);
-            if range.is_empty() {
-                // 零宽诊断画不出下划线也进不了 gutter，丢弃比占位更有用。
-                return None;
-            }
+        .map(|d| {
+            let range = visible_diagnostic_range(rope, range_to_bytes(rope, d.range));
             let message = build_message(&d);
             let source = d.source.map(|s| format!("lsp:{s}"));
             let mut diag = Diagnostic::new(range, severity(d.severity), message);
             if let Some(source) = source {
                 diag = diag.with_source(source);
             }
-            Some(diag)
+            diag
         })
         .collect()
+}
+
+/// 把零宽诊断扩成一个字符的可视区间。
+///
+/// LSP 允许诊断只给一个插入点（`start == end`），例如
+/// “expected `;` here”。编辑器的下划线与 gutter 都按区间绘制，零宽区间
+/// 等于完全不可见；直接丢弃又会让服务器明确报告的问题凭空消失。
+/// 这里向后扩一个字符；若位置在文件末尾则向前扩，至少保留一个可见标记。
+fn visible_diagnostic_range(rope: &Rope, range: Range<usize>) -> Range<usize> {
+    if !range.is_empty() {
+        return range;
+    }
+    let len = rope.len();
+    if len == 0 {
+        return 0..0;
+    }
+    let start = range.start.min(len);
+    if start < len {
+        // `Rope::char` 收**字节**下标（ropey 2.0），别把 char 下标喂进去。
+        let end = start + rope.char(start).len_utf8();
+        return start..end;
+    }
+    // 文件末尾：向前扩最后一个字符。
+    let last_ix = rope.len_chars().saturating_sub(1);
+    rope.char_to_byte_idx(last_ix)..len
 }
 
 /// LSP 严重级别 → 编辑器严重级别。
@@ -278,9 +299,12 @@ pub fn first_location(response: &lsp_types::GotoDefinitionResponse) -> Option<Lo
     match response {
         lsp_types::GotoDefinitionResponse::Scalar(l) => Some(l.clone()),
         lsp_types::GotoDefinitionResponse::Array(v) => v.first().cloned(),
+        // `target_range` 是整个定义（通常从 `fn`/`struct` 关键字开始），
+        // `target_selection_range` 才是符号名本身。跳转、引用列表都该落在
+        // 标识符上——Zed 的 `definition_locations_from_lsp` 同样取后者。
         lsp_types::GotoDefinitionResponse::Link(links) => links.first().map(|l| Location {
             uri: l.target_uri.clone(),
-            range: l.target_range,
+            range: l.target_selection_range,
         }),
     }
 }
@@ -294,7 +318,7 @@ pub fn locations_of(response: &lsp_types::GotoDefinitionResponse) -> Vec<Locatio
             .iter()
             .map(|l| Location {
                 uri: l.target_uri.clone(),
-                range: l.target_range,
+                range: l.target_selection_range,
             })
             .collect(),
     }
@@ -793,17 +817,41 @@ mod tests {
         assert_eq!(range_to_bytes(&text, range(0, 4, 0, 1)), 1..4);
     }
 
+    /// 零宽诊断（`start == end`，例如 “expected `;` here”）不能丢弃：
+    /// 下划线与 gutter 都按区间绘制，零宽等于完全不可见。规则是向后扩一个
+    /// 字符，文件末尾则向前扩最后一个字符。
     #[test]
-    fn diagnostics_drop_empty_ranges() {
-        let text = rope("abc");
-        let d = lsp_types::Diagnostic {
-            range: range(0, 1, 0, 1),
-            message: "empty".into(),
+    fn diagnostics_expand_empty_ranges() {
+        let emit = |line: u32, col: u32| lsp_types::Diagnostic {
+            range: range(line, col, line, col),
+            message: "expected `;` here".into(),
             severity: Some(LspSeverity::ERROR),
             source: Some("rustc".into()),
             ..Default::default()
         };
-        assert!(to_diagnostics(&text, vec![d]).is_empty());
+
+        // 文本中间：0:1 落在 'b' 上，扩成 1..2。
+        let out = to_diagnostics(&rope("abc"), vec![emit(0, 1)]);
+        assert_eq!(out.len(), 1, "零宽诊断不能被丢弃");
+        assert_eq!(out[0].range, 1..2);
+
+        // 文件末尾：向前扩最后一个字符 'c'，而不是保留 3..3。
+        let out = to_diagnostics(&rope("abc"), vec![emit(0, 3)]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].range, 2..3);
+
+        // 空文档：没有可扩的字符，保留空区间（不 panic、不丢诊断）。
+        let out = to_diagnostics(&rope(""), vec![emit(0, 0)]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].range.is_empty());
+
+        // 多字节文本（中文）：`Rope::char` 必须收字节下标；用 char 下标会
+        // 落在字符内部 panic。UTF-16 列 1 → 字节 3（'文'），列 2 → 字节 6。
+        let cjk = rope("中文abc");
+        let out = to_diagnostics(&cjk, vec![emit(0, 1)]);
+        assert_eq!(out[0].range, 3..6, "零宽诊断应扩成完整的 '文'");
+        let out = to_diagnostics(&cjk, vec![emit(0, 2)]);
+        assert_eq!(out[0].range, 6..7, "零宽诊断应扩成完整的 'a'");
     }
 
     #[test]

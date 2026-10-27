@@ -360,11 +360,7 @@ impl ScrollBarMap {
             .entry(block_id)
             .or_insert_with(|| cx.new(|_| ScrollBarState::default()))
             .clone();
-        let handle = self
-            .handles
-            .entry(block_id)
-            .or_insert_with(ScrollHandle::new)
-            .clone();
+        let handle = self.handles.entry(block_id).or_default().clone();
         (state, handle)
     }
 

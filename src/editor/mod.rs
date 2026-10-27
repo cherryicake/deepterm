@@ -17,6 +17,7 @@ pub mod markdown_element;
 pub mod markdown_live;
 pub mod markdown_parser;
 pub mod markdown_selectable;
+pub mod md_image;
 pub mod rename;
 pub mod symbols;
 pub mod syntax;

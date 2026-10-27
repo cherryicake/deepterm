@@ -19,19 +19,15 @@ fn generate_id(username: &str, host: &str, port: u16, nickname: Option<&str>) ->
 /// 文件夹排序方式
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SortMode {
+    #[default]
     NameAsc,
     NameDesc,
     CreatedDesc,
     CreatedAsc,
     CountDesc,
     Custom,
-}
-
-impl Default for SortMode {
-    fn default() -> Self {
-        SortMode::NameAsc
-    }
 }
 
 impl SortMode {
@@ -60,10 +56,10 @@ fn validate_group_name(
         return Err("文件夹名称不能超过20字符".to_string());
     }
     let is_duplicate = existing.iter().any(|g| {
-        if let Some(exclude) = exclude_id {
-            if g.id == exclude {
-                return false;
-            }
+        if let Some(exclude) = exclude_id
+            && g.id == exclude
+        {
+            return false;
         }
         g.name.eq_ignore_ascii_case(&trimmed)
     });
@@ -509,11 +505,11 @@ impl SshGlobalConfig {
             self.host_groups.iter().map(|g| g.id.clone()).collect();
         let mut changed = false;
         for conn in &mut self.saved_connections {
-            if let Some(gid) = conn.group_id.as_deref() {
-                if !valid.contains(gid) {
-                    conn.group_id = None;
-                    changed = true;
-                }
+            if let Some(gid) = conn.group_id.as_deref()
+                && !valid.contains(gid)
+            {
+                conn.group_id = None;
+                changed = true;
             }
         }
         changed
@@ -597,28 +593,26 @@ impl SshGlobalConfig {
         let content = match std::fs::read_to_string(config_path) {
             Ok(c) => c,
             Err(_) => {
-                if let Some(legacy) = Self::legacy_config_path() {
-                    if legacy != config_path {
-                        if let Ok(legacy_content) = std::fs::read_to_string(&legacy) {
-                            if let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content) {
-                                log::info!(
-                                    "Migrating SSH config {} -> {}",
-                                    legacy.display(),
-                                    config_path.display()
-                                );
-                                // 先完成凭据迁移（内联密码 → keychain 引用），
-                                // 否则下方 save() 会被明文阻断，导致每次启动重复尝试迁移
-                                if let Err(err) = cfg.migrate_keychain_refs() {
-                                    log::warn!("SSH 凭据迁移失败: {}", err);
-                                }
-                                let _ = cfg.migrate_legacy_host_key_strict();
-                                if let Err(e) = cfg.save() {
-                                    log::warn!("Failed to migrate SSH config to new location: {e}");
-                                }
-                                return cfg;
-                            }
-                        }
+                if let Some(legacy) = Self::legacy_config_path()
+                    && legacy != config_path
+                    && let Ok(legacy_content) = std::fs::read_to_string(&legacy)
+                    && let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content)
+                {
+                    log::info!(
+                        "Migrating SSH config {} -> {}",
+                        legacy.display(),
+                        config_path.display()
+                    );
+                    // 先完成凭据迁移（内联密码 → keychain 引用），
+                    // 否则下方 save() 会被明文阻断，导致每次启动重复尝试迁移
+                    if let Err(err) = cfg.migrate_keychain_refs() {
+                        log::warn!("SSH 凭据迁移失败: {}", err);
                     }
+                    let _ = cfg.migrate_legacy_host_key_strict();
+                    if let Err(e) = cfg.save() {
+                        log::warn!("Failed to migrate SSH config to new location: {e}");
+                    }
+                    return cfg;
                 }
                 return Self::new();
             }
@@ -629,11 +623,11 @@ impl SshGlobalConfig {
             .or_else(|| {
                 // 主文件损坏：尝试 .bak 恢复，避免静默清空 host 列表
                 let bak = config_path.with_extension("json.bak");
-                if let Ok(bak_content) = std::fs::read_to_string(&bak) {
-                    if let Ok(cfg) = serde_json::from_str::<Self>(&bak_content) {
-                        log::info!("Recovered SSH config from backup {}", bak.display());
-                        return Some(cfg);
-                    }
+                if let Ok(bak_content) = std::fs::read_to_string(&bak)
+                    && let Ok(cfg) = serde_json::from_str::<Self>(&bak_content)
+                {
+                    log::info!("Recovered SSH config from backup {}", bak.display());
+                    return Some(cfg);
                 }
                 log::warn!(
                     "Failed to parse {} and no valid .bak, using empty config",
@@ -689,22 +683,20 @@ impl SshGlobalConfig {
             Ok(content) => serde_json::from_str(&content)?,
             Err(_) => {
                 // 新路径不存在，尝试旧路径迁移
-                if let Some(legacy) = Self::legacy_config_path() {
-                    if legacy != config_path {
-                        if let Ok(legacy_content) = std::fs::read_to_string(&legacy) {
-                            if let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content) {
-                                log::info!(
-                                    "Migrating SSH config (load_or_create) {} -> {}",
-                                    legacy.display(),
-                                    config_path.display()
-                                );
-                                let _ = cfg.migrate_keychain_refs();
-                                // 保存到新路径
-                                let _ = cfg.save();
-                                return Ok(cfg);
-                            }
-                        }
-                    }
+                if let Some(legacy) = Self::legacy_config_path()
+                    && legacy != config_path
+                    && let Ok(legacy_content) = std::fs::read_to_string(&legacy)
+                    && let Ok(mut cfg) = serde_json::from_str::<Self>(&legacy_content)
+                {
+                    log::info!(
+                        "Migrating SSH config (load_or_create) {} -> {}",
+                        legacy.display(),
+                        config_path.display()
+                    );
+                    let _ = cfg.migrate_keychain_refs();
+                    // 保存到新路径
+                    let _ = cfg.save();
+                    return Ok(cfg);
                 }
                 let default_config = Self::new();
                 default_config.save()?;

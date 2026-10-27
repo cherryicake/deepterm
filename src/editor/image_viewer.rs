@@ -292,25 +292,27 @@ impl IntoElement for ImageContentElement {
     }
 }
 
+/// 可解码的图片扩展名（小写）。
+///
+/// 单一口径：图像标签页（[`is_image_file`]）、Markdown 图片解析与粘贴落盘
+/// 都引用这一份，避免三处白名单各自漂移。`load_image_from_bytes` 能解码的
+/// 格式必须全部列进来（`ppm`/`pnm` 由 `image::ImageFormat::Pnm` 覆盖）。
+pub(crate) const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico", "svg", "ppm", "pnm",
+];
+
 pub fn is_image_file(path: &std::path::Path) -> bool {
-    let ext = path
-        .extension()
+    path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    matches!(
-        ext.as_deref(),
-        Some("png")
-            | Some("jpg")
-            | Some("jpeg")
-            | Some("gif")
-            | Some("webp")
-            | Some("bmp")
-            | Some("tiff")
-            | Some("tif")
-            | Some("ico")
-            | Some("svg")
-    )
+        .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
 }
+
+/// 单张图片字节上限（解码器侧的硬门禁）。
+///
+/// Markdown 图片的元数据预筛 / 远程下载限流量都从这里取值，避免两处常量
+/// 各自漂移导致"预筛放行、解码器拒绝"或反过来。
+pub(crate) const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
 pub fn load_image_from_bytes(
     bytes: &[u8],
@@ -318,7 +320,6 @@ pub fn load_image_from_bytes(
 ) -> anyhow::Result<(Arc<gpui::Image>, (u32, u32))> {
     // 关键安全/性能：限制解码炸弹。SVG 用受限 Options（禁用外部资源），
     // 位图先读尺寸，超限直接拒绝，避免 `image` 全量解码耗尽内存。
-    const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
     const MAX_IMAGE_PIXELS: u64 = 8000 * 8000;
     if bytes.len() > MAX_IMAGE_BYTES {
         anyhow::bail!("图片过大（{} bytes），超过 20MB 限制", bytes.len());

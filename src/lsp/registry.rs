@@ -557,7 +557,7 @@ fn settle_probe(command: &str, ssh_config: Option<&crate::ssh::SshConnectionConf
     if command.starts_with('/') {
         let hit = ssh_config.is_none() && std::path::Path::new(command).is_file();
         let probe = Probe::Settled(hit);
-        record(command, ssh_config, probe.clone());
+        record(command, ssh_config, probe);
         return probe;
     }
     let probe = match ssh_config {
@@ -573,7 +573,7 @@ fn settle_probe(command: &str, ssh_config: Option<&crate::ssh::SshConnectionConf
         }
         None => Probe::Settled(command_exists(command)),
     };
-    record(command, ssh_config, probe.clone());
+    record(command, ssh_config, probe);
     probe
 }
 

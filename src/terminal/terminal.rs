@@ -1287,16 +1287,16 @@ impl Terminal {
         // 把当前二进制所在目录前置进子 shell 的 PATH：Finder 启动与
         // `cargo run` 都不保证 deepterm 已在 PATH 里，而用户在终端里可能想
         // 直接调它。仅注入本地 PTY，不能把本机路径传给 SSH。
-        if let Ok(executable) = std::env::current_exe() {
-            if let Some(directory) = executable.parent() {
-                let path = pty_options.env.get("PATH").cloned().unwrap_or_default();
-                if let Ok(path) = std::env::join_paths(
-                    std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
-                ) {
-                    pty_options
-                        .env
-                        .insert("PATH".into(), path.to_string_lossy().into_owned());
-                }
+        if let Ok(executable) = std::env::current_exe()
+            && let Some(directory) = executable.parent()
+        {
+            let path = pty_options.env.get("PATH").cloned().unwrap_or_default();
+            if let Ok(path) = std::env::join_paths(
+                std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&path)),
+            ) {
+                pty_options
+                    .env
+                    .insert("PATH".into(), path.to_string_lossy().into_owned());
             }
         }
         // WSL 标签页：给本会话的 shell 打一个唯一 cwd 标记，并把它点名进
@@ -2089,6 +2089,9 @@ impl Terminal {
 
     #[cfg(unix)]
     fn process_name_by_pid(pid: u32) -> Option<String> {
+        // 各平台分支显式 `return`：这样即使分析器没有应用 `cfg`（把三个块
+        // 都当普通语句看），也不会把非尾块判成「应为 ()」。编译器的 cfg
+        // 结果与原来完全一致。
         #[cfg(target_os = "linux")]
         {
             std::fs::read_to_string(format!("/proc/{}/comm", pid))
@@ -2098,7 +2101,7 @@ impl Terminal {
         }
         #[cfg(target_os = "macos")]
         {
-            std::process::Command::new("/bin/ps")
+            return std::process::Command::new("/bin/ps")
                 .args(["-p", &pid.to_string(), "-o", "comm="])
                 .output()
                 .ok()
@@ -2117,7 +2120,7 @@ impl Terminal {
                     } else {
                         None
                     }
-                })
+                });
         }
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
@@ -2243,7 +2246,7 @@ impl Terminal {
     fn report_focus_state(&mut self) {
         let mode = {
             let term = self.term.lock();
-            term.mode().clone()
+            *term.mode()
         };
         if mode.contains(TermMode::FOCUS_IN_OUT) {
             // write_raw：应用应答通道不应维护输入区锚点。
@@ -3081,7 +3084,8 @@ impl Terminal {
             let title = parts.next().unwrap_or("").trim().to_string();
             let body = parts.next().unwrap_or("").trim().to_string();
             (title, body)
-        } else if let Some(message) = content.strip_prefix("9;") {
+        } else {
+            let message = content.strip_prefix("9;")?;
             // OSC 9;message（iTerm2 兼容形态）：首行作标题，其余作正文。
             // 排除 OSC 9;4（进度上报，暂不支持，透传给 vte 忽略），
             // 避免把进度参数误当通知文本。
@@ -3096,8 +3100,6 @@ impl Terminal {
             let title = lines.next().unwrap_or("").trim().to_string();
             let body = lines.next().unwrap_or("").trim().to_string();
             (title, body)
-        } else {
-            return None;
         };
 
         if title.is_empty() && body.is_empty() {
@@ -7559,6 +7561,7 @@ mod paste_sanitize_tests {
 mod powershell_cwd_sync_tests {
     use super::powershell_cwd_sync_args;
 
+    #[cfg(windows)]
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }

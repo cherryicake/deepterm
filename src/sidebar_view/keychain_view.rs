@@ -410,18 +410,18 @@ impl Render for KeychainSidebarView {
                     cx,
                 );
                 cx.spawn(async move |_, cx| {
-                    if let Ok(0) = answer.await {
-                        if let Some(entity) = weak.upgrade() {
-                            entity.update(cx, |this, cx| {
-                                let mut store = KeychainStore::load_or_default();
-                                for id in &ids_to_delete {
-                                    let _ = store.delete_item(id);
-                                }
-                                this.selected_ids.clear();
-                                this.context_menu_item_id = None;
-                                cx.notify();
-                            });
-                        }
+                    if let Ok(0) = answer.await
+                        && let Some(entity) = weak.upgrade()
+                    {
+                        entity.update(cx, |this, cx| {
+                            let mut store = KeychainStore::load_or_default();
+                            for id in &ids_to_delete {
+                                let _ = store.delete_item(id);
+                            }
+                            this.selected_ids.clear();
+                            this.context_menu_item_id = None;
+                            cx.notify();
+                        });
                     }
                 })
                 .detach();

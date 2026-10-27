@@ -371,10 +371,10 @@ impl SidebarFileTree {
         // clicking an `ls` directory then expands as soon as it is listed.
         // Known files (`Makefile`, `LICENSE`, …) are never expanded, so no
         // doomed `load_directory` warn-spam and no stale `expanded_folders`.
-        if target_kind == Some(FileEntryKind::Directory) || target_kind.is_none() {
-            if path != self.root_path {
-                ancestors.push(path.clone());
-            }
+        if (target_kind == Some(FileEntryKind::Directory) || target_kind.is_none())
+            && path != self.root_path
+        {
+            ancestors.push(path.clone());
         }
         let mut newly_expanded = false;
         for dir in ancestors {
@@ -779,11 +779,11 @@ impl SidebarFileTree {
                             }
                             this.schedule_load_retry(path_for_refresh.clone(), cx);
                             // 目录确实消失时，父目录的刷新会让它从列表里消失。
-                            if let Some(parent) = path_for_refresh.parent() {
-                                if this.loader.has_cached(parent) || this.loader.is_loading(parent)
-                                {
-                                    this.schedule_refresh(parent.to_path_buf(), cx);
-                                }
+                            if let Some(parent) = path_for_refresh.parent()
+                                && (this.loader.has_cached(parent)
+                                    || this.loader.is_loading(parent))
+                            {
+                                this.schedule_refresh(parent.to_path_buf(), cx);
                             }
                         }
                     }
@@ -856,25 +856,23 @@ impl SidebarFileTree {
         }
         // 行内「新建」：在目标目录顶部注入合成行（不依赖目录是否已缓存，
         // 父目录加载失败/未加载时输入行依然可见，避免编辑状态卡死）
-        if let Some(editing) = &self.editing {
-            if let TreeEditMode::Create {
+        if let Some(editing) = &self.editing
+            && let TreeEditMode::Create {
                 parent,
                 kind,
                 proposed,
             } = &editing.mode
-            {
-                if parent == directory {
-                    result.push((
-                        FileEntry {
-                            name: proposed.clone(),
-                            path: parent.join(proposed),
-                            kind: kind.clone(),
-                            size: 0,
-                        },
-                        depth,
-                    ));
-                }
-            }
+            && parent == directory
+        {
+            result.push((
+                FileEntry {
+                    name: proposed.clone(),
+                    path: parent.join(proposed),
+                    kind: kind.clone(),
+                    size: 0,
+                },
+                depth,
+            ));
         }
         if let Some(entries) = self.loader.get_cached(directory) {
             for entry in entries {
@@ -1067,20 +1065,21 @@ impl SidebarFileTree {
                     }
                 })
                 .await;
-            if let Ok(Some(bytes)) = result {
-                if bytes.len() <= 128 * 1024 && !crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
-                    let decoded = crate::editor::encoding::decode_bytes(&bytes);
-                    RemoteFileTreeCache::global().lock().insert_file_content(
-                        &task_cfg,
-                        &task_path,
-                        decoded.text,
-                        decoded.encoding,
-                        // hover/目录预取只进内存缓存，不落盘（隐私边界）：
-                        // 此前鼠标划过服务器上的 .env / 私钥即明文持久化
-                        // 到 sftp_cache.json 且无过期机制。
-                        false,
-                    );
-                }
+            if let Ok(Some(bytes)) = result
+                && bytes.len() <= 128 * 1024
+                && !crate::ssh::sftp_fs::is_binary_bytes(&bytes)
+            {
+                let decoded = crate::editor::encoding::decode_bytes(&bytes);
+                RemoteFileTreeCache::global().lock().insert_file_content(
+                    &task_cfg,
+                    &task_path,
+                    decoded.text,
+                    decoded.encoding,
+                    // hover/目录预取只进内存缓存，不落盘（隐私边界）：
+                    // 此前鼠标划过服务器上的 .env / 私钥即明文持久化
+                    // 到 sftp_cache.json 且无过期机制。
+                    false,
+                );
             }
             let _ = weak.update(cx, |this, _| {
                 this.prefetch_tasks.remove(&task_path);
@@ -1227,13 +1226,13 @@ impl SidebarFileTree {
 
         while idx > 0 {
             idx -= 1;
-            if let Some((entry, depth)) = flat.get(idx) {
-                if *depth < current_depth {
-                    sticky_parents.push((entry.clone(), *depth + 1));
-                    current_depth = *depth;
-                    if current_depth == 0 {
-                        break;
-                    }
+            if let Some((entry, depth)) = flat.get(idx)
+                && *depth < current_depth
+            {
+                sticky_parents.push((entry.clone(), *depth + 1));
+                current_depth = *depth;
+                if current_depth == 0 {
+                    break;
                 }
             }
         }

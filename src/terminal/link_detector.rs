@@ -20,8 +20,7 @@ use crate::terminal::terminal::IndexedCell;
 
 /// 显式 scheme 锚点。`ftp://` 曾经也收在这里，但 `utils::safe_open` 的
 /// http/https 白名单会把点击静默吞掉 —— 与其给出一个点不动的链接，不如不认。
-static SCHEME_ANCHOR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)https?://").unwrap());
+static SCHEME_ANCHOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)https?://").unwrap());
 
 /// `www.` 前缀（后面必须还有域名标签）。
 static WWW_ANCHOR: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)www\.[a-z0-9]").unwrap());

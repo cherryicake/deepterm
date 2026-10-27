@@ -140,35 +140,35 @@ impl SearchMatcher {
 
     fn update_matches(&mut self) {
         let mut new_ranges = Vec::new();
-        if self.text.len() <= SEARCH_MAX_TEXT_LEN {
-            if let Some(query) = &self.query {
-                let text = self.text.to_string();
-                match query {
-                    SearchQuery::Literal(matcher) => {
-                        let whole = self.literal_whole_word;
-                        for query_match in matcher.stream_find_iter(text.as_bytes()) {
-                            // 关键防御：流式匹配理论上恒 Ok，但渲染路径不得 expect panic，
-                            // 出错时跳过该匹配，保证搜索永不崩溃。
-                            let Ok(query_match) = query_match else {
-                                log::warn!("搜索字面量匹配流异常，已跳过");
-                                continue;
-                            };
-                            let range = query_match.range();
-                            if whole && !Self::literal_word_boundary(&text, &range) {
-                                continue;
-                            }
-                            new_ranges.push(range);
-                            if new_ranges.len() >= SEARCH_MAX_MATCHES {
-                                break;
-                            }
+        if self.text.len() <= SEARCH_MAX_TEXT_LEN
+            && let Some(query) = &self.query
+        {
+            let text = self.text.to_string();
+            match query {
+                SearchQuery::Literal(matcher) => {
+                    let whole = self.literal_whole_word;
+                    for query_match in matcher.stream_find_iter(text.as_bytes()) {
+                        // 关键防御：流式匹配理论上恒 Ok，但渲染路径不得 expect panic，
+                        // 出错时跳过该匹配，保证搜索永不崩溃。
+                        let Ok(query_match) = query_match else {
+                            log::warn!("搜索字面量匹配流异常，已跳过");
+                            continue;
+                        };
+                        let range = query_match.range();
+                        if whole && !Self::literal_word_boundary(&text, &range) {
+                            continue;
+                        }
+                        new_ranges.push(range);
+                        if new_ranges.len() >= SEARCH_MAX_MATCHES {
+                            break;
                         }
                     }
-                    SearchQuery::Regex(re) => {
-                        for m in re.find_iter(&text) {
-                            new_ranges.push(m.range());
-                            if new_ranges.len() >= SEARCH_MAX_MATCHES {
-                                break;
-                            }
+                }
+                SearchQuery::Regex(re) => {
+                    for m in re.find_iter(&text) {
+                        new_ranges.push(m.range());
+                        if new_ranges.len() >= SEARCH_MAX_MATCHES {
+                            break;
                         }
                     }
                 }

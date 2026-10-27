@@ -329,11 +329,13 @@ impl<'a> Builder<'a> {
             vis: at..at + len,
         });
         // Coalesce with the previous run when nothing changed.
-        if let Some(last) = self.runs.last_mut() {
-            if last.marker == marker && last.dim == dim && last.style == style {
-                last.len += len;
-                return;
-            }
+        if let Some(last) = self.runs.last_mut()
+            && last.marker == marker
+            && last.dim == dim
+            && last.style == style
+        {
+            last.len += len;
+            return;
         }
         self.runs.push(RunAttrs {
             len,

@@ -61,11 +61,11 @@ impl CommandHistory {
             log::warn!("unable to resolve command history path");
             return;
         };
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                log::warn!("failed to create command history dir: {err}");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("failed to create command history dir: {err}");
+            return;
         }
         match serde_json::to_string_pretty(self) {
             Ok(json) => {

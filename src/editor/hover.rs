@@ -567,10 +567,7 @@ impl HoverState {
                 // 不再负责（新的 watcher 会接管），避免旧任务误杀新安排。
                 let deadline = editor
                     .update(cx, |state, _cx| {
-                        if state.hover_popover().is_none() {
-                            // 本来就没浮层：无事可做，也别为了这事专门刷一帧。
-                            return None;
-                        }
+                        state.hover_popover()?;
                         if state.hover_keyboard_takeover() {
                             // 接管中：用户正用 hjkl 看内容，在飞的旧请求返回
                             // 「无内容」也不能安排隐藏 —— 否则退出接管的瞬间

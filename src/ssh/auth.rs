@@ -124,14 +124,13 @@ pub async fn try_default_keys<H: russh::client::Handler>(
 
     // 若之前对同一目标成功认证过某把磁盘密钥，把它挪到最前面。避免每次新建 SFTP
     // session（文件浏览器、文件传输都会触发）时都要先对着错误密钥走一个 RTT。
-    if let Some(cached) = lookup_authenticated_key(config) {
-        if let Some(idx) = default_keys.iter().position(|p| p == &cached) {
-            if idx != 0 {
-                let hit = default_keys.remove(idx);
-                default_keys.insert(0, hit);
-                log::info!("复用上次认证过的密钥 {:?}，优先尝试", default_keys[0]);
-            }
-        }
+    if let Some(cached) = lookup_authenticated_key(config)
+        && let Some(idx) = default_keys.iter().position(|p| p == &cached)
+        && idx != 0
+    {
+        let hit = default_keys.remove(idx);
+        default_keys.insert(0, hit);
+        log::info!("复用上次认证过的密钥 {:?}，优先尝试", default_keys[0]);
     }
 
     let hash_alg = handle

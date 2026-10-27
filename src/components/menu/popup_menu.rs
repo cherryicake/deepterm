@@ -250,19 +250,18 @@ impl PopupMenu {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(index) = self.selected_index {
-            if let Some(PopupMenuItem::Item {
+        if let Some(index) = self.selected_index
+            && let Some(PopupMenuItem::Item {
                 handler, action, ..
             }) = self.menu_items.get(index)
-            {
-                if let Some(handler) = handler {
-                    handler(&ClickEvent::default(), window, cx);
-                } else if let Some(action) = action.as_ref() {
-                    window.dispatch_action(action.boxed_clone(), cx);
-                }
-
-                self.dismiss(&Cancel, window, cx);
+        {
+            if let Some(handler) = handler {
+                handler(&ClickEvent::default(), window, cx);
+            } else if let Some(action) = action.as_ref() {
+                window.dispatch_action(action.boxed_clone(), cx);
             }
+
+            self.dismiss(&Cancel, window, cx);
         }
     }
 

@@ -199,10 +199,8 @@ impl SshPtyTerminal {
 
         // sshpass -e 从 SSHPASS 环境变量读取密码（仅子进程环境可见，
         // 不会出现在 ps 输出中）
-        if use_sshpass_env {
-            if let ResolvedAuthMethod::Password { password } = &resolved_auth {
-                env.insert("SSHPASS".to_string(), password.to_string());
-            }
+        if use_sshpass_env && let ResolvedAuthMethod::Password { password } = &resolved_auth {
+            env.insert("SSHPASS".to_string(), password.to_string());
         }
 
         let pty_options = Options {

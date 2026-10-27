@@ -267,10 +267,8 @@ impl Render for MultilineTextArea {
         };
 
         let mut rendered_lines = lines;
-        if is_focused {
-            if let Some(last) = rendered_lines.last_mut() {
-                last.push('▏');
-            }
+        if is_focused && let Some(last) = rendered_lines.last_mut() {
+            last.push('▏');
         }
 
         div()
@@ -492,12 +490,12 @@ impl KeychainEditor {
             .or_else(|| sibling_certificate_path(&private_key_path).filter(|path| path.exists()));
         self.editing_certificate_path = certificate_path.clone();
 
-        if self.label_input.read(cx).value().trim().is_empty() {
-            if let Some(file_name) = private_key_path.file_name() {
-                self.label_input.update(cx, |input, cx| {
-                    input.set_text(file_name.to_string_lossy().to_string(), cx);
-                });
-            }
+        if self.label_input.read(cx).value().trim().is_empty()
+            && let Some(file_name) = private_key_path.file_name()
+        {
+            self.label_input.update(cx, |input, cx| {
+                input.set_text(file_name.to_string_lossy().to_string(), cx);
+            });
         }
     }
 

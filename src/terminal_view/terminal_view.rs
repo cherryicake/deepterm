@@ -342,14 +342,14 @@ fn decode_pct_path(path: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
-                && let Ok(v) = u8::from_str_radix(hex, 16)
-            {
-                out.push(v);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(v) = u8::from_str_radix(hex, 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
@@ -371,9 +371,9 @@ fn parse_file_uri_local_path(uri: &str) -> Option<std::path::PathBuf> {
     }
     let rest = &trimmed[7..];
     // Split `host/path`; empty/localhost host means local path.
-    let path = match rest.find('/') {
-        Some(idx) => &rest[idx..],
-        None => return None,
+    let path = {
+        let idx = rest.find('/')?;
+        &rest[idx..]
     };
     let decoded = decode_pct_path(path);
     if !decoded.starts_with('/') {
@@ -930,11 +930,11 @@ impl TerminalView {
 
     /// 检查终端是否检测到新的远程操作系统，如果是则发出事件
     fn check_remote_os(&mut self, terminal: Entity<Terminal>, cx: &mut Context<Self>) {
-        if let Some(os) = terminal.read(cx).remote_os {
-            if self.remote_os != Some(os) {
-                self.remote_os = Some(os);
-                cx.emit(Event::RemoteOsDetected { os });
-            }
+        if let Some(os) = terminal.read(cx).remote_os
+            && self.remote_os != Some(os)
+        {
+            self.remote_os = Some(os);
+            cx.emit(Event::RemoteOsDetected { os });
         }
     }
 
@@ -1119,13 +1119,13 @@ impl TerminalView {
                 .await;
             let _ = this.update(cx, |this, cx| {
                 this.wsl_scan_in_flight = false;
-                if let Some(cwd) = cwd {
-                    if this.wsl_cwd.as_deref() != Some(cwd.as_str()) {
-                        this.wsl_cwd = Some(cwd);
-                        // 文件树换根 + tab 标签里的 `~/...` 都要跟着走。
-                        cx.emit(Event::WorkingDirectoryChanged);
-                        this.check_tab_label_changed(cx);
-                    }
+                if let Some(cwd) = cwd
+                    && this.wsl_cwd.as_deref() != Some(cwd.as_str())
+                {
+                    this.wsl_cwd = Some(cwd);
+                    // 文件树换根 + tab 标签里的 `~/...` 都要跟着走。
+                    cx.emit(Event::WorkingDirectoryChanged);
+                    this.check_tab_label_changed(cx);
                 }
                 cx.notify();
                 if std::mem::take(&mut this.wsl_scan_again) {
@@ -2045,10 +2045,10 @@ impl TerminalView {
         };
         let deadline = Instant::now() + delay;
         // 已有在途任务且它醒得不比新的晚 → 什么都不用做。
-        if let Some((_, scheduled)) = &self.agent_timer_task {
-            if *scheduled <= deadline {
-                return;
-            }
+        if let Some((_, scheduled)) = &self.agent_timer_task
+            && *scheduled <= deadline
+        {
+            return;
         }
         // 期限提前了：撤掉旧任务（drop 即取消）重排一个。
         self.agent_timer_task = None;
@@ -2368,10 +2368,10 @@ impl TerminalView {
     fn cached_path_exists(&mut self, path: &std::path::Path) -> bool {
         const TTL: Duration = Duration::from_secs(2);
         const MAX_ENTRIES: usize = 256;
-        if let Some((exists, at)) = self.file_hover_stat_cache.get(path) {
-            if at.elapsed() < TTL {
-                return *exists;
-            }
+        if let Some((exists, at)) = self.file_hover_stat_cache.get(path)
+            && at.elapsed() < TTL
+        {
+            return *exists;
         }
         let exists = std::fs::metadata(path).is_ok();
         if self.file_hover_stat_cache.len() >= MAX_ENTRIES {
@@ -3727,10 +3727,10 @@ impl TerminalView {
         self.builtin_command_manager.clear();
 
         if was_active {
-            if !self.broadcast_suppressed.get() {
-                if let Some(ref callback) = self.broadcast_callback {
-                    callback(BroadcastMsg::BuiltinEnd);
-                }
+            if !self.broadcast_suppressed.get()
+                && let Some(ref callback) = self.broadcast_callback
+            {
+                callback(BroadcastMsg::BuiltinEnd);
             }
             cx.notify();
         }
@@ -4067,14 +4067,14 @@ impl TerminalView {
 
         // 广播缓冲最新状态（文本 / 光标 / 浮层折叠），让广播组内其他面板镜像显示
         // 同一段输入。应用远端同步（broadcast_suppressed）时不广播，防止回环。
-        if !self.broadcast_suppressed.get() {
-            if let Some(ref callback) = self.broadcast_callback {
-                callback(BroadcastMsg::BuiltinSync {
-                    text: self.builtin_command_text().to_string(),
-                    cursor: self.builtin_command_cursor(),
-                    dismissed: self.builtin_command_manager.is_dismissed(),
-                });
-            }
+        if !self.broadcast_suppressed.get()
+            && let Some(ref callback) = self.broadcast_callback
+        {
+            callback(BroadcastMsg::BuiltinSync {
+                text: self.builtin_command_text().to_string(),
+                cursor: self.builtin_command_cursor(),
+                dismissed: self.builtin_command_manager.is_dismissed(),
+            });
         }
 
         cx.notify();
@@ -5163,10 +5163,10 @@ impl TerminalView {
         });
 
         // 如果有输入数据且广播回调已设置，调用广播回调
-        if let Some(ref bytes) = input_bytes {
-            if let Some(ref callback) = self.broadcast_callback {
-                callback(BroadcastMsg::Raw(bytes.clone()));
-            }
+        if let Some(ref bytes) = input_bytes
+            && let Some(ref callback) = self.broadcast_callback
+        {
+            callback(BroadcastMsg::Raw(bytes.clone()));
         }
 
         if handled {

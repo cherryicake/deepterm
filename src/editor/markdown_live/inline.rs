@@ -135,7 +135,7 @@ impl Inline {
         //  - on an **opening** delimiter (content of the same style follows)
         //    → the construct to its right.
         let anchor = if self.spans[idx].marker {
-            let style = self.spans[idx].style.clone();
+            let style = self.spans[idx].style;
             let link = self.spans[idx].link;
             let same = |s: &InlineSpan| s.link == link && s.style == style && !s.marker;
             let left = self.spans[..idx].iter().rposition(same);
@@ -165,7 +165,7 @@ impl Inline {
         } else {
             idx
         };
-        let style = self.spans[anchor].style.clone();
+        let style = self.spans[anchor].style;
         let link = self.spans[anchor].link;
         // A link construct is identified by its `link` index (its text carries
         // `link_text` while its `[`/`](url)` delimiters do not, so style alone
@@ -670,18 +670,17 @@ fn mark_autolinks(text: &str, a: &mut Attrs, links: &mut Vec<String>) {
             i += 1;
             continue;
         }
-        if is_bare_url_start(bytes, i) {
-            if let Some((range, url)) = find_bare_url(text, i)
-                && range.start == i
-            {
-                let idx = links.len();
-                links.push(url);
-                set(&mut a.link_text, range.clone());
-                set(&mut a.escaped, range.clone());
-                a.link_idx[range.clone()].iter_mut().for_each(|l| *l = idx);
-                i = range.end;
-                continue;
-            }
+        if is_bare_url_start(bytes, i)
+            && let Some((range, url)) = find_bare_url(text, i)
+            && range.start == i
+        {
+            let idx = links.len();
+            links.push(url);
+            set(&mut a.link_text, range.clone());
+            set(&mut a.escaped, range.clone());
+            a.link_idx[range.clone()].iter_mut().for_each(|l| *l = idx);
+            i = range.end;
+            continue;
         }
         i += 1;
     }

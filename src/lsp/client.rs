@@ -585,17 +585,17 @@ impl LspClient {
 
     /// `textDocument/prepareRename`：先问服务器「这里能重命名吗」。
     ///
-    /// 返回 `Some(range)` = 可重命名，`range` 是要被替换的标识符区间；
-    /// `None` = 服务器说不可重命名（或方法未声明）。
+    /// 返回 `Some(response)` = 可重命名；`None` = 服务器说不可重命名（或方法未声明）。
     ///
     /// 对照 LSP 规范：响应的 `range` 比客户端按词边界猜的范围**更准**
-    /// （例如 `foo.bar` 里只应替换 `bar`，而不是整串）。此前直接按词边界
-    /// 猜，光标停在不可重命名的位置时也会弹出输入框。
+    /// （例如 `foo.bar` 里只应替换 `bar`，而不是整串）；`placeholder`
+    /// 是服务器建议的初始输入值。3.16 还允许 `{defaultBehavior:true}`，
+    /// 表示“按客户端的默认词边界处理”，不能当成拒绝。
     pub async fn prepare_rename(
         &self,
         uri: &Url,
         position: Position,
-    ) -> Result<Option<lsp_types::Range>> {
+    ) -> Result<Option<lsp_types::PrepareRenameResponse>> {
         if self.capabilities.capabilities.rename_provider.is_none() {
             return Ok(None);
         }
@@ -611,17 +611,8 @@ impl LspClient {
         if result.is_null() {
             return Ok(None);
         }
-        // 规范允许两种形态：`Range`，或 `{ range, placeholder }`。
-        if let Ok(range) = serde_json::from_value::<lsp_types::Range>(result.clone()) {
-            return Ok(Some(range));
-        }
-        #[derive(serde::Deserialize)]
-        struct WithPlaceholder {
-            range: lsp_types::Range,
-        }
-        Ok(serde_json::from_value::<WithPlaceholder>(result)
-            .ok()
-            .map(|w| w.range))
+        // `PrepareRenameResponse` 是 untagged enum，三种形态由 serde 一次解析。
+        Ok(serde_json::from_value(result).ok())
     }
 
     /// `textDocument/formatting`。
@@ -685,17 +676,30 @@ impl LspClient {
     }
 
     /// `textDocument/signatureHelp`。
+    ///
+    /// `context` 让服务器知道这是首次触发、触发字符还是光标移动后的重触发。
+    /// 不传时按 LSP 的默认语义处理（旧调用点保持兼容）。
     pub async fn signature_help(
         &self,
         uri: &Url,
         position: Position,
+    ) -> Result<Option<SignatureHelp>> {
+        self.signature_help_with_context(uri, position, None).await
+    }
+
+    /// 带 `SignatureHelpContext` 的签名帮助请求。
+    pub async fn signature_help_with_context(
+        &self,
+        uri: &Url,
+        position: Position,
+        context: Option<lsp_types::SignatureHelpContext>,
     ) -> Result<Option<SignatureHelp>> {
         let params = SignatureHelpParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
                 position,
             },
-            context: None,
+            context,
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let value = serde_json::to_value(&params)?;
@@ -1061,7 +1065,7 @@ fn trigger_characters_of(result: &InitializeResult) -> Vec<String> {
         .completion_provider
         .as_ref()
         .and_then(|provider| provider.trigger_characters.as_ref())
-        .map(|chars| chars.iter().cloned().collect())
+        .map(|chars| chars.to_vec())
         .unwrap_or_default()
 }
 

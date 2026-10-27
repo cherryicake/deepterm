@@ -2084,7 +2084,18 @@ mod tests {
                 .spawn()
                 .and_then(|mut child| {
                     use std::io::Write as _;
-                    child.stdin.take().unwrap().write_all(json.as_bytes())?;
+                    // 未知事件/未知 agent 会被脚本**先退出、再读 stdin**（设计如此：
+                    // 不能阻塞 agent）。因此写 stdin 与子进程退出天然存在竞争，
+                    // `BrokenPipe` 是合法结果，不能当成测试失败。
+                    if let Some(mut stdin) = child.stdin.take()
+                        && let Err(e) = stdin.write_all(json.as_bytes())
+                    {
+                        assert_eq!(
+                            e.kind(),
+                            std::io::ErrorKind::BrokenPipe,
+                            "写入上报脚本 stdin 失败：{e}"
+                        );
+                    }
                     child.wait_with_output()
                 })
                 .expect("上报脚本必须能被 /bin/sh 执行");

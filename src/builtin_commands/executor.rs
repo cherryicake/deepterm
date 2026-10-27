@@ -455,10 +455,10 @@ fn candidate_host_path_splits(token: &str) -> Vec<(&str, &str)> {
 /// - 远程终端 → `FileEndpoint::Remote`，相对路径以 `remote_cwd` 为基准；
 ///   `remote_cwd` 缺失时退化为登录家目录（即 `./xx`，由对端 SFTP 解析）
 fn resolve_bare_path(path: &str, ctx: &CommandContext) -> FileEndpoint {
-    if ctx.is_remote {
-        if let Some(ssh_config) = ctx.ssh_config.clone() {
-            return resolve_remote_path_with_cwd(path, ssh_config, ctx.remote_cwd.as_deref());
-        }
+    if ctx.is_remote
+        && let Some(ssh_config) = ctx.ssh_config.clone()
+    {
+        return resolve_remote_path_with_cwd(path, ssh_config, ctx.remote_cwd.as_deref());
     }
     resolve_local_endpoint(path, ctx)
 }

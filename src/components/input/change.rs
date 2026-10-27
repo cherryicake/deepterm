@@ -3,12 +3,16 @@
 pub struct Change {
     /// 变更前的文本范围 (byte offset)
     pub old_range: std::ops::Range<usize>,
-    /// 变更前的文本内容
-    pub old_text: String,
+    /// 变更前的文本内容。
+    ///
+    /// 用 `Arc<str>` 而不是 `String`：撤销时 `pop_group` 会把整组变更
+    /// 克隆到对侧栈，共享文本可避免每次撤销再复制一份全文（整篇替换
+    /// 类操作可达数十 MB）。
+    pub old_text: std::sync::Arc<str>,
     /// 变更后的文本范围
     pub new_range: std::ops::Range<usize>,
     /// 变更后的文本内容
-    pub new_text: String,
+    pub new_text: std::sync::Arc<str>,
     /// 版本号（用于分组）
     version: usize,
     /// 编辑前的选区 `(start, end)`，用于 undo 时恢复光标位置。
@@ -27,9 +31,9 @@ impl Change {
     ) -> Self {
         Self {
             old_range,
-            old_text: old_text.to_string(),
+            old_text: std::sync::Arc::from(old_text),
             new_range,
-            new_text: new_text.to_string(),
+            new_text: std::sync::Arc::from(new_text),
             version: 0,
             old_selection: None,
             new_selection: None,
@@ -69,6 +73,12 @@ impl PartialEq for Change {
 pub trait HistoryItem: Clone + PartialEq {
     fn version(&self) -> usize;
     fn set_version(&mut self, version: usize);
+
+    /// 条目在堆上额外占用的字节数（估算），供 [`History`] 的字节预算
+    /// 淘汰使用。不关心堆占用的条目返回 0 即可。
+    fn heap_bytes(&self) -> usize {
+        0
+    }
 }
 
 impl HistoryItem for Change {
@@ -78,6 +88,18 @@ impl HistoryItem for Change {
 
     fn set_version(&mut self, version: usize) {
         self.version = version;
+    }
+
+    /// 堆上文本的近似字节数。
+    ///
+    /// `old_text` / `new_text` 是 `Arc<str>`：撤销分组、克隆到对侧栈都会
+    /// 共享同一块内存。按持有者数量均摊，避免同一次插入被重复记账而让
+    /// 预算提前触发淘汰（也避免整篇替换类操作被算成 N 倍大小）。
+    fn heap_bytes(&self) -> usize {
+        fn shared_len(text: &std::sync::Arc<str>) -> usize {
+            text.len() / std::sync::Arc::strong_count(text).max(1)
+        }
+        shared_len(&self.old_text) + shared_len(&self.new_text)
     }
 }
 

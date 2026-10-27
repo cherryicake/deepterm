@@ -51,11 +51,11 @@ fn cross_file_location_opens_target_file() {
     let location = file_loc(&target, 9, 2);
     let action = lsp_location_action(&location, false);
     match action {
-        LspJumpAction::OpenFile { path, line, col } => {
+        LspJumpAction::OpenFile { path, position } => {
             assert_eq!(path, target);
-            // LSP 0 基 → 编辑器 1 基：行、列**都要** +1。
-            assert_eq!(line, 10, "LSP line is 0-based; editor line is 1-based");
-            assert_eq!(col, 3, "LSP col is 0-based; editor col is 1-based");
+            // 保留 LSP 原始的 0 基 Position（character 是 UTF-16 code unit）；
+            // 真正的字节 offset 在目标文本加载后换算，不能在这里 +1 降级。
+            assert_eq!(position, Position::new(9, 2));
         }
         other => panic!("cross-file jump must open the target file, got {other:?}"),
     }
@@ -67,9 +67,8 @@ fn same_file_location_jumps_in_place() {
     let location = file_loc(&std::env::temp_dir().join("same.rs"), 3, 0);
     let action = lsp_location_action(&location, true);
     match action {
-        LspJumpAction::JumpInPlace { line, col } => {
-            assert_eq!(line, 4, "0-based LSP line 3 -> 1-based editor line 4");
-            assert_eq!(col, 1, "0-based LSP col 0 -> 1-based editor col 1");
+        LspJumpAction::JumpInPlace { position } => {
+            assert_eq!(position, Position::new(3, 0));
         }
         other => panic!("same-file jump must jump in place, got {other:?}"),
     }
@@ -97,7 +96,9 @@ fn same_file_takes_precedence_over_uri_shape() {
 fn first_line_maps_to_line_one() {
     let location = file_loc(&std::env::temp_dir().join("a.rs"), 0, 0);
     match lsp_location_action(&location, false) {
-        LspJumpAction::OpenFile { line, .. } => assert_eq!(line, 1),
+        LspJumpAction::OpenFile { position, .. } => {
+            assert_eq!(position.line, 0);
+        }
         other => panic!("expected OpenFile, got {other:?}"),
     }
 }

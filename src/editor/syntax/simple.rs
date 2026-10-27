@@ -456,10 +456,10 @@ impl SimpleHighlighter {
                 e = e.min(range.end);
                 s = clip_offset(&self.text, s, Bias::Right);
                 e = clip_offset(&self.text, e, Bias::Left);
-                if e > s {
-                    if let Some(style) = theme.style(name) {
-                        styles.push((s..e, style));
-                    }
+                if e > s
+                    && let Some(style) = theme.style(name)
+                {
+                    styles.push((s..e, style));
                 }
             }
         }
@@ -736,14 +736,13 @@ fn unique_styles(
     // Merge adjacent ranges with the same style, but not across significant boundaries.
     let mut merged: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(result.len());
     for (range, style) in result {
-        if let Some((last_range, last_style)) = merged.last_mut() {
-            if last_range.end == range.start
-                && *last_style == style
-                && !significant_intervals.contains(&range.start)
-            {
-                last_range.end = range.end;
-                continue;
-            }
+        if let Some((last_range, last_style)) = merged.last_mut()
+            && last_range.end == range.start
+            && *last_style == style
+            && !significant_intervals.contains(&range.start)
+        {
+            last_range.end = range.end;
+            continue;
         }
         merged.push((range, style));
     }

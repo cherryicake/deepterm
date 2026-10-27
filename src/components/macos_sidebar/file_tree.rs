@@ -299,50 +299,40 @@ impl MacosSidebar {
         let old_file_tree_key = self.get_current_file_tree_key(cx);
 
         // 路径+后端一致 → 复用（仅切换订阅）
-        if let Some(ref path) = path {
-            if let Some(tree) = &self.file_tree_view {
-                if tree
-                    .read(cx)
-                    .matches_location(path, is_local, ssh_config.as_ref())
-                {
-                    self.file_tree_subscription.take();
-                    self.file_tree_terminal_view = Some(terminal_view.clone());
-                    self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
-                    self.file_tree_target_label = Some(display_name);
-                    self.ensure_git_panel(cx);
-                    self.ensure_file_search_panel(cx);
+        if let Some(ref path) = path
+            && let Some(tree) = &self.file_tree_view
+            && tree
+                .read(cx)
+                .matches_location(path, is_local, ssh_config.as_ref())
+        {
+            self.file_tree_subscription.take();
+            self.file_tree_terminal_view = Some(terminal_view.clone());
+            self.subscribe_file_tree_to_terminal(&terminal_view, tree.clone(), cx);
+            self.file_tree_target_label = Some(display_name);
+            self.ensure_git_panel(cx);
+            self.ensure_file_search_panel(cx);
 
-                    // 文件树 key 发生变化时才触发编辑器状态保存/恢复
-                    let new_key = crate::editor::FileTreeKey::new(
-                        Some(path.clone()),
-                        is_local,
-                        ssh_config.clone(),
-                    );
-                    if old_file_tree_key != Some(new_key.clone()) {
-                        let app_window = self.app_window.clone();
-                        let window_handle = window.window_handle();
-                        cx.defer(move |cx| {
-                            if let Some(aw) = &app_window {
-                                cx.update_window(window_handle, |_view, window, cx| {
-                                    aw.update(cx, |this, cx| {
-                                        this.on_file_tree_switched(
-                                            old_file_tree_key,
-                                            new_key,
-                                            window,
-                                            cx,
-                                        );
-                                    })
-                                    .ok();
-                                })
-                                .ok();
-                            }
-                        });
+            // 文件树 key 发生变化时才触发编辑器状态保存/恢复
+            let new_key =
+                crate::editor::FileTreeKey::new(Some(path.clone()), is_local, ssh_config.clone());
+            if old_file_tree_key != Some(new_key.clone()) {
+                let app_window = self.app_window.clone();
+                let window_handle = window.window_handle();
+                cx.defer(move |cx| {
+                    if let Some(aw) = &app_window {
+                        cx.update_window(window_handle, |_view, window, cx| {
+                            aw.update(cx, |this, cx| {
+                                this.on_file_tree_switched(old_file_tree_key, new_key, window, cx);
+                            })
+                            .ok();
+                        })
+                        .ok();
                     }
-
-                    cx.notify();
-                    return;
-                }
+                });
             }
+
+            cx.notify();
+            return;
         }
 
         // 不同 → 重建

@@ -193,14 +193,14 @@ impl KeychainStore {
         let path = Self::config_path()?;
         // mtime+size 缓存：命中则免读盘免解析（keychain_view / host_view 的
         // render 路径会频繁 load）。persist() 后同步刷新。
-        if let Some((mtime, len)) = Self::stat_sig(&path) {
-            if let Ok(cache) = keychain_cache().lock() {
-                if let Some(entry) = cache.as_ref() {
-                    if entry.path == path && entry.mtime == mtime && entry.len == len {
-                        return Some(entry.store.as_ref().clone());
-                    }
-                }
-            }
+        if let Some((mtime, len)) = Self::stat_sig(&path)
+            && let Ok(cache) = keychain_cache().lock()
+            && let Some(entry) = cache.as_ref()
+            && entry.path == path
+            && entry.mtime == mtime
+            && entry.len == len
+        {
+            return Some(entry.store.as_ref().clone());
         }
         let store = Self::load_uncached(&path);
         Self::store_cache(&path, &store);
@@ -213,15 +213,15 @@ impl KeychainStore {
     }
 
     fn store_cache(path: &Path, store: &Self) {
-        if let Some((mtime, len)) = Self::stat_sig(path) {
-            if let Ok(mut cache) = keychain_cache().lock() {
-                *cache = Some(CachedKeychain {
-                    path: path.to_path_buf(),
-                    mtime,
-                    len,
-                    store: std::sync::Arc::new(store.clone()),
-                });
-            }
+        if let Some((mtime, len)) = Self::stat_sig(path)
+            && let Ok(mut cache) = keychain_cache().lock()
+        {
+            *cache = Some(CachedKeychain {
+                path: path.to_path_buf(),
+                mtime,
+                len,
+                store: std::sync::Arc::new(store.clone()),
+            });
         }
     }
 
@@ -236,22 +236,20 @@ impl KeychainStore {
             },
             Err(_) => {
                 // 新路径不存在：尝试旧路径并自动迁移（仅当新文件不存在，不覆盖）
-                if let Some(legacy) = Self::legacy_config_path() {
-                    if legacy != path {
-                        if let Ok(content) = std::fs::read_to_string(&legacy) {
-                            if let Ok(store) = serde_json::from_str::<Self>(&content) {
-                                log::info!(
-                                    "Migrating keychain {} -> {}",
-                                    legacy.display(),
-                                    path.display()
-                                );
-                                if let Err(e) = store.save() {
-                                    log::warn!("Failed to migrate keychain: {e}");
-                                }
-                                return store;
-                            }
-                        }
+                if let Some(legacy) = Self::legacy_config_path()
+                    && legacy != path
+                    && let Ok(content) = std::fs::read_to_string(&legacy)
+                    && let Ok(store) = serde_json::from_str::<Self>(&content)
+                {
+                    log::info!(
+                        "Migrating keychain {} -> {}",
+                        legacy.display(),
+                        path.display()
+                    );
+                    if let Err(e) = store.save() {
+                        log::warn!("Failed to migrate keychain: {e}");
                     }
+                    return store;
                 }
                 Self::new()
             }
@@ -261,11 +259,11 @@ impl KeychainStore {
     /// 从同名 .bak 恢复；均失败则返回空库（避免返回 None 破坏调用方）
     fn load_from_bak(path: &Path) -> Option<Self> {
         let bak = path.with_extension("json.bak");
-        if let Ok(content) = std::fs::read_to_string(&bak) {
-            if let Ok(store) = serde_json::from_str::<Self>(&content) {
-                log::info!("Recovered keychain from backup {}", bak.display());
-                return Some(store);
-            }
+        if let Ok(content) = std::fs::read_to_string(&bak)
+            && let Ok(store) = serde_json::from_str::<Self>(&content)
+        {
+            log::info!("Recovered keychain from backup {}", bak.display());
+            return Some(store);
         }
         // 主文件与 .bak 都损坏：返回空库前把坏文件留一份 .corrupt 副本。
         // 否则任何后续 save()（如新增一条凭据）会以空库覆盖主文件，

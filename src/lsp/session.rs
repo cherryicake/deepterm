@@ -310,7 +310,7 @@ impl LspSession {
         let uri = self.uri.clone();
         let text_str = text.to_string();
 
-        // **版本号在真正发送时递增，而不是每次击键**。
+        // **版本号在真正发送时原子递增，而不是每次击键**。
         //
         // 对照 Zed 的 `lsp_store.rs`：它在发出 `didChangeTextDocument` 的那一
         // 刻算 `next_version = previous_snapshot.version + 1`，让版本号与
@@ -320,21 +320,21 @@ impl LspSession {
         // 远跑在服务器已收到的版本前面。而 `publishDiagnostics` 的版本门控
         // 拿它当基准比较，服务器的诊断版本永远追不上，**所有诊断都会被当成
         // 「过期」丢弃**（用户看到的就是「没有诊断」）。
+        //
+        // 仍不能在调度时读取 base：前一次 didChange 可能正在发送、尚未回写，
+        // 两个任务会拿到同一个 base，产生重复版本。改为发送前 `fetch_add`，
+        // 由原子变量唯一分配。失败时留下版本空洞是允许的（版本只需递增）。
         let version_slot = self.version.clone();
-        let base_version = version_slot.load(std::sync::atomic::Ordering::SeqCst);
         self.change_task.take();
         self.change_task = Some(cx.spawn(async move |_cx| {
             // 用 smol 的定时器：gpui 的 background_executor 在这里拿不到
             // （`cx` 是 `WeakEntity` 上下文，没有 executor 句柄）。
             smol::Timer::after(std::time::Duration::from_millis(CHANGE_DEBOUNCE_MS)).await;
-            // 发送那一刻才定版本：`base + 1`。取消掉的任务不会推进版本。
-            let version = base_version + 1;
+            // 发送那一刻才分配版本：取消掉的任务不会推进版本。
+            let version = version_slot.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             // 全量同步：不构造增量 TextEdit，避免与服务器文本漂移。
             if let Err(e) = client.did_change(&uri, version, &text_str, &[]).await {
                 log::debug!("lsp didChange failed for {uri}: {e}");
-            } else {
-                // 记录已送达的版本，供下一次递增取基准。
-                version_slot.fetch_max(version, std::sync::atomic::Ordering::SeqCst);
             }
         }));
     }
@@ -513,6 +513,9 @@ impl LspSession {
                     break;
                 }
             }
+            // 通道关闭 = 服务器进程退出/连接断开。最后一份诊断已经没有
+            // 来源可以更新，留着会变成永久的旧错误。
+            let _ = weak.update(cx, |state, _| state.reset_lsp_diagnostics());
         }));
     }
 }

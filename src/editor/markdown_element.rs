@@ -175,15 +175,21 @@ pub struct MarkdownElementBuilder {
     item_ix: usize,
     fragment_counter: usize,
     pending_fragments: Vec<(usize, String)>,
+    /// 文档级图片缓存（后台加载 + 按解析后身份缓存位图）。
+    image_cache: Entity<crate::editor::md_image::ImageCache>,
+    /// 当前文档所在目录：相对图片路径以它为基准。
+    doc_dir: Option<std::path::PathBuf>,
 }
 
 impl MarkdownElementBuilder {
-    pub fn new_with_item(
+    pub(crate) fn new_with_item(
         style: MarkdownStyle,
         copied_code_blocks: std::collections::HashSet<usize>,
         markdown: Entity<Markdown>,
         highlight_cache: HighlightCache,
         item_ix: usize,
+        image_cache: Entity<crate::editor::md_image::ImageCache>,
+        doc_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
@@ -214,6 +220,8 @@ impl MarkdownElementBuilder {
             item_ix,
             fragment_counter: 0,
             pending_fragments: Vec::new(),
+            image_cache,
+            doc_dir,
         }
     }
 
@@ -293,10 +301,10 @@ impl MarkdownElementBuilder {
                             ..Default::default()
                         });
                     }
-                    if level <= 2 {
-                        if let Some(color) = self.style.heading_border_color {
-                            heading = heading.border_b_1().border_color(color);
-                        }
+                    if level <= 2
+                        && let Some(color) = self.style.heading_border_color
+                    {
+                        heading = heading.border_b_1().border_color(color);
                     }
                     self.push_div(heading, &range, markdown_end);
                 }
@@ -805,12 +813,8 @@ impl MarkdownElementBuilder {
                         } else {
                             Some(img_state.runs.clone())
                         };
-                        self.append_child(Self::image_card(
-                            &img_state.url,
-                            &img_state.alt,
-                            alt_runs,
-                            cx,
-                        ));
+                        let card = self.image_card(&img_state.url, &img_state.alt, alt_runs, cx);
+                        self.append_child(card);
                     }
                 }
             },
@@ -1008,10 +1012,10 @@ impl MarkdownElementBuilder {
             self.push_code_text(text, range, cx);
             return;
         }
-        if !self.code_block_language.is_empty() {
-            if let Some(content) = self.code_block_content.last_mut() {
-                content.push_str(text);
-            }
+        if !self.code_block_language.is_empty()
+            && let Some(content) = self.code_block_content.last_mut()
+        {
+            content.push_str(text);
         }
         let style = self.text_style();
         self.pending_line.text.push_str(text);
@@ -1070,6 +1074,12 @@ impl MarkdownElementBuilder {
         self.append_child(
             div()
                 .min_w_0()
+                // 段落是 `flex().flex_wrap()`：纯文本片段本身也是 flex item，
+                // 默认按 max-content 取宽。没有这条上限时，一段很长的注释会
+                // 以自然宽度占满一整行并溢出卡片，`flex_wrap` 只会在片段之间
+                // 换行，不会在文字内部折行。`max_w_full` 把片段宽度夹到容器
+                // 宽度，`StyledText` 才能拿到定宽并真正换行。
+                .max_w_full()
                 .child(
                     SelectableText::new(
                         SharedString::from(format!("sel-{}", frag_id)),
@@ -1209,29 +1219,45 @@ impl MarkdownElementBuilder {
     /// Notion 风格的图片卡片（含 caption）：预览与实时编辑共用，保证两处样式一致。
     /// `alt` 为空时回退显示 url；`alt_runs` 保留 alt 文本的加粗/斜体（若有）。
     ///
-    /// 同步读盘路径：**只读预览**（`Markdown`）用它；实时编辑器改走
-    /// [`Self::image_card_with_image`]（视图侧缓存 + 后台加载）。
-    pub(crate) fn image_card(
+    /// 图片由 [`crate::editor::md_image::ImageCache`] 后台加载并缓存：渲染路径
+    /// 只查缓存（本地多做一次 `metadata`），绝不在这里同步读盘/发请求。
+    pub(crate) fn image_card_slot(
+        url: &str,
+        alt_text: &str,
+        alt_runs: Option<Vec<TextRun>>,
+        state: crate::editor::md_image::SlotState,
+        cx: &mut gpui::App,
+    ) -> AnyElement {
+        use crate::editor::md_image::SlotState;
+        match state {
+            SlotState::Ready(image, size) => {
+                Self::image_card_inner(url, alt_text, None, Some((image, size)), None, cx)
+            }
+            SlotState::Loading => {
+                Self::image_card_inner(url, alt_text, alt_runs, None, Some("加载中…"), cx)
+            }
+            SlotState::Failed => {
+                Self::image_card_inner(url, alt_text, alt_runs, None, Some("图片无法加载"), cx)
+            }
+            SlotState::Unsupported => {
+                Self::image_card_inner(url, alt_text, alt_runs, None, None, cx)
+            }
+        }
+    }
+
+    /// 查文档级图片缓存，返回该 URL 对应的卡片。
+    fn image_card(
+        &self,
         url: &str,
         alt_text: &str,
         alt_runs: Option<Vec<TextRun>>,
         cx: &mut gpui::App,
     ) -> AnyElement {
-        let maybe_image = Self::load_local_image(url);
-        Self::image_card_inner(url, alt_text, alt_runs, maybe_image, cx)
-    }
-
-    /// [`Self::image_card`] with an already-resolved image: the live editor
-    /// caches decoded images and loads them off-thread, so the card must be
-    /// buildable without touching the filesystem.
-    pub(crate) fn image_card_with_image(
-        url: &str,
-        alt_text: &str,
-        image: std::sync::Arc<gpui::Image>,
-        size: (u32, u32),
-        cx: &mut gpui::App,
-    ) -> AnyElement {
-        Self::image_card_inner(url, alt_text, None, Some((image, size)), cx)
+        let doc_dir = self.doc_dir.as_deref();
+        let state = self
+            .image_cache
+            .update(cx, |cache, cx| cache.slot(url, doc_dir, cx));
+        Self::image_card_slot(url, alt_text, alt_runs, state, cx)
     }
 
     fn image_card_inner(
@@ -1239,6 +1265,7 @@ impl MarkdownElementBuilder {
         alt_text: &str,
         alt_runs: Option<Vec<TextRun>>,
         maybe_image: Option<(std::sync::Arc<gpui::Image>, (u32, u32))>,
+        hint: Option<&'static str>,
         cx: &mut gpui::App,
     ) -> AnyElement {
         let alt = if alt_text.is_empty() {
@@ -1329,7 +1356,15 @@ impl MarkdownElementBuilder {
                                     .text_size(px(11.))
                                     .text_color(cx.theme().ui.text_muted)
                                     .child(url.to_string()),
-                            ),
+                            )
+                            .when_some(hint, |this, hint| {
+                                this.child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(cx.theme().ui.text_muted.opacity(0.8))
+                                        .child(hint),
+                                )
+                            }),
                     )
                     .into_any_element()
             }
@@ -1364,85 +1399,23 @@ impl MarkdownElementBuilder {
         }
     }
 
-    /// Validate a markdown image URL and resolve it to a local file path.
-    ///
-    /// Security gates (shared by the synchronous loader and the live view's
-    /// background loader, so both enforce exactly the same policy):
-    /// 1. only image extensions — `![](../../.ssh/id_rsa)` must not read
-    ///    arbitrary files into memory;
-    /// 2. reject `..` components and empty/overlong paths;
-    /// 3. no remote URLs.
-    ///
-    /// Size/pixel limits are enforced later by
-    /// [`crate::editor::image_viewer::load_image_from_bytes`].
-    pub(crate) fn local_image_path(url: &str) -> Option<std::path::PathBuf> {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            return None;
-        }
-        let trimmed = url.trim().trim_start_matches("file://");
-        if trimmed.is_empty() || trimmed.len() > 1024 {
-            return None;
-        }
-        let p = std::path::Path::new(trimmed);
-        // 拒绝 `..` 组件，防止工作区越狱；绝对路径仅允许存在且为文件的情况（仍受扩展名/大小约束）。
-        if p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-        {
-            log::warn!("已拦截含 `..` 的本地图片路径: {trimmed:?}");
-            return None;
-        }
-        let ext_ok = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| {
-                matches!(
-                    e.to_ascii_lowercase().as_str(),
-                    "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "ico"
-                )
-            })
-            .unwrap_or(false);
-        if !ext_ok {
-            return None;
-        }
-        Some(p.to_path_buf())
-    }
-
-    fn load_local_image(url: &str) -> Option<(std::sync::Arc<gpui::Image>, (u32, u32))> {
-        // 安全校验（扩展名 / `..` 逃逸 / 远程 URL）统一走 `local_image_path`。
-        // 注意：这条同步路径仍被**只读预览**（`Markdown`）使用；实时编辑器已改为
-        // 后台加载 + 缓存（`LiveMarkdownView::image_slot`），不再在 render 里读盘。
-        const MAX_IMAGE_BYTES: u64 = 20 * 1024 * 1024;
-        let cand = Self::local_image_path(url)?;
-        let Ok(meta) = std::fs::metadata(&cand) else {
-            return None;
-        };
-        if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES || meta.len() == 0 {
-            return None;
-        }
-        let bytes = std::fs::read(&cand).ok()?;
-        if bytes.len() as u64 > MAX_IMAGE_BYTES {
-            return None;
-        }
-        crate::editor::image_viewer::load_image_from_bytes(&bytes, &cand).ok()
-    }
-
     fn parse_callout(text: &str) -> Option<(CalloutKind, Option<String>)> {
         let trimmed = text.trim();
         if let Some(kind) = CalloutKind::from_marker(trimmed) {
             return Some((kind, None));
         }
-        if trimmed.starts_with("[!") {
-            if let Some(end) = trimmed.find(']') {
-                let marker = &trimmed[..=end];
-                if let Some(kind) = CalloutKind::from_marker(marker) {
-                    let rest = trimmed[end + 1..].trim_start();
-                    let remainder = if rest.is_empty() {
-                        None
-                    } else {
-                        Some(rest.to_string())
-                    };
-                    return Some((kind, remainder));
-                }
+        if trimmed.starts_with("[!")
+            && let Some(end) = trimmed.find(']')
+        {
+            let marker = &trimmed[..=end];
+            if let Some(kind) = CalloutKind::from_marker(marker) {
+                let rest = trimmed[end + 1..].trim_start();
+                let remainder = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                };
+                return Some((kind, remainder));
             }
         }
         None

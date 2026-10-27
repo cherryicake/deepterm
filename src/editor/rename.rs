@@ -4,9 +4,9 @@
 //! `Editor` 持有 `Option<Entity<..>>`，作为 `relative()` 父容器的
 //! `absolute()` 兄弟节点渲染。
 //!
-//! 提交后向服务器发 `textDocument/rename`，拿到 `WorkspaceEdit` 后只应用
-//! **当前文件**的那部分——跨文件的重命名需要额外的文件写入与磁盘同步，
-//! 首版不做（服务器给的其他文件编辑会被跳过并记日志）。
+//! 提交后向服务器发 `textDocument/rename`，拿到 `WorkspaceEdit` 后应用到
+//! 所有受影响的文件：已打开的标签走编辑事务，未打开的文件在后台读写磁盘
+//! （保留编码与换行风格）。
 
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, IntoElement, Subscription, Window, div, px};
@@ -34,11 +34,13 @@ impl RenamePanel {
         host: gpui::WeakEntity<Editor>,
         editor: Entity<InputState>,
         window_handle: gpui::AnyWindowHandle,
+        original: Option<String>,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<Self> {
-        // 初始值取光标下的词：用户通常是在改这个名字。
-        let original = editor.read(cx).word_at_cursor();
+        // 初始值优先用服务器 `prepareRename` 给的 placeholder：它对宏、
+        // 运算符等场景比客户端的词边界更准。没有就退回光标下的词。
+        let original = original.unwrap_or_else(|| editor.read(cx).word_at_cursor());
         let input = cx.new(|cx| {
             let mut state = InputState::new(window, cx)
                 .placeholder("新名称")

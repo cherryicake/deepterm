@@ -273,10 +273,10 @@ impl SplitContainer {
                 let mut new_sizes = Vec::new();
 
                 for (i, child) in children.iter().enumerate() {
-                    if let SplitContainer::Panel(p) = child {
-                        if p.read(cx).panel_id == panel_id {
-                            continue;
-                        }
+                    if let SplitContainer::Panel(p) = child
+                        && p.read(cx).panel_id == panel_id
+                    {
+                        continue;
                     }
 
                     if let Some(new_child) = child.remove_panel(panel_id, cx) {

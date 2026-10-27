@@ -205,16 +205,16 @@ let very_long_line = "This is a very long line that should trigger horizontal sc
 
 ## 8. 图片 Images（已完成 Tier 2）
 
-> 本地路径（如 `assets/icon.png`）会尝试 `fs::read` 并用 `image_viewer::load_image_from_bytes` 渲染真实图片（`max_w 640` 等比）；远程 `http(s)` 链接显示占位卡片，点击卡片任意位置 `open::that` 外部打开。
+> 图片地址统一由 `editor::md_image` 解析与加载：本地路径（含相对路径、`file://`、`..`、`~`、百分号转义）按**文档所在目录**解析；远程 `http(s)` 链接走带超时/限流量/限重定向的 HTTP 客户端下载并缓存。渲染路径只查缓存（后台加载，首帧占位），加载完成自动重绘；失败/加载中显示占位卡片并给出状态提示，点击卡片仍按白名单外部打开。
 
 ![DeepTerm Logo](assets/icon.png)
-*↑ 本地图片 `assets/icon.png` — 若文件存在则渲染真实图片，否则回退为 🖼 占位卡片*
+*↑ 本地相对路径 `assets/icon.png` — 相对**本文档目录**解析；文件存在则渲染真实图片，否则回退为 🖼 占位卡片*
 
-![远程图片示例](https://via.placeholder.com/640x360.png?text=Remote+Image)
-*↑ 远程图片占位卡片：`elevated bg + 🖼 + alt + url`，点击外部打开*
+![远程图片示例](https://picsum.photos/640/360 "Random photo")
+*↑ 远程图片：联网时下载并渲染真实图片（`picsum.photos` 会返回一张随机照片；断网/超时则退回占位卡片）*
 
 ![带 alt 的图片](https://example.com/not-found.png "Title text")
-*↑ 失效图片同样为占位卡片，下方另有 Notion 风格 caption 行*
+*↑ 失效/加载中的图片显示占位卡片与状态提示，下方另有 Notion 风格 caption 行*
 
 ---
 

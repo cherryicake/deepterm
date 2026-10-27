@@ -1053,14 +1053,13 @@ impl TerminalElement {
                 continue;
             }
 
-            if let Some(last) = merged.last_mut() {
-                if last.row == span.row
-                    && last.color == span.color
-                    && last.start_col + last.width == span.start_col
-                {
-                    last.width += span.width;
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && last.row == span.row
+                && last.color == span.color
+                && last.start_col + last.width == span.start_col
+            {
+                last.width += span.width;
+                continue;
             }
 
             merged.push(span);

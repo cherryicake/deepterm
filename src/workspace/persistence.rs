@@ -14,13 +14,13 @@ impl PersistenceManager {
         let config_dir = Self::get_config_dir();
 
         // 确保配置目录存在；失败仅日志，不崩溃
-        if !config_dir.exists() {
-            if let Err(e) = fs::create_dir_all(&config_dir) {
-                log::error!(
-                    "Failed to create config directory {}: {e}",
-                    config_dir.display()
-                );
-            }
+        if !config_dir.exists()
+            && let Err(e) = fs::create_dir_all(&config_dir)
+        {
+            log::error!(
+                "Failed to create config directory {}: {e}",
+                config_dir.display()
+            );
         }
 
         // 自动迁移旧路径 ~/.config/deepterm -> dirs::config_dir()/deepterm
@@ -152,22 +152,22 @@ impl PersistenceManager {
 
         if !file_path.exists() {
             // 兼容旧路径
-            if let Some(legacy) = Self::legacy_session_path() {
-                if legacy != file_path {
-                    log::info!("Found legacy session at {}, migrating", legacy.display());
-                    match fs::read_to_string(&legacy) {
-                        Ok(json) => match serde_json::from_str::<AppSessionState>(&json) {
-                            Ok(session) => {
-                                // 迁移到新路径
-                                if let Ok(new_json) = serde_json::to_string_pretty(&session) {
-                                    let _ = Self::atomic_write(&file_path, new_json.as_bytes());
-                                }
-                                return Ok(Some(session));
+            if let Some(legacy) = Self::legacy_session_path()
+                && legacy != file_path
+            {
+                log::info!("Found legacy session at {}, migrating", legacy.display());
+                match fs::read_to_string(&legacy) {
+                    Ok(json) => match serde_json::from_str::<AppSessionState>(&json) {
+                        Ok(session) => {
+                            // 迁移到新路径
+                            if let Ok(new_json) = serde_json::to_string_pretty(&session) {
+                                let _ = Self::atomic_write(&file_path, new_json.as_bytes());
                             }
-                            Err(e) => log::warn!("Failed to parse legacy session: {e}"),
-                        },
-                        Err(e) => log::warn!("Failed to read legacy session: {e}"),
-                    }
+                            return Ok(Some(session));
+                        }
+                        Err(e) => log::warn!("Failed to parse legacy session: {e}"),
+                    },
+                    Err(e) => log::warn!("Failed to read legacy session: {e}"),
                 }
             }
             return Ok(None);
@@ -179,13 +179,12 @@ impl PersistenceManager {
             Err(e) => {
                 log::warn!("Failed to parse {}: {e}, trying .bak", file_path.display());
                 let bak = file_path.with_extension("json.bak");
-                if bak.exists() {
-                    if let Ok(bak_json) = fs::read_to_string(&bak) {
-                        if let Ok(session) = serde_json::from_str(&bak_json) {
-                            log::info!("Recovered session from backup {}", bak.display());
-                            return Ok(Some(session));
-                        }
-                    }
+                if bak.exists()
+                    && let Ok(bak_json) = fs::read_to_string(&bak)
+                    && let Ok(session) = serde_json::from_str(&bak_json)
+                {
+                    log::info!("Recovered session from backup {}", bak.display());
+                    return Ok(Some(session));
                 }
                 Err(Box::new(e))
             }

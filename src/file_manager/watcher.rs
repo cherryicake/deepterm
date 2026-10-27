@@ -194,26 +194,43 @@ pub struct FsWatcher {
 
 impl EventEmitter<FsChangeEvent> for FsWatcher {}
 
+/// 单元测试下是否启动真实 OS 文件监视。
+///
+/// gpui 的 `TestScheduler` 会把测试期间仍在活动的外部线程判为「非确定性」
+/// 并 abort 整个测试二进制。`notify` 的 inotify 线程恰恰是这样一条线程：
+/// 只要期间有一个文件事件被投递，`cargo test` 就会随机炸掉（与 LSP 的
+/// `smol::spawn` 同一类问题）。测试只覆盖引用计数与事件分发逻辑，
+/// 不需要真的落到 inotify，因此这里直接不创建底层 watcher（`None` 分支
+/// 在 `watch`/`unwatch` 里已有完整处理）。
+#[cfg(not(test))]
+fn spawn_os_watcher(tx: async_channel::Sender<Event>) -> Option<RecommendedWatcher> {
+    match RecommendedWatcher::new(
+        move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                let _ = tx.try_send(event);
+            }
+        },
+        notify::Config::default().with_poll_interval(Duration::from_millis(500)),
+    ) {
+        Ok(watcher) => Some(watcher),
+        Err(e) => {
+            log::error!("Failed to create file watcher: {e} — file watching disabled");
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+fn spawn_os_watcher(_tx: async_channel::Sender<Event>) -> Option<RecommendedWatcher> {
+    log::debug!("FsWatcher: 单元测试下不启动 OS 文件监视线程");
+    None
+}
+
 impl FsWatcher {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let (tx, rx) = async_channel::unbounded();
 
-        let watcher = Arc::new(Mutex::new(
-            match RecommendedWatcher::new(
-                move |res: Result<Event, notify::Error>| {
-                    if let Ok(event) = res {
-                        let _ = tx.try_send(event);
-                    }
-                },
-                notify::Config::default().with_poll_interval(Duration::from_millis(500)),
-            ) {
-                Ok(w) => Some(w),
-                Err(e) => {
-                    log::error!("Failed to create file watcher: {e} — file watching disabled");
-                    None
-                }
-            },
-        ));
+        let watcher = Arc::new(Mutex::new(spawn_os_watcher(tx)));
 
         let watched_paths = Arc::new(Mutex::new(HashMap::new()));
         let weak = cx.entity().downgrade();
@@ -261,16 +278,16 @@ impl FsWatcher {
         if need_start || need_upgrade {
             let mut guard = self.watcher.lock();
             if let Some(watcher) = guard.as_mut() {
-                if need_upgrade {
-                    if let Err(e) = watcher.unwatch(&path) {
-                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
-                    }
+                if need_upgrade && let Err(e) = watcher.unwatch(&path) {
+                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
                 }
                 if let Err(e) = watcher.watch(&path, RecursiveMode::Recursive) {
                     log::warn!("Failed to watch {}: {e}", path.display());
                 }
             } else {
-                log::warn!(
+                // 创建失败时 `new` 已经 error 过一次；这里逐路径降为 debug，
+                // 避免监视不可用的机器上每个文件都刷一条 warning。
+                log::debug!(
                     "File watcher disabled, ignoring watch for {}",
                     path.display()
                 );
@@ -299,7 +316,9 @@ impl FsWatcher {
                     log::warn!("Failed to watch {}: {e}", path.display());
                 }
             } else {
-                log::warn!(
+                // 创建失败时 `new` 已经 error 过一次；这里逐路径降为 debug，
+                // 避免监视不可用的机器上每个文件都刷一条 warning。
+                log::debug!(
                     "File watcher disabled, ignoring watch for {}",
                     path.display()
                 );
@@ -341,10 +360,9 @@ impl FsWatcher {
                 if let Err(e) = watcher.unwatch(&path) {
                     log::warn!("Failed to unwatch {}: {e}", path.display());
                 }
-                if need_downgrade {
-                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
-                    }
+                if need_downgrade && let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive)
+                {
+                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
                 }
             }
         }
@@ -387,10 +405,9 @@ impl FsWatcher {
                 if let Err(e) = watcher.unwatch(&path) {
                     log::warn!("Failed to unwatch {}: {e}", path.display());
                 }
-                if need_downgrade {
-                    if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
-                    }
+                if need_downgrade && let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive)
+                {
+                    log::warn!("Failed to reconfigure watch for {}: {e}", path.display());
                 }
             }
         }
@@ -699,31 +716,29 @@ impl RemoteFsWatcher {
                         }
                     };
 
-                    if should_emit {
-                        if let Some(watcher) = weak.upgrade() {
-                            // On recovery from a previously reported missing state, force a Create
-                            // event so subscribers reload the path even if its metadata matches
-                            // the old baseline.
-                            let event = if reported_missing {
-                                FsChangeEvent::remote(
-                                    path.clone(),
-                                    FsChangeKind::Create,
-                                    server.clone(),
-                                )
-                            } else if let Some(entries) = entries {
-                                FsChangeEvent::remote_with_entries(
-                                    path.clone(),
-                                    kind,
-                                    server.clone(),
-                                    entries,
-                                )
-                            } else {
-                                FsChangeEvent::remote(path.clone(), kind, server.clone())
-                            };
-                            watcher.update(cx, |_, cx| {
-                                cx.emit(event);
-                            });
-                        }
+                    if should_emit && let Some(watcher) = weak.upgrade() {
+                        // On recovery from a previously reported missing state, force a Create
+                        // event so subscribers reload the path even if its metadata matches
+                        // the old baseline.
+                        let event = if reported_missing {
+                            FsChangeEvent::remote(
+                                path.clone(),
+                                FsChangeKind::Create,
+                                server.clone(),
+                            )
+                        } else if let Some(entries) = entries {
+                            FsChangeEvent::remote_with_entries(
+                                path.clone(),
+                                kind,
+                                server.clone(),
+                                entries,
+                            )
+                        } else {
+                            FsChangeEvent::remote(path.clone(), kind, server.clone())
+                        };
+                        watcher.update(cx, |_, cx| {
+                            cx.emit(event);
+                        });
                     }
                 }
             }

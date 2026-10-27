@@ -58,12 +58,12 @@ impl TerminalPalette {
         match color {
             AlacColor::Named(named) => self
                 .get(*named as usize)
-                .map(|rgb| rgb888_to_hsla(rgb))
+                .map(rgb888_to_hsla)
                 .unwrap_or_else(|| theme.named_color(*named)),
             AlacColor::Spec(rgb) => rgb888_to_hsla(*rgb),
             AlacColor::Indexed(idx) => self
                 .get(*idx as usize)
-                .map(|rgb| rgb888_to_hsla(rgb))
+                .map(rgb888_to_hsla)
                 .unwrap_or_else(|| theme.indexed_color(*idx)),
         }
     }

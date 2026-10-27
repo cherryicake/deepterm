@@ -153,11 +153,11 @@ impl Workspace {
                 }
 
                 // 检查是否已启用 "应用到全部"
-                if shared_resolver.has_cached_resolution() {
-                    if let Some(resolution) = shared_resolver.get_cached_resolution() {
-                        let _ = prompt.response.try_send(resolution);
-                        continue;
-                    }
+                if shared_resolver.has_cached_resolution()
+                    && let Some(resolution) = shared_resolver.get_cached_resolution()
+                {
+                    let _ = prompt.response.try_send(resolution);
+                    continue;
                 }
 
                 let answer = cx.update_window(window_handle, |_view, window, cx| {
@@ -212,11 +212,11 @@ impl Workspace {
                     )
                 });
 
-                if let Ok(receiver) = apply_all_answer {
-                    if let Ok(1) = receiver.await {
-                        // 用户选择 "应用到全部"
-                        shared_resolver.set_cached_resolution(resolution.clone());
-                    }
+                if let Ok(receiver) = apply_all_answer
+                    && let Ok(1) = receiver.await
+                {
+                    // 用户选择 "应用到全部"
+                    shared_resolver.set_cached_resolution(resolution.clone());
                 }
 
                 let _ = prompt.response.try_send(resolution);

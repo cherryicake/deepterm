@@ -345,10 +345,10 @@ pub(crate) fn load_local_text(path: &Path) -> Result<LoadedText, String> {
         }
     };
     // 先用 metadata 粗筛，避免对超大文件做无谓的 read
-    if let Ok(meta) = std::fs::metadata(path) {
-        if meta.len() > MAX_EDITOR_FILE_BYTES as u64 {
-            return Err(too_large(meta.len(), true));
-        }
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_EDITOR_FILE_BYTES as u64
+    {
+        return Err(too_large(meta.len(), true));
     }
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if bytes.len() > MAX_EDITOR_FILE_BYTES {
@@ -377,13 +377,13 @@ pub(crate) fn load_remote_text(
     // 避免对 1GB 远端文件全量 `read_to_end` 进内存导致 OOM/卡死。
     // `metadata` 走 SFTP 会话缓存，仅一次往返；与本地 `load_local_text` 的
     // `metadata` 粗筛对称。>512KB 的大文件后续走流水线读取（见 sftp_fs）。
-    if let Ok(meta) = crate::ssh::sftp_fs::metadata(config, path) {
-        if meta.size > MAX_EDITOR_FILE_BYTES as u64 {
-            return Err(format!(
-                "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制",
-                meta.size / (1024 * 1024)
-            ));
-        }
+    if let Ok(meta) = crate::ssh::sftp_fs::metadata(config, path)
+        && meta.size > MAX_EDITOR_FILE_BYTES as u64
+    {
+        return Err(format!(
+            "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制",
+            meta.size / (1024 * 1024)
+        ));
     }
     let bytes = crate::ssh::sftp_fs::read_file_bytes(config, path)
         .map_err(|e| e.to_string())?
@@ -513,6 +513,13 @@ pub struct Editor {
     pending_live_sync: HashMap<SharedString, u64>,
     /// tab_id -> pending `Cmd+Click` line/col jump (applied after async load).
     pending_jumps: HashMap<String, (u32, Option<u32>)>,
+    /// tab_id -> pending LSP jump (applied after async load).
+    ///
+    /// LSP 的 `Position.character` 是 UTF-16 code unit，而 `jump_to_line_col`
+    /// 的列按 Unicode `char` 计数。若把 LSP 列直接塞进 `pending_jumps`，
+    /// 目标行里有 emoji 等非 BMP 字符时光标会左偏。这里保留原始 Position，
+    /// 等文件内容加载完成后再按 UTF-16 精确换算字节 offset。
+    pending_lsp_jumps: HashMap<String, lsp_types::Position>,
     /// 跳转到行面板（cmd-l / ctrl-g 切换）。
     goto_line_panel: Option<Entity<goto_line::GotoLinePanel>>,
     /// 语言选择弹出菜单（状态栏语言 chip 点击时创建）。
@@ -551,6 +558,15 @@ pub struct Editor {
     last_inlay_range: Option<lsp_types::Range>,
     /// 上次请求签名帮助时的光标位置（避免重复请求）。
     last_signature_cursor: Option<usize>,
+    /// 当前 hover 浮层里显示的是不是签名帮助。
+    ///
+    /// 签名帮助复用 hover 浮层，所以不能再用「浮层存在」判断是否该请求：
+    /// 那个判断会把签名帮助自己挡住，光标在参数间移动时永远不刷新。
+    signature_help_active: bool,
+    /// 签名帮助写进浮层时的锚点，用来识别浮层是否已经被普通 hover 换掉。
+    signature_hover_anchor: Option<usize>,
+    /// 签名帮助请求代号：快速移动光标时只允许最新响应落地。
+    signature_request_generation: u64,
     /// 上一次记进日志的 chip（文案 + 状态），`render_lsp_status_chip` 的去重状态。
     ///
     /// 键含文案与状态（不只是文案）：`NotStarted`/`Stopped`/`Ready` 文案相同，
@@ -633,6 +649,19 @@ fn signature_trigger_for(text: &ropey::Rope, cursor: usize) -> bool {
     false
 }
 
+/// 光标前一个字符（`None` = 文本开头）。
+///
+/// **不要**把 `byte_to_char_idx` 的结果直接喂给 `Rope::char`：ropey 2.0 的
+/// `char` 收的是**字节下标**，字符下标喂进去会落在多字节字符内部并 panic
+/// （本项目大量中文/emoji，一撞就必现）。这里统一走 `RopeExt` 的换算原语。
+fn char_before(text: &ropey::Rope, offset: usize) -> Option<char> {
+    use crate::components::input::rope_ext::RopeExt as _;
+
+    let byte = text.clip_offset(offset.min(text.len()), sum_tree::Bias::Left);
+    let ci = text.offset_to_char_index(byte);
+    (ci > 0).then(|| text.char(text.char_index_to_offset(ci - 1)))
+}
+
 impl Editor {
     /// Markdown 编辑模式 tab 的 id 后缀：预览中双击后新开的纯编辑 tab。
     const MARKDOWN_EDIT_SUFFIX: &str = "#edit";
@@ -688,6 +717,7 @@ impl Editor {
             loading_gens: HashMap::new(),
             pending_live_sync: HashMap::new(),
             pending_jumps: HashMap::new(),
+            pending_lsp_jumps: HashMap::new(),
             goto_line_panel: None,
             language_menu: None,
             _language_menu_subscription: None,
@@ -705,6 +735,9 @@ impl Editor {
             last_highlight_cursor: None,
             last_inlay_range: None,
             last_signature_cursor: None,
+            signature_help_active: false,
+            signature_hover_anchor: None,
+            signature_request_generation: 0,
             last_chip_log: std::cell::RefCell::new(None),
             last_completion_visible_log: std::cell::Cell::new(false),
             pending_root_attach: Vec::new(),
@@ -1059,7 +1092,18 @@ impl Editor {
             && !file_info.id.as_ref().ends_with(Self::MARKDOWN_EDIT_SUFFIX)
             && !is_live;
         let markdown = if is_markdown {
-            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content.clone(), cx)))
+            // 相对图片路径以文档所在目录为基准（远程文件的路径不在本机，
+            // 不拿它当本地目录用）。
+            let md_doc_dir = if ssh_config.is_none() {
+                std::path::Path::new(&path_str)
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+            } else {
+                None
+            };
+            Some(cx.new(|cx| {
+                crate::editor::markdown::Markdown::new_with_dir(content.clone(), md_doc_dir, cx)
+            }))
         } else {
             None
         };
@@ -1101,7 +1145,7 @@ impl Editor {
                         else {
                             return;
                         };
-                        this.on_live_change(&live_tab_id.clone().into(), *version, cx);
+                        this.on_live_change(&live_tab_id.clone(), *version, cx);
                     },
                 ),
             );
@@ -1771,10 +1815,14 @@ impl Editor {
         cx.notify();
     }
 
-    /// 重命名：光标处符号改名，应用服务器返回的 `WorkspaceEdit`。
+    /// 重命名：光标处符号改名，应用服务器返回的整个 `WorkspaceEdit`。
     ///
     /// `Editor` 里有会话（uri + client），而命名面板只有编辑器实体，
     /// 所以由面板回调到这里发起请求。
+    ///
+    /// 跨文件是常态（rust-analyzer 改结构体字段会同时改所有使用点）。
+    /// 已打开的标签走编辑事务（保留撤销历史并自动发 didChange），未打开
+    /// 的文件在后台读改写回磁盘，保留各自的编码与换行风格。
     pub(crate) fn apply_rename(
         &mut self,
         editor: &Entity<InputState>,
@@ -1782,25 +1830,155 @@ impl Editor {
         new_name: String,
         cx: &mut Context<Self>,
     ) {
-        let Some((client, uri)) = self
+        let Some((client, origin_uri)) = self
             .active_lsp_client(cx)
             .zip(self.active_lsp_session().map(|s| s.uri().clone()))
         else {
             return;
         };
+        // 请求期间用户可能切标签/切主机；后续编辑必须按发起时的归属处理。
+        let ssh = self
+            .active_lsp_session()
+            .and_then(|s| s.ssh_config().cloned());
         let editor = editor.clone();
-        cx.spawn(async move |_this, cx| {
-            let Ok(Some(edit)) = client.rename(&uri, position, &new_name).await else {
+        cx.spawn(async move |this, cx| {
+            let Ok(Some(edit)) = client.rename(&origin_uri, position, &new_name).await else {
                 return;
             };
-            let Some(edits) = crate::lsp::features::edits_for_uri(&edit, &uri) else {
-                // 跨文件重命名：只处理了当前文件的部分（可能是 0 条）。
-                log::info!("lsp: rename touched other files, applying current file only");
+
+            if let Some(lsp_types::DocumentChanges::Operations(ops)) = &edit.document_changes {
+                let has_resource_ops = ops.iter().any(|op| {
+                    matches!(op, lsp_types::DocumentChangeOperation::Op(_))
+                });
+                if has_resource_ops {
+                    // 文件创建/移动/删除无法用 TextEdit 表达，当前只应用文本
+                    // 编辑。明确记日志，避免用户以为重命名“什么都没做”。
+                    log::warn!("lsp: rename contains file resource operations; text edits only");
+                }
+            }
+
+            let uris = crate::lsp::features::affected_uris(&edit);
+            let mut disk_jobs: Vec<(
+                std::path::PathBuf,
+                String,
+                Option<crate::ssh::SshConnectionConfig>,
+                Vec<lsp_types::TextEdit>,
+            )> = Vec::new();
+            let mut open_files = 0usize;
+
+            let Some(entity) = this.upgrade() else {
                 return;
             };
-            cx.update_entity(&editor, |state, cx| {
-                crate::lsp::session::apply_text_edits(state, edits, cx);
+            entity.update(cx, |this, cx| {
+                for uri in uris {
+                    let Some(edits) = crate::lsp::features::edits_for_uri(&edit, &uri) else {
+                        continue;
+                    };
+                    if edits.is_empty() {
+                        continue;
+                    }
+                    // 发起请求的那个编辑器即使标签已被关闭，也还能安全应用
+                    // 编辑（InputState 实体仍然存活）。
+                    if crate::lsp::client::uri_eq(&uri, &origin_uri) {
+                        editor.update(cx, |state, cx| {
+                            crate::lsp::session::apply_text_edits(state, edits, cx);
+                        });
+                        open_files += 1;
+                        continue;
+                    }
+                    let Some(path) = crate::lsp::client::uri_to_path(&uri) else {
+                        log::warn!("lsp: rename target is not a file uri: {uri}");
+                        continue;
+                    };
+                    let path_str = path.to_string_lossy().to_string();
+                    if let Some(tab_id) = this.find_open_tab_by_path(&path_str, ssh.as_ref()) {
+                        let Some(file) = this.open_files.iter().find(|f| f.id.as_ref() == tab_id)
+                        else {
+                            continue;
+                        };
+                        if file.read_only {
+                            log::warn!("lsp: skip read-only rename target {path_str}");
+                            continue;
+                        }
+                        let state = file.editor_state.clone();
+                        state.update(cx, |state, cx| {
+                            crate::lsp::session::apply_text_edits(state, edits, cx);
+                        });
+                        open_files += 1;
+                    } else {
+                        disk_jobs.push((path, path_str, ssh.clone(), edits));
+                    }
+                }
             });
+
+            // 未打开的文件：后台读取 → 应用编辑 → 原子写回。远端文件也走
+            // 同一条路径，服务器和文件在同一台主机上。
+            let (disk_applied, disk_failed) = if disk_jobs.is_empty() {
+                (0usize, 0usize)
+            } else {
+                cx.background_spawn(async move {
+                    let mut applied = 0usize;
+                    let mut failed = 0usize;
+                    for (path, path_str, ssh, edits) in disk_jobs {
+                        let loaded = match ssh.as_ref() {
+                            Some(config) => load_remote_text(config, &path_str),
+                            None => load_local_text(&path),
+                        };
+                        let loaded = match loaded {
+                            Ok(loaded) => loaded,
+                            Err(e) => {
+                                log::warn!("lsp: rename read failed for {path_str}: {e}");
+                                failed += 1;
+                                continue;
+                            }
+                        };
+                        if loaded.read_only {
+                            log::warn!("lsp: skip read-only rename target {path_str}");
+                            failed += 1;
+                            continue;
+                        }
+                        let rope = ropey::Rope::from(loaded.text.as_str());
+                        let byte_edits =
+                            crate::lsp::features::to_byte_edits(&rope, edits);
+                        let new_text =
+                            crate::lsp::features::apply_byte_edits(&loaded.text, &byte_edits);
+                        if new_text == loaded.text {
+                            applied += 1;
+                            continue;
+                        }
+                        match save_text_to_file(
+                            &path_str,
+                            ssh.as_ref(),
+                            &loaded.text,
+                            &new_text,
+                            loaded.encoding,
+                        ) {
+                            Ok(_) => applied += 1,
+                            Err(e) => {
+                                log::warn!("lsp: rename write failed for {path_str}: {e}");
+                                failed += 1;
+                            }
+                        }
+                    }
+                    (applied, failed)
+                })
+                .await
+            };
+
+            log::info!(
+                "lsp: rename applied to {open_files} open file(s), {disk_applied} unopened file(s), {disk_failed} failed"
+            );
+            if disk_failed > 0
+                && let Some(entity) = this.upgrade()
+            {
+                entity.update(cx, |this, cx| {
+                    this.show_notification(
+                        format!("重命名有 {disk_failed} 个文件写入失败，详见 LSP 日志"),
+                        NotificationKind::Warning,
+                        cx,
+                    );
+                });
+            }
         })
         .detach();
     }
@@ -2033,7 +2211,7 @@ impl Editor {
             LspJumpAction::Ignore => {
                 log::debug!("lsp: cannot open non-file location {}", location.uri);
             }
-            LspJumpAction::JumpInPlace { line, col } => {
+            LspJumpAction::JumpInPlace { position } => {
                 // 跳到**发起请求的那个标签**，不是此刻活动的标签。
                 //
                 // `same_file` 是用请求前捕获的 `origin` 算的，用户在这段
@@ -2046,7 +2224,7 @@ impl Editor {
                     .filter(|id| self.open_files.iter().any(|f| &f.id == id))
                     .or_else(|| self.active_file_id.clone());
                 if let Some(tab_id) = tab_id {
-                    self.jump_to_line_col(&tab_id, line, Some(col), window, cx);
+                    self.jump_to_lsp_position(&tab_id, position, window, cx);
                 }
             }
             // 跨文件（或目标未打开）：打开并定位。
@@ -2055,7 +2233,7 @@ impl Editor {
             // SSH 那台机器上）返回的 Location 路径也在那台机器上，必须走
             // 远程打开；按本地路径打开会去本机磁盘上找一个不存在的文件，
             // 结果是「跳转了但什么也没发生」。
-            LspJumpAction::OpenFile { path, line, col } => {
+            LspJumpAction::OpenFile { path, position } => {
                 // 归属拆成两半：主机决定走哪条打开路径，根决定目标文件接哪个服务器。
                 let (remote, origin_root) = match active {
                     Some(o) => (o.ssh_config, o.root),
@@ -2069,22 +2247,29 @@ impl Editor {
                     self.lsp_jump_roots.insert(key.clone(), root);
                     self.prune_lsp_jump_roots(&key);
                 }
-                match remote {
+                match remote.as_ref() {
                     Some(ssh_config) => self.open_remote_file_at_line_col_no_notify(
-                        path_str,
-                        ssh_config,
-                        Some(line),
-                        Some(col),
+                        path_str.clone(),
+                        ssh_config.clone(),
+                        // 行列留空：目标文本可能还在异步加载，LSP Position
+                        // 必须等加载完成后按 UTF-16 换算，不能提前降级成
+                        // 编译器口径的 1 基字符列。
+                        None,
+                        None,
                         window,
                         cx,
                     ),
-                    None => self.open_file_at_line_col_no_notify(
-                        path,
-                        Some(line),
-                        Some(col),
-                        window,
-                        cx,
-                    ),
+                    None => {
+                        self.open_file_at_line_col_no_notify(path.clone(), None, None, window, cx)
+                    }
+                }
+                // 打开动作可能是同步复用已有标签，也可能是新标签（还在
+                // loading）。两种情况都交给 `jump_to_lsp_position`：它会在
+                // 未加载时把 Position 放进 `pending_lsp_jumps`。
+                if let Some(tab_id) = self.find_open_tab_by_path(&path_str, remote.as_ref()) {
+                    self.jump_to_lsp_position(&tab_id, position, window, cx);
+                } else {
+                    log::debug!("lsp: target file opened but tab not found for jump: {path_str}");
                 }
             }
         }
@@ -2241,6 +2426,10 @@ impl Editor {
         };
         let client = self.active_lsp_client(cx);
         let cursor = editor.read(cx).cursor();
+        // 普通 hover 接管浮层后，签名帮助就不能再认为自己拥有当前卡片；
+        // 否则光标再动时它会把注释卡当成签名卡刷新掉。
+        self.signature_help_active = false;
+        self.signature_hover_anchor = None;
         self.hover
             .on_keyboard_triggered(cursor, &editor, client, uri, cx);
         cx.notify();
@@ -2370,10 +2559,30 @@ impl Editor {
             let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
             cx.spawn_in(window, async move |this, cx| {
                 match client.prepare_rename(&uri, position).await {
-                    // 服务器说可重命名：开面板。
-                    Ok(Some(_range)) => {
+                    // 服务器说可重命名：开面板。placeholder 比词边界更准。
+                    Ok(Some(response)) => {
+                        let original = match response {
+                            lsp_types::PrepareRenameResponse::RangeWithPlaceholder {
+                                placeholder,
+                                ..
+                            } => Some(placeholder),
+                            lsp_types::PrepareRenameResponse::DefaultBehavior {
+                                default_behavior: false,
+                            } => {
+                                this.update_in(cx, |this, _window, cx| {
+                                    this.show_notification(
+                                        "此处不可重命名",
+                                        NotificationKind::Warning,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                                return;
+                            }
+                            _ => None,
+                        };
                         this.update_in(cx, |this, window, cx| {
-                            this.open_rename_panel(editor, handle, window, cx);
+                            this.open_rename_panel(editor, handle, original, window, cx);
                         })
                         .ok();
                     }
@@ -2399,7 +2608,7 @@ impl Editor {
                     Err(e) => {
                         log::debug!("lsp: prepareRename failed, falling back: {e}");
                         this.update_in(cx, |this, window, cx| {
-                            this.open_rename_panel(editor, handle, window, cx);
+                            this.open_rename_panel(editor, handle, None, window, cx);
                         })
                         .ok();
                     }
@@ -2411,7 +2620,7 @@ impl Editor {
 
         // 没有 LSP：直接开面板（按词边界）。
         let handle = self.window_handle.unwrap_or_else(|| window.window_handle());
-        self.open_rename_panel(editor, handle, window, cx);
+        self.open_rename_panel(editor, handle, None, window, cx);
     }
 
     /// 打开重命名面板（`prepareRename` 通过后的落点）。
@@ -2419,10 +2628,18 @@ impl Editor {
         &mut self,
         editor: Entity<InputState>,
         handle: gpui::AnyWindowHandle,
+        original: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let panel = rename::RenamePanel::new(cx.entity().downgrade(), editor, handle, window, cx);
+        let panel = rename::RenamePanel::new(
+            cx.entity().downgrade(),
+            editor,
+            handle,
+            original,
+            window,
+            cx,
+        );
         panel.update(cx, |p, cx| p.focus(window, cx));
         self.rename_panel = Some(panel);
         cx.notify();
@@ -2505,8 +2722,53 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
-        // hover 已显示时不抢：两个浮层叠在一起没有意义。
-        if editor.read(cx).hover_popover().is_some() {
+
+        // 先取快照再判断：后面的 `editor.update` 需要可变借用，不能一边读
+        // state 一边在同一个表达式里调它。
+        let (cursor, in_params, popover_anchor, prev_char) = {
+            let state = editor.read(cx);
+            let cursor = state.cursor();
+            let text = state.text();
+            (
+                cursor,
+                signature_trigger_for(text, cursor),
+                state.hover_popover().map(|(anchor, _)| anchor),
+                char_before(text, cursor),
+            )
+        };
+
+        if !in_params {
+            // 光标离开参数列表：签名浮层不能继续挂着。只清自己那张卡，
+            // 不碰用户可能正在看的 hover。
+            self.last_signature_cursor = None;
+            let owned = self.signature_help_active
+                && popover_anchor.is_some()
+                && popover_anchor == self.signature_hover_anchor;
+            self.signature_help_active = false;
+            self.signature_hover_anchor = None;
+            if owned {
+                editor.update(cx, |state, cx| {
+                    state.clear_hover_popover();
+                    cx.notify();
+                });
+            }
+            return;
+        }
+
+        // 有浮层时只允许刷新「自己」那张签名卡。普通 hover 仍然优先，
+        // 不能被签名帮助覆盖（鼠标悬停时用户想看的是注释）。
+        if popover_anchor.is_some() {
+            let owned = self.signature_help_active
+                && popover_anchor.is_some()
+                && popover_anchor == self.signature_hover_anchor;
+            if !owned {
+                self.signature_help_active = false;
+                self.signature_hover_anchor = None;
+                return;
+            }
+        }
+
+        if self.last_signature_cursor == Some(cursor) {
             return;
         }
         let Some(client) = self.active_lsp_session().and_then(|s| s.client().cloned()) else {
@@ -2516,41 +2778,88 @@ impl Editor {
             return;
         };
 
-        // 触发判定：光标前最近的未闭合 `(` 之后仍在参数列表内。
-        let (cursor, text_len) = {
-            let state = editor.read(cx);
-            (state.cursor(), state.text().len())
-        };
-        let in_params = signature_trigger_for(editor.read(cx).text(), cursor);
-        if !in_params {
-            self.last_signature_cursor = None;
-            return;
-        }
-        if self.last_signature_cursor == Some(cursor) {
-            return;
-        }
         self.last_signature_cursor = Some(cursor);
-        let _ = text_len;
+        // 请求代号：慢响应回来时如果光标已经移动/发了新请求，直接丢弃，
+        // 避免旧签名覆盖新签名。
+        self.signature_request_generation = self.signature_request_generation.wrapping_add(1);
+        let generation = self.signature_request_generation;
+        let was_active = self.signature_help_active;
 
         let position = editor.read(cx).lsp_cursor_position();
-        cx.spawn(async move |_this, cx| {
-            let Ok(Some(help)) = client.signature_help(&uri, position).await else {
-                return;
-            };
-            let contents = crate::lsp::features::signature_text(&help);
-            if contents.trim().is_empty() {
-                return;
-            }
-            cx.update_entity(&editor, |state, cx| {
-                // 签名帮助复用 hover 浮层，所以走同一个构造：它同样要 markdown
-                // 解析（rust-analyzer 给的签名是 ```rust 代码块）与滚动句柄。
-                let contents = crate::editor::hover::HoverInfo::from_plain_text(contents, cx);
-                // 锚点用当前光标：签名帮助本来就是按光标位置请求的
-                // （见 `set_pending_hover` 的文档）。
-                let at = state.cursor();
-                state.set_pending_hover(contents, at);
-                cx.notify();
-            });
+        let trigger_char = match prev_char {
+            Some(c @ ('(' | ',')) => Some(c.to_string()),
+            _ => None,
+        };
+        let context = lsp_types::SignatureHelpContext {
+            trigger_kind: if trigger_char.is_some() {
+                lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER
+            } else {
+                lsp_types::SignatureHelpTriggerKind::CONTENT_CHANGE
+            },
+            trigger_character: trigger_char,
+            is_retrigger: was_active,
+            active_signature_help: None,
+        };
+
+        cx.spawn(async move |this, cx| {
+            let reply = client
+                .signature_help_with_context(&uri, position, Some(context))
+                .await;
+            this.update(cx, |this, cx| {
+                if this.signature_request_generation != generation {
+                    return;
+                }
+                let Some(active) = this.active_text_editor(cx) else {
+                    return;
+                };
+                if active.entity_id() != editor.entity_id() {
+                    return;
+                }
+
+                // `editor.update` 里拿不到 `this` 的可变借用（`this` 已经
+                // 被本闭包借用），所以先把结果算成一个局部状态，回到外层
+                // 再写 Editor 字段。
+                let outcome = editor.update(cx, |state, cx| {
+                    if state.cursor() != cursor || !signature_trigger_for(state.text(), cursor) {
+                        return None;
+                    }
+                    match reply {
+                        Ok(Some(help)) => {
+                            let contents = crate::lsp::features::signature_text(&help);
+                            if contents.trim().is_empty() {
+                                return None;
+                            }
+                            let contents =
+                                crate::editor::hover::HoverInfo::from_plain_text(contents, cx);
+                            state.set_pending_hover(contents, cursor);
+                            Some(true)
+                        }
+                        // 服务器没有签名或请求失败：清掉自己那张卡，避免
+                        // 已经离开调用点时还显示旧签名。
+                        _ => {
+                            if was_active {
+                                state.clear_hover_popover();
+                            }
+                            Some(false)
+                        }
+                    }
+                });
+
+                match outcome {
+                    Some(true) => {
+                        this.signature_help_active = true;
+                        this.signature_hover_anchor = Some(cursor);
+                        cx.notify();
+                    }
+                    Some(false) => {
+                        this.signature_help_active = false;
+                        this.signature_hover_anchor = None;
+                        cx.notify();
+                    }
+                    None => {}
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -2670,7 +2979,7 @@ impl Editor {
         if self.last_inlay_range.as_ref() == Some(&range) {
             return;
         }
-        self.last_inlay_range = Some(range.clone());
+        self.last_inlay_range = Some(range);
 
         cx.spawn(async move |_this, cx| {
             let Ok(hints) = client.inlay_hints(&uri, range).await else {
@@ -2953,10 +3262,10 @@ impl Editor {
         let Some(tab_id) = self.active_file_id.clone() else {
             return;
         };
-        if let Some(file) = self.open_files.iter().find(|f| f.id == tab_id) {
-            if file.image.is_some() || file.diff.is_some() {
-                return;
-            }
+        if let Some(file) = self.open_files.iter().find(|f| f.id == tab_id)
+            && (file.image.is_some() || file.diff.is_some())
+        {
+            return;
         }
 
         // 点开菜单是「用户正在等一个答案」的时刻，而候选链很可能还没探过
@@ -2972,10 +3281,10 @@ impl Editor {
                 .unwrap_or_default();
             (language, f.ssh_config.clone())
         });
-        if let Some((language, ssh_config)) = active {
-            if !language.is_empty() {
-                self.warm_lsp_chain(&language, ssh_config.as_ref(), true, cx);
-            }
+        if let Some((language, ssh_config)) = active
+            && !language.is_empty()
+        {
+            self.warm_lsp_chain(&language, ssh_config.as_ref(), true, cx);
         }
 
         let Some(snapshot) = self.active_lsp_snapshot(cx) else {
@@ -3297,15 +3606,23 @@ impl Editor {
     /// 共享 client 并发 N+1 次 `shutdown`——每个克隆都可能在别人 `take()`
     /// 之前看到「进程还在」，于是各发一遍 `shutdown`/`exit` 并各等到超时。
     /// 这里只摘掉编辑器手里的 client 并发 `didClose`，不再重复关进程。
-    fn stop_sessions_for_key(&mut self, key: &crate::lsp::project::ServerKey, cx: &App) {
+    fn stop_sessions_for_key(
+        &mut self,
+        key: &crate::lsp::project::ServerKey,
+        cx: &mut Context<Self>,
+    ) {
         for tab_id in self.tabs_for_server_key(key, cx) {
             let Some(idx) = self.open_files.iter().position(|f| f.id.as_ref() == tab_id) else {
                 continue;
             };
+            let editor = self.open_files[idx].editor_state.clone();
             if let Some(session) = self.open_files[idx].lsp.as_mut() {
                 log::debug!("lsp: closing session for {} ({})", tab_id, key.language);
                 session.close();
             }
+            // 服务器停了，它上一次发布的诊断已经没有任何来源可以更新。
+            // 留着会让用户继续看到旧错误，且版本门控还停在旧会话上。
+            editor.update(cx, |state, _| state.reset_lsp_diagnostics());
         }
     }
 
@@ -3720,6 +4037,68 @@ impl Editor {
         });
         self.switch_to_file(tab_id, cx);
         self.focus_editor_tab(tab_id, window, cx);
+    }
+
+    /// LSP 位置跳转：按 UTF-16 列精确换算字节 offset。
+    ///
+    /// 不能复用 [`Self::jump_to_line_col`]：那条路径给终端 Cmd+Click 用，
+    /// 列按 Unicode `char` 计数；LSP 的 `character` 是 UTF-16 code unit。
+    /// 目标行在落点之前有 emoji（非 BMP）时，两者会差出若干列。
+    fn jump_to_lsp_position(
+        &mut self,
+        tab_id: &str,
+        position: lsp_types::Position,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == tab_id) else {
+            return;
+        };
+        // 图片/二进制预览没有文本行概念：只切换、不跳转。
+        if crate::editor::image_viewer::is_image_file(Path::new(&file.path)) {
+            self.switch_to_file(tab_id, cx);
+            return;
+        }
+        if file.is_loading {
+            // 内容还没到，拿不到 rope；保留原始 LSP Position，加载完成后换算。
+            self.pending_lsp_jumps.insert(tab_id.to_string(), position);
+            self.switch_to_file(tab_id, cx);
+            return;
+        }
+        let editor_state = file.editor_state.clone();
+        editor_state.update(cx, |state, cx| {
+            let offset = crate::lsp::features::position_to_offset(state.text(), position);
+            let offset = offset.min(state.text().len());
+            state.selected_range = (offset..offset).into();
+            state.scroll_to_center(offset, cx);
+            cx.notify();
+        });
+        self.switch_to_file(tab_id, cx);
+        self.focus_editor_tab(tab_id, window, cx);
+    }
+
+    /// 按路径与后端（本地/远端主机）找一个已打开的标签。
+    ///
+    /// LSP 跳转打开目标文件后，标签 id 由打开路径与远端归属共同决定；直接
+    /// 用 path 猜 id 会在远端或已打开标签上失效。这里按实际字段匹配。
+    fn find_open_tab_by_path(
+        &self,
+        path: &str,
+        ssh: Option<&SshConnectionConfig>,
+    ) -> Option<String> {
+        self.open_files
+            .iter()
+            .find(|f| {
+                f.path == path
+                    && match (&f.ssh_config, ssh) {
+                        (None, None) => true,
+                        (Some(a), Some(b)) => {
+                            a.host == b.host && a.port == b.port && a.username == b.username
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|f| f.id.to_string())
     }
 
     /// 把键盘焦点交给这个标签的编辑器。
@@ -4165,9 +4544,14 @@ impl Editor {
                                 // 后台计算 Git 行变更标记（行号区色条）
                                 this.refresh_git_marks(&tab_id, cx);
                             }
-                            // Terminal Cmd+Click deferred jump: content just
-                            // arrived, apply line:col now (clamped to total).
-                            if let Some((line, col)) = this.take_pending_jump(&tab_id) {
+                            // LSP deferred jump: the target text is available
+                            // now, so the UTF-16 LSP position can be converted
+                            // to an exact byte offset.
+                            if let Some(position) = this.pending_lsp_jumps.remove(&tab_id) {
+                                this.jump_to_lsp_position(&tab_id, position, window, cx);
+                            } else if let Some((line, col)) = this.take_pending_jump(&tab_id) {
+                                // Terminal Cmd+Click deferred jump: content just
+                                // arrived, apply line:col now (clamped to total).
                                 this.jump_to_line_col(&tab_id, line, col, window, cx);
                             }
                             // 加载完成才有内容：此时才接语言服务器（didOpen
@@ -4645,8 +5029,9 @@ impl Editor {
                                 return;
                             }
                             this.loading_gens.remove(&tab_id);
-                            // 图片没有行列概念：丢弃可能残留的 Cmd+Click pending 跳转。
+                            // 图片没有行列概念：丢弃可能残留的跳转。
                             this.pending_jumps.remove(&tab_id);
+                            this.pending_lsp_jumps.remove(&tab_id);
                             if let Some(file) = this.open_files.iter_mut().find(|f| f.id == tab_id)
                             {
                                 file.is_loading = false;
@@ -4956,7 +5341,15 @@ impl Editor {
             && path.extension().and_then(|e| e.to_str()) == Some("md");
         let markdown = if is_markdown {
             let content_clone = content.clone();
-            Some(cx.new(|cx| crate::editor::markdown::Markdown::new(content_clone, cx)))
+            // 相对图片路径以文档所在目录为基准。
+            let md_doc_dir = if ssh_config.is_none() {
+                path.parent().map(std::path::Path::to_path_buf)
+            } else {
+                None
+            };
+            Some(cx.new(|cx| {
+                crate::editor::markdown::Markdown::new_with_dir(content_clone, md_doc_dir, cx)
+            }))
         } else {
             None
         };
@@ -5123,42 +5516,36 @@ impl Editor {
         // 那时若仍没有根，`root_for` 退回路径本身的目录（与之前行为一致）。
         //
         // 已经带着根来的（`jump_root`）不在这条路上：既不用探，也就不会挂起。
-        if jump_root.is_none() {
-            if let Some(ssh) = ssh_config.as_ref() {
-                if !crate::lsp::project::remote_root_is_known(ssh, &self.open_files[idx].path) {
-                    // 已经有一次探测在飞：等它落地后由那边的回调重走本函数。
-                    // **不能落到下面的 `connect`**——那里的 `key_for_file` 会在
-                    // UI 线程上做同一趟同步往返，正是这条挂起逻辑要避免的。
-                    if self.pending_root_attach.iter().any(|t| t == tab_id) {
-                        return;
-                    }
-                    self.pending_root_attach.push(tab_id.to_string());
-                    let path_for_probe = self.open_files[idx].path.clone();
-                    let ssh_for_probe = ssh.clone();
-                    let tab = tab_id.to_string();
-                    log::debug!(
-                        "lsp(remote): deferring attach for {tab} until project root is known"
-                    );
-                    cx.spawn(async move |this, cx| {
-                        cx.background_spawn(async move {
-                            crate::lsp::project::remote_project_root(
-                                &ssh_for_probe,
-                                &path_for_probe,
-                            );
-                        })
-                        .await;
-                        let Some(entity) = this.upgrade() else {
-                            return;
-                        };
-                        entity.update(cx, |editor, cx| {
-                            editor.pending_root_attach.retain(|t| t != &tab);
-                            editor.start_lsp_for_tab(&tab, cx);
-                        });
-                    })
-                    .detach();
-                    return;
-                }
+        if jump_root.is_none()
+            && let Some(ssh) = ssh_config.as_ref()
+            && !crate::lsp::project::remote_root_is_known(ssh, &self.open_files[idx].path)
+        {
+            // 已经有一次探测在飞：等它落地后由那边的回调重走本函数。
+            // **不能落到下面的 `connect`**——那里的 `key_for_file` 会在
+            // UI 线程上做同一趟同步往返，正是这条挂起逻辑要避免的。
+            if self.pending_root_attach.iter().any(|t| t == tab_id) {
+                return;
             }
+            self.pending_root_attach.push(tab_id.to_string());
+            let path_for_probe = self.open_files[idx].path.clone();
+            let ssh_for_probe = ssh.clone();
+            let tab = tab_id.to_string();
+            log::debug!("lsp(remote): deferring attach for {tab} until project root is known");
+            cx.spawn(async move |this, cx| {
+                cx.background_spawn(async move {
+                    crate::lsp::project::remote_project_root(&ssh_for_probe, &path_for_probe);
+                })
+                .await;
+                let Some(entity) = this.upgrade() else {
+                    return;
+                };
+                entity.update(cx, |editor, cx| {
+                    editor.pending_root_attach.retain(|t| t != &tab);
+                    editor.start_lsp_for_tab(&tab, cx);
+                });
+            })
+            .detach();
+            return;
         }
         // 记下路径：跨文件跳转时用它判断「是不是同一个文件」。
         self.open_files[idx].editor_state.update(cx, |state, _| {
@@ -5264,6 +5651,9 @@ impl Editor {
                 };
                 log::debug!("lsp: didOpen {file_path} ({} bytes)", text.len());
                 session.on_connected(client, &text);
+                // 新会话的版本从 0 重新开始：清掉旧会话的诊断与版本门控，
+                // 否则旧 applied version 会把新服务器的诊断全判为过期。
+                editor.update(cx, |state, _| state.reset_lsp_diagnostics());
                 // 诊断监听要在会话拿到 client 之后建。
                 session.spawn_diagnostic_listener(&editor, cx);
                 // 握手完成 → 就绪。若服务器随后开始索引，它会用
@@ -5421,10 +5811,10 @@ impl Editor {
     pub fn refresh_diff_for_path(&mut self, path: &str, cx: &mut Context<Self>) {
         let suffix = format!("/{path}");
         for file in self.open_files.iter() {
-            if let Some(view) = file.diff.clone() {
-                if file.path == path || file.id.as_ref().ends_with(suffix.as_str()) {
-                    view.update(cx, |v, cx| v.refresh(cx));
-                }
+            if let Some(view) = file.diff.clone()
+                && (file.path == path || file.id.as_ref().ends_with(suffix.as_str()))
+            {
+                view.update(cx, |v, cx| v.refresh(cx));
             }
         }
     }
@@ -5747,6 +6137,7 @@ impl Editor {
     fn close_file_direct(&mut self, id: &str, cx: &mut Context<Self>) {
         self.loading_gens.remove(id);
         self.pending_jumps.remove(id);
+        self.pending_lsp_jumps.remove(id);
         self.editor_state_subscriptions.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
@@ -5930,18 +6321,18 @@ impl Editor {
             .open_files
             .iter()
             .position(|f| f.id.as_ref() == dragged_id);
-        if let Some(from) = from_index {
-            if from != to_index {
-                let file = self.open_files.remove(from);
-                let insert_idx = if to_index > from {
-                    to_index.saturating_sub(1)
-                } else {
-                    to_index
-                };
-                let capped = insert_idx.min(self.open_files.len());
-                self.open_files.insert(capped, file);
-                cx.notify();
-            }
+        if let Some(from) = from_index
+            && from != to_index
+        {
+            let file = self.open_files.remove(from);
+            let insert_idx = if to_index > from {
+                to_index.saturating_sub(1)
+            } else {
+                to_index
+            };
+            let capped = insert_idx.min(self.open_files.len());
+            self.open_files.insert(capped, file);
+            cx.notify();
         }
     }
 
@@ -6254,6 +6645,10 @@ impl Render for Editor {
                                                 return;
                                             };
                                             let client = this.active_lsp_client(cx);
+                                            // 鼠标 hover 显示的是注释卡；此后
+                                            // 签名帮助不能再把它当作自己的卡片。
+                                            this.signature_help_active = false;
+                                            this.signature_hover_anchor = None;
                                             this.hover
                                                 .on_mouse_moved(offset, &editor, client, uri, cx);
                                             cx.notify();
@@ -6776,10 +7171,10 @@ fn atomic_write_local(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(e);
     }
 
-    if let Some(dir) = parent {
-        if let Ok(f) = std::fs::File::open(dir) {
-            let _ = f.sync_all();
-        }
+    if let Some(dir) = parent
+        && let Ok(f) = std::fs::File::open(dir)
+    {
+        let _ = f.sync_all();
     }
     Ok(())
 }
@@ -7076,9 +7471,12 @@ pub(crate) fn lsp_jump_root_key(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LspJumpAction {
     /// 目标就是当前文件：原地跳。
-    JumpInPlace { line: u32, col: u32 },
+    JumpInPlace { position: lsp_types::Position },
     /// 目标在别的文件（或尚未打开）：打开它并定位。
-    OpenFile { path: PathBuf, line: u32, col: u32 },
+    OpenFile {
+        path: PathBuf,
+        position: lsp_types::Position,
+    },
     /// 无法处理（非 `file://` uri）。
     Ignore,
 }
@@ -7092,25 +7490,20 @@ pub(crate) enum LspJumpAction {
 /// 之所以抽成纯函数：跨文件跳转的失败模式（旧实现直接 return）在真实
 /// 绘制/文件系统环境里很难断言，而这个决策本身就是唯一的分支点。
 ///
-/// 行号 +1：LSP 是 0 基，编辑器内部 `jump_to_line_col` 收 1 基。
+/// 位置保留 LSP 原始的 0 基 `Position`：它的 `character` 是 UTF-16 code
+/// unit，不能直接交给按 Unicode char 计列的 `jump_to_line_col`。真正的
+/// 字节 offset 在目标文本可用后由 `position_to_offset` 换算。
 pub(crate) fn lsp_location_action(
     location: &lsp_types::Location,
     same_file: bool,
 ) -> LspJumpAction {
-    // LSP 是 **0 基**行/列；`jump_to_line_col` 收 **1 基**（终端 Cmd+Click
-    // 传的是编译器输出的 `line:col`，那是 1 基）。
-    //
-    // 这里两个都要 +1。此前只把行 +1、列原样传下去，于是光标总是落在目标
-    // 列**左边一格**——用户看到的现象就是「文件开了，但没跳到函数上」
-    // （列偏一格通常落在空格或前一个字符上）。
-    let line = location.range.start.line + 1;
-    let col = location.range.start.character + 1;
+    let position = location.range.start;
 
     if same_file {
-        return LspJumpAction::JumpInPlace { line, col };
+        return LspJumpAction::JumpInPlace { position };
     }
     match crate::lsp::client::uri_to_path(&location.uri) {
-        Some(path) => LspJumpAction::OpenFile { path, line, col },
+        Some(path) => LspJumpAction::OpenFile { path, position },
         None => LspJumpAction::Ignore,
     }
 }
@@ -8353,5 +8746,27 @@ mod lsp_signature_tests {
         let t = Rope::from("中文abc");
         assert!(!signature_trigger_for(&t, 1));
         assert!(!signature_trigger_for(&t, 2));
+    }
+
+    /// 回归：`Rope::char` 收的是**字节下标**，把 char 下标直接喂进去会在
+    /// 中文/emoji 内部 panic。签名帮助每次请求都会取「光标前一个字符」。
+    #[test]
+    fn char_before_handles_multibyte_text() {
+        use super::char_before;
+
+        let t = Rope::from("中文abc");
+        assert_eq!(char_before(&t, 0), None);
+        assert_eq!(char_before(&t, 3), Some('中'));
+        assert_eq!(char_before(&t, 6), Some('文'));
+        assert_eq!(char_before(&t, 7), Some('a'));
+        // 落在多字节字符内部：向左吸附后取前一个字符（1 → 0，无前字符）。
+        assert_eq!(char_before(&t, 1), None);
+        assert_eq!(char_before(&t, 4), Some('中'));
+        // 越界钳制到末尾。
+        assert_eq!(char_before(&t, 999), Some('c'));
+
+        let e = Rope::from("a🎉");
+        assert_eq!(char_before(&e, e.len()), Some('🎉'));
+        assert_eq!(char_before(&e, 3), Some('a'));
     }
 }

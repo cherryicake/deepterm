@@ -1204,6 +1204,78 @@ mod tests {
     }
 
     /// 残尾超限（无终止符的 `ESC ]`）必须放弃拼接、原样透传，不能无限占内存。
+    /// 回归：**协议分片 + 跨读边界**同时出现时，APC 不能被吞掉。
+    ///
+    /// 复现自 `local_pty` 的 grok 分片用例：PTY 的 read 大小（实测 4095）
+    /// 与 printf 的分片大小（4096 + 头尾）不对齐，`scan` 每次都要把
+    /// `pending` 和半截 APC 拼起来。若残尾处理有偏差，整条流会被当成
+    /// 一个巨大 APC 消费掉，既不进 vte 也进不了存储。
+    #[test]
+    fn chunked_protocol_across_read_boundaries_survives() {
+        let storage = shared_storage();
+        let mut scanner = KittyGraphicsScanner::with_storage(
+            storage.clone(),
+            true,
+            Box::new(CollectingSink::default()),
+        );
+
+        // 需要多分片：随机像素压不动，PNG 才够大。
+        let mut rgba = Vec::with_capacity(120 * 90 * 4);
+        let mut lcg: u32 = 0x9E37_79B9;
+        for _ in 0..120 * 90 {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = (lcg >> 24) as u8;
+            rgba.extend_from_slice(&[v, v.wrapping_mul(3), v.wrapping_mul(7), 255]);
+        }
+        let img = image::RgbaImage::from_raw(120, 90, rgba).unwrap();
+        let mut png = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let b64 = crate::terminal::kitty::command::encode_base64(&png);
+        let chunks: Vec<&str> = b64
+            .as_bytes()
+            .chunks(4096)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"\x1b[7;10H");
+        for (i, chunk) in chunks.iter().enumerate() {
+            let m = usize::from(i + 1 < chunks.len());
+            if i == 0 {
+                stream.extend_from_slice(
+                    format!("\x1b_Ga=T,f=100,t=d,q=2,C=1,z=1,i=1,p=1,c=12,r=6,m={m};{chunk}\x1b\\")
+                        .as_bytes(),
+                );
+            } else {
+                stream.extend_from_slice(format!("\x1b_Gq=2,m={m};{chunk}\x1b\\").as_bytes());
+            }
+        }
+        stream.extend_from_slice(b"SENTINEL");
+
+        let mut pending = Vec::new();
+        let mut emitted = Vec::new();
+        for slice in stream.chunks(4095) {
+            scanner.scan(
+                slice,
+                &mut pending,
+                &mut |bytes| emitted.extend_from_slice(bytes),
+                &mut grid_state_fixture,
+            );
+        }
+        assert!(pending.is_empty(), "最终不应有残尾：{}", pending.len());
+        assert!(
+            storage.lock().unwrap().get(1).is_some(),
+            "分片图必须传完；emitted={}",
+            emitted.len()
+        );
+        let tail = String::from_utf8_lossy(&emitted);
+        assert!(
+            tail.contains("SENTINEL"),
+            "SENTINEL 必须透传到 vte：{tail:?}"
+        );
+    }
+
     #[test]
     fn oversized_osc_residue_is_flushed() {
         let (mut scanner, _collected, _cursors) = scanner_with_osc_collector();

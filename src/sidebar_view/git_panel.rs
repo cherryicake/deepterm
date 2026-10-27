@@ -243,7 +243,7 @@ impl GitPanel {
         if let Some(editor) = self.commit_editor.clone() {
             let want = self.commit_placeholder();
             if editor.read(cx).placeholder.as_ref() != want.as_str() {
-                let _ = cx.update_entity(&editor, |s, cx| {
+                cx.update_entity(&editor, |s, cx| {
                     s.set_placeholder(want, window, cx);
                 });
             }
@@ -453,14 +453,13 @@ impl GitPanel {
                         // 都报 `No such file`。代际已在上方校验，fs 与 workspace
                         // 路径取当前值即为本次代际的；离开工作区时由
                         // `set_workspace_path` 的 unwatch 分支统一释放。
-                        if !this.is_local {
-                            if let (Some(fs), Some(root)) =
+                        if !this.is_local
+                            && let (Some(fs), Some(root)) =
                                 (this.filesystem.clone(), this.workspace_path.clone())
-                            {
-                                for git_path in [root.join(".git/index"), root.join(".git/HEAD")] {
-                                    cx.watch_remote_path(&git_path, fs.clone());
-                                    this.remote_git_watched.push(git_path);
-                                }
+                        {
+                            for git_path in [root.join(".git/index"), root.join(".git/HEAD")] {
+                                cx.watch_remote_path(&git_path, fs.clone());
+                                this.remote_git_watched.push(git_path);
                             }
                         }
                         this.refresh(cx);
@@ -874,7 +873,7 @@ impl GitPanel {
             return;
         }
         if entry.status.is_untracked() {
-            self.delete_untracked_files(&[entry.path.clone()], window, cx);
+            self.delete_untracked_files(std::slice::from_ref(&entry.path), window, cx);
             return;
         }
 
@@ -2244,7 +2243,7 @@ impl Render for GitPanel {
         if let Some(editor) = self.commit_editor.clone() {
             let want = self.commit_placeholder();
             if editor.read(cx).placeholder.as_ref() != want.as_str() {
-                let _ = cx.update_entity(&editor, |s, cx| {
+                cx.update_entity(&editor, |s, cx| {
                     s.set_placeholder(want, window, cx);
                 });
             }

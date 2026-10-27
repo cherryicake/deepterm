@@ -878,25 +878,24 @@ impl BuiltinCommandManager {
         let cursor = state.cursor();
 
         // `/scp` 走独立分支：补全项自带 `replacement`（可能含 host 前缀）
-        if is_scp_command(&current_input) {
-            if let Some(replacement) = selected.replacement.clone() {
-                if let Some(query) = scp_completion::analyse_at(&current_input, cursor) {
-                    let mut next = String::with_capacity(current_input.len() + replacement.len());
-                    next.push_str(&current_input[..query.token_start]);
-                    next.push_str(&replacement);
-                    next.push_str(&current_input[query.token_end..]);
-                    // 光标落到替换串末尾（保持在被补全的 token 上，便于继续展开目录）
-                    let new_cursor = query.token_start + replacement.len();
-                    state.set_buffer_with_cursor(next, new_cursor);
-                    self.path_selected_index = None;
-                    self.refresh_path_completions();
-                    // 选中目录后保持浮层可见，但不预选 —— 用户需主动按 ↑/↓/Tab 才能选中
-                    if selected.is_directory {
-                        self.overlay = OverlayState::Visible;
-                    }
-                    return;
-                }
+        if is_scp_command(&current_input)
+            && let Some(replacement) = selected.replacement.clone()
+            && let Some(query) = scp_completion::analyse_at(&current_input, cursor)
+        {
+            let mut next = String::with_capacity(current_input.len() + replacement.len());
+            next.push_str(&current_input[..query.token_start]);
+            next.push_str(&replacement);
+            next.push_str(&current_input[query.token_end..]);
+            // 光标落到替换串末尾（保持在被补全的 token 上，便于继续展开目录）
+            let new_cursor = query.token_start + replacement.len();
+            state.set_buffer_with_cursor(next, new_cursor);
+            self.path_selected_index = None;
+            self.refresh_path_completions();
+            // 选中目录后保持浮层可见，但不预选 —— 用户需主动按 ↑/↓/Tab 才能选中
+            if selected.is_directory {
+                self.overlay = OverlayState::Visible;
             }
+            return;
         }
 
         // 通用命令：替换光标所在的参数 token（而非整行末尾）。

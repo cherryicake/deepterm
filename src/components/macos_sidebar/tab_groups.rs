@@ -752,17 +752,10 @@ impl MacosSidebar {
                                         cx,
                                     );
                                 }
-                            } else if event.click_count() == 1 {
-                                if let Some(ref callback) = on_tab_single_click {
-                                    callback(
-                                        &click_group_id,
-                                        &tab_id,
-                                        &tab_label,
-                                        this,
-                                        window,
-                                        cx,
-                                    );
-                                }
+                            } else if event.click_count() == 1
+                                && let Some(ref callback) = on_tab_single_click
+                            {
+                                callback(&click_group_id, &tab_id, &tab_label, this, window, cx);
                             }
                         }),
                     )

@@ -921,10 +921,10 @@ impl HostView {
                         if let Some(ref f) = on_select {
                             f(&id, window, cx);
                         }
-                    } else if let Some(ref config) = host_config {
-                        if let Some(ref f) = on_connect {
-                            f(config, window, cx);
-                        }
+                    } else if let Some(ref config) = host_config
+                        && let Some(ref f) = on_connect
+                    {
+                        f(config, window, cx);
                     }
                 }
             }))
@@ -1334,12 +1334,11 @@ impl Render for HostView {
                         .context_menu_host_id
                         .clone()
                         .or_else(|| this.selected_ids.iter().next().cloned());
-                    if let Some(id) = host_id {
-                        if let Some(config) =
+                    if let Some(id) = host_id
+                        && let Some(config) =
                             configs_rc.iter().find(|c| c.id() == id.as_ref()).cloned()
-                        {
-                            this.open_edit_modal(&config, window, cx);
-                        }
+                    {
+                        this.open_edit_modal(&config, window, cx);
                     }
                 }
             }))
@@ -1350,10 +1349,10 @@ impl Render for HostView {
                         .context_menu_host_id
                         .clone()
                         .or_else(|| this.selected_ids.iter().next().cloned());
-                    if let Some(id) = host_id {
-                        if let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref()) {
-                            cx.write_to_clipboard(ClipboardItem::new_string(config.host.clone()));
-                        }
+                    if let Some(id) = host_id
+                        && let Some(config) = configs_rc.iter().find(|c| c.id() == id.as_ref())
+                    {
+                        cx.write_to_clipboard(ClipboardItem::new_string(config.host.clone()));
                     }
                 }
             }))
@@ -1395,20 +1394,20 @@ impl Render for HostView {
                     cx,
                 );
                 cx.spawn(async move |_, cx| {
-                    if let Ok(0) = answer.await {
-                        if let Some(entity) = weak.upgrade() {
-                            entity.update(cx, |this, cx| {
-                                if let Ok(mut global) = SshGlobalConfig::load_or_create() {
-                                    for id in &ids_to_delete {
-                                        global.remove_connection(id);
-                                    }
-                                    let _ = global.save();
+                    if let Ok(0) = answer.await
+                        && let Some(entity) = weak.upgrade()
+                    {
+                        entity.update(cx, |this, cx| {
+                            if let Ok(mut global) = SshGlobalConfig::load_or_create() {
+                                for id in &ids_to_delete {
+                                    global.remove_connection(id);
                                 }
-                                this.selected_ids.clear();
-                                this.context_menu_host_id = None;
-                                cx.notify();
-                            });
-                        }
+                                let _ = global.save();
+                            }
+                            this.selected_ids.clear();
+                            this.context_menu_host_id = None;
+                            cx.notify();
+                        });
                     }
                 })
                 .detach();

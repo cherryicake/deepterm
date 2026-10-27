@@ -341,6 +341,12 @@ pub struct Markdown {
     pub(crate) selection: MarkdownSelection,
     /// fragment_id -> text, populated lazily during render for copy. Wrapped in Rc<RefCell> so builder can write without Entity borrow during render.
     pub(crate) fragment_texts: Rc<RefCell<std::collections::HashMap<usize, String>>>,
+    /// 文档级图片缓存：后台加载 + 按解析后的身份缓存位图（见 [`md_image`]）。
+    pub(crate) image_cache: Entity<crate::editor::md_image::ImageCache>,
+    /// 文档所在目录：相对图片路径以它为基准（`None` = 进程工作目录）。
+    pub(crate) doc_dir: Option<std::path::PathBuf>,
+    /// 图片加载完成后由 `image_cache` 触发重绘，订阅必须持有。
+    _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl Markdown {
@@ -357,8 +363,20 @@ impl Markdown {
     }
 
     pub fn new(source: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
+        Self::new_with_dir(source, None, cx)
+    }
+
+    /// 与 [`Self::new`] 相同，但带上文档所在目录：`![](assets/a.png)` 这类
+    /// 相对引用以 `doc_dir` 为基准解析（不传则退回进程工作目录）。
+    pub fn new_with_dir(
+        source: impl Into<SharedString>,
+        doc_dir: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let source = source.into();
         let focus_handle = cx.focus_handle();
+        let image_cache = cx.new(|_| crate::editor::md_image::ImageCache::new());
+        let _subscriptions = vec![cx.observe(&image_cache, |_, _, cx| cx.notify())];
         let mut this = Self {
             source: SharedString::default(),
             events: Vec::new(),
@@ -369,6 +387,9 @@ impl Markdown {
             list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             selection: MarkdownSelection::default(),
             fragment_texts: Default::default(),
+            image_cache,
+            doc_dir,
+            _subscriptions,
         };
         this.set_text(source, cx);
         this
@@ -384,6 +405,9 @@ impl Markdown {
         self.highlight_cache.borrow_mut().clear();
         self.selection.clear();
         self.fragment_texts.borrow_mut().clear();
+        // 上一份文档的位图（含远程下载结果）不应继续驻留：键空间是「本文档
+        // 出现过的每个 URL」，不清则会随切文档/外部重载只增不减。
+        self.image_cache.update(cx, |cache, cx| cache.clear(cx));
         self.parse();
         cx.notify();
     }
@@ -635,18 +659,28 @@ impl Markdown {
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
-        let (copied, events, highlight_cache) = markdown.update(cx, |markdown, _cx| {
-            let range = markdown.item_ranges[ix].clone();
-            (
-                markdown.copied_code_blocks.clone(),
-                markdown.events[range].to_vec(),
-                markdown.highlight_cache.clone(),
-            )
-        });
+        let (copied, events, highlight_cache, image_cache, doc_dir) =
+            markdown.update(cx, |markdown, _cx| {
+                let range = markdown.item_ranges[ix].clone();
+                (
+                    markdown.copied_code_blocks.clone(),
+                    markdown.events[range].to_vec(),
+                    markdown.highlight_cache.clone(),
+                    markdown.image_cache.clone(),
+                    markdown.doc_dir.clone(),
+                )
+            });
 
-        let elements =
-            MarkdownElementBuilder::new_with_item(style, copied, markdown, highlight_cache, ix)
-                .build(&events, cx);
+        let elements = MarkdownElementBuilder::new_with_item(
+            style,
+            copied,
+            markdown,
+            highlight_cache,
+            ix,
+            image_cache,
+            doc_dir,
+        )
+        .build(&events, cx);
 
         div().w_full().children(elements).into_any_element()
     }

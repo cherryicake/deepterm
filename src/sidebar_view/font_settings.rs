@@ -126,10 +126,10 @@ fn get_system_monospace_font() -> &'static str {
 
     static SYSTEM_MONO_FONT: OnceLock<String> = OnceLock::new();
     SYSTEM_MONO_FONT.get_or_init(|| {
-        if let Some(fc) = Fontconfig::new() {
-            if let Some(font) = fc.find("monospace", None) {
-                return font.name;
-            }
+        if let Some(fc) = Fontconfig::new()
+            && let Some(font) = fc.find("monospace", None)
+        {
+            return font.name;
         }
         "DejaVu Sans Mono".to_string()
     })

@@ -457,16 +457,17 @@ pub fn match_hosts_by_prefix<'a>(
 
     // 1) nickname 子串
     for cfg in saved {
-        if let Some(nick) = cfg.nickname.as_deref() {
-            if nick.to_lowercase().contains(&prefix_lc) && pushed_ids.insert(cfg.id()) {
-                out.push(ScpHostSuggestion {
-                    config: Some(cfg),
-                    display: nick.to_string(),
-                    replacement: cfg.host_label(),
-                    kind: HostSuggestionKind::Nickname,
-                    icon: icon_for_config(cfg),
-                });
-            }
+        if let Some(nick) = cfg.nickname.as_deref()
+            && nick.to_lowercase().contains(&prefix_lc)
+            && pushed_ids.insert(cfg.id())
+        {
+            out.push(ScpHostSuggestion {
+                config: Some(cfg),
+                display: nick.to_string(),
+                replacement: cfg.host_label(),
+                kind: HostSuggestionKind::Nickname,
+                icon: icon_for_config(cfg),
+            });
         }
     }
 

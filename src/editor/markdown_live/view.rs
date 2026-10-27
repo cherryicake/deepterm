@@ -38,9 +38,7 @@ use crate::editor::markdown_live::element::{
     runs_for_row,
 };
 use crate::editor::markdown_live::highlight::HighlightCache;
-use crate::editor::markdown_live::images::{
-    MAX_IMAGE_BYTES, assets_dir, format_extension, is_image_file, unique_file_name,
-};
+use crate::editor::markdown_live::images::{assets_dir, format_extension, unique_file_name};
 use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::interactions::{
     OrderedCounter, SLASH_COMMANDS, backspace_marker, cell_content_cols, classify_alone,
@@ -63,6 +61,7 @@ use crate::editor::markdown_live::reveal::{
 use crate::editor::markdown_live::scrollbar::{
     BAR_THICKNESS, ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
 };
+use crate::editor::md_image::{MAX_IMAGE_BYTES, is_supported_extension};
 use crate::theme::ActiveTheme;
 use ropey::Rope;
 
@@ -266,11 +265,10 @@ pub struct LiveMarkdownView {
     /// 已发出的 `Change` 对应的 `text_version`：`edit` 不再直接发射，
     /// 统一由 `after_edit`/`set_text` 按版本去重后发射，避免每键两次同步。
     emitted_version: u64,
-    /// 本地图片缓存：`url → 加载状态`。此前每个图片行的卡片在 render 里
-    /// **同步**做 `fs::metadata` + `fs::read` + 解码 + 字节哈希，每帧每张
-    /// 可见图都重来一遍（代码里原本就留了 TODO）。改为后台加载 + 缓存：
-    /// 首帧占位，加载完 notify 重绘；文件 mtime/大小变化时自动失效。
-    image_cache: HashMap<String, ImageSlot>,
+    /// 文档级图片缓存（本地/远程解析 + 后台加载），与只读预览共用同一实现
+    /// （`crate::editor::md_image::ImageCache`）。渲染路径只查缓存，首帧占位，
+    /// 加载完 notify 重绘；本地文件 mtime/大小变化时自动失效。
+    image_cache: Entity<crate::editor::md_image::ImageCache>,
     /// IME 组字区间（**字节**偏移，非 UTF-16）：组字期间文本恒等于该区间，
     /// 平台按 UTF-16 查询时经 [`Self::byte_to_utf16`] 换算。`None` = 无组字。
     ime_marked_range: Option<std::ops::Range<usize>>,
@@ -291,7 +289,12 @@ impl LiveMarkdownView {
 
     pub fn with_text(text: &str, cx: &mut Context<Self>) -> Self {
         let blink = cx.new(|_| BlinkCursor::new());
-        let _subscriptions = vec![cx.observe(&blink, |_, _, cx| cx.notify())];
+        let image_cache = cx.new(|_| crate::editor::md_image::ImageCache::new());
+        let _subscriptions = vec![
+            cx.observe(&blink, |_, _, cx| cx.notify()),
+            // 图片在后台加载完成时由缓存实体 notify，这里转发成整视图重绘。
+            cx.observe(&image_cache, |_, _, cx| cx.notify()),
+        ];
         Self {
             buffer: LiveBuffer::new(text),
             focus: cx.focus_handle(),
@@ -377,7 +380,7 @@ impl LiveMarkdownView {
             virt_top_off: 0,
             stat_cache: None,
             emitted_version: 0,
-            image_cache: HashMap::new(),
+            image_cache,
             ime_marked_range: None,
             input_registered: false,
             #[cfg(test)]
@@ -433,16 +436,16 @@ impl LiveMarkdownView {
         self.wide_blocks.clear();
         self.mermaid.clear_block_state();
         self.h_scroll.clear();
-        // 同理：image_cache 以 URL 为键持有解码后的位图（`Arc<gpui::Image>`，
-        // 单张可达数 MB），键空间是「本文档出现过的每个 URL」——不清则每次
-        // set_text（切文档/外部重载）都往上一份文档的残留里再叠一份，
-        // 反复编辑长会话下只增不减。
+        // 同理：图片缓存以**解析后的身份**（绝对路径 / 远程 URL）为键持有解码后的
+        // 位图（`Arc<gpui::Image>`，单张可达数 MB），键空间是「本文档出现过的每个
+        // 图片」——不清则每次 set_text（切文档/外部重载）都往上一份文档的残留里
+        // 再叠一份，反复编辑长会话下只增不减。
         //
         // 代价是每次 set_text 后首帧要重新读盘 + 解码本文档的所有图片
         // （外部重载 / stale-while-revalidate 刷新都会触发 set_text）。
         // 只清「新文档里不再出现的 URL」不解决问题：重载时图片大多仍在，
         // 却因内容变化必须重解码；而真正的大头（上一个文档的残留）全都会被清掉。
-        self.image_cache.clear();
+        self.image_cache.update(cx, |cache, cx| cache.clear(cx));
         self.scroll_to_cursor = true;
         self.emitted_version = self.buffer.text_version();
         if let Some(panel) = self.search_panel.clone() {
@@ -576,7 +579,7 @@ impl LiveMarkdownView {
 
     /// 单个图片文件导入 assets（拖拽 / Finder 拷贝），返回引用名。
     fn import_image_file(&self, src: &Path) -> Option<String> {
-        if !is_image_file(src) {
+        if !is_supported_extension(src) {
             return None;
         }
         let ext = src.extension()?.to_str()?.to_ascii_lowercase();
@@ -624,7 +627,7 @@ impl LiveMarkdownView {
                 }
                 ClipboardEntry::ExternalPaths(paths) => {
                     for path in paths.paths() {
-                        if !is_image_file(path) {
+                        if !is_supported_extension(path) {
                             continue;
                         }
                         saw_image = true;
@@ -2267,10 +2270,10 @@ impl LiveMarkdownView {
                 None => {
                     // 表格首格：整表为空 → 删除整张表；否则原地消费。
                     use crate::editor::markdown_live::table_ops as t;
-                    if let Some(block) = t::table_block_range(&lines, cur.line) {
-                        if table_block_all_empty(&lines, block) {
-                            self.run_table_op(cx, t::delete_table);
-                        }
+                    if let Some(block) = t::table_block_range(&lines, cur.line)
+                        && table_block_all_empty(&lines, block)
+                    {
+                        self.run_table_op(cx, t::delete_table);
                     }
                     return true;
                 }
@@ -3368,7 +3371,6 @@ impl LiveMarkdownView {
                 });
                 self.clamp_cursor_off_table_pipe(cx);
                 self.after_move(cx);
-                return;
             }
             "right" => {
                 // spec #8/#14：Alt+→ 表格里整列右移；普通文本按词右移。
@@ -3395,7 +3397,6 @@ impl LiveMarkdownView {
                 });
                 self.clamp_cursor_off_table_pipe(cx);
                 self.after_move(cx);
-                return;
             }
             "up" => {
                 if platform {
@@ -3415,7 +3416,6 @@ impl LiveMarkdownView {
                 } else {
                     self.move_visual(false, shift, cx);
                 }
-                return;
             }
             "down" => {
                 if platform {
@@ -3435,7 +3435,6 @@ impl LiveMarkdownView {
                 } else {
                     self.move_visual(true, shift, cx);
                 }
-                return;
             }
             "home" => {
                 self.edit(cx, |m| {
@@ -3446,7 +3445,6 @@ impl LiveMarkdownView {
                     }
                 });
                 self.after_move(cx);
-                return;
             }
             "end" => {
                 self.edit(cx, |m| {
@@ -3457,7 +3455,6 @@ impl LiveMarkdownView {
                     }
                 });
                 self.after_move(cx);
-                return;
             }
             "backspace" => {
                 if self.read_only {
@@ -3529,7 +3526,6 @@ impl LiveMarkdownView {
                 } else {
                     cx.stop_propagation();
                 }
-                return;
             }
             "delete" => {
                 if self.read_only {
@@ -3577,7 +3573,6 @@ impl LiveMarkdownView {
                 } else {
                     cx.stop_propagation();
                 }
-                return;
             }
             "enter" => {
                 // Typora 表格内的 Enter 家族优先（否则会被下面的
@@ -3643,7 +3638,6 @@ impl LiveMarkdownView {
                     on_enter(m, &text, in_code);
                 });
                 self.after_edit(cx);
-                return;
             }
             "tab" => {
                 if platform || self.read_only {
@@ -3688,7 +3682,6 @@ impl LiveMarkdownView {
                     // 回退路径会把 key_char（"\t"）当可打印文本再插一遍。
                     cx.stop_propagation();
                 }
-                return;
             }
             "escape" => {
                 if let Some(panel) = self.search_panel.clone()
@@ -3708,7 +3701,6 @@ impl LiveMarkdownView {
                     self.edit(cx, |m| m.clear_selection());
                     cx.notify();
                 }
-                return;
             }
             "a" if platform => {
                 // Typora：表格里 Cmd/Ctrl+A 只选**当前格**内容，不升级到
@@ -3720,13 +3712,11 @@ impl LiveMarkdownView {
                 self.edit(cx, |m| m.select_all());
                 cx.notify();
                 cx.stop_propagation();
-                return;
             }
             // Typora 的表格选择快捷键：Cmd/Ctrl+E 选格、Cmd/Ctrl+L 选整行。
             "e" if platform => {
                 if self.select_table_cell_contents(cx) {
                     cx.stop_propagation();
-                    return;
                 }
             }
             "l" if platform => {
@@ -3766,7 +3756,6 @@ impl LiveMarkdownView {
                 }
                 if self.select_table_row(cx) {
                     cx.stop_propagation();
-                    return;
                 }
             }
             "b" if platform => {
@@ -3781,7 +3770,6 @@ impl LiveMarkdownView {
                     });
                     self.after_edit(cx);
                 }
-                return;
             }
             "i" if platform => {
                 if !self.read_only {
@@ -3795,7 +3783,6 @@ impl LiveMarkdownView {
                     });
                     self.after_edit(cx);
                 }
-                return;
             }
             "k" if platform => {
                 if !self.read_only {
@@ -3809,12 +3796,10 @@ impl LiveMarkdownView {
                     });
                     self.after_edit(cx);
                 }
-                return;
             }
             "c" if platform => {
                 self.copy_selection_or_table_row(cx);
                 cx.stop_propagation();
-                return;
             }
             "x" if platform => {
                 if self.read_only {
@@ -3841,7 +3826,6 @@ impl LiveMarkdownView {
                     }
                     None => cx.stop_propagation(),
                 }
-                return;
             }
             "v" if platform => {
                 if self.read_only {
@@ -3877,7 +3861,6 @@ impl LiveMarkdownView {
                     }
                 }
                 cx.stop_propagation();
-                return;
             }
             "z" if platform => {
                 if self.read_only {
@@ -3893,13 +3876,11 @@ impl LiveMarkdownView {
                     cx.stop_propagation();
                 }
                 self.skip_reformat = false;
-                return;
             }
             "f" if platform => {
                 // 代码编辑器同款查找面板（只读也允许查找，替换行自动隐藏）。
                 self.open_search(window, cx);
                 cx.stop_propagation();
-                return;
             }
             "g" if platform => {
                 if self.search_panel.is_none() {
@@ -3911,20 +3892,17 @@ impl LiveMarkdownView {
                     panel.update(cx, |p, cx| p.jump(if shift { -1 } else { 1 }, window, cx));
                 }
                 cx.stop_propagation();
-                return;
             }
             "/" if platform => {
                 // Typora 源码模式切换（与状态条"源码"芯片同一开关）。
                 self.toggle_show_source(cx);
                 cx.stop_propagation();
-                return;
             }
             "o" if platform && shift => {
                 // Typora 大纲侧栏显隐（与状态条按钮同一开关）。
                 self.show_outline = !self.show_outline;
                 cx.notify();
                 cx.stop_propagation();
-                return;
             }
             _ => {}
         }
@@ -3982,102 +3960,32 @@ impl LiveMarkdownView {
         String::new()
     }
 
-    /// 图片卡片：本地图片走缓存 + 后台加载，远程/非法 URL 走原有占位分支。
+    /// 图片卡片：本地文件 / 远程 URL 统一走文档级缓存 + 后台加载。
     fn image_card_cached(
         &mut self,
         url: &str,
         alt: &str,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        match self.image_slot(url, cx) {
-            // 本地图片：缓存命中给图；加载中 / 失败给占位（卡片外壳沿用
-            // `image_card` 的样式，`alt_runs = None`）。
-            Some((Some(image), (w, h))) => {
-                MarkdownElementBuilder::image_card_with_image(url, alt, image, (w, h), cx)
-            }
-            Some((None, _)) => MarkdownElementBuilder::image_card(url, alt, None, cx),
-            // 非本地图片（远程 / 非法路径）：原有分支（含远程占位）。
-            None => MarkdownElementBuilder::image_card(url, alt, None, cx),
-        }
+        let cache = self.image_cache.clone();
+        // `doc_path` 是**文档文件**路径（粘贴归档用它定位 `<stem>.assets/`）；
+        // 相对图片引用要的是**所在目录**，不是文件本身。
+        let doc_dir = self
+            .doc_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let state = cache.update(cx, |cache, cx| cache.slot(url, doc_dir.as_deref(), cx));
+        MarkdownElementBuilder::image_card_slot(url, alt, None, state, cx)
     }
 
-    /// 本地图片：缓存查询 + 后台加载（render 路径不再同步读盘）。
-    ///
-    /// 返回 `Some((image, size))` 表示这是一个本地图片行：`image = None` 时
-    /// 用占位卡片（加载中 / 失败 / 文件缺失）。`None` 表示该 URL 不是可加载
-    /// 的本地图片（远程 URL、非法路径），调用方走原有的占位分支。
-    ///
-    /// 缓存未命中时只做一次 `metadata`（不读文件内容），随后
-    /// `cx.spawn` 到后台线程读盘 + 解码；完成后写回缓存并 `notify` 重绘。
-    /// 文件 mtime/大小变化时自动失效重载。
-    fn image_slot(
-        &mut self,
-        url: &str,
-        cx: &mut Context<Self>,
-    ) -> Option<(Option<Arc<gpui::Image>>, (u32, u32))> {
-        // 远程 URL 与非法路径交给占位卡片（与 `load_local_image` 同规则）。
-        let path = crate::editor::markdown_element::MarkdownElementBuilder::local_image_path(url)?;
-        let stamp = local_image_stamp(&path);
-        let cached = self.image_cache.get(url);
-        match cached {
-            // 命中且文件未变：直接用。
-            Some(ImageSlot::Ready {
-                image,
-                size,
-                stamp: s,
-            }) if *s == stamp => {
-                return Some((Some(image.clone()), *size));
-            }
-            // 加载中且文件未变：继续占位。
-            Some(ImageSlot::Loading) if stamp.0.is_some() => {
-                return Some((None, (0, 0)));
-            }
-            // 已失败且文件仍不存在：不再重试（避免每帧 stat 风暴）。
-            Some(ImageSlot::Failed) if stamp.0.is_none() => {
-                return Some((None, (0, 0)));
-            }
-            _ => {}
-        }
-        // 未命中 / 过期：文件不存在则记 Failed，否则起后台加载。
-        if stamp.0.is_none() {
-            self.image_cache.insert(url.to_string(), ImageSlot::Failed);
-            return Some((None, (0, 0)));
-        }
-        self.image_cache.insert(url.to_string(), ImageSlot::Loading);
-        let url_owned = url.to_string();
-        cx.spawn(async move |this, cx| {
-            let loaded = cx
-                .background_executor()
-                .spawn(async move {
-                    let bytes = std::fs::read(&path).ok()?;
-                    crate::editor::image_viewer::load_image_from_bytes(&bytes, &path).ok()
-                })
-                .await;
-            if let Some(this) = this.upgrade() {
-                this.update(cx, |view, cx| {
-                    let slot = match loaded {
-                        Some((image, size)) => ImageSlot::Ready { image, size, stamp },
-                        None => ImageSlot::Failed,
-                    };
-                    // 期间可能又 set_text 过（切文档 / 外部重载），缓存已被清空。
-                    // 此时旧 URL 可能已不在新文档里：直接插回去会让上一份文档的
-                    // 位图继续驻留。只在该 URL 仍是本次期望的加载结果时写回。
-                    if view
-                        .image_cache
-                        .get(&url_owned)
-                        .is_some_and(|s| matches!(s, ImageSlot::Loading))
-                    {
-                        view.image_cache.insert(url_owned, slot);
-                        cx.notify();
-                    }
-                });
-            }
-        })
-        .detach();
-        Some((None, (0, 0)))
+    /// 测试探针：图片缓存实体（渲染路径实际使用的那一个）。
+    #[cfg(test)]
+    pub(crate) fn image_cache_entity(&self) -> Entity<crate::editor::md_image::ImageCache> {
+        self.image_cache.clone()
     }
 
-    /// 把当前文本同步进查找面板（防抖落地点）。
+    /// 将当前文本同步进查找面板（防抖落地点）。
     ///
     /// 面板已关时跳过（没有匹配要维护）。`SearchMatcher::update` 内部有
     /// `Rope` 相等性早退，因此这里无需自己判重。
@@ -4346,11 +4254,12 @@ fn parse_image_line(line: &str) -> Option<(String, String)> {
     let alt = inner[..close].to_string();
     let rest = &inner[close + 2..];
     let end = rest.find(')')?;
-    let url = rest[..end]
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string();
+    let spec = rest[..end].trim();
+    // `![](<a b.png>)`：尖括号里可以有空格；`![](a.png "title")`：忽略标题。
+    let url = match spec.strip_prefix('<') {
+        Some(angle) => angle.split('>').next().unwrap_or(angle).to_string(),
+        None => spec.split_whitespace().next().unwrap_or("").to_string(),
+    };
     if url.is_empty() || !rest[end + 1..].trim().is_empty() {
         return None;
     }
@@ -4727,29 +4636,6 @@ struct RowPaint {
     caret_block_text: Option<ShapedLine>,
 }
 
-/// Identity of a local image file for cache invalidation: `(mtime, len)`.
-/// `None` mtime means the file could not be stat'ed (missing / unreadable).
-fn local_image_stamp(path: &Path) -> (Option<std::time::SystemTime>, u64) {
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => (m.modified().ok(), m.len()),
-        _ => (None, 0),
-    }
-}
-
-/// One entry in the live view's local-image cache.///
-/// `Loading` is the placeholder written when a background load is kicked off;
-/// `Ready`/`Failed` are terminal. `stamp` is `(mtime, len)` so an edited file
-/// invalidates its own entry.
-enum ImageSlot {
-    Loading,
-    Ready {
-        image: Arc<gpui::Image>,
-        size: (u32, u32),
-        stamp: (Option<std::time::SystemTime>, u64),
-    },
-    Failed,
-}
-
 /// A source line's last-frame text layout, recorded by `LiveLine::paint`.
 #[derive(Clone)]
 /// 单元格的帧内命中记录（spec #6）：cell LiveLine 在 `paint` 时写入，
@@ -5008,13 +4894,7 @@ impl PlanGeometry {
         // ---- mermaid blocks ----
         let mut mermaid_blocks: Vec<MermaidBlockRef> = Vec::new();
         for gr in &groups {
-            let Group::Fence {
-                open,
-                code,
-                close: _,
-                ..
-            } = gr
-            else {
+            let Group::Fence { open, code, .. } = gr else {
                 continue;
             };
             let lang = match &rows[*open].block {
@@ -5494,18 +5374,19 @@ impl LiveMarkdownView {
         };
         // 窗口迟滞：小幅滚动复用上帧窗口（overscan 覆盖视口），避免 lo/hi
         // 逐 group 步进带动顶部占位跳变；该跳变是底部回滚上下抖动的直接观感。
-        if !text_changed && !want_caret && old_same_shape {
-            if let Some((olo, ohi)) = old_window
-                && ohi < g
-                && olo <= ohi
-                && lo.abs_diff(olo) <= WIN_HYST_GROUPS
-                && hi.abs_diff(ohi) <= WIN_HYST_GROUPS
-                && prefix[olo] <= off_y + 1.0
-                && off_y + vp_h <= prefix[ohi + 1] + 1.0
-            {
-                lo = olo;
-                hi = ohi;
-            }
+        if !text_changed
+            && !want_caret
+            && old_same_shape
+            && let Some((olo, ohi)) = old_window
+            && ohi < g
+            && olo <= ohi
+            && lo.abs_diff(olo) <= WIN_HYST_GROUPS
+            && hi.abs_diff(ohi) <= WIN_HYST_GROUPS
+            && prefix[olo] <= off_y + 1.0
+            && off_y + vp_h <= prefix[ohi + 1] + 1.0
+        {
+            lo = olo;
+            hi = ohi;
         }
         // Caret edits/moves must land inside the window: the caret row has to
         // be *built* so the scroll logic can measure and reveal it (and so the
@@ -7849,7 +7730,7 @@ impl Render for LiveMarkdownView {
                 );
             } else if rows.is_empty() {
                 let ent = entity.clone();
-                if show_caret {}
+
                 self.row_targets.push((0, 0));
                 row_els.push(
                     div()
@@ -7932,8 +7813,7 @@ impl Render for LiveMarkdownView {
             let outline = outline_entries(&row_refs);
             let current = outline
                 .iter()
-                .filter(|(line, _, _)| *line <= cursor.line)
-                .last()
+                .rfind(|(line, _, _)| *line <= cursor.line)
                 .map(|(line, _, _)| *line);
             (outline, current)
         } else {

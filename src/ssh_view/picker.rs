@@ -167,18 +167,18 @@ fn scan_unix_terminals() -> Vec<LocalTerminalOption> {
 
     // 常见 shell
     for shell in ["bash", "zsh", "fish"] {
-        if let Ok(output) = std::process::Command::new("which").arg(shell).output() {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                // 避免重复添加已存在的 shell
-                if !path.is_empty() && !options.iter().any(|opt| opt.command == path) {
-                    options.push(LocalTerminalOption::new(
-                        shell.to_string(),
-                        path,
-                        vec![],
-                        Icon::Terminal,
-                    ));
-                }
+        if let Ok(output) = std::process::Command::new("which").arg(shell).output()
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            // 避免重复添加已存在的 shell
+            if !path.is_empty() && !options.iter().any(|opt| opt.command == path) {
+                options.push(LocalTerminalOption::new(
+                    shell.to_string(),
+                    path,
+                    vec![],
+                    Icon::Terminal,
+                ));
             }
         }
     }
@@ -384,24 +384,24 @@ impl SshPicker {
 
         if self.selected_index < local_count {
             // 本地终端选项
-            if let Some(&idx) = self.filtered_local_indices.get(self.selected_index) {
-                if let Some(option) = self.local_terminal_options.get(idx) {
-                    let (command, args) = (option.command.clone(), option.args.clone());
-                    workspace.update(cx, |w, cx| {
-                        w.create_local_terminal_with_command(&command, &args, window, cx)
-                    });
-                }
+            if let Some(&idx) = self.filtered_local_indices.get(self.selected_index)
+                && let Some(option) = self.local_terminal_options.get(idx)
+            {
+                let (command, args) = (option.command.clone(), option.args.clone());
+                workspace.update(cx, |w, cx| {
+                    w.create_local_terminal_with_command(&command, &args, window, cx)
+                });
             }
         } else {
             // Host 列表
             let host_index = self.selected_index - local_count;
-            if let Some(&idx) = self.filtered_indices.get(host_index) {
-                if let Some(config) = self.configs.get(idx) {
-                    let config = config.clone();
-                    workspace.update(cx, |w, cx| {
-                        w.create_ssh_terminal_with_config(&config, window, cx)
-                    });
-                }
+            if let Some(&idx) = self.filtered_indices.get(host_index)
+                && let Some(config) = self.configs.get(idx)
+            {
+                let config = config.clone();
+                workspace.update(cx, |w, cx| {
+                    w.create_ssh_terminal_with_config(&config, window, cx)
+                });
             }
         }
     }

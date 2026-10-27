@@ -75,11 +75,11 @@ impl SharedConflictResolver {
 impl ConflictResolver for SharedConflictResolver {
     fn prompt(&self, prompt: ConflictPrompt) {
         // 如果用户已选择 "应用到全部"，直接返回缓存的决策
-        if self.apply_to_all.load(Ordering::Relaxed) {
-            if let Some(resolution) = self.cached_resolution.lock().as_ref() {
-                let _ = prompt.response.try_send(resolution.clone());
-                return;
-            }
+        if self.apply_to_all.load(Ordering::Relaxed)
+            && let Some(resolution) = self.cached_resolution.lock().as_ref()
+        {
+            let _ = prompt.response.try_send(resolution.clone());
+            return;
         }
 
         // 否则将请求发送到 UI 层

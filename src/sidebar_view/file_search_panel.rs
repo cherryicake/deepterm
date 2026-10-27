@@ -615,9 +615,10 @@ mod tests {
 
         // 清空查询：结果清空，但索引保留（下次输入无需重新遍历）。
         //
-        // 全选键跟着平台走：windows 上是 ctrl-a，unix/macos 上才是 cmd-a。
-        let select_all = if cfg!(windows) { "ctrl-a" } else { "cmd-a" };
-        cx.simulate_keystrokes(format!("{select_all} backspace").as_str());
+        // `secondary` 才是跨平台写法：macOS 解析成 cmd，Linux/Windows 解析成
+        // ctrl。写死 `cmd-a` 在 Linux 上会变成 Super+a（keymaps 里绑的是
+        // ctrl-a），全选不生效、backspace 只删掉一个字符。
+        cx.simulate_keystrokes("secondary-a backspace");
         cx.run_until_parked();
         panel.read_with(cx, |panel, _| {
             assert!(panel.results.is_empty(), "清空查询后不应残留结果");

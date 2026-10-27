@@ -229,10 +229,10 @@ pub fn copy_remote_to_different_remote(
 
     sftp_fs::with_cached_session(source_config, |source_session| {
         let metadata = source_session.metadata(remote_path)?;
-        if metadata.kind == RemoteFileKind::File {
-            if let Some(r) = reporter {
-                r.set_total_bytes(metadata.size);
-            }
+        if metadata.kind == RemoteFileKind::File
+            && let Some(r) = reporter
+        {
+            r.set_total_bytes(metadata.size);
         }
         let is_directory = metadata.kind == RemoteFileKind::Directory;
         let effective_name = if is_directory {
@@ -853,11 +853,11 @@ fn monitor_dest_progress(
             log::warn!("传输进度监控：目标会话连续失败，停止监控（传输继续，仅进度不再更新）");
             break;
         }
-        if let Some(size) = size {
-            if size > last_size {
-                progress.fetch_add(size - last_size, Ordering::Relaxed);
-                last_size = size;
-            }
+        if let Some(size) = size
+            && size > last_size
+        {
+            progress.fetch_add(size - last_size, Ordering::Relaxed);
+            last_size = size;
         }
     }
 }

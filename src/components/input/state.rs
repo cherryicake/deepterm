@@ -1854,6 +1854,18 @@ impl InputState {
         self.applied_diagnostics_version
     }
 
+    /// 清空 LSP 诊断及其版本门控（服务器重连/停止时用）。
+    ///
+    /// 新会话的 `didOpen` 从 version 0 重新计数。如果保留旧会话的
+    /// `applied_diagnostics_version`（例如 42），新服务器推出的 v0/v1
+    /// 会被门控当成过期诊断全部丢掉，表现为“重启后诊断永远不出现”。
+    /// 因此重连/停止必须同时清掉诊断、版本号和状态栏计数。
+    pub fn reset_lsp_diagnostics(&mut self) {
+        self.applied_diagnostics_version = None;
+        self.set_diagnostics(Vec::new());
+        self.set_lsp_diagnostic_counts(0, 0);
+    }
+
     /// 滚到某个偏移并居中（LSP 跳转定位用）。
     pub fn reveal_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.scroll_to_center(offset, cx);
@@ -3608,12 +3620,12 @@ impl InputState {
         }
 
         for row in (0..=buffer_start_row).rev() {
-            if let Some(crease) = self.display_map.crease_for_buffer_row(&self.text, row) {
-                if crease.end.row >= buffer_start_row {
-                    to_fold.push(crease);
-                    if row <= buffer_start_row {
-                        break;
-                    }
+            if let Some(crease) = self.display_map.crease_for_buffer_row(&self.text, row)
+                && crease.end.row >= buffer_start_row
+            {
+                to_fold.push(crease);
+                if row <= buffer_start_row {
+                    break;
                 }
             }
         }
@@ -4129,10 +4141,10 @@ impl InputState {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(ime_marked_range) = &self.ime_marked_range {
-            if ime_marked_range.is_empty() {
-                self.ime_marked_range = None;
-            }
+        if let Some(ime_marked_range) = &self.ime_marked_range
+            && ime_marked_range.is_empty()
+        {
+            self.ime_marked_range = None;
         }
 
         if event.button == MouseButton::Left {
@@ -5141,10 +5153,10 @@ impl InputState {
             return true;
         }
 
-        if let Some(validate) = &self.validate {
-            if !validate(new_text, cx) {
-                return false;
-            }
+        if let Some(validate) = &self.validate
+            && !validate(new_text, cx)
+        {
+            return false;
         }
 
         let Some(pattern) = &self.pattern else {
@@ -5596,24 +5608,24 @@ impl EntityInputHandler for InputState {
 
             let index_offset = last_layout.visible_line_byte_offsets[vi];
 
-            if start_origin.is_none() {
-                if let Some(p) = line.position_for_index(
+            if start_origin.is_none()
+                && let Some(p) = line.position_for_index(
                     range.start.saturating_sub(index_offset),
                     last_layout,
                     false,
-                ) {
-                    start_origin = Some(p + point(px(0.), y_offset));
-                }
+                )
+            {
+                start_origin = Some(p + point(px(0.), y_offset));
             }
 
-            if end_origin.is_none() {
-                if let Some(p) = line.position_for_index(
+            if end_origin.is_none()
+                && let Some(p) = line.position_for_index(
                     range.end.saturating_sub(index_offset),
                     last_layout,
                     false,
-                ) {
-                    end_origin = Some(p + point(px(0.), y_offset));
-                }
+                )
+            {
+                end_origin = Some(p + point(px(0.), y_offset));
             }
 
             y_offset += line.size(line_height).height;

@@ -72,7 +72,7 @@ pub struct PlannedRow {
 }
 
 /// Line-reveal input. `focused=false` (or read-only) forces full preview.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct Reveal {
     pub cursor: Pos,
     pub selection: Option<(Pos, Pos)>,
@@ -82,18 +82,6 @@ pub struct Reveal {
     /// source, including tables (which otherwise stay rendered grids so a
     /// cell can be edited in place).
     pub show_source: bool,
-}
-
-impl Default for Reveal {
-    fn default() -> Self {
-        Self {
-            cursor: Pos::default(),
-            selection: None,
-            focused: false,
-            read_only: false,
-            show_source: false,
-        }
-    }
 }
 
 impl Reveal {
@@ -151,10 +139,10 @@ pub fn reveal_set(blocks: &[Block], line_count: usize, reveal: Reveal) -> BTreeS
     // which reveals every line via the selection in `plan_rows`.
     let mut run_start: Option<usize> = None;
     let flush = |start: Option<usize>, end: usize, revealed: &mut BTreeSet<usize>| {
-        if let Some(s) = start {
-            if (s..end).any(|l| revealed.contains(&l)) {
-                revealed.extend(s..end);
-            }
+        if let Some(s) = start
+            && (s..end).any(|l| revealed.contains(&l))
+        {
+            revealed.extend(s..end);
         }
     };
     for (i, b) in blocks.iter().enumerate() {
@@ -295,7 +283,7 @@ pub fn classify_incremental(
         states.extend(prev.states[..ck].iter().cloned());
         // Re-derive the state for the checkpoint line itself, so `states`
         // stays aligned with `blocks`.
-        if from % CLASSIFY_CHECKPOINT == 0 {
+        if from.is_multiple_of(CLASSIFY_CHECKPOINT) {
             states.push(state.clone());
         }
         start = from;
@@ -308,7 +296,7 @@ pub fn classify_incremental(
     let mut converged_at: Option<usize> = None;
     let mut i = start;
     while i < n {
-        if i > start && i % CLASSIFY_CHECKPOINT == 0 {
+        if i > start && i.is_multiple_of(CLASSIFY_CHECKPOINT) {
             states.push(state.clone());
         }
         let next = lines.get(i + 1).map(|l| l.as_str());
@@ -336,18 +324,18 @@ pub fn classify_incremental(
         i += 1;
     }
 
-    if let (Some(at), Some(prev)) = (converged_at, prev) {
-        if at < n {
-            blocks.extend_from_slice(&prev.blocks[at..]);
-            lang_before.extend_from_slice(&prev.lang_before[at..]);
-            // Checkpoints for the reused tail come straight from the old table.
-            let first_ck = at.div_ceil(CLASSIFY_CHECKPOINT);
-            let last_ck = (n - 1) / CLASSIFY_CHECKPOINT;
-            for k in first_ck..=last_ck {
-                if let Some(s) = prev.states.get(k) {
-                    states.truncate(k);
-                    states.push(s.clone());
-                }
+    if let (Some(at), Some(prev)) = (converged_at, prev)
+        && at < n
+    {
+        blocks.extend_from_slice(&prev.blocks[at..]);
+        lang_before.extend_from_slice(&prev.lang_before[at..]);
+        // Checkpoints for the reused tail come straight from the old table.
+        let first_ck = at.div_ceil(CLASSIFY_CHECKPOINT);
+        let last_ck = (n - 1) / CLASSIFY_CHECKPOINT;
+        for k in first_ck..=last_ck {
+            if let Some(s) = prev.states.get(k) {
+                states.truncate(k);
+                states.push(s.clone());
             }
         }
     }
@@ -409,7 +397,7 @@ pub fn classify_incremental(
 
 /// The checkpointed classifier state entering line `i`, if recorded.
 fn prev_state_at(prev: &Classified, i: usize) -> Option<&DocState> {
-    if i % CLASSIFY_CHECKPOINT != 0 {
+    if !i.is_multiple_of(CLASSIFY_CHECKPOINT) {
         return None;
     }
     prev.states.get(i / CLASSIFY_CHECKPOINT)

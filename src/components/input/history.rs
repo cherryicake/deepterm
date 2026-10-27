@@ -3,6 +3,14 @@ use std::fmt::Debug;
 
 use super::change::{Change, HistoryItem};
 
+/// 单个文档的默认 undo 文本预算。
+///
+/// 1000 步的**条数**上限对正常击键够用，但对「整篇替换 / 格式化 / 全选
+/// 粘贴」没有约束：一条 `Change` 就可能同时持有整篇旧文和新文，1000 条
+/// 足以把内存推到 GB 级。这里再按字节收一道；至少要保留一条，否则一次
+/// 大操作会连撤销本身都丢失。
+const DEFAULT_MAX_HISTORY_BYTES: usize = 16 * 1024 * 1024;
+
 /// 编辑历史管理，用于 undo/redo 功能
 #[derive(Debug)]
 pub struct History<I: HistoryItem> {
@@ -16,6 +24,8 @@ pub struct History<I: HistoryItem> {
     pub ignore: bool,
     /// 最大 undo 次数
     max_undos: usize,
+    /// undo/redo 文本的字节预算（见 [`DEFAULT_MAX_HISTORY_BYTES`]）。
+    max_bytes: usize,
     /// 最后变更时间（用于分组）
     last_changed_at: std::time::Instant,
     /// 分组间隔，在此间隔内的变更会被分到同一组
@@ -37,6 +47,7 @@ where
             version: 0,
             ignore: false,
             max_undos: 1000,
+            max_bytes: DEFAULT_MAX_HISTORY_BYTES,
             last_changed_at: std::time::Instant::now(),
             group_interval: None,
             grouping: false,
@@ -48,6 +59,33 @@ where
     pub fn max_undos(mut self, max_undos: usize) -> Self {
         self.max_undos = max_undos;
         self
+    }
+
+    /// 设置 undo/redo 文本的字节预算。
+    ///
+    /// 传 0 表示不按字节淘汰（只受 `max_undos` 限制），仅供测试或特殊
+    /// 调用方使用。
+    pub fn max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// 当前 undo + redo 栈中文本的大致字节数（缓存预算用）。
+    ///
+    /// 按需计算而不是维护计数器：`undo`/`redo` 会在两个栈之间整组克隆，
+    /// 手工加减很容易漏（历史版本就漏在 `pop_group`/`clear` 上，计数器
+    /// 一旦漂移，预算淘汰就失真）。栈上限只有 1000 条，单次求和是 O(n)，
+    /// 而且只在 push/查询时发生。
+    pub fn approx_bytes(&self) -> usize {
+        Self::stack_bytes(&self.undos).saturating_add(Self::stack_bytes(&self.redos))
+    }
+
+    fn item_bytes(item: &I) -> usize {
+        std::mem::size_of::<I>().saturating_add(item.heap_bytes())
+    }
+
+    fn stack_bytes(stack: &VecDeque<I>) -> usize {
+        stack.iter().map(Self::item_bytes).sum()
     }
 
     /// 设置去重，开启后相同变更不会重复记录
@@ -123,11 +161,6 @@ where
     pub fn push(&mut self, item: I) {
         let version = self.inc_version();
 
-        // 限制 undo 栈大小
-        if self.undos.len() >= self.max_undos {
-            self.undos.pop_front();
-        }
-
         if self.unique {
             self.undos.retain(|c| *c != item);
             self.redos.retain(|c| *c != item);
@@ -139,6 +172,23 @@ where
         let mut item = item;
         item.set_version(version);
         self.undos.push_back(item);
+
+        // 条数上限：先按步数淘汰最旧条目。
+        while self.undos.len() > self.max_undos {
+            self.undos.pop_front();
+        }
+
+        // 字节上限：至少保留最新一条，哪怕它本身就超过预算。否则一次
+        // 整篇替换/格式化会连「撤销这次操作」都做不到。
+        if self.max_bytes > 0 {
+            let mut total = Self::stack_bytes(&self.undos);
+            while self.undos.len() > 1 && total > self.max_bytes {
+                let Some(oldest) = self.undos.pop_front() else {
+                    break;
+                };
+                total = total.saturating_sub(Self::item_bytes(&oldest));
+            }
+        }
     }
 
     /// 获取 undo 栈
@@ -243,14 +293,14 @@ mod tests {
         // undo 一次
         let changes = history.undo().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].new_text, "orld");
+        assert_eq!(&*changes[0].new_text, "orld");
         assert_eq!(history.undos().len(), 2);
         assert_eq!(history.redos().len(), 1);
 
         // redo
         let changes = history.redo().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].new_text, "orld");
+        assert_eq!(&*changes[0].new_text, "orld");
         assert_eq!(history.undos().len(), 3);
         assert_eq!(history.redos().len(), 0);
     }
@@ -303,7 +353,7 @@ mod tests {
         // 一次 undo 只撤销最后一组（单个 "e"），而不是整段输入。
         let changes = history.undo().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].new_text, "e");
+        assert_eq!(&*changes[0].new_text, "e");
         assert_eq!(history.undos().len(), 4);
     }
 
@@ -319,7 +369,7 @@ mod tests {
         // 虽然间隔远未超过 group_interval，"c" 也必须独立成组。
         let changes = history.undo().unwrap();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].new_text, "c");
+        assert_eq!(&*changes[0].new_text, "c");
     }
 
     /// 回归测试：`unique()` 曾完全是空操作 —— 去重的 `retain` 执行在
@@ -339,7 +389,51 @@ mod tests {
             2,
             "duplicate change should replace the older one, not stack up"
         );
-        assert_eq!(history.undos().back().unwrap().new_text, "a");
+        assert_eq!(&*history.undos().back().unwrap().new_text, "a");
+    }
+
+    /// 字节预算：超出后淘汰最旧条目，但至少保留最新一条（否则一次整篇
+    /// 替换会连撤销都做不到）。
+    #[test]
+    fn byte_budget_evicts_oldest_but_keeps_latest() {
+        let budget = 800;
+        let mut history: History<Change> = History::new().max_undos(1000).max_bytes(budget);
+        for i in 0..20 {
+            history.push(Change::new(i..i, "", i..i + 1, "a"));
+        }
+        assert!(history.undos().len() > 1, "预算应允许保留多条小变更");
+        assert!(history.undos().len() < 20, "超预算时应淘汰最旧条目");
+        assert!(
+            history.approx_bytes() <= budget,
+            "淘汰后近似总量应回到预算内：{} > {budget}",
+            history.approx_bytes()
+        );
+
+        // 单条就超预算：仍保留它，否则这次操作无法撤销。
+        let mut history: History<Change> = History::new().max_bytes(1);
+        history.push(Change::new(0..0, "", 0..10, "0123456789"));
+        assert_eq!(history.undos().len(), 1);
+    }
+
+    /// `approx_bytes` 按需计算，undo/redo 在两个栈之间搬条目时总量不应
+    /// 突变（文本 `Arc` 被共享，按持有者均摊）。
+    #[test]
+    fn approx_bytes_is_stable_across_undo_redo() {
+        let mut history = History::new();
+        history.push(Change::new(0..0, "", 0..5, "hello"));
+        history.push(Change::new(5..5, "", 5..7, " w"));
+        let before = history.approx_bytes();
+        assert!(before > 0);
+
+        history.undo();
+        assert!(
+            history.approx_bytes() <= before,
+            "undo 只是搬栈，近似总量不应增加"
+        );
+        let after_undo = history.approx_bytes();
+
+        history.redo();
+        assert!(history.approx_bytes() <= after_undo);
     }
 
     #[test]

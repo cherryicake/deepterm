@@ -111,7 +111,7 @@ impl VisibleRows {
 }
 
 /// 一个图像放置：锚定到网格的哪一行/列、占多少行列、层级。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Placement {
     /// 锚定行（终端网格的绝对行号，随滚动变化）。
     pub row: i32,
@@ -128,21 +128,6 @@ pub struct Placement {
     pub z: i32,
     /// 位置类型（`U=`）。虚拟放置不直接绘制。
     pub location: PlacementLocation,
-}
-
-impl Default for Placement {
-    fn default() -> Self {
-        Self {
-            row: 0,
-            col: 0,
-            columns: None,
-            rows: None,
-            x_offset: 0,
-            y_offset: 0,
-            z: 0,
-            location: PlacementLocation::default(),
-        }
-    }
 }
 
 impl Placement {
@@ -170,10 +155,11 @@ impl Placement {
     /// （`render.rs:placement_rect`）会按宽高比补出另一边，那是**绘制**的尺寸；
     /// 删除判定必须与 ghostty 一致，所以这里不引入那个补算。
     pub fn grid_size(&self, image: &DecodedImage, geometry: CellGeometry) -> (u32, u32) {
-        if let (Some(cols), Some(rows)) = (self.columns, self.rows) {
-            if cols > 0 && rows > 0 {
-                return (cols, rows);
-            }
+        if let (Some(cols), Some(rows)) = (self.columns, self.rows)
+            && cols > 0
+            && rows > 0
+        {
+            return (cols, rows);
         }
 
         // 单元格尺寸为 0 时无法推导（ghostty 对除零返回 0 并注释为安全）。

@@ -631,16 +631,16 @@ impl LspManager {
         // 两个进程各持一份文档，诊断与补全互相错。
         {
             let mut guard = lock(&table);
-            if let Some(client) = guard.get(&key) {
+            if let Some(client) = guard.get(key) {
                 let (tx, rx) = async_channel::bounded(1);
                 let _ = tx.try_send(Some(client));
                 return Some(rx);
             }
             // 进程已死（崩溃/被杀）：清掉旧记录，允许重启。
-            if guard.ready.contains_key(&key) {
-                guard.ready.remove(&key);
+            if guard.ready.contains_key(key) {
+                guard.ready.remove(key);
             }
-            if guard.failed.contains(&key) {
+            if guard.failed.contains(key) {
                 return None;
             }
             // **正在握手的也算「已经有授权了」**：菜单按「Start」时
@@ -652,7 +652,7 @@ impl LspManager {
             // ——`stop_sessions_for_key` 已经把会话拆了，从此再也接不回来。
             // 与上面 `ready` 那一档同理：进程是用户显式拉起来的，那时已经授权
             // 过一次，「默认关闭」是不自动起，不是起了也装作没起。
-            if let Some(waiters) = guard.starting.get_mut(&key) {
+            if let Some(waiters) = guard.starting.get_mut(key) {
                 // 只登记，不发东西：结果由启动任务完成时统一投递给所有 waiter。
                 let (tx, rx) = async_channel::bounded(1);
                 waiters.push(tx);
@@ -676,7 +676,7 @@ impl LspManager {
         let (tx, rx) = async_channel::bounded(1);
         let should_spawn = {
             let mut guard = lock(&table);
-            match guard.starting.get_mut(&key) {
+            match guard.starting.get_mut(key) {
                 Some(waiters) => {
                     waiters.push(tx);
                     false
