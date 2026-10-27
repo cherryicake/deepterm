@@ -8,12 +8,18 @@
 //! inode 会变，直接监听文件在某些平台上会随 rename 丢失句柄。
 
 use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{App, BorrowAppContext as _};
+// 真实 watcher 只在 `cfg(not(test))` 分支里使用（测试里不启动 OS 监视线程），
+// 这些 import 同步按 cfg 收窄，避免 test 构建出现 unused 警告。
+#[cfg(not(test))]
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
+#[cfg(not(test))]
 use parking_lot::Mutex;
+#[cfg(not(test))]
+use std::sync::Arc;
+#[cfg(not(test))]
+use std::time::Duration;
 
 use super::store::SettingsStore;
 
@@ -27,63 +33,74 @@ pub fn watch_config_file(
     cx: &mut App,
     on_change: impl Fn(&mut App) + 'static,
 ) {
-    let Some(parent) = path.parent().map(Path::to_path_buf) else {
-        log::warn!("{label} 没有父目录，热重载未启用");
-        return;
-    };
-
-    if let Err(err) = std::fs::create_dir_all(&parent) {
-        log::warn!(
-            "failed to create config directory {}: {err}",
-            parent.display()
-        );
+    // 单元测试里不启动真实 OS 监视：notify 的 inotify 线程会被 gpui
+    // `TestScheduler` 判为「非确定性活动」并 abort 整个测试进程
+    // （与 `FsWatcher` 同一类问题；配置热重载在测试里没有意义）。
+    #[cfg(test)]
+    {
+        let _ = (path, label, cx, on_change);
     }
 
-    let (tx, rx) = async_channel::unbounded::<()>();
-    let file_name = path.file_name().map(|name| name.to_owned());
+    #[cfg(not(test))]
+    {
+        let Some(parent) = path.parent().map(Path::to_path_buf) else {
+            log::warn!("{label} 没有父目录，热重载未启用");
+            return;
+        };
 
-    let watcher = match RecommendedWatcher::new(
-        move |res: Result<Event, notify::Error>| {
-            let Ok(event) = res else { return };
-            // 只关心目标文件的事件：配置目录里的其它写入不应触发重载。
-            let touches_target = event
-                .paths
-                .iter()
-                .any(|changed| changed.file_name().map(|name| name.to_owned()) == file_name);
-            if touches_target {
-                let _ = tx.try_send(());
+        if let Err(err) = std::fs::create_dir_all(&parent) {
+            log::warn!(
+                "failed to create config directory {}: {err}",
+                parent.display()
+            );
+        }
+
+        let (tx, rx) = async_channel::unbounded::<()>();
+        let file_name = path.file_name().map(|name| name.to_owned());
+
+        let watcher = match RecommendedWatcher::new(
+            move |res: Result<Event, notify::Error>| {
+                let Ok(event) = res else { return };
+                // 只关心目标文件的事件：配置目录里的其它写入不应触发重载。
+                let touches_target = event
+                    .paths
+                    .iter()
+                    .any(|changed| changed.file_name().map(|name| name.to_owned()) == file_name);
+                if touches_target {
+                    let _ = tx.try_send(());
+                }
+            },
+            notify::Config::default().with_poll_interval(Duration::from_millis(500)),
+        ) {
+            Ok(watcher) => watcher,
+            Err(err) => {
+                log::error!("failed to create watcher for {label}: {err} — 热重载未启用");
+                return;
             }
-        },
-        notify::Config::default().with_poll_interval(Duration::from_millis(500)),
-    ) {
-        Ok(watcher) => watcher,
-        Err(err) => {
-            log::error!("failed to create watcher for {label}: {err} — 热重载未启用");
+        };
+
+        let watcher = Arc::new(Mutex::new(watcher));
+        if let Err(err) = watcher.lock().watch(&parent, RecursiveMode::NonRecursive) {
+            log::error!("failed to watch {}: {err} — 热重载未启用", parent.display());
             return;
         }
-    };
 
-    let watcher = Arc::new(Mutex::new(watcher));
-    if let Err(err) = watcher.lock().watch(&parent, RecursiveMode::NonRecursive) {
-        log::error!("failed to watch {}: {err} — 热重载未启用", parent.display());
-        return;
+        cx.spawn(async move |cx| {
+            // 持有句柄，防止 watcher 被 drop 后停止监听。
+            let _keep_alive = watcher;
+
+            while rx.recv().await.is_ok() {
+                cx.background_executor()
+                    .timer(Duration::from_millis(80))
+                    .await;
+                while rx.try_recv().is_ok() {}
+
+                // 窗口可能已全部关闭；此时静默跳过即可。
+                cx.update(|cx| on_change(cx));
+            }
+        })
+        .detach();
     }
-
-    cx.spawn(async move |cx| {
-        // 持有句柄，防止 watcher 被 drop 后停止监听。
-        let _keep_alive = watcher;
-
-        while rx.recv().await.is_ok() {
-            cx.background_executor()
-                .timer(Duration::from_millis(80))
-                .await;
-            while rx.try_recv().is_ok() {}
-
-            // 窗口可能已全部关闭；此时静默跳过即可。
-            cx.update(|cx| on_change(cx));
-        }
-    })
-    .detach();
 }
 
 /// 监听用户设置文件。

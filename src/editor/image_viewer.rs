@@ -301,6 +301,8 @@ pub(crate) const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif", "ico", "svg", "ppm", "pnm",
 ];
 
+/// 这个路径是否应按「图片」处理：图像标签页用它决定打开方式，Markdown
+/// 图片解析/粘贴落盘也用它做扩展名门禁（扩展名不区分大小写）。
 pub fn is_image_file(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
