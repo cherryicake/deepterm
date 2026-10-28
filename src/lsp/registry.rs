@@ -105,22 +105,65 @@ pub fn builtin_candidates() -> &'static HashMap<&'static str, Vec<Candidate>> {
     })
 }
 
+/// 探测一个命令是否可用的策略，按命令名选。
+///
+/// **为什么不能对一切命令都跑 `<cmd> --version`**：那是真实故障的根源——
+/// gopls 没有 `--version` 旗标（正确的形式是子命令 `gopls version`），裸跑
+/// `gopls --version` 以退出码 2 失败；pyright 系的 `-langserver` 包装脚本连
+/// `version` / `--help` 旗标都没有，任何旗标都以非零退出（裸跑更是要挂住
+/// 等 LSP 握手，绝不能试）。把它们判成「未安装」的后果在
+/// [`language_might_have_server_on`] 上最严重：候选链整条探空后返回 false，
+/// 状态栏 chip 连占位都撤掉，唯一的开启入口随之消失——用户看到的是
+/// 「这台机器没有这门语言的 LSP」，而二进制其实就在 PATH 上。
+///
+/// 表里没有的命令一律落 [`ProbeStrategy::VersionFlag`]：`--version` 短、
+/// 退出快、不读 stdin，且能挡住 rustup 的组件存根（组件缺失时代理以非零
+/// 退出，见 `integration_tests` 里 `has_server` 的注释）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeStrategy {
+    /// `<cmd> --version` 退出 0（默认）。
+    VersionFlag,
+    /// `<cmd> version` 退出 0（gopls 的版本探针是子命令）。
+    VersionSubcommand,
+    /// 纯 PATH 存在性检查（pyright 系 / jdtls：没有任何版本探针可用）。
+    OnPath,
+}
+
+fn probe_strategy_for(command: &str) -> ProbeStrategy {
+    match command {
+        "gopls" => ProbeStrategy::VersionSubcommand,
+        "pyright-langserver" | "basedpyright-langserver" | "jdtls" => ProbeStrategy::OnPath,
+        _ => ProbeStrategy::VersionFlag,
+    }
+}
+
 /// 命令是否可用（在 PATH 里，或本身是绝对路径且存在）。
 ///
-/// **会起子进程**：只允许从后台探测路径进来（UI 线程一律只读缓存，
-/// 见 [`command_availability_cached`]）。曾经 UI 路径也内联调它，结果
-/// 冷机器上第一次打开代码文件的整帧被一个数秒级的进程冷启动吞掉。
+/// **会起子进程**（仅对带版本探针的策略）：只允许从后台探测路径进来
+/// （UI 线程一律只读缓存，见 [`command_availability_cached`]）。曾经 UI
+/// 路径也内联调它，结果冷机器上第一次打开代码文件的整帧被一个数秒级的
+/// 进程冷启动吞掉。
 fn command_exists(command: &str) -> bool {
-    // 绝对路径：直接看文件在不在，不必过 PATH。
-    if command.starts_with('/') {
-        return std::path::Path::new(command).is_file();
+    match probe_strategy_for(command) {
+        ProbeStrategy::VersionFlag => probe_exit_zero(command, "--version"),
+        ProbeStrategy::VersionSubcommand => probe_exit_zero(command, "version"),
+        ProbeStrategy::OnPath => command_on_path(command),
     }
-    // `--version` 而不是 `--help`：前者短、退出快、且不读 stdin。
-    // rustup 的代理存根在组件缺失时会以非零退出（见 `integration_tests`
-    // 里 `has_server` 的注释），这里沿用同一判定。
+}
+
+/// 跑一次 `<cmd> <version_arg>` 并要求退出码 0。
+///
+/// 子进程的 `PATH` 与真实启动用同一份（[`crate::utils::path::local_spawn_path`]，
+/// 同 jsonrpc 的 `spawn_command_environment`）：这个探测要回答的是
+/// 「起进程能不能成」，两边搜的目录不一致时，探测说「没有」启动却起得来
+/// （或反之），chip 显示的与实际状态就对不上了。
+fn probe_exit_zero(command: &str, version_arg: &str) -> bool {
     let started = std::time::Instant::now();
     let mut cmd = std::process::Command::new(command);
-    cmd.arg("--version")
+    if let Some(path) = crate::utils::path::local_spawn_path() {
+        cmd.env("PATH", path);
+    }
+    cmd.arg(version_arg)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     // Windows 上不给 `CREATE_NO_WINDOW`：控制台程序会附带一个新分配的控制台
@@ -137,9 +180,42 @@ fn command_exists(command: &str) -> bool {
     // 只在慢时打日志：卡顿现场排查时这是第一条线索，平时不刷屏。
     let elapsed = started.elapsed();
     if elapsed > std::time::Duration::from_millis(200) {
-        log::warn!("lsp: probing `{command} --version` took {elapsed:?} (available={hit})");
+        log::warn!("lsp: probing `{command} {version_arg}` took {elapsed:?} (available={hit})");
     }
     hit
+}
+
+/// [`ProbeStrategy::OnPath`] 的实现：不起子进程，只沿 PATH 找可执行文件。
+///
+/// 语义与远端探测（`command -v <name>`）对齐——只回答「这个名字能不能
+/// 解析到一个可执行文件」，绝不真的起进程。搜索的 PATH 也与真实启动
+/// 同一份（见 [`probe_exit_zero`] 里为什么必须一致）。
+fn command_on_path(command: &str) -> bool {
+    let search = crate::utils::path::local_spawn_path()
+        // 取不到主目录时 `local_spawn_path` 返回 None，启动那边也保持
+        // 继承行为，这里同样退回继承 PATH。
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+    std::env::split_paths(&search).any(|dir| executable_in_dir(&dir, command))
+}
+
+/// `dir` 下有没有名为 `name` 的可执行文件（跟随符号链接）。
+#[cfg(unix)]
+fn executable_in_dir(dir: &std::path::Path, name: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(dir.join(name))
+        .map(|m| m.is_file() && (m.mode() & 0o111) != 0)
+        .unwrap_or(false)
+}
+
+/// Windows 没有 exec 位：npm 全局安装的包装脚本落成 `.cmd` / `.bat`，
+/// 与裸名一起试。
+#[cfg(windows)]
+fn executable_in_dir(dir: &std::path::Path, name: &str) -> bool {
+    [".exe", ".cmd", ".bat", ""].iter().any(|ext| {
+        std::fs::metadata(dir.join(format!("{name}{ext}")))
+            .map(|m| m.is_file())
+            .unwrap_or(false)
+    })
 }
 
 /// `settings.json` 里的 `lsp` 段。
@@ -552,27 +628,35 @@ fn cached_probe(key: &str) -> Option<Probe> {
 
 /// 真的去问一次目标主机，并把结论落进缓存。
 fn settle_probe(command: &str, ssh_config: Option<&crate::ssh::SshConnectionConfig>) -> Probe {
-    // 绝对路径：本机看文件在不在；远端交给启动时的 `resolve_remote_binary`
-    // （那里才做真实探测，这里没法替它答）。
-    if command.starts_with('/') {
-        let hit = ssh_config.is_none() && std::path::Path::new(command).is_file();
-        let probe = Probe::Settled(hit);
-        record(command, ssh_config, probe);
-        return probe;
-    }
-    let probe = match ssh_config {
-        Some(config) => {
-            use crate::ssh::lsp_channel::RemoteBinary;
-            match crate::ssh::lsp_channel::resolve_remote_binary_detailed(config, command) {
-                RemoteBinary::Found(_) => Probe::Settled(true),
-                RemoteBinary::NotInstalled => Probe::Settled(false),
-                RemoteBinary::Unreachable => {
-                    Probe::RetryAt(std::time::Instant::now() + UNREACHABLE_RETRY)
+    let probe = if command.starts_with('/') {
+        // 绝对路径：本机看文件在不在；远端交给启动时的 `resolve_remote_binary`
+        // （那里才做真实探测，这里没法替它答）。
+        Probe::Settled(ssh_config.is_none() && std::path::Path::new(command).is_file())
+    } else {
+        match ssh_config {
+            Some(config) => {
+                use crate::ssh::lsp_channel::RemoteBinary;
+                match crate::ssh::lsp_channel::resolve_remote_binary_detailed(config, command) {
+                    RemoteBinary::Found(_) => Probe::Settled(true),
+                    RemoteBinary::NotInstalled => Probe::Settled(false),
+                    RemoteBinary::Unreachable => {
+                        Probe::RetryAt(std::time::Instant::now() + UNREACHABLE_RETRY)
+                    }
                 }
             }
+            None => Probe::Settled(command_exists(command)),
         }
-        None => Probe::Settled(command_exists(command)),
     };
+    // 探明「没有」就落一条 INFO。此前只有慢探针才有 WARN，快速否定的候选
+    // 零痕迹——「为什么这台机器上这门语言连 chip 都不出」在日志里完全
+    // 反推不出来。探测结果按 (命令, 主机) 落缓存，同一条目至多打一次，
+    // 不会刷屏。
+    if probe == Probe::Settled(false) {
+        let host = ssh_config
+            .map(|c| c.connection_string())
+            .unwrap_or_else(|| "local".to_string());
+        log::info!("lsp: probe settled: `{command}` is not available on {host}");
+    }
     record(command, ssh_config, probe);
     probe
 }
@@ -960,6 +1044,76 @@ mod tests {
             Some("ruff"),
             "ruff 不该抢在类型检查服务器前面：{names:?}"
         );
+    }
+
+    /// 回归：没有版本探针的服务器必须走各自的探测策略。
+    ///
+    /// 守的是实际故障：探测曾对一切命令都裸跑 `<cmd> --version`，而
+    /// gopls 没有这个旗标（正确形式是子命令 `gopls version`，错误退出码 2）、
+    /// pyright 系连 version/help 旗标都没有（任何旗标都以非零退出）——
+    /// 明明装好了却被判成「未安装」，候选链整条探空后
+    /// `language_might_have_server_on` 返回 false，状态栏 chip 连占位都
+    /// 撤掉。用户看到的就是「这台机器上这门语言没有 LSP」。
+    #[test]
+    fn servers_without_a_version_flag_get_a_matching_probe_strategy() {
+        // gopls 的版本探针是子命令 `version`。
+        assert_eq!(
+            probe_strategy_for("gopls"),
+            ProbeStrategy::VersionSubcommand
+        );
+        // pyright 系 / jdtls：只能查存在性。
+        for name in ["pyright-langserver", "basedpyright-langserver", "jdtls"] {
+            assert_eq!(probe_strategy_for(name), ProbeStrategy::OnPath, "{name}");
+        }
+        // 其余保持默认 `--version`：rustup 存根保护（组件缺失时非零退出）
+        // 不能丢。
+        for name in [
+            "rust-analyzer",
+            "clangd",
+            "pylsp",
+            "ruff",
+            "typescript-language-server",
+        ] {
+            assert_eq!(
+                probe_strategy_for(name),
+                ProbeStrategy::VersionFlag,
+                "{name}"
+            );
+        }
+        // 用户自定义的陌生命令名落默认策略：不 panic，也不误走存在性检查。
+        assert_eq!(
+            probe_strategy_for("my-own-server"),
+            ProbeStrategy::VersionFlag
+        );
+    }
+
+    /// 真机回归：装了这些服务器的机器上，探测必须答「可用」。
+    ///
+    /// 上一个用例只证明「策略选对了」，这个证明「选中的策略真探得出来」。
+    /// 只在二进制确实在机器上时断言：没装的环境里「不可用」同样是正确
+    /// 答案，把环境差异当失败会让任何干净 CI 常红（跳过方式沿用
+    /// `integration_tests::has_server` 的先例）。
+    #[test]
+    #[cfg(unix)]
+    fn versionless_servers_probe_available_when_installed() {
+        for name in ["gopls", "pyright-langserver", "basedpyright-langserver"] {
+            let installed = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("command -v {name}"))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !installed {
+                eprintln!("skipping {name}: not installed on this machine");
+                continue;
+            }
+            assert!(
+                command_exists(name),
+                "`{name}` 在 PATH 上却探测为不可用——chip 会因此消失"
+            );
+        }
     }
 
     #[test]
