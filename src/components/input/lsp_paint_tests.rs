@@ -40,13 +40,25 @@ fn draw_with(
     cx: &mut gpui::TestAppContext,
     setup: impl FnOnce(&mut InputState, &mut gpui::Context<InputState>),
 ) -> gpui::Entity<InputState> {
+    draw_with_probe(text, cx, setup, |_| ()).0
+}
+
+/// 同 [`draw_with`]，并在绘制完成后把 `VisualTestContext` 交给 `probe`
+/// 查询 `debug_bounds` 之类的绘制探针（`VisualTestContext` 是
+/// `TestAppContext` 的借用，不能带出函数）。
+fn draw_with_probe<R>(
+    text: &str,
+    cx: &mut gpui::TestAppContext,
+    setup: impl FnOnce(&mut InputState, &mut gpui::Context<InputState>),
+    probe: impl FnOnce(&mut gpui::VisualTestContext) -> R,
+) -> (gpui::Entity<InputState>, R) {
     cx.update(|cx| {
         crate::theme::init(cx);
         crate::sidebar_view::font_settings::FontState::init(cx);
     });
 
     let cell = std::cell::RefCell::new(None);
-    let (_host, cx) = cx.add_window_view(|window, cx| {
+    let (_host, vcx) = cx.add_window_view(|window, cx| {
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .code_editor("rust")
@@ -62,8 +74,9 @@ fn draw_with(
     let input = cell.into_inner().unwrap();
 
     // 真正跑一遍布局 + 绘制：浮层相关的 panic 会在这里发生。
-    let _ = cx.refresh();
-    input
+    let _ = vcx.refresh();
+    let probed = probe(vcx);
+    (input, probed)
 }
 
 /// hover 浮层存在时，绘制不能 panic。
@@ -577,6 +590,107 @@ fn hover_card_code_block_stays_within_card_width(cx: &mut gpui::TestAppContext) 
     assert!(
         bounds.size.height > px(120.),
         "长代码行必须在卡片内换行（不换行时只有 81px 高）: {bounds:?}"
+    );
+}
+
+/// 回归：hover 卡片里的长文档注释必须在**卡内折行**，不能被右侧裁掉。
+///
+/// 根因：卡片宽度曾由内容撑开（auto），markdown 段落的
+/// `w_full`/`max_w_full` 百分比链解析不出定宽 —— gpui 的文本只有在
+/// `known_dimensions.width` / `AvailableSpace::Definite` 时才设置
+/// `wrap_width`，于是长段落按自然宽度（实测 4000+ px）排成一行，再被卡片的
+/// `overflow_x_hidden` 裁掉。现在卡片在最终渲染时带显式宽度（两趟测量），
+/// 文本片段宽度必须落在卡片内，且高度随折行增长。
+#[gpui::test]
+fn hover_card_paragraph_wraps_inside_card(cx: &mut gpui::TestAppContext) {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(40);
+    let (input, frag) = draw_with_probe(
+        "fn main() {\n    let x = 1;\n}\n",
+        cx,
+        |state, cx| {
+            let info = crate::editor::hover::HoverInfo::from_plain_text(long, cx);
+            state.set_hover_popover(7, info);
+        },
+        |cx| cx.debug_bounds("md-frag"),
+    );
+    let card = input
+        .read_with(cx, |s, _| s.hover_popover_bounds())
+        .expect("hover card must be laid out");
+    // 编辑区只有 600px 宽：卡片必须夹到「视口 - 两侧留白」= 584，
+    // 不能按 `MAX_WIDTH`（680）排版——那会让卡片右侧落到视口外。
+    assert!(
+        card.size.width <= px(584.),
+        "卡片宽度必须夹到编辑区视口内: card={card:?}"
+    );
+    let frag = frag.expect("长段落应渲染出文本片段");
+    assert!(
+        frag.size.width <= card.size.width,
+        "文本片段不能比卡片宽（不换行时是 4000+ px）: frag={frag:?} card={card:?}"
+    );
+    assert!(
+        frag.size.height > px(40.),
+        "长段落必须在卡内折行（不换行只有一行高）: frag={frag:?}"
+    );
+}
+
+/// 回归：链接文本同样要在卡内折行。裸 `StyledText` 是 flex item，默认按
+/// max-content 取宽，长链接会整行溢出卡片被裁掉。
+#[gpui::test]
+fn hover_card_link_text_wraps_inside_card(cx: &mut gpui::TestAppContext) {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(20);
+    let contents = format!("[{long}](https://example.com)");
+    let (input, link) = draw_with_probe(
+        "fn main() {\n    let x = 1;\n}\n",
+        cx,
+        |state, cx| {
+            let info = crate::editor::hover::HoverInfo::from_plain_text(contents, cx);
+            state.set_hover_popover(7, info);
+        },
+        |cx| cx.debug_bounds("md-link"),
+    );
+    let card = input
+        .read_with(cx, |s, _| s.hover_popover_bounds())
+        .expect("hover card must be laid out");
+    let link = link.expect("链接元素应渲染");
+    assert!(
+        link.size.width <= card.size.width,
+        "链接块不能比卡片宽: link={link:?} card={card:?}"
+    );
+    assert!(
+        link.size.height > px(40.),
+        "长链接文本必须在卡内折行（不换行只有一行高）: link={link:?}"
+    );
+}
+
+/// 回归：列表不能把整套 hover 卡片塌成一条窄柱。
+///
+/// 根因：列表项正文容器是 `flex_1().w_0()`（flex-basis 0），**宽度测量**
+/// 里拿不到文本的自然宽度，整张卡片只会量到「项目符号 + 内边距」（实测
+/// 66px），正文被压成逐字换行。改成 `flex_basis: auto` 后卡片应接近正文宽度。
+#[gpui::test]
+fn hover_card_list_keeps_usable_width(cx: &mut gpui::TestAppContext) {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(20);
+    let contents = format!("- {long}");
+    let (input, frag) = draw_with_probe(
+        "fn main() {\n    let x = 1;\n}\n",
+        cx,
+        |state, cx| {
+            let info = crate::editor::hover::HoverInfo::from_plain_text(contents, cx);
+            state.set_hover_popover(7, info);
+        },
+        |cx| cx.debug_bounds("md-frag"),
+    );
+    let card = input
+        .read_with(cx, |s, _| s.hover_popover_bounds())
+        .expect("hover card must be laid out");
+    assert!(
+        card.size.width > px(200.),
+        "列表内容不能把卡片塌成窄柱（此前只有 66px）: card={card:?}"
+    );
+    let frag = frag.expect("列表项文本应渲染");
+    assert!(
+        frag.size.width <= card.size.width && frag.size.width > px(100.),
+        "列表文本应在卡内换行而不是塌成 0 宽: frag={frag:?} card={card:?}"
     );
 }
 

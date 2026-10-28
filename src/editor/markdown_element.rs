@@ -479,7 +479,16 @@ impl MarkdownElementBuilder {
                     };
                     self.push_div(bullet_el, &range, markdown_end);
                     self.pop_div();
-                    self.push_div(div().flex_1().w_0().min_w_0(), &range, markdown_end);
+                    // 列表项正文容器：`flex_basis: auto`（不是 0）——
+                    // 基数为 0 时，**内容宽度的测量**拿不到文本的自然宽度，
+                    // 整张 hover 卡片会塌成「项目符号 + 内边距」那么宽
+                    //（实测 66px）。`flex_grow` 仍让它在最终布局里吃满剩余
+                    // 宽度，`min_w_0` 允许长文本收缩换行。
+                    self.push_div(
+                        div().flex_grow(1.).flex_shrink(1.).min_w_0(),
+                        &range,
+                        markdown_end,
+                    );
                 }
                 MarkdownTag::BlockQuote => {
                     self.blockquote_depth += 1;
@@ -796,19 +805,33 @@ impl MarkdownElementBuilder {
                         let url = link.url.clone();
                         let url_for_id = SharedString::from(url.clone());
                         let is_external = url.starts_with("http://") || url.starts_with("https://");
+                        // 链接文本必须和正文一样能折行：裸 `StyledText` 是
+                        // flex item，默认按 max-content 取宽 —— 长链接会整行
+                        // 溢出卡片、被 `overflow_x_hidden` 裁掉。这里套一层
+                        // `min_w_0 + max_w_full`（与 `flush_text` 同款），并让
+                        // 链接容器自己也受段落宽度约束、文本可收缩。
+                        let text_wrap = div()
+                            .min_w_0()
+                            .max_w_full()
+                            .child(styled_text)
+                            .into_any_element();
                         let link_el = div()
                             .id(url_for_id)
+                            // 测试探针：链接整块（文本 + 外链箭头）。
+                            .debug_selector(|| "md-link".into())
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap_1()
+                            .min_w_0()
+                            .max_w_full()
                             .cursor_pointer()
                             .on_click(move |_: &ClickEvent, _, _cx| {
                                 // 关键安全：仅允许 http/https 直接打开，
                                 // file:// 与自定义 Scheme 默认拦截（见 safe_open 模块）。
                                 crate::utils::safe_open::open_url_safely(&url);
                             })
-                            .child(styled_text)
+                            .child(text_wrap)
                             .when(is_external, |this| {
                                 this.child(
                                     div()
@@ -1088,6 +1111,9 @@ impl MarkdownElementBuilder {
         self.pending_fragments.push((frag_id, text.clone()));
         self.append_child(
             div()
+                // 测试探针：文本片段（含内联代码/链接之外的普通文本）。
+                // 单段落内容时 `debug_bounds("md-frag")` 就是这一段的盒子。
+                .debug_selector(|| "md-frag".into())
                 .min_w_0()
                 // 段落是 `flex().flex_wrap()`：纯文本片段本身也是 flex item，
                 // 默认按 max-content 取宽。没有这条上限时，一段很长的注释会

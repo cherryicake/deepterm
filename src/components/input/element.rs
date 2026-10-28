@@ -4373,11 +4373,52 @@ impl TextElement {
         }) else {
             return;
         };
-        let Some(mut content) =
-            crate::editor::hover::render_hover_card(&info, window, weak_state, cx)
-        else {
+
+        // ---- hover 卡片宽度：两趟测量 + 缓存 --------------------------------
+        //
+        // 卡片里的 markdown 段落是 `flex_wrap` 的行容器，文本片段用
+        // `max_w_full()`（百分比）夹到容器宽度；gpui 的文本只有拿到
+        // `known_dimensions.width` / `AvailableSpace::Definite` 才设置
+        // `wrap_width`。卡片宽度若由内容撑开（auto），百分比链解析不出定宽
+        // → 长注释按自然宽度排成一行，再被卡片的 `overflow_x_hidden` 裁掉
+        //（用户报的「hover 里长注释不换行、右边被截断」）。
+        //
+        // 因此最终渲染必须给卡片**显式宽度**。目标宽度的取法：
+        //   1. 先按视口可用宽度（`wrap_at`）量一遍 auto 卡片：
+        //      短内容得到自然宽，长内容得到封顶宽；
+        //   2. 取 min(量到的宽, wrap_at)，用这个宽度重建卡片 → 文本折行。
+        // 第一步只在**新 hover / 视口宽度变化**时做；结果缓存在
+        // `InputState`，之后每帧直接用定宽渲染一次，不重复建元素。
+        let wrap_at = popover_wrap_width(viewport, px(crate::editor::hover::MAX_WIDTH));
+        let cached_width = self.state.read(cx).hover_card_width(wrap_at);
+        let Some(mut content) = crate::editor::hover::render_hover_card(
+            &info,
+            cached_width,
+            window,
+            weak_state.clone(),
+            cx,
+        ) else {
             return;
         };
+        if cached_width.is_none() {
+            let measured = content.layout_as_root(
+                Size {
+                    width: AvailableSpace::Definite(wrap_at),
+                    height: AvailableSpace::MaxContent,
+                },
+                window,
+                cx,
+            );
+            let width = measured.width.min(wrap_at);
+            if let Some(fixed) =
+                crate::editor::hover::render_hover_card(&info, Some(width), window, weak_state, cx)
+            {
+                content = fixed;
+                self.state
+                    .update(cx, |state, _cx| state.set_hover_card_width(wrap_at, width));
+            }
+        }
+
         if let Some((origin, anchor_y, size)) = self.place_at_anchor(
             anchor,
             &mut content,
@@ -4478,10 +4519,7 @@ impl TextElement {
         // 窗口（或卡片的 `overflow_x_hidden`）裁掉——用户看到的就是“这一行
         // 不换行、后面完全看不见”。先夹出视口内可用的最大宽度，再交给
         // `layout_as_root`，换行宽度与最终可见宽度才是同一个值。
-        let wrap_at = wrap_at.map(|requested| {
-            let margin = POPOVER_VIEWPORT_MARGIN * 2.;
-            (viewport.size.width - margin).max(px(80.)).min(requested)
-        });
+        let wrap_at = wrap_at.map(|requested| popover_wrap_width(viewport, requested));
         let size = match wrap_at {
             Some(max_w) => content.layout_as_root(
                 Size {
@@ -4521,6 +4559,15 @@ impl TextElement {
         // （见 `InputState::record_hover_popover_bounds`）。
         Some((point(x, y), anchor_y, size))
     }
+}
+
+/// 浮层可用的排版宽度：视口宽减去两侧留白，再夹到调用方的上限。
+///
+/// 供 `place_at_anchor`（测量/夹取）与 hover 卡片的定宽两趟测量共用，
+/// 保证「按它折行的宽度」与「最终可见宽度」永远是同一个值。
+fn popover_wrap_width(viewport: Bounds<Pixels>, requested: Pixels) -> Pixels {
+    let margin = POPOVER_VIEWPORT_MARGIN * 2.;
+    (viewport.size.width - margin).max(px(80.)).min(requested)
 }
 
 /// 决定浮层画在哪一边，返回它的 y（窗口坐标）。

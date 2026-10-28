@@ -664,6 +664,14 @@ pub struct InputState {
     /// hover 浮层在窗口坐标系里的矩形；见
     /// [`Self::record_hover_popover_bounds`]。
     hover_popover_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    /// hover 卡片的定宽缓存：`(排版可用宽度, 卡片宽度)`。
+    ///
+    /// 卡片必须用**显式宽度**渲染，markdown 里的 `w_full`/`max_w_full`
+    /// 百分比链才有确定宽度、长文本才会折行（详见
+    /// `element.rs::layout_lsp_popovers` 的两趟测量）。第一趟量出的宽度
+    /// 缓存在这里，之后每帧单趟渲染；窗口宽度变化（可用宽度不同）或
+    /// 换了新的 hover 内容时缓存失效。
+    hover_card_width: Option<(gpui::Pixels, gpui::Pixels)>,
     /// hover 浮层被键盘接管（`K` 第二次按下）。
     ///
     /// **不用真焦点，用标志位**。卡片是用 `defer_draw` 画到窗口层上的，
@@ -821,6 +829,7 @@ impl InputState {
             pending_hover: None,
             hover_pointer_inside: false,
             hover_popover_bounds: None,
+            hover_card_width: None,
             hover_keyboard_takeover: false,
             hover_hide_deadline: None,
             pending_completions: None,
@@ -1318,8 +1327,24 @@ impl InputState {
         info: crate::editor::hover::HoverInfo,
     ) {
         self.hover_popover = Some((anchor_offset, info));
-        // 新内容落定：之前安排的延迟隐藏作废。
+        // 新内容落定：之前安排的延迟隐藏作废；上一份内容量出的卡片宽度
+        // 也随之失效（下一帧重新两趟测量）。
         self.hover_hide_deadline = None;
+        self.hover_card_width = None;
+    }
+
+    /// 已缓存的 hover 卡片宽度（仅当排版可用宽度一致时命中）。
+    ///
+    /// 见 [`Self::set_hover_card_width`]。
+    pub fn hover_card_width(&self, wrap_at: gpui::Pixels) -> Option<gpui::Pixels> {
+        self.hover_card_width
+            .filter(|(wrapped, _)| *wrapped == wrap_at)
+            .map(|(_, width)| width)
+    }
+
+    /// 记录 hover 卡片的定宽（`wrap_at` 为本次排版可用宽度，用于失效判断）。
+    pub fn set_hover_card_width(&mut self, wrap_at: gpui::Pixels, width: gpui::Pixels) {
+        self.hover_card_width = Some((wrap_at, width));
     }
 
     /// 当前悬浮浮层（锚点偏移 + 内容）。
@@ -1358,6 +1383,7 @@ impl InputState {
         // 矩形必须同步清掉：否则 `hover_popover_contains` 会拿一个已经不存在的
         // 卡片去判断命中，导致该区域内的滚动被无谓地吞掉。
         self.hover_popover_bounds = None;
+        self.hover_card_width = None;
         // 浮层没了，「指针在浮层上」这件事也随之失效。不重置的话，下一次
         // 浮层弹出时 `hover_pointer_inside` 仍是 true，`hide` 会被无谓地跳过，
         // 表现为「鼠标明明已经移开，浮层却赖着不走」。

@@ -857,8 +857,22 @@ pub fn init_keystroke_interceptor(cx: &mut App) {
 /// 对照 Zed `hover_popover.rs::InfoPopover::render`：它同样是
 /// `MarkdownElement` 内联 + `.overflow_y_scroll()` + `.track_scroll(...)`，
 /// 样式取自独立的 `hover_markdown_style`。
+///
+/// `width` 是**显式给定的卡片宽度**（`None` = 由内容撑开的 shrink-to-fit）。
+///
+/// 为什么最终渲染一定要走 `Some`：卡片里的 markdown 段落是
+/// `flex().flex_wrap()`，文本片段用 `max_w_full()`（百分比宽度）夹到容器宽度，
+/// 而 gpui 的文本只有在 `known_dimensions.width` 或 `AvailableSpace::Definite`
+/// 时才有 `wrap_width`。卡片宽度由内容决定（auto）时，百分比链解析不出定宽，
+/// 长段落会按**自然宽度**排成一行再被卡片 `overflow_x_hidden` 裁掉
+/// （用户报的「hover 里长注释不换行、右边被截断」）。定宽后整条
+/// `w_full`/`max_w_full` 链都拿到确定宽度，文本才会在卡内折行。
+///
+/// 宽度本身由 [`crate::components::input::element`] 里的两趟测量算出来：
+/// 先按可用宽度量一次拿到目标宽度，再用它重建这张卡片。
 pub fn render_hover_card(
     info: &HoverInfo,
+    width: Option<Pixels>,
     window: &mut gpui::Window,
     editor_state: gpui::WeakEntity<InputState>,
     cx: &mut App,
@@ -897,7 +911,7 @@ pub fn render_hover_card(
             .map(|item| div().flex_shrink_0().w_full().child(item)),
     );
 
-    let card = div()
+    let mut card = div()
         // `.id(...)` 不是装饰：它把 `Div` 变成 `Stateful<Div>`，而
         // `overflow_y_scroll` / `track_scroll` 只在 `StatefulInteractiveElement`
         // 上有实现。少这一行整个滚动容器就编译不过。
@@ -916,16 +930,19 @@ pub fn render_hover_card(
         // 编辑器侧还留了一份几何判断（`hover_popover_contains`）做兜底：
         // 卡片 hitbox 要到它自己那一帧的 prepaint 才存在，两帧之间靠它拦。
         .occlude()
-        // 宽度上限 + 换行的**唯一**来源。两件事必须由同一条约束提供：
+        // 宽度上限：卡片永远不超过 `MAX_WIDTH`（窄窗口由调用方把 width
+        // 再夹到视口内，见 `place_at_anchor`）。
         //
-        //   * 夹住卡片盒子 —— 段落是 `flex().flex_wrap()` 的行容器，它的主轴
-        //     尺寸在 taffy 的内在尺寸算法里取**内容贡献**（不看可用宽度），
-        //     会把卡片顶到内容的自然宽度（实测 1599 / 3183 / …）。
-        //   * 给子内容一个定宽 —— 文本只有拿到 `AvailableSpace::Definite`
-        //     才换行（见 `place_at_anchor::wrap_at` 的注释），可用宽度定下来后
-        //     正好是 `MAX_WIDTH - padding`，段落与代码块都按它折行。
+        // `width` 才是换行的**前提**：卡片宽度由内容决定（auto）时，
+        // 段落里的 `w_full`/`max_w_full` 百分比链解析不出定宽，文本会按
+        // 自然宽度排成一行再被 `overflow_x_hidden` 裁掉。显式 `w(px)` 后
+        // 整条链都拿到确定宽度，段落、列表、链接里的文字才会在卡内折行。
         .max_w(px(MAX_WIDTH))
-        .max_h(px(MAX_HEIGHT))
+        .max_h(px(MAX_HEIGHT));
+    if let Some(width) = width {
+        card = card.w(width);
+    }
+    let card = card
         .flex()
         .flex_col()
         .overflow_y_scroll()
