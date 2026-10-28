@@ -5560,6 +5560,24 @@ impl LiveMarkdownView {
     }
 }
 
+/// 代码 / mermaid 卡片左上角胶囊的基础样式（mermaid「预览 | 源码」等 tab 与
+/// 语言徽章共用同一套数值：10px 字号、600 字重、14px 行高、圆角 5、上下 2
+/// 左右 9 内边距）。
+///
+/// 调用方补颜色与交互：tab 挂 `cursor_pointer`/`on_click`，语言徽章只复用
+/// 样式、不可点击。
+fn card_pill(bg: Hsla, fg: Hsla) -> gpui::Div {
+    div()
+        .px(px(9.0))
+        .py(px(2.0))
+        .rounded(px(5.0))
+        .bg(bg)
+        .text_size(px(10.0))
+        .line_height(px(14.0))
+        .font_weight(gpui::FontWeight(600.))
+        .text_color(fg)
+}
+
 impl Render for LiveMarkdownView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -6520,21 +6538,19 @@ impl Render for LiveMarkdownView {
                         });
                     }
                     // mermaid 卡片不渲染语言徽章（左上角让位给「预览 | 源码」
-                    // tab）；其他语言保持原样。
+                    // tab）；其他语言保留徽章，样式与那些 tab 完全一致 ——
+                    // 同一个胶囊（[`card_pill`]），区别只是不可点击。
                     if !is_mermaid && let Some(lang) = lang {
                         card = card.child(
                             div()
+                                .debug_selector(|| "live-code-lang".into())
                                 .absolute()
-                                .top(px(7.0))
-                                .left(px(12.0))
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(px(4.0))
-                                .bg(ui.text.opacity(0.06))
-                                .text_size(px(10.0))
-                                .font_weight(gpui::FontWeight(600.))
-                                .text_color(ui.text_muted)
-                                .child(lang.to_uppercase())
+                                .top(px(9.0))
+                                .left(px(10.0))
+                                .child(
+                                    card_pill(ui.text.opacity(0.05), ui.text_muted)
+                                        .child(lang.to_uppercase()),
+                                )
                                 .into_any_element(),
                         );
                     }
@@ -6585,28 +6601,25 @@ impl Render for LiveMarkdownView {
                                        sel: &'static str,
                                        to_source: bool,
                                        ent: Entity<Self>| {
-                            div()
-                                .id(id)
-                                .debug_selector(move || sel.to_string())
-                                .px(px(9.0))
-                                .py(px(2.0))
-                                .rounded(px(5.0))
-                                .cursor_pointer()
-                                .bg(if active {
+                            card_pill(
+                                if active {
                                     ui.text.opacity(0.12)
                                 } else {
                                     ui.text.opacity(0.05)
-                                })
-                                .text_size(px(10.0))
-                                .line_height(px(14.0))
-                                .font_weight(gpui::FontWeight(600.))
-                                .text_color(if active { ui.text } else { ui.text_muted })
-                                .child(label)
-                                .on_click(move |_: &ClickEvent, _, cx: &mut gpui::App| {
+                                },
+                                if active { ui.text } else { ui.text_muted },
+                            )
+                            .id(id)
+                            .debug_selector(move || sel.to_string())
+                            .cursor_pointer()
+                            .child(label)
+                            .on_click(
+                                move |_: &ClickEvent, _, cx: &mut gpui::App| {
                                     ent.update(cx, |v, cx| {
                                         v.set_mermaid_showing_code(block_id, to_source, cx)
                                     });
-                                })
+                                },
+                            )
                         };
                         card = card.child(
                             div()
@@ -8531,6 +8544,32 @@ mod live_frame_tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
             self.0.clone()
         }
+    }
+
+    /// 语言徽章必须和 mermaid 卡片左上角「预览 | 源码」tab 同款：共用
+    /// [`card_pill`] 的胶囊样式（同高、左偏移一致），区别只是不可点击。
+    #[gpui::test]
+    fn code_language_badge_matches_mermaid_tab_pill(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        const DOC: &str =
+            "```rust\nfn main() {}\n```\n\n```mermaid\nflowchart TD\n    A --> B\n```\n";
+        let (_host, cx) =
+            cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        let lang = cx.debug_bounds("live-code-lang").expect("语言徽章");
+        let tab = cx.debug_bounds("live-mm-tab-graph").expect("预览 tab");
+        assert!(
+            (f32::from(lang.size.height) - f32::from(tab.size.height)).abs() <= 0.5,
+            "语言徽章与 mermaid tab 必须同高：{lang:?} vs {tab:?}"
+        );
+        assert!(
+            (f32::from(lang.origin.x) - f32::from(tab.origin.x)).abs() <= 0.5,
+            "语言徽章与 mermaid tab 必须左边对齐：{lang:?} vs {tab:?}"
+        );
     }
 
     /// Full-frame assertions shared by all window sizes.

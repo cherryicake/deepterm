@@ -30,6 +30,11 @@ pub struct MarkdownStyle {
     pub base_text_style: gpui::TextStyle,
     pub container_style: StyleRefinement,
     pub code_block: StyleRefinement,
+    /// 代码块是否带卡片附带的交互 chrome：左上角语言徽章 + 右上角复制按钮。
+    ///
+    /// `true`（预览 tab / live 卡片）；`false`（hover 浮层）—— 浮层里只留
+    /// 代码本身的高亮，不标语言、不给复制入口。
+    pub code_block_chrome: bool,
     pub inline_code: TextStyleRefinement,
     pub block_quote: TextStyleRefinement,
     pub link: TextStyleRefinement,
@@ -143,6 +148,7 @@ impl MarkdownStyle {
             base_text_style,
             container_style: StyleRefinement::default(),
             code_block,
+            code_block_chrome: true,
             inline_code,
             block_quote: TextStyleRefinement {
                 color: Some(ui.text.opacity(0.78)),
@@ -181,41 +187,20 @@ impl MarkdownStyle {
             ..Default::default()
         });
 
-        // 代码块：编辑器背景 + 淡边框，与浮层卡片自身有层次差。
+        // 代码块：hover 里**不画框**——不铺背景、不描边、不留内边距，只保留
+        // 等宽高亮的代码本身（语言徽章与复制按钮由 `code_block_chrome = false`
+        // 关掉）。上下留 4px 让它与正文段落分开即可。
         //
         // 字段形状照 [`Self::themed`] 的 `code_block`：`StyleRefinement` 用的是
         // `background` / `border_widths` / `border_radius`，没有
         // `background_color` / `border_width` 这些名字。
         let code_block = StyleRefinement {
-            padding: gpui::EdgesRefinement {
-                top: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(6.)),
-                )),
-                left: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
-                )),
-                right: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(8.)),
-                )),
-                bottom: Some(gpui::DefiniteLength::Absolute(
-                    gpui::AbsoluteLength::Pixels(px(6.)),
-                )),
-            },
             margin: gpui::EdgesRefinement {
                 top: Some(gpui::Length::Definite(px(4.).into())),
                 left: Some(gpui::Length::Definite(px(0.).into())),
                 right: Some(gpui::Length::Definite(px(0.).into())),
                 bottom: Some(gpui::Length::Definite(px(4.).into())),
             },
-            border_style: Some(gpui::BorderStyle::Solid),
-            border_widths: gpui::EdgesRefinement {
-                top: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                left: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                right: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-                bottom: Some(gpui::AbsoluteLength::Pixels(px(1.))),
-            },
-            border_color: Some(ui.border.opacity(if is_dark { 0.28 } else { 0.20 })),
-            background: Some(theme.editor_background().into()),
             // **行高必须显式给且大于字号**：卡片有 `max_h`，行高塌陷会让
             // 相邻两行叠在一起（用户看到的「多行字符堆叠」）。
             text: TextStyleRefinement {
@@ -264,6 +249,8 @@ impl MarkdownStyle {
             base_text_style,
             container_style: StyleRefinement::default(),
             code_block,
+            // hover 里代码块只渲染高亮本身（见上方 `code_block` 注释）。
+            code_block_chrome: false,
             inline_code,
             block_quote: TextStyleRefinement {
                 color: Some(ui.text.opacity(0.78)),
@@ -763,4 +750,89 @@ pub fn highlight_code_runs(
         runs.push(base_style.to_run(content.len() - offset));
     }
     runs
+}
+
+#[cfg(test)]
+mod chrome_tests {
+    use super::*;
+
+    /// 一段带语言的代码块：预览样式要画卡片 chrome，hover 样式只留高亮。
+    const SAMPLE: &str = "```rust\nfn main() {}\n```\n";
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Look {
+        Preview,
+        Hover,
+    }
+
+    struct Host {
+        markdown: Entity<Markdown>,
+        look: Look,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let style = match self.look {
+                Look::Preview => MarkdownStyle::themed(window, cx),
+                Look::Hover => MarkdownStyle::hover_style(window, cx, "Menlo".to_string()),
+            };
+            div().size_full().flex().flex_col().children(
+                Markdown::render_items_inline(self.markdown.clone(), style, cx)
+                    .into_iter()
+                    .map(|item| div().w_full().child(item)),
+            )
+        }
+    }
+
+    /// hover 浮层里的 markdown 代码块：**不画框、不标语言、不给复制按钮**，
+    /// 只渲染代码本身的高亮；预览（整页 / live）仍保留卡片 chrome。
+    #[gpui::test]
+    fn hover_code_block_renders_without_card_chrome(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|_, cx| Host {
+            markdown: cx.new(|cx| Markdown::new(SAMPLE, cx)),
+            look: Look::Hover,
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+
+        let code = cx
+            .debug_bounds("md-code-block")
+            .expect("代码块本体仍应渲染");
+        assert!(
+            code.size.height > px(0.),
+            "hover 代码块高度应大于 0：{code:?}"
+        );
+        assert!(
+            cx.debug_bounds("md-code-lang").is_none(),
+            "hover 代码块不该渲染语言徽章"
+        );
+        assert!(
+            cx.debug_bounds("md-code-copy").is_none(),
+            "hover 代码块不该渲染复制按钮"
+        );
+
+        // 预览样式：卡片 chrome 照旧（语言徽章 + 复制按钮都在）。
+        host.update(cx, |h, cx| {
+            h.look = Look::Preview;
+            cx.notify();
+        });
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("md-code-block").is_some(),
+            "预览代码块本体应渲染"
+        );
+        assert!(
+            cx.debug_bounds("md-code-lang").is_some(),
+            "预览代码块必须有语言徽章"
+        );
+        assert!(
+            cx.debug_bounds("md-code-copy").is_some(),
+            "预览代码块必须有复制按钮"
+        );
+    }
 }

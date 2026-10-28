@@ -324,6 +324,9 @@ impl MarkdownElementBuilder {
                         .is_some();
                     let mut outer = div()
                         .group("code-block")
+                        // 测试探针：代码块卡片本体（hover 样式下也应存在，
+                        // 只是没有 chrome）。
+                        .debug_selector(|| "md-code-block".into())
                         .relative()
                         .w_full()
                         .rounded(px(8.0))
@@ -350,7 +353,9 @@ impl MarkdownElementBuilder {
                     } else {
                         inner.overflow_x_scroll()
                     };
-                    if has_language {
+                    // 语言徽章会占住卡片顶部，给内容留出 24px 的顶距；没有
+                    // chrome（hover 浮层）时内容直接从顶部开始。
+                    if has_language && self.style.code_block_chrome {
                         inner = inner.pt(px(24.0));
                     }
                     self.push_div(inner, &range, markdown_end);
@@ -656,71 +661,81 @@ impl MarkdownElementBuilder {
                     let content = self.code_block_content.pop().unwrap_or_default();
                     let code_block_id = self.code_block_ids.pop().unwrap_or_default();
                     let language = self.code_block_language.last().cloned().flatten();
-                    let copy_id = gpui::ElementId::Name(SharedString::from(format!(
-                        "copy-{}",
-                        code_block_id
-                    )));
 
-                    if let Some(lang) = language {
-                        let label = div()
-                            .absolute()
-                            .top(px(7.0))
-                            .left(px(12.0))
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(px(4.0))
-                            .bg(cx.theme().ui.text.opacity(0.06))
-                            .text_size(px(10.0))
-                            .font_weight(gpui::FontWeight(600.))
-                            .text_color(cx.theme().ui.text_muted)
-                            .child(lang.to_uppercase())
-                            .into_any_element();
-                        self.append_child(label);
-                    }
+                    // 卡片 chrome（语言徽章 + 复制按钮）只给预览/live 卡片；
+                    // hover 浮层（`code_block_chrome = false`）只渲染代码高亮
+                    // 本身，不标语言、不给复制入口。
+                    if self.style.code_block_chrome {
+                        let copy_id = gpui::ElementId::Name(SharedString::from(format!(
+                            "copy-{}",
+                            code_block_id
+                        )));
 
-                    let is_copied = self.copied_code_blocks.contains(&code_block_id);
-                    let copy_content = content.clone();
-                    let markdown_copy = self.markdown.clone();
-                    let copy_btn = div()
-                        .id(copy_id)
-                        .px_2()
-                        .py_1()
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .invisible()
-                        .group_hover("code-block", |style| style.visible())
-                        .child(if is_copied {
-                            svg()
-                                .size(px(16.0))
-                                .text_color(cx.theme().ui.success)
-                                .path(Icon::Check.path())
-                        } else {
-                            svg()
-                                .size(px(16.0))
+                        if let Some(lang) = language {
+                            let label = div()
+                                .debug_selector(|| "md-code-lang".into())
+                                .absolute()
+                                .top(px(7.0))
+                                .left(px(12.0))
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(4.0))
+                                .bg(cx.theme().ui.text.opacity(0.06))
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight(600.))
                                 .text_color(cx.theme().ui.text_muted)
-                                .path(Icon::Copy.path())
-                        })
-                        .on_click(move |_: &ClickEvent, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(copy_content.clone()));
-                            markdown_copy.update(cx, |markdown, cx| {
-                                markdown.mark_code_block_copied(code_block_id, cx);
-                            });
-                        })
-                        .into_any_element();
+                                .child(lang.to_uppercase())
+                                .into_any_element();
+                            self.append_child(label);
+                        }
 
-                    let buttons = div()
-                        .absolute()
-                        .top(px(6.0))
-                        .right(px(6.0))
-                        .flex()
-                        .rounded(px(6.0))
-                        .bg(cx.theme().editor_background())
-                        .border_1()
-                        .border_color(cx.theme().ui.border.opacity(0.18))
-                        .shadow_sm()
-                        .child(copy_btn)
-                        .into_any_element();
-                    self.append_child(buttons);
+                        let is_copied = self.copied_code_blocks.contains(&code_block_id);
+                        let copy_content = content.clone();
+                        let markdown_copy = self.markdown.clone();
+                        let copy_btn = div()
+                            .id(copy_id)
+                            .debug_selector(|| "md-code-copy".into())
+                            .px_2()
+                            .py_1()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .invisible()
+                            .group_hover("code-block", |style| style.visible())
+                            .child(if is_copied {
+                                svg()
+                                    .size(px(16.0))
+                                    .text_color(cx.theme().ui.success)
+                                    .path(Icon::Check.path())
+                            } else {
+                                svg()
+                                    .size(px(16.0))
+                                    .text_color(cx.theme().ui.text_muted)
+                                    .path(Icon::Copy.path())
+                            })
+                            .on_click(move |_: &ClickEvent, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_content.clone(),
+                                ));
+                                markdown_copy.update(cx, |markdown, cx| {
+                                    markdown.mark_code_block_copied(code_block_id, cx);
+                                });
+                            })
+                            .into_any_element();
+
+                        let buttons = div()
+                            .absolute()
+                            .top(px(6.0))
+                            .right(px(6.0))
+                            .flex()
+                            .rounded(px(6.0))
+                            .bg(cx.theme().editor_background())
+                            .border_1()
+                            .border_color(cx.theme().ui.border.opacity(0.18))
+                            .shadow_sm()
+                            .child(copy_btn)
+                            .into_any_element();
+                        self.append_child(buttons);
+                    }
 
                     self.pop_text_style();
                     self.code_block_language.pop();
