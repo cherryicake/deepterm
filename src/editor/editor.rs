@@ -439,12 +439,26 @@ impl FileTreeKey {
     }
 }
 
+/// 按 tab id 索引的 LSP 会话表：切标签页组/文件树时随编辑器状态换手。
+type LspSessionMap = HashMap<SharedString, crate::lsp::session::LspSession>;
+
 /// 每个文件树的编辑器状态
 pub struct FileTreeEditorState {
     pub open_files_info: Vec<EditorOpenFileInfo>,
     pub cached_editor_states: HashMap<SharedString, Entity<InputState>>,
     /// diff tab 的视图缓存：切组时整实体保留，未保存的右侧编辑、滚动、折叠状态不丢。
     pub cached_diff_views: HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
+    /// 各标签的 LSP 会话：切组时随 `InputState` 一起换手。
+    ///
+    /// 不能留在 `EditorFile` 里。`save_to_file_tree_state` 会 `clear()` 整个
+    /// 编辑器，会话的 `Drop` 于是发出 `didClose`；而恢复路径原本只重建文本与
+    /// tab，从不重建会话——服务器进程仍活在 `LspManager` 里，编辑器手上却
+    /// 没有 client，hover / 跳转 / 补全全部静默失效。把会话搬进状态表，
+    /// 切回来原样放回 `EditorFile`，文档在服务器侧一直开着，无需重连。
+    ///
+    /// 有界性：随 `FileTreeEditorStates`（`lib.rs`）的 8 条上限一起淘汰；
+    /// 淘汰即 drop 会话 → 正常补发 `didClose`。
+    pub cached_lsp_sessions: LspSessionMap,
     pub active_file_id: Option<SharedString>,
 }
 
@@ -457,6 +471,17 @@ impl FileTreeEditorState {
     pub fn has_unsaved_edits(&self) -> bool {
         self.open_files_info.iter().any(|info| info.dirty)
     }
+}
+
+/// 恢复编辑器时按 tab id 索引的三类缓存。
+///
+/// 三张表必须一起传：`InputState` 是文本的唯一持有者，LSP 会话与它必须落在
+/// 同一个 tab id 上。分开传参时恢复路径只认识前两张，会话就被落下了
+/// ——`lsp: None` 那个历史 bug 正是这么来的。
+struct RestoreBuffers<'a> {
+    states: &'a HashMap<SharedString, Entity<InputState>>,
+    diffs: &'a HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
+    lsp_sessions: &'a mut LspSessionMap,
 }
 
 pub struct Editor {
@@ -939,6 +964,22 @@ impl Editor {
         cached
     }
 
+    /// 取出各标签的 LSP 会话，用于标签页组/文件树切换时随状态一起换手。
+    ///
+    /// 必须在 `clear(cx)` **之前**调用：`EditorFile` 一旦被析构，`LspSession`
+    /// 的 `Drop` 就会发 `didClose`，服务器此后不再持有这些文档；而进程本身
+    /// 仍活在 `LspManager` 的表里。会话原样搬进 `FileTreeEditorState`，切回来
+    /// 时再放回 `EditorFile`——文档仍开着，hover/跳转无需重连。
+    fn take_cached_lsp_sessions(&mut self) -> LspSessionMap {
+        let mut sessions = HashMap::new();
+        for file in &mut self.open_files {
+            if let Some(session) = file.lsp.take() {
+                sessions.insert(file.id.clone(), session);
+            }
+        }
+        sessions
+    }
+
     /// 保存当前编辑器状态到文件树状态
     pub fn save_to_file_tree_state(&mut self, cx: &mut Context<Self>) -> FileTreeEditorState {
         // 切标签页组会缓存影子 InputState：先把防抖中的 live 文本落盘，
@@ -947,6 +988,10 @@ impl Editor {
         let open_files_info = self.get_open_files_info(cx);
         let cached_editor_states = self.take_cached_editor_states();
         let cached_diff_views = self.take_cached_diff_views();
+        // LSP 会话同样必须在 `clear` 之前摘出来：`clear` 释放 `EditorFile`，
+        // 会话的 `Drop` 会补发 `didClose`，切回来就只剩一个“进程还在、没人
+        // 连得上”的空壳（hover/跳转/补全静默失效）。
+        let cached_lsp_sessions = self.take_cached_lsp_sessions();
         let active_file_id = self.active_file_id.clone();
 
         // 清空编辑器
@@ -956,6 +1001,7 @@ impl Editor {
             open_files_info,
             cached_editor_states,
             cached_diff_views,
+            cached_lsp_sessions,
             active_file_id,
         }
     }
@@ -967,23 +1013,37 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let FileTreeEditorState {
+            open_files_info,
+            cached_editor_states,
+            cached_diff_views,
+            mut cached_lsp_sessions,
+            active_file_id,
+        } = state;
         self.restore_from_info(
-            state.open_files_info,
-            state.active_file_id,
-            &state.cached_editor_states,
-            &state.cached_diff_views,
+            open_files_info,
+            active_file_id,
+            RestoreBuffers {
+                states: &cached_editor_states,
+                diffs: &cached_diff_views,
+                lsp_sessions: &mut cached_lsp_sessions,
+            },
             window,
             cx,
         );
     }
 
-    /// 从缓存恢复文件列表
-    pub fn restore_from_info(
+    /// 从缓存恢复文件列表。
+    ///
+    /// `buffers.lsp_sessions` 按 tab id 一一对应：能原样放回的会话由
+    /// `restore_file_from_cache_with_session` 取走；没被接走的
+    /// （加载中的文件、图片、diff、切换期间被删的 tab）在本函数末尾统一
+    /// drop，`Drop` 会补发 `didClose`，服务器侧不会留下僵尸文档。
+    fn restore_from_info(
         &mut self,
         files_info: Vec<EditorOpenFileInfo>,
         active_file_id: Option<SharedString>,
-        cached_states: &HashMap<SharedString, Entity<InputState>>,
-        cached_diffs: &HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
+        buffers: RestoreBuffers<'_>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -997,7 +1057,7 @@ impl Editor {
         for file_info in &files_info {
             // diff tab：优先复用缓存的 DiffView 实体（保留未保存编辑/滚动/折叠），
             // 无缓存时用保存的仓库后台重载；走纯文本恢复会得到空白页。
-            if let Some(cached_diff) = cached_diffs.get(&file_info.id) {
+            if let Some(cached_diff) = buffers.diffs.get(&file_info.id) {
                 let diff_repo = file_info.diff_repo.clone();
                 self.push_existing_diff_tab(
                     file_info.id.to_string(),
@@ -1059,11 +1119,27 @@ impl Editor {
             }
 
             // 检查是否有缓存的 InputState（远程文件）
-            if let Some(cached_state) = cached_states.get(&file_info.id) {
-                // 直接使用缓存的 InputState
-                self.restore_file_from_cache(file_info, cached_state.clone(), window, cx);
+            if let Some(cached_state) = buffers.states.get(&file_info.id) {
+                // 直接使用缓存的 InputState，并把切走前的 LSP 会话一起放回。
+                match buffers.lsp_sessions.remove(&file_info.id) {
+                    Some(lsp_session) => self.restore_file_from_cache_with_session(
+                        file_info,
+                        cached_state.clone(),
+                        Some(lsp_session),
+                        window,
+                        cx,
+                    ),
+                    // 切走前就没有会话（LSP 关闭 / 用户 Stop / 无服务器）：
+                    // 保持没有，不在这里擅自拉起服务器。
+                    None => {
+                        self.restore_file_from_cache(file_info, cached_state.clone(), window, cx)
+                    }
+                }
             } else {
-                // 本地文件或正在加载的文件，重新打开
+                // 本地文件或正在加载的文件，重新打开。
+                // 旧会话的编辑器句柄指向即将被替换的 InputState，不能复用；
+                // 留在表里由本函数末尾统一 drop（补发 didClose），加载完成
+                // 后由 `finish_file_load` 重新接服务器。
                 if let Some(ref ssh_config) = file_info.ssh_config {
                     self.open_remote_file_inner(
                         file_info.path.clone(),
@@ -1088,20 +1164,64 @@ impl Editor {
                 }
             }
         }
+        // 没有任何标签接走的会话：图片/diff/加载中的 tab、切换期间被删的文件。
+        // 统一在这里释放，`Drop` 会补发 `didClose`，服务器侧不留僵尸文档。
+        buffers.lsp_sessions.clear();
         if let Some(ref active_id) = active_file_id {
             self.switch_to_file(active_id, cx);
         }
         self.suppress_open_animation = false;
     }
 
-    /// 从缓存恢复单个文件
+    /// 从缓存恢复单个文件（测试与不需要会话恢复的调用方使用）。
     fn restore_file_from_cache(
         &mut self,
         file_info: &EditorOpenFileInfo,
         editor_state: Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_file_from_cache_with_session(file_info, editor_state, None, window, cx);
+    }
+
+    /// 从缓存恢复单个文件，并尝试接回切走前的 LSP 会话。
+    ///
+    /// 只有**仍然连着服务器**的会话能原样放回。已经断开的（服务器崩溃、
+    /// 用户 Stop、握手未完成就被切走）不能复活：它的 `client` 要么已关闭、
+    /// 要么从未就绪，`active_lsp_session()` 拿到它只会让 hover/跳转继续
+    /// 静默失败。丢弃后走一次正常接回路径（`start_lsp_for_tab`），由它按
+    /// 「用户是否 Stop / 语言是否禁用 / 远端根是否已知」重新决策。
+    fn restore_file_from_cache_with_session(
+        &mut self,
+        file_info: &EditorOpenFileInfo,
+        editor_state: Entity<InputState>,
+        lsp_session: Option<crate::lsp::session::LspSession>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 复用的 InputState 与切走前是同一个实体，会话里的编辑器句柄仍然有效。
+        let (lsp, needs_reattach) = match lsp_session {
+            Some(session) if session.is_active() => (Some(session), false),
+            Some(session) => {
+                log::info!(
+                    "lsp: session for {} is not connected after restore; reconnecting",
+                    file_info.path
+                );
+                // drop 会补发 didClose；没 didOpen 过时是无害的空操作。
+                drop(session);
+                (None, true)
+            }
+            None => (None, false),
+        };
+        if needs_reattach {
+            // 旧会话留下的 Ready 状态与诊断已经没有来源，且新会话的 didOpen
+            // 从 version 0 重新计数；不清理会让状态栏显示一个假 Ready，诊断
+            // 版本门控也会把新服务器推来的诊断全判为过期。
+            editor_state.update(cx, |state, _| {
+                state.reset_lsp_diagnostics();
+                state.set_lsp_status(None);
+            });
+        }
         let path_str = file_info.path.clone();
         let label = file_info.label.clone();
         let ssh_config = file_info.ssh_config.clone();
@@ -1221,7 +1341,7 @@ impl Editor {
             image: None,
             diff: None,
             diff_repo: None,
-            lsp: None,
+            lsp,
         };
 
         // 只读文件：恢复后同样置为禁用，避免可编辑后保存才报错。
@@ -1247,6 +1367,13 @@ impl Editor {
                 cx,
             );
         });
+
+        // 会话在切走期间断了：像正常打开一样重新接一次。`start_lsp_for_tab`
+        // 会尊重用户 Stop / 语言禁用 / 远端根未探到等既有门控；失败时只记
+        // 日志并退回「无 LSP」，不会阻塞恢复。
+        if needs_reattach {
+            self.start_lsp_for_tab(&file_info.id, cx);
+        }
 
         self.switch_to_file(&file_info.id, cx);
         cx.notify();
@@ -7954,8 +8081,11 @@ mod tests {
                 editor.restore_from_info(
                     vec![info],
                     None,
-                    &HashMap::new(),
-                    &HashMap::new(),
+                    RestoreBuffers {
+                        states: &HashMap::new(),
+                        diffs: &HashMap::new(),
+                        lsp_sessions: &mut HashMap::new(),
+                    },
                     window,
                     cx,
                 );
@@ -8046,7 +8176,18 @@ mod tests {
                     SharedString,
                     Entity<crate::editor::diff_view::DiffView>,
                 > = std::collections::HashMap::new();
-                editor.restore_from_info(infos, active, &empty_text, &empty_diff, window, cx);
+                let mut empty_lsp = LspSessionMap::new();
+                editor.restore_from_info(
+                    infos,
+                    active,
+                    RestoreBuffers {
+                        states: &empty_text,
+                        diffs: &empty_diff,
+                        lsp_sessions: &mut empty_lsp,
+                    },
+                    window,
+                    cx,
+                );
             });
             let diff_ok = editor
                 .read(cx)
@@ -8056,6 +8197,191 @@ mod tests {
             assert!(diff_ok, "diff tab must rebuild its DiffView after restore");
         });
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 在已建好的编辑器上恢复一个 `restore-<tag>.rs` 标签，供 LSP 换手用例复用。
+    ///
+    /// 路径带 `tag`：两个用例并行跑时不能共用同一路径，否则文件监视器的
+    /// 注册/注销会互相干扰。
+    fn lsp_restore_tab(
+        editor: &gpui::Entity<Editor>,
+        cx: &mut gpui::VisualTestContext,
+        tag: &str,
+    ) -> EditorOpenFileInfo {
+        let path = std::env::temp_dir().join(format!("deepterm-lsp-restore-{tag}.rs"));
+        let info = EditorOpenFileInfo {
+            id: format!("editor-{}", path.display()).into(),
+            path: path.to_string_lossy().to_string(),
+            label: "restore.rs".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("fn main() {}\n".into()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            dirty: false,
+            diff_repo: None,
+        };
+        cx.update(|window, cx| {
+            let cached = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).multi_line(true);
+                state.set_value("fn main() {}\n", window, cx);
+                state
+            });
+            with_lsp_disabled(|| {
+                editor.update(cx, |editor, cx| {
+                    editor.restore_file_from_cache(&info, cached, window, cx)
+                });
+            });
+        });
+        info
+    }
+
+    /// 给 `tab_id` 对应的标签安装会话；`active` 决定它「仍连着」还是「已断开」。
+    fn install_lsp_session(
+        editor: &gpui::Entity<Editor>,
+        tab_id: &SharedString,
+        active: bool,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        editor.update(cx, |editor, _| {
+            let file = editor
+                .open_files
+                .iter_mut()
+                .find(|f| &f.id == tab_id)
+                .expect("fixture tab must exist");
+            let state = file.editor_state.downgrade();
+            let mut session =
+                crate::lsp::session::LspSession::new(Path::new(&file.path), "rust", state, None)
+                    .expect("session");
+            if active {
+                session.mark_active_for_test();
+            }
+            file.lsp = Some(session);
+        });
+    }
+
+    /// 回归：切标签页组/文件树后，LSP 会话必须随编辑器状态一起换手。
+    ///
+    /// 背景：`FileTreeEditorState` 原本只保存文本与 tab，`restore_file_from_cache`
+    /// 又硬编码 `lsp: None`。切走时 `LspSession::drop` 发了 `didClose`，切回来
+    /// 服务器进程还在、编辑器却没有 client——hover/跳转/补全全部静默失效。
+    #[gpui::test]
+    fn lsp_session_survives_file_tree_state_restore(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct Host {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| Host {
+            editor: cx.new(|cx| Editor::new(window, cx)),
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+        let info = lsp_restore_tab(&editor, cx, "survives");
+        install_lsp_session(&editor, &info.id, true, cx);
+
+        let state = editor.update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+        assert!(
+            state.cached_lsp_sessions.contains_key(&info.id),
+            "live LSP session must be parked in FileTreeEditorState"
+        );
+        assert!(
+            editor.read_with(cx, |editor, _| editor.open_files.is_empty()),
+            "save must clear the editor"
+        );
+
+        cx.update(|window, cx| {
+            with_lsp_disabled(|| {
+                editor.update(cx, |editor, cx| {
+                    editor.restore_from_file_tree_state(state, window, cx)
+                });
+            });
+        });
+        editor.read_with(cx, |editor, _| {
+            let file = editor
+                .open_files
+                .iter()
+                .find(|f| f.id == info.id)
+                .expect("tab must be restored");
+            assert!(
+                file.lsp.as_ref().is_some_and(|session| session.is_active()),
+                "restored tab must keep its connected LSP session (hover/jump depend on it)"
+            );
+        });
+    }
+
+    /// 回归：断开/未就绪的会话不得在恢复时被原样复活，旧 Ready 状态也要清掉。
+    ///
+    /// 覆盖服务器在切走期间崩溃、用户 Stop、握手没完成就切走这三种情况：
+    /// 会话没有可用 client，原样放回只会让 `active_lsp_session()` 拿到空壳，
+    /// hover/跳转继续静默失败。
+    #[gpui::test]
+    fn restore_drops_disconnected_lsp_session_and_clears_stale_status(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct Host {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| Host {
+            editor: cx.new(|cx| Editor::new(window, cx)),
+        });
+        let editor = host.read_with(cx, |h, _| h.editor.clone());
+        let info = lsp_restore_tab(&editor, cx, "drops");
+        install_lsp_session(&editor, &info.id, false, cx);
+        editor.update(cx, |editor, cx| {
+            editor.open_files[0].editor_state.update(cx, |state, _| {
+                state.set_lsp_status(Some(crate::lsp::status::LspStatus::Ready {
+                    errors: 2,
+                    warnings: 1,
+                }));
+            });
+        });
+
+        let state = editor.update(cx, |editor, cx| editor.save_to_file_tree_state(cx));
+        assert!(
+            state.cached_lsp_sessions.contains_key(&info.id),
+            "even a disconnected session is parked with the state"
+        );
+
+        cx.update(|window, cx| {
+            with_lsp_disabled(|| {
+                editor.update(cx, |editor, cx| {
+                    editor.restore_from_file_tree_state(state, window, cx)
+                });
+            });
+        });
+        editor.read_with(cx, |editor, cx| {
+            let file = editor
+                .open_files
+                .iter()
+                .find(|f| f.id == info.id)
+                .expect("tab must be restored");
+            assert!(
+                file.lsp.is_none(),
+                "disconnected session must not be resurrected"
+            );
+            assert!(
+                file.editor_state.read(cx).lsp_status().is_none(),
+                "stale Ready status must be cleared before reconnecting"
+            );
+        });
     }
 
     /// 回归（B4）：两个不同仓库的同名相对路径不得共用 diff tab。
@@ -8672,6 +8998,7 @@ mod tests {
                         open_files_info: Vec::new(),
                         cached_editor_states: HashMap::new(),
                         cached_diff_views: HashMap::new(),
+                        cached_lsp_sessions: HashMap::new(),
                         active_file_id: None,
                     },
                     window,

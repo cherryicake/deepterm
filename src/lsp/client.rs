@@ -6,8 +6,10 @@
 //! 返回值统一是 `lsp_types` 的类型；`params` 直接传 `&Value`，
 //! 新增一个方法不需要动 [`crate::lsp::jsonrpc`]。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicI32;
 
 use anyhow::{Context as _, Result};
 use lsp_types::{
@@ -48,6 +50,66 @@ fn is_transient_lsp_error(e: &anyhow::Error) -> bool {
     })
 }
 
+/// 一个已在服务器侧打开的文档。
+struct OpenDocument {
+    /// 文档版本的唯一分配者。
+    ///
+    /// 同一个 URI 可能被多个 `LspSession` 持有（同一个文件在两个标签页组里
+    /// 打开）。版本号必须共用一套，否则各自的计数器会互相覆盖，服务器看到
+    /// 的版本不再单调。
+    version: Arc<AtomicI32>,
+    /// 持有该文档的会话数。最后一个释放时才发 `didClose`。
+    refs: usize,
+}
+
+/// 按 URI 登记「哪些会话打开了这个文档」。
+///
+/// LSP 的 `didOpen`/`didClose` 是**按文档**计的，不是按会话：同一个文件同时
+/// 出现在两个标签页组时，两侧各有一个 `LspSession`，但服务器只应收到一次
+/// `didOpen`；也只有最后一个会话关闭时才该收到 `didClose`。会话在切组时被
+/// 整份保留（见 `FileTreeEditorState::cached_lsp_sessions`），这条登记因此
+/// 是必需的——否则切回同一项目时会重复 didOpen，版本号还会互相打架。
+#[derive(Default)]
+pub(crate) struct DocumentRegistry {
+    docs: parking_lot::Mutex<HashMap<Url, OpenDocument>>,
+}
+
+impl DocumentRegistry {
+    /// 登记一次持有。返回（共享版本号，是否已由别的会话打开）。
+    fn acquire(&self, uri: &Url) -> (Arc<AtomicI32>, bool) {
+        let mut docs = self.docs.lock();
+        if let Some(doc) = docs.get_mut(uri) {
+            doc.refs += 1;
+            return (doc.version.clone(), true);
+        }
+        let version = Arc::new(AtomicI32::new(0));
+        docs.insert(
+            uri.clone(),
+            OpenDocument {
+                version: version.clone(),
+                refs: 1,
+            },
+        );
+        (version, false)
+    }
+
+    /// 释放一次持有。`true` 表示最后一个持有者已离开，调用方应发 `didClose`。
+    fn release(&self, uri: &Url) -> bool {
+        let mut docs = self.docs.lock();
+        let Some(doc) = docs.get_mut(uri) else {
+            // 没登记过（例如会话从未真正 didOpen）：保持旧的「直接关闭」语义。
+            return true;
+        };
+        doc.refs = doc.refs.saturating_sub(1);
+        if doc.refs == 0 {
+            docs.remove(uri);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// 一次 `initialize` 握手的结果。
 pub struct LspClient {
     conn: Arc<Connection>,
@@ -58,6 +120,8 @@ pub struct LspClient {
     root: PathBuf,
     /// 服务器声明的文档同步方式：全量或增量。
     sync_kind: lsp_types::TextDocumentSyncKind,
+    /// 已打开文档的引用计数与共享版本号。
+    documents: DocumentRegistry,
 }
 
 impl LspClient {
@@ -186,6 +250,7 @@ impl LspClient {
             capabilities: Arc::new(result),
             root,
             sync_kind,
+            documents: DocumentRegistry::default(),
         })
     }
 
@@ -231,6 +296,20 @@ impl LspClient {
     }
 
     // ---------------------------------------------------------------- 文档同步
+
+    /// 登记一次文档持有。返回（共享版本号，是否已由别的会话打开）。
+    ///
+    /// 同一个 URI 被多个 `LspSession` 持有时（同一文件出现在两个标签页组），
+    /// 只有第一次需要发 `didOpen`，后续持有者用共享版本号发 `didChange` 对齐
+    /// 文本即可（见 [`crate::lsp::session::LspSession::on_connected`]）。
+    pub(crate) fn acquire_document(&self, uri: &Url) -> (Arc<AtomicI32>, bool) {
+        self.documents.acquire(uri)
+    }
+
+    /// 释放一次文档持有。`true` 表示最后一个持有者离开，应发 `didClose`。
+    pub(crate) fn release_document(&self, uri: &Url) -> bool {
+        self.documents.release(uri)
+    }
 
     /// `textDocument/didOpen`。
     pub async fn did_open(
@@ -1494,5 +1573,40 @@ mod tests {
             "capabilities": { "codeActionProvider": true }
         }));
         assert!(!supports_code_action_resolve(&plain));
+    }
+
+    /// 同一个 URI 的多个持有者必须共用版本号，且只有最后一个释放才 didClose。
+    ///
+    /// 场景：同一个文件在两个标签页组里打开。会话随编辑器状态换手后两侧都会
+    /// 持有该文档；各自维护版本号会让服务器看到回退的 version，诊断与内容
+    /// 同步都会失效。
+    #[test]
+    fn document_registry_shares_version_and_closes_after_last_holder() {
+        use std::sync::atomic::Ordering;
+
+        let registry = DocumentRegistry::default();
+        let uri = Url::parse("file:///tmp/deepterm-registry.rs").unwrap();
+
+        let (first, already_open) = registry.acquire(&uri);
+        assert!(!already_open, "第一次持有应由调用方发 didOpen");
+        let (second, already_open) = registry.acquire(&uri);
+        assert!(already_open, "第二次持有不能再发 didOpen");
+        assert!(Arc::ptr_eq(&first, &second), "版本号必须共用同一个计数器");
+
+        // 两个会话看到的是同一个版本号。
+        first.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+
+        assert!(!registry.release(&uri), "还有持有者时不得发 didClose");
+        assert!(registry.release(&uri), "最后一个持有者负责 didClose");
+
+        // 全部释放后重新打开：版本号必须重新从 0 开始（新文档会话）。
+        let (fresh, already_open) = registry.acquire(&uri);
+        assert!(!already_open);
+        assert_eq!(fresh.load(Ordering::SeqCst), 0);
+
+        // 没登记过的 URI（例如会话从未真正 didOpen）沿用「直接关闭」语义。
+        let unopened = Url::parse("file:///tmp/deepterm-never-opened.rs").unwrap();
+        assert!(registry.release(&unopened));
     }
 }

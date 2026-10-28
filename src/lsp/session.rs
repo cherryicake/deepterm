@@ -68,6 +68,12 @@ pub struct LspSession {
     editor: WeakEntity<InputState>,
     /// 该会话是否已发送过 didOpen。
     opened: bool,
+    /// 测试用：不依赖真实服务器，伪造「仍连着」的会话状态。
+    ///
+    /// 只影响 [`Self::is_active`]；`client()` 仍为空。用于验证会话在
+    /// 标签页组/文件树切换时被原样换手，而不是拿它发请求。
+    #[cfg(test)]
+    test_active: bool,
 }
 
 impl LspSession {
@@ -97,6 +103,8 @@ impl LspSession {
             notify_task: None,
             editor,
             opened: false,
+            #[cfg(test)]
+            test_active: false,
         })
     }
 
@@ -104,6 +112,15 @@ impl LspSession {
     #[cfg(test)]
     pub fn set_uri_for_test(&mut self, uri: lsp_types::Url) {
         self.uri = uri;
+    }
+
+    /// 测试用：把会话标成「已连接」，无需真实语言服务器。
+    ///
+    /// 仅用于验证跨标签页组/文件树的会话换手：那种测试不应该为了一个
+    /// 状态位去 spawn 真进程（gpui 的 `TestScheduler` 会判非确定性）。
+    #[cfg(test)]
+    pub fn mark_active_for_test(&mut self) {
+        self.test_active = true;
     }
 
     /// 已送达服务器的文档版本（测试观测点）。
@@ -129,6 +146,11 @@ impl LspSession {
 
     /// 是否已连上服务器。
     pub fn is_active(&self) -> bool {
+        // 测试钩子：无真实 client 时也能验证「健康会话原样换手」这条路径。
+        #[cfg(test)]
+        if self.test_active {
+            return true;
+        }
         self.client.as_ref().is_some_and(|c| !c.is_closed())
     }
 
@@ -276,22 +298,42 @@ impl LspSession {
         Some(rx)
     }
 
-    /// 服务器就绪后的收尾：didOpen + 订阅诊断通知。
+    /// 服务器就绪后的收尾：didOpen（或用共享版本发 didChange）。
     ///
     /// 状态由调用方置为 `Ready`（`InputState` 是状态的唯一真相源：状态栏
     /// 渲染与进度监听都从它读写，两处存会漂移）。
+    ///
+    /// 同一个 URI 可能已被另一个标签页组的会话打开（会话随编辑器状态换手，
+    /// 见 `FileTreeEditorState::cached_lsp_sessions`）。LSP 规定同一文档只能
+    /// `didOpen` 一次，所以这种情形改为用**共享版本号**发一次全量
+    /// `didChange` 对齐文本；版本号由 `LspClient::acquire_document` 统一分配，
+    /// 两个会话的后续编辑不会互相把版本推回去。
     pub fn on_connected(&mut self, client: Arc<LspClient>, text: &Rope) {
-        self.client = Some(client.clone());
-        self.opened = true;
-        self.version.store(0, std::sync::atomic::Ordering::SeqCst);
-
+        // 已经连着时不重复登记：同一启动回调被投递两次会让引用计数永远
+        // 不归零，最后一个会话关闭时 didClose 发不出去。注意判断的是
+        // `is_active` 而不是 `opened`——服务器崩溃后复用同一个会话重连
+        // 时，`client` 已失效但 `opened` 还是 true，此时必须允许重新登记。
+        if self.is_active() {
+            return;
+        }
         let uri = self.uri.clone();
         let language_id = self.language_id.clone();
         let text_str = text.to_string();
-        // didOpen 必须在后台发：它在 await 期间不能占住 UI 线程。
+        let (version, already_open) = client.acquire_document(&uri);
+        self.version = version.clone();
+        self.client = Some(client.clone());
+        self.opened = true;
+
+        // didOpen/didChange 必须在后台发：它在 await 期间不能占住 UI 线程。
         smol::spawn(async move {
-            if let Err(e) = client.did_open(&uri, &language_id, 0, &text_str).await {
-                log::warn!("lsp didOpen failed for {uri}: {e}");
+            let result = if already_open {
+                let next = version.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                client.did_change(&uri, next, &text_str, &[]).await
+            } else {
+                client.did_open(&uri, &language_id, 0, &text_str).await
+            };
+            if let Err(e) = result {
+                log::warn!("lsp document sync failed for {uri}: {e}");
             }
         })
         .detach();
@@ -357,16 +399,22 @@ impl LspSession {
         .detach();
     }
 
-    /// 关闭标签：发 didClose 并停掉所有任务。
+    /// 关闭标签：释放文档持有并停掉所有任务。
+    ///
+    /// `didClose` 只在**最后一个持有者**离开时发送：同一个文件可能同时被
+    /// 两个标签页组的会话持有（会话随编辑器状态换手），提前关掉会把另一个
+    /// 组的文档从服务器侧删掉，切回去 hover/跳转就全空了。
     pub fn close(&mut self) {
         self.change_task.take();
         self.notify_task.take();
         if let Some(client) = self.client.take() {
             let uri = self.uri.clone();
-            smol::spawn(async move {
-                let _ = client.did_close(&uri).await;
-            })
-            .detach();
+            if client.release_document(&uri) {
+                smol::spawn(async move {
+                    let _ = client.did_close(&uri).await;
+                })
+                .detach();
+            }
         }
         self.opened = false;
     }
@@ -374,20 +422,27 @@ impl LspSession {
     /// 用户主动停止服务器：断开当前会话，但保留 uri / language_id / 版本号。
     ///
     /// 与 [`Self::close`] 的两点差别：
-    /// - **发 `didClose` 后还要收进程**：`close` 只通知服务器「文档关了」，
-    ///   进程交给 `Drop` 兜底；而用户按「停止」要的就是进程消失，必须显式
-    ///   `shutdown()`（握手 → 等退出 → 超时强杀）。
+    /// - **要收进程**：`close` 只通知服务器「文档关了」，进程交给 `Drop` 兜底；
+    ///   而用户按「停止」要的就是进程消失，必须显式 `shutdown()`（握手 →
+    ///   等退出 → 超时强杀）。最后一个持有者时先发 `didClose` 再关；还有
+    ///   别的会话持有时只关进程（文档由对方负责）。
     /// - **不清会话**：`connect` 之后还能原样重启，`uri` / `version` 都在。
     pub fn stop(&mut self) {
         self.change_task.take();
         self.notify_task.take();
         if let Some(client) = self.client.take() {
             let uri = self.uri.clone();
-            smol::spawn(async move {
-                let _ = client.did_close(&uri).await;
+            if client.release_document(&uri) {
+                // 保持旧顺序：先发 didClose，再走关闭握手。
+                smol::spawn(async move {
+                    let _ = client.did_close(&uri).await;
+                    client.shutdown();
+                })
+                .detach();
+            } else {
+                // 另一个标签页组还持有该文档；进程本身仍要按用户意图关掉。
                 client.shutdown();
-            })
-            .detach();
+            }
             log::info!("lsp: stopped server for {}", self.uri);
         }
         self.opened = false;
