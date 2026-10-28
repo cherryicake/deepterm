@@ -258,6 +258,14 @@ impl AppWindow {
         }
         this.sync_sidebar_tab_groups(cx);
 
+        // 首帧 `render` 之前也可能打开文件：`deepterm <file>` 在 `window.defer`
+        // 里执行，早于第一帧渲染。先下发一次可用宽度，保证这种打开也能按
+        // 「与终端平分」确定默认宽度（之后每帧由 `render` 刷新）。
+        let available_width = this.main_area_width(window, cx);
+        this.editor.update(cx, |editor, _cx| {
+            editor.set_available_width(available_width);
+        });
+
         this
     }
 
@@ -1232,9 +1240,11 @@ impl AppWindow {
         cx.notify();
     }
 
-    /// 编辑器「窗口跟随」的宽度上限：窗口宽 − 侧边栏占位 − 主区最小宽。
-    /// `render` 与 `render_main_area` 共用（两处都要下发同一上限）。
-    fn editor_follow_limit(&self, window: &gpui::Window, cx: &gpui::App) -> f32 {
+    /// 编辑器与主区（终端）共享的可用横向宽度：窗口宽 − 侧边栏占位。
+    ///
+    /// 编辑器首次打开文件时按它的一半作为默认宽度（与终端区域平分），
+    /// 窗口跟随的宽度上限也由它推出。侧边栏隐藏时占位为 0。
+    fn main_area_width(&self, window: &gpui::Window, cx: &gpui::App) -> f32 {
         let win_w: f32 = window.viewport_size().width.into();
         let sidebar = self.sidebar.read(cx);
         let sidebar_occ = if sidebar.is_visible() {
@@ -1242,7 +1252,13 @@ impl AppWindow {
         } else {
             0.0
         };
-        (win_w - sidebar_occ - MAIN_AREA_MIN_WIDTH).max(0.0)
+        (win_w - sidebar_occ).max(0.0)
+    }
+
+    /// 编辑器「窗口跟随」的宽度上限：可用宽度 − 主区最小宽。
+    /// `render` 与 `render_main_area` 共用（两处都要下发同一上限）。
+    fn editor_follow_limit(&self, window: &gpui::Window, cx: &gpui::App) -> f32 {
+        (self.main_area_width(window, cx) - MAIN_AREA_MIN_WIDTH).max(0.0)
     }
 
     /// 渲染侧边栏切换按钮
@@ -1561,9 +1577,13 @@ impl Render for AppWindow {
 
         // 编辑器「窗口跟随」的宽度上限：窗口宽 − 侧边栏占位 − 主区最小宽。
         // 每帧下发，保证窗口缩窄时编辑器让位，不会把主区挤出窗口。
-        let editor_limit = self.editor_follow_limit(window, cx);
+        // 同时下发可用宽度：编辑器首次打开文件时按它的一半作为默认宽度
+        //（与终端区域平分）。
+        let main_area_width = self.main_area_width(window, cx);
+        let editor_limit = (main_area_width - MAIN_AREA_MIN_WIDTH).max(0.0);
         self.editor.update(cx, |editor, _cx| {
             editor.set_window_follow_limit(editor_limit);
+            editor.set_available_width(main_area_width);
         });
 
         if editor_is_empty {

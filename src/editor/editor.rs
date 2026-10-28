@@ -84,6 +84,9 @@ use crate::workspace::tab_bar::{DraggedTab, TabBar, TabItem};
 
 const EDITOR_DEFAULT_WIDTH: f32 = 680.0;
 const EDITOR_MIN_WIDTH: f32 = 200.0;
+/// 首次打开文件时编辑器占「可用宽度」（窗口宽 − 侧边栏占位）的比例：
+/// 0.5 即与终端区域平分。只在空 → 非空的开合路径生效。
+const EDITOR_OPEN_SPLIT_RATIO: f32 = 0.5;
 /// 窗口拉宽/窄时编辑器吃掉的增量比例：0.5 与主区（终端）平分，
 /// 1.0 则编辑器独占（终端宽度只随内部分屏变化）。
 const EDITOR_WINDOW_FOLLOW_RATIO: f32 = 0.5;
@@ -468,6 +471,10 @@ pub struct Editor {
     /// 窗口跟随的宽度上限：由 AppWindow 每帧下发（窗口宽 − 侧边栏占位 −
     /// 主区最小宽）。`f32::INFINITY` 表示未下发（如单测），不设上限。
     window_follow_limit: f32,
+    /// 「可用宽度」：窗口宽 − 侧边栏占位，由 AppWindow 每帧下发。
+    /// 首次打开文件时按它的一半确定默认宽度（与终端区域平分）。
+    /// 0.0 表示尚未下发（如单测），此时沿用 [`EDITOR_DEFAULT_WIDTH`]。
+    available_width: f32,
     app_window: Option<WeakEntity<crate::AppWindow>>,
     /// 主窗口句柄：fs 事件回调中没有 Window，弹窗时用它取回窗口。
     window_handle: Option<gpui::AnyWindowHandle>,
@@ -696,6 +703,7 @@ impl Editor {
             resize_drag_x: None,
             last_window_width: 0.0,
             window_follow_limit: f32::INFINITY,
+            available_width: 0.0,
             app_window: None,
             window_handle: Some(_window.window_handle()),
             tab_bar_pad_epoch: 0,
@@ -764,15 +772,34 @@ impl Editor {
     }
 
     /// 编辑器从关闭 → 打开（首个文件打开）：记录展开动画（0 → 当前宽度）。
+    ///
+    /// 打开时默认宽度 = 可用宽度的一半（与终端区域平分），见
+    /// [`Self::apply_open_split_width`]；恢复路径（`suppress_open_animation`）
+    /// 不在此列，保留用户当前宽度。
     fn begin_open_animation(&mut self) {
         if self.suppress_open_animation {
             return;
         }
+        self.apply_open_split_width();
         self.open_anim_epoch = self.open_anim_epoch.wrapping_add(1);
         self.panel_anim_epoch = self.panel_anim_epoch.wrapping_add(1);
         self.panel_anim_start = 0.0;
         self.panel_anim_end = self.width;
         self.panel_anim_ms = EDITOR_OPEN_ANIMATION_MS;
+    }
+
+    /// 首次打开文件时的默认宽度：与主区（终端）平分可用宽度。
+    ///
+    /// 只在空 → 非空的开合路径生效：打开后用户拖拽的宽度、恢复（切标签页组/
+    /// 文件树）保留的宽度都不受影响。可用宽度未知（未下发布局，如单测）时
+    /// 保留现有宽度。
+    fn apply_open_split_width(&mut self) {
+        if self.available_width <= 0.0 {
+            return;
+        }
+        let max_w = self.window_follow_limit.max(EDITOR_MIN_WIDTH);
+        self.width =
+            (self.available_width * EDITOR_OPEN_SPLIT_RATIO).clamp(EDITOR_MIN_WIDTH, max_w);
     }
 
     /// 编辑器从打开 → 关闭（最后一个文件关闭）：记录收起动画（当前宽度 → 0）。
@@ -1774,6 +1801,13 @@ impl Editor {
     /// 主区最小宽）。仅用于钳制窗口跟随，不影响拖拽/最小宽度语义。
     pub fn set_window_follow_limit(&mut self, limit: f32) {
         self.window_follow_limit = limit;
+    }
+
+    /// 由 AppWindow 每帧下发「可用宽度」（窗口宽 − 侧边栏占位）。
+    /// 仅用于首次打开文件时的默认宽度（与终端区域平分），见
+    /// [`Self::apply_open_split_width`]。
+    pub fn set_available_width(&mut self, available: f32) {
+        self.available_width = available;
     }
 
     pub fn set_paddings(&mut self, content_left: f32, content_bottom: f32, cx: &mut Context<Self>) {
@@ -8366,6 +8400,121 @@ mod tests {
                 "immediate path must not record an animation"
             );
             assert_eq!(e.panel_anim_epoch, 0, "immediate path must not bump epoch");
+        });
+    }
+
+    /// 首个文件打开时编辑器默认与终端区域平分可用宽度（代码与 markdown
+    /// 走同一条打开路径）；之后再打开文件、恢复（切标签页组）都不重新平分。
+    #[gpui::test]
+    fn editor_opens_at_half_of_available_width(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+        });
+        struct Host(gpui::Entity<Editor>);
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+        let (host, cx) =
+            cx.add_window_view(|window, cx| Host(cx.new(|cx| Editor::new(window, cx))));
+        let editor = host.read_with(cx, |h, _| h.0.clone());
+        // AppWindow 每帧下发：窗口 1600 − 侧边栏占位 280 = 1320 可用；
+        // 主区最小宽 320 → 窗口跟随上限 1000。
+        editor.update(cx, |e, _| {
+            e.set_available_width(1320.0);
+            e.set_window_follow_limit(1000.0);
+        });
+
+        let open = |editor: &gpui::Entity<Editor>,
+                    cx: &mut gpui::VisualTestContext,
+                    id: &str,
+                    live: bool| {
+            with_lsp_disabled(|| {
+                cx.update(|window, cx| {
+                    editor.update(cx, |editor, cx| {
+                        editor.open_file_with_content(
+                            id.to_string(),
+                            id.to_string(),
+                            "hello\n".to_string(),
+                            PathBuf::from(id),
+                            None,
+                            FileEncoding::Utf8,
+                            false,
+                            window,
+                            cx,
+                            false,
+                            false,
+                            false,
+                            live,
+                        );
+                    });
+                });
+            });
+        };
+
+        // 首个文件（markdown live）：与终端平分 1320 → 660，展开动画 0 → 660。
+        open(&editor, cx, "notes.md", true);
+        editor.update(cx, |e, _| {
+            assert!(
+                (e.width - 660.0).abs() <= 0.5,
+                "first open must split available width in half, width={:.1}",
+                e.width
+            );
+            assert!(
+                e.panel_anim_start.abs() <= 0.5 && (e.panel_anim_end - e.width).abs() <= 0.5,
+                "open animation must run 0 → half width, got {:.1}->{:.1}",
+                e.panel_anim_start,
+                e.panel_anim_end
+            );
+        });
+
+        // 用户拖拽到 900 后打开第二个文件（普通代码）：不重新平分。
+        editor.update(cx, |e, _| e.width = 900.0);
+        open(&editor, cx, "main.rs", false);
+        editor.update(cx, |e, _| {
+            assert!(
+                (e.width - 900.0).abs() <= 0.5,
+                "later opens must keep the user width, width={:.1}",
+                e.width
+            );
+        });
+
+        // 恢复（切标签页组/文件树）保留当前宽度，不因「瞬时为空」重新平分。
+        let state = editor.update(cx, |e, cx| e.save_to_file_tree_state(cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |e, cx| {
+                e.restore_from_file_tree_state(state, window, cx)
+            });
+        });
+        editor.update(cx, |e, _| {
+            assert!(
+                (e.width - 900.0).abs() <= 0.5,
+                "restore must keep the current width, width={:.1}",
+                e.width
+            );
+        });
+
+        // 钳制：窄窗口不低于最小宽度，宽窗口不超过「主区最小宽」给的上限。
+        editor.update(cx, |e, _| {
+            e.set_available_width(300.0);
+            e.set_window_follow_limit(0.0);
+            e.apply_open_split_width();
+            assert!(
+                (e.width - EDITOR_MIN_WIDTH).abs() <= 0.5,
+                "narrow window must clamp to min width, width={:.1}",
+                e.width
+            );
+            e.set_available_width(3000.0);
+            e.set_window_follow_limit(1000.0);
+            e.apply_open_split_width();
+            assert!(
+                (e.width - 1000.0).abs() <= 0.5,
+                "wide window must respect the main area min width, width={:.1}",
+                e.width
+            );
         });
     }
 
