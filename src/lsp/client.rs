@@ -272,6 +272,19 @@ impl LspClient {
         trigger_characters_of(&self.capabilities)
     }
 
+    /// 服务器是否支持 `completionItem/resolve`。
+    ///
+    /// 不支持时确认候选不该白等一次往返：resolve 请求会被服务器回
+    /// method-not-found（或直接超时），菜单明明可以立即插入。
+    pub fn supports_completion_resolve(&self) -> bool {
+        self.capabilities
+            .capabilities
+            .completion_provider
+            .as_ref()
+            .and_then(|provider| provider.resolve_provider)
+            .unwrap_or(false)
+    }
+
     /// 项目根。
     pub fn root(&self) -> &Path {
         &self.root
@@ -1180,11 +1193,23 @@ fn client_capabilities() -> ClientCapabilities {
             }),
             completion: Some(lsp_types::CompletionClientCapabilities {
                 completion_item: Some(lsp_types::CompletionItemCapability {
-                    snippet_support: Some(false),
+                    // 声明 snippet 支持：rust-analyzer 等服务器只有在
+                    // `snippetSupport=true` 时才会给函数/方法补全带上
+                    // `(${1:arg})$0`。我们暂不做 tabstop 编辑，但会把它
+                    // 降级成纯文本（`foo(arg)` / `foo()`），至少括号不会丢。
+                    snippet_support: Some(true),
                     documentation_format: Some(vec![
                         lsp_types::MarkupKind::Markdown,
                         lsp_types::MarkupKind::PlainText,
                     ]),
+                    // 补全项可以在菜单里预选中某一项（如结构体字段补全）。
+                    preselect_support: Some(true),
+                    deprecated_support: Some(true),
+                    // 我们读 `label_details.detail/description` 作右侧说明。
+                    label_details_support: Some(true),
+                    tag_support: Some(lsp_types::TagSupport {
+                        value_set: vec![lsp_types::CompletionItemTag::DEPRECATED],
+                    }),
                     resolve_support: Some(lsp_types::CompletionItemCapabilityResolveSupport {
                         properties: vec![
                             "documentation".to_string(),
@@ -1432,6 +1457,25 @@ mod tests {
         assert!(
             item.resolve_support.is_some(),
             "we call completionItem/resolve, so it must be advertised"
+        );
+        assert_eq!(
+            item.preselect_support,
+            Some(true),
+            "菜单要尊重服务器的 preselect 项"
+        );
+        assert_eq!(
+            item.label_details_support,
+            Some(true),
+            "菜单右侧说明读的是 label_details"
+        );
+        assert_eq!(
+            item.deprecated_support,
+            Some(true),
+            "弃用候选需要显示删除线"
+        );
+        assert!(
+            item.tag_support.is_some(),
+            "弃用标记也会走 tags，两者都要声明"
         );
     }
 

@@ -882,7 +882,15 @@ fn pending_completion_is_drained_exactly_once(cx: &mut gpui::TestAppContext) {
             label: "foo_bar".into(),
             ..Default::default()
         };
-        state.set_pending_completions(vec![item], lsp_types::Position::new(0, 0), state.cursor());
+        let version = state.text_version();
+        state.set_pending_completions_from_request(
+            vec![item],
+            lsp_types::Position::new(0, 0),
+            state.cursor(),
+            version,
+            lsp_types::Url::parse("file:///a.rs").unwrap(),
+            false,
+        );
         // 契约：写入后必须 notify，否则不会产生新的一帧，`render` 不跑，
         // `drain_lsp_results` 也就永远不会把候选搬进浮层状态。
         cx.notify();
@@ -942,7 +950,15 @@ fn pending_completion_is_dropped_once_cursor_moved(cx: &mut gpui::TestAppContext
             label: "at_request_position".into(),
             ..Default::default()
         };
-        state.set_pending_completions(vec![item], lsp_types::Position::new(0, 3), requested_at);
+        let version = state.text_version();
+        state.set_pending_completions_from_request(
+            vec![item],
+            lsp_types::Position::new(0, 3),
+            requested_at,
+            version,
+            lsp_types::Url::parse("file:///a.rs").unwrap(),
+            false,
+        );
     });
 
     let taken = input.update(cx, |state, _cx| state.take_pending_completions());
@@ -974,13 +990,17 @@ fn pending_completion_reports_the_offset_it_was_requested_at(cx: &mut gpui::Test
     });
     let requested_at = input.update(cx, |state, _| state.cursor());
     input.update(cx, |state, _| {
-        state.set_pending_completions(
+        let version = state.text_version();
+        state.set_pending_completions_from_request(
             vec![lsp_types::CompletionItem {
                 label: "alpha".into(),
                 ..Default::default()
             }],
             lsp_types::Position::new(0, 7),
             requested_at,
+            version,
+            lsp_types::Url::parse("file:///a.rs").unwrap(),
+            false,
         );
     });
 
@@ -1236,6 +1256,64 @@ fn apply_completion_replaces_range_and_moves_cursor(cx: &mut gpui::TestAppContex
             assert_eq!(state.value().as_ref(), "let x = foo_bar");
             // 光标落在插入文本末尾。
             assert_eq!(state.cursor(), 15);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn apply_completion_with_snippet_metadata_selects_placeholder(cx: &mut gpui::TestAppContext) {
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input
+        .downgrade()
+        .update_in(cx, |state, window, cx| {
+            state.replace_text_in_range_silent(None, "fo", window, cx);
+            // `foo(${1:a})$0` 的纯文本 + 第一个 tabstop / 最终光标。
+            let ok = state.apply_completion_with_edits_and_metadata(
+                0..2,
+                "foo(a)",
+                &[],
+                Some(6),
+                Some(4..5),
+                cx,
+            );
+            assert!(ok);
+            assert_eq!(state.value().as_ref(), "foo(a)");
+            assert_eq!(
+                (state.selected_range.start, state.selected_range.end),
+                (4, 5),
+                "应选中第一个 tabstop 的默认参数 a"
+            );
+        })
+        .unwrap();
+
+    input
+        .downgrade()
+        .update_in(cx, |state, window, cx| {
+            state.set_value("println!", window, cx);
+            let ok = state.apply_completion_with_edits_and_metadata(
+                0..8,
+                "println!()",
+                &[],
+                Some(9),
+                None,
+                cx,
+            );
+            assert!(ok);
+            assert_eq!(state.value().as_ref(), "println!()");
+            assert_eq!(state.cursor(), 9, "`$0` 应把光标放进括号内");
         })
         .unwrap();
 }

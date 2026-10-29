@@ -122,9 +122,11 @@ actions!(
         FormatDocument,
         /// 手动触发补全（ctrl-space）。
         TriggerCompletion,
-        /// 补全菜单：上下移动 / 确认 / 取消。
+        /// 补全菜单：上下移动 / 首尾 / 确认 / 取消。
         CompletionNext,
         CompletionPrev,
+        CompletionFirst,
+        CompletionLast,
         CompletionConfirm,
         CompletionCancel,
         /// 文档符号大纲（cmd-shift-o）。
@@ -213,7 +215,6 @@ pub fn init(cx: &mut App) {
             KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
             KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
             KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
-            KeyBinding::new("ctrl-space", TriggerCompletion, Some("EditorPanel")),
             KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
             KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
             // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
@@ -223,12 +224,13 @@ pub fn init(cx: &mut App) {
             // `keymap::tests::default_keymaps_cover_all_migrated_bindings` 会核对
             // JSON 与迁移前的键位总数，加在 JSON 里得同步改那个魔数。
             KeyBinding::new("K", Hover, Some("EditorPanel")),
-            // 补全菜单导航：只在菜单可见时生效（处理器里判断）。
-            // 用 down/up/enter 是因为它们与菜单的语义一致；escape 关闭菜单。
-            KeyBinding::new("down", CompletionNext, Some("EditorPanel")),
-            KeyBinding::new("up", CompletionPrev, Some("EditorPanel")),
-            KeyBinding::new("enter", CompletionConfirm, Some("EditorPanel")),
-            KeyBinding::new("escape", CompletionCancel, Some("EditorPanel")),
+            // 补全触发/导航键在 `assets/keymaps/completion.json`：
+            // - 全部无条件绑在 `Input` 上，先于普通编辑键；
+            // - handler 在菜单不可见时 `cx.propagate()`，普通 Enter/Tab/
+            //   方向键/escape 照常执行；菜单可见时才消费。
+            //
+            // **不能**绑在 `EditorPanel`：`Input` 上已有 enter/escape/up/down，
+            // 同深度下更深（Input）的绑定先派发并消费事件，补全动作永远收不到。
             KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
             KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
             KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
@@ -1858,6 +1860,13 @@ impl Editor {
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
+        // 标签全部销毁前收起补全：`CompletionState` 是 Editor 级别的，
+        // 不清会留下一个指向已释放 InputState 的可见菜单。
+        if let Some(editor) = self.active_text_editor(cx) {
+            self.completion.hide_in(&editor, cx);
+        } else {
+            self.completion.hide();
+        }
         self.unwatch_all_files(cx);
         self.open_files.clear();
         self.active_file_id = None;
@@ -2531,6 +2540,9 @@ impl Editor {
             return;
         };
         let Some(uri) = self.active_lsp_session().map(|s| s.uri().clone()) else {
+            // 没有可用会话：顺手收起可能残留的旧菜单。
+            self.completion.hide_in(&editor, cx);
+            cx.notify();
             return;
         };
         let client = self.active_lsp_client(cx);
@@ -2597,38 +2609,101 @@ impl Editor {
     }
 
     /// 补全菜单：下一项。
-    fn completion_next(
-        &mut self,
-        _: &CompletionNext,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn completion_next(&mut self, _: &CompletionNext, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
+            return;
+        }
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            cx.propagate();
+            return;
+        };
+        // 菜单状态可见时这个键归补全管：即使随后 `validate` 发现菜单过期并
+        // 收起，也不能把 Down 再透给 `editor::MoveDown`。
+        cx.stop_propagation();
+        self.completion.validate(&editor, cx);
         if !self.completion.is_visible() {
             return;
         }
         self.completion.move_selection(1);
-        let editor = self.active_text_editor(cx);
-        if let Some(editor) = editor {
-            self.completion.sync_selection(&editor, cx);
-        }
+        self.completion.sync_selection(&editor, cx);
         cx.notify();
     }
 
     /// 补全菜单：上一项。
-    fn completion_prev(
-        &mut self,
-        _: &CompletionPrev,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn completion_prev(&mut self, _: &CompletionPrev, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
+            return;
+        }
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            cx.propagate();
+            return;
+        };
+        cx.stop_propagation();
+        self.completion.validate(&editor, cx);
         if !self.completion.is_visible() {
             return;
         }
         self.completion.move_selection(-1);
-        let editor = self.active_text_editor(cx);
-        if let Some(editor) = editor {
-            self.completion.sync_selection(&editor, cx);
+        self.completion.sync_selection(&editor, cx);
+        cx.notify();
+    }
+
+    /// 补全菜单：第一项。
+    fn completion_first(
+        &mut self,
+        _: &CompletionFirst,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
+            return;
         }
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            cx.propagate();
+            return;
+        };
+        cx.stop_propagation();
+        self.completion.validate(&editor, cx);
+        if !self.completion.is_visible() {
+            return;
+        }
+        self.completion.select_first();
+        self.completion.sync_selection(&editor, cx);
+        cx.notify();
+    }
+
+    /// 补全菜单：最后一项。
+    fn completion_last(&mut self, _: &CompletionLast, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
+            return;
+        }
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            cx.propagate();
+            return;
+        };
+        cx.stop_propagation();
+        self.completion.validate(&editor, cx);
+        if !self.completion.is_visible() {
+            return;
+        }
+        self.completion.select_last();
+        self.completion.sync_selection(&editor, cx);
         cx.notify();
     }
 
@@ -2636,20 +2711,43 @@ impl Editor {
     fn completion_confirm(
         &mut self,
         _: &CompletionConfirm,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
             return;
         }
-        let Some(editor) = self.active_text_editor(cx) else {
+        log::info!(
+            "lsp: completion Confirm 键位触发 anchor={}",
+            self.completion.anchor()
+        );
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            cx.propagate();
             return;
         };
+        // **先消费按键，再校验菜单**。`validate` 可能因为光标/文本/焦点已变
+        // 而收起菜单；此时若还没 `stop_propagation`，Enter 会继续派发给
+        // `Input` 上的 `editor::Enter`，用户看到的就是「补全没插入，反而多
+        // 了一个换行」。只要菜单状态是可见，这次 Enter/Tab 就归补全管。
+        cx.stop_propagation();
+        // 确认菜单仍属于当前编辑器/光标；切 tab 或点走光标后不能拿旧候选
+        // 往新位置插入。
+        self.completion.validate(&editor, cx);
+        if !self.completion.is_visible() {
+            return;
+        }
         let client = self.active_lsp_client(cx);
         // 需要 `completionItem/resolve` 时，在这里 spawn：只有
         // `Context<Editor>` 能把 `cx` 带进 async 块。
         let pending = self.completion.confirm(&editor, client.clone(), cx);
         if let (Some((item, range)), Some(client)) = (pending, client) {
+            // resolve 是异步的；期间用户可能继续输入。文本变了以后响应里的
+            // 区间/附加编辑都基于旧文档，宁可放弃这次插入，也不能写错位置。
+            let text_version = editor.read(cx).text_version();
             cx.spawn(async move |_this, cx| {
                 let resolved = client.resolve_completion(item.clone()).await;
                 let item = match resolved {
@@ -2663,6 +2761,10 @@ impl Editor {
                 // `apply_completion_item` 需要 `&mut App`；`AsyncApp`
                 // 通过 `update` 提供。
                 cx.update(|cx| {
+                    if editor.read(cx).text_version() != text_version {
+                        log::debug!("lsp: 文本在 resolve 期间变化，放弃本次补全");
+                        return;
+                    }
                     crate::editor::completion::apply_completion_item(&item, &editor, range, cx);
                 });
             })
@@ -2675,17 +2777,24 @@ impl Editor {
     fn completion_cancel(
         &mut self,
         _: &CompletionCancel,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.completion.is_visible() {
+            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
+            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
+            // `IndentInline` / 方向键才会继续执行。
+            cx.propagate();
             return;
         }
-        if let Some(editor) = self.active_text_editor(cx) {
-            self.completion.hide_in(&editor, cx);
-        } else {
-            self.completion.hide();
-        }
+        let Some(editor) = self.focused_completion_editor(window, cx) else {
+            // 焦点在编辑区里的查找框/重命名框：这个 Esc 不属于补全。
+            cx.propagate();
+            return;
+        };
+        // 只关补全，不再透传给 `Input` 的 Escape（那会清选区/退出 vim 插入）。
+        cx.stop_propagation();
+        self.completion.hide_in(&editor, cx);
         cx.notify();
     }
 
@@ -3243,10 +3352,15 @@ impl Editor {
     /// 在 `render` 里调用：后台任务完成时只能把结果放进 `InputState` 的槽，
     /// 真正的浮层状态在 `Editor` 上，需要一个时机把它们搬过来。渲染前是最
     /// 自然的时机——不额外起任务，且保证下一帧就能看到。
-    fn drain_lsp_results(&mut self, cx: &mut Context<Self>) {
+    fn drain_lsp_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
+        // 焦点离开编辑区（切到终端 / 状态栏菜单 / 查找框）时收起补全。
+        // 菜单是 `defer_draw` 画在编辑区上的，不主动收会一直悬在窗口里。
+        if self.completion.is_visible() && !editor.read(cx).focus_handle.is_focused(window) {
+            self.completion.hide_in(&editor, cx);
+        }
         // 只在「可见性变化」时记录：`drain_lsp_results` 每帧都跑，逐帧打
         // 会瞬间灌满日志文件（实测一次会话 6.9 万行），把有用线索冲掉。
         // 去重状态放在本 Editor 上（不用 `thread_local!`），理由见
@@ -3258,7 +3372,16 @@ impl Editor {
             }
         }
         self.hover.take_pending(&editor, cx);
+        // 先校验旧菜单是否还对得上当前编辑器/光标，再取新结果：
+        // 点鼠标、方向键、切 tab 这些路径没有文本变更事件，只能在这里收口。
+        self.completion.validate(&editor, cx);
         self.completion.take_pending(&editor, cx);
+        // Enter 落到 `InputState::enter`（CompletionConfirm 键位没接住）时，
+        // 这里补上确认动作。`enter` 已经吞掉了换行，不能让用户什么都得不到。
+        if editor.update(cx, |state, _| state.take_completion_accept_request()) {
+            log::info!("lsp: completion 处理 Enter/Tab 兜底请求");
+            self.completion_confirm(&CompletionConfirm, window, cx);
+        }
         if let Some(panel) = self.symbols_panel.clone() {
             let response = editor.update(cx, |state, _| state.take_pending_symbols());
             if let Some(response) = response {
@@ -3341,6 +3464,20 @@ impl Editor {
             return None;
         }
         Some(file.editor_state.clone())
+    }
+
+    /// 补全键的归属编辑器：不仅要是当前 tab，还必须**真的持有焦点**。
+    ///
+    /// 补全键无条件绑在 `Input` 上，因此编辑区内的查找框/重命名框也会
+    /// 派发到这些 action；若只看 `completion.is_visible()`，用户在查找框按
+    /// Enter 会把候选插进背后的代码编辑器。焦点不匹配时一律放行。
+    fn focused_completion_editor(&self, window: &Window, cx: &App) -> Option<Entity<InputState>> {
+        let editor = self.active_text_editor(cx)?;
+        editor
+            .read(cx)
+            .focus_handle
+            .is_focused(window)
+            .then_some(editor)
     }
 
     /// 状态栏语言 chip → 弹出语言选择菜单。
@@ -5393,6 +5530,10 @@ impl Editor {
                     }
                     if has_session && is_active {
                         let editor = this.open_files[idx].editor_state.clone();
+                        // 先用**已有候选**按新前缀本地过滤：LSP 往返通常几十
+                        // 到几百毫秒，只等新响应会让菜单在这段时间里继续展示
+                        // 与当前输入不匹配的旧候选（「候选内容错误」的主因之一）。
+                        this.completion.refilter(&editor, cx);
                         // 触发判定（对照 Zed 的 `completion_query` 与
                         // `completion_triggers`）：
                         // 1. 光标前是「词字符」→ 按标识符补全；
@@ -5405,21 +5546,10 @@ impl Editor {
                         // 「输入语法匹配不准确」，且 `:`/`@`/`<` 这些服务器
                         // 明确要求的触发点永远不会请求补全。
                         let client = this.active_lsp_client(cx);
-                        let (prev_char, cursor) = {
-                            let state = editor.read(cx);
-                            let cursor = state.cursor();
-                            (
-                                if cursor > 0 {
-                                    state
-                                        .text()
-                                        .char_at(cursor.saturating_sub(1).min(state.text().len()))
-                                } else {
-                                    None
-                                },
-                                cursor,
-                            )
-                        };
-                        let _ = cursor;
+                        // 光标前一字符必须走 `char_before`：它用 `RopeExt`
+                        // 做边界吸附。`text.char_at(cursor - 1)` 在光标跟在
+                        // 中文/emoji 后面时会落在字符中间并 panic。
+                        let prev_char = char_before(editor.read(cx).text(), editor.read(cx).cursor());
 
                         // 服务器声明的触发字符集合。
                         let declared_triggers: Vec<String> = client
@@ -5463,6 +5593,21 @@ impl Editor {
                             // （比如刚打完空格）。
                             this.completion.hide_in(&editor, cx);
                         }
+                    }
+                }
+
+                // 只是移动了光标（点击 / 方向键 / 拖选），或文本变了但
+                // 没走到上面的补全分支：菜单必须立刻收起。`drain_lsp_results`
+                // 里的 `validate` 只在 Editor 重新渲染时跑，而光标移动通常
+                // 只让 InputState 重绘，不保证 Editor 也重绘——菜单会视觉上
+                // 「粘」在原地，此时按 Enter 还会按新光标位置确认旧候选。
+                if this.active_file_id.as_deref() == Some(sync_tab_id.as_str())
+                    && this.completion.is_visible()
+                {
+                    let cursor = state_entity.read(cx).cursor();
+                    if this.completion.anchor() != cursor {
+                        this.completion.hide_in(&state_entity, cx);
+                        cx.notify();
                     }
                 }
 
@@ -5832,6 +5977,14 @@ impl Editor {
     }
 
     fn switch_to_file(&mut self, id: &str, cx: &mut Context<Self>) {
+        // 切 tab 前收起旧 tab 的补全菜单：`CompletionState` 挂在 Editor 上
+        // （不随 tab 走），不清的话菜单锚点/替换区间会属于旧文件，确认时
+        // 把候选插进新文件。点当前 tab 不算切换，保留菜单。
+        if self.active_file_id.as_deref() != Some(id)
+            && let Some(previous) = self.active_text_editor(cx)
+        {
+            self.completion.hide_in(&previous, cx);
+        }
         self.active_file_id = Some(id.into());
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.set_active_tab(id, cx);
@@ -6302,6 +6455,12 @@ impl Editor {
         self.editor_state_subscriptions.remove(id);
         let pos = self.open_files.iter().position(|f| f.id.as_ref() == id);
         if let Some(index) = pos {
+            // 关闭的是当前 tab：先收起它的补全菜单，否则 `CompletionState`
+            // 会保留一个指向已移除 InputState 的可见状态。
+            if self.active_file_id.as_deref() == Some(id) {
+                let editor = self.open_files[index].editor_state.clone();
+                self.completion.hide_in(&editor, cx);
+            }
             // LSP：发 didClose 并停掉该 tab 的同步/监听任务。
             // `close()` 内部会 take 掉任务，Drop 时不会再重复发一次。
             if let Some(session) = self.open_files[index].lsp.as_mut() {
@@ -6557,7 +6716,7 @@ impl Render for Editor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 搬移后台算好的 LSP 结果（hover / 补全）：后台任务只能把结果写进
         // `InputState` 的槽，浮层状态在 `Editor` 上，渲染前搬到本帧可见。
-        self.drain_lsp_results(cx);
+        self.drain_lsp_results(window, cx);
         // 光标处的符号高亮：跟着光标走，渲染前发请求（有位置闸门，不会每帧发）。
         self.request_document_highlight(cx);
         self.request_inlay_hints(cx);
@@ -6982,6 +7141,12 @@ impl Render for Editor {
                 }))
                 .on_action(cx.listener(|this, _: &CompletionPrev, window, cx| {
                     this.completion_prev(&CompletionPrev, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionFirst, window, cx| {
+                    this.completion_first(&CompletionFirst, window, cx);
+                }))
+                .on_action(cx.listener(|this, _: &CompletionLast, window, cx| {
+                    this.completion_last(&CompletionLast, window, cx);
                 }))
                 .on_action(cx.listener(|this, _: &CompletionConfirm, window, cx| {
                     this.completion_confirm(&CompletionConfirm, window, cx);
@@ -9153,6 +9318,308 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("GBK"));
+    }
+
+    /// 建一个带「可见补全菜单」的 Editor，供 Enter 键位回归用例复用。
+    fn completion_key_fixture(
+        cx: &mut gpui::TestAppContext,
+        show_menu: bool,
+    ) -> (
+        gpui::Entity<Editor>,
+        gpui::Entity<InputState>,
+        &mut gpui::VisualTestContext,
+    ) {
+        let _ = env_logger::builder().is_test(true).try_init();
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+            crate::file_manager::watcher::init(cx);
+            crate::keymap::init(cx);
+        });
+        struct Host {
+            editor: gpui::Entity<Editor>,
+        }
+        impl gpui::Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.editor.clone())
+            }
+        }
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| Editor::new(window, cx));
+            editor.update(cx, |editor, _| editor.suppress_open_animation = true);
+            Host { editor }
+        });
+        let editor = host.read_with(cx, |host, _| host.editor.clone());
+
+        let info = EditorOpenFileInfo {
+            id: "a.rs".into(),
+            path: "a.rs".into(),
+            label: "a.rs".into(),
+            ssh_config: None,
+            is_loading: false,
+            original_content: Some("pri".to_string()),
+            encoding: FileEncoding::Utf8,
+            read_only: false,
+            dirty: false,
+            diff_repo: None,
+        };
+        cx.update(|window, cx| {
+            let cached = cx.new(|cx| {
+                let mut state = InputState::new(window, cx)
+                    .code_editor("rust")
+                    .multi_line(true);
+                state.set_value("pri", window, cx);
+                state
+            });
+            editor.update(cx, |editor, cx| {
+                editor.restore_file_from_cache(&info, cached, window, cx);
+            });
+        });
+        let input = editor.read_with(cx, |editor, _| editor.open_files[0].editor_state.clone());
+
+        input.update(cx, |state, _| {
+            state.selected_range = (3..3).into();
+        });
+        editor.update(cx, |editor, cx| {
+            editor.active_file_id = Some(info.id.clone());
+            let owner = input.entity_id();
+            let uri = lsp_types::Url::parse("file:///a.rs").unwrap();
+            if show_menu {
+                input.update(cx, |state, _| {
+                    assert!(
+                        editor.completion.show_for_test(
+                            state,
+                            owner,
+                            uri,
+                            vec![lsp_types::CompletionItem {
+                                label: "println".into(),
+                                kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+                                ..Default::default()
+                            }],
+                            3,
+                        ),
+                        "前置：补全菜单必须可见"
+                    );
+                });
+            } else {
+                // 无菜单时也要设置 owner/uri，确保 completion 只是不可见，
+                // 而不是因为状态缺失被动跳过。
+                editor.completion.show_none_for_test(owner, uri);
+            }
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.focus_handle.clone().focus(window, cx);
+            });
+        });
+        // 生成一帧：`EditorInput` 的键位上下文必须带上 `showing_completions`。
+        let _ = cx.refresh();
+        (editor, input, cx)
+    }
+
+    /// 回归：补全菜单可见时按 Enter，不能同时插入换行。
+    ///
+    /// 走**真实**的 `Editor` 渲染树与击键派发：`CompletionConfirm` 和
+    /// `editor::Enter` 会同时匹配，前者必须 `stop_propagation()` 并消费掉
+    /// 这次按键，否则用户看到的就是「确认补全后又多了一行」。
+    #[gpui::test]
+    fn enter_confirming_completion_does_not_insert_newline(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, true);
+        cx.simulate_keystrokes("enter");
+
+        let text = input.read_with(cx, |state, _| state.text().to_string());
+        assert_eq!(
+            text, "println",
+            "Enter 只能确认补全，不能再触发 editor::Enter 插入换行"
+        );
+        assert!(
+            input.read_with(cx, |state, _| state.completion_menu().is_none()),
+            "确认后菜单快照必须清掉"
+        );
+    }
+
+    /// 回归：候选区间起点越过光标（例如 3..3 光标在 3 后一字节）时，
+    /// 确认必须退回当前词区间，不能在光标后/下一行插入补全。
+    #[gpui::test]
+    fn completion_range_past_cursor_is_clamped(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, true);
+        editor.update(&mut *cx, |editor, _| {
+            editor.completion.break_selected_range_for_test(4..4);
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "println",
+            "越过光标的候选区间必须退回当前词，不能把补全写到下一个位置"
+        );
+    }
+
+    /// 回归：函数补全必须按 snippet 展开成 `foo(a)`，并选中第一个参数，
+    /// 而不是只插入函数名。
+    #[gpui::test]
+    fn function_snippet_completion_inserts_parentheses_and_selects_arg(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (editor, input, cx) = completion_key_fixture(cx, true);
+        let owner = input.entity_id();
+        let uri = lsp_types::Url::parse("file:///a.rs").unwrap();
+        editor.update(&mut *cx, |editor, cx| {
+            input.update(cx, |state, _| {
+                assert!(editor.completion.show_for_test(
+                    state,
+                    owner,
+                    uri,
+                    vec![lsp_types::CompletionItem {
+                        label: "foo(…)".into(),
+                        filter_text: Some("pri".into()),
+                        kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+                        insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+                        text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                            range: lsp_types::Range::new(
+                                lsp_types::Position::new(0, 0),
+                                lsp_types::Position::new(0, 3),
+                            ),
+                            new_text: "foo(${1:a})$0".into(),
+                        },)),
+                        ..Default::default()
+                    }],
+                    3,
+                ));
+            });
+        });
+
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "foo(a)",
+            "函数补全必须带上括号和参数占位符"
+        );
+        assert_eq!(
+            input.read_with(cx, |state, _| (
+                state.selected_range.start,
+                state.selected_range.end
+            )),
+            (4, 5),
+            "第一个 tabstop 应该选中参数 a"
+        );
+    }
+
+    /// 回归：补全键的归属编辑器必须真的持有焦点；焦点在编辑区里的其它
+    /// 输入框时，不能把候选插进背后的代码编辑器。
+    #[gpui::test]
+    fn completion_owner_requires_focus(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, true);
+        let other = cx.update(|window, cx| {
+            let other = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+            other.update(cx, |state, cx| {
+                state.focus_handle.clone().focus(window, cx);
+            });
+            other
+        });
+
+        let owner_focused = cx.update(|window, cx| {
+            editor.read_with(cx, |editor, cx| {
+                editor.focused_completion_editor(window, cx).is_some()
+            })
+        });
+        assert!(!owner_focused, "焦点在别的输入框时不能认领补全键");
+        assert_eq!(
+            input.read_with(&mut *cx, |state, _| state.text().to_string()),
+            "pri",
+            "失焦只应收起菜单，不能写入候选"
+        );
+        drop(other);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.focus_handle.clone().focus(window, cx);
+            });
+        });
+        let owner_focused = cx.update(|window, cx| {
+            editor.read_with(cx, |editor, cx| {
+                editor.focused_completion_editor(window, cx).is_some()
+            })
+        });
+        assert!(owner_focused, "焦点回到编辑区后应重新认领补全键");
+    }
+
+    /// 回归：补全菜单不可见时，无条件的 CompletionConfirm 绑定必须让位，
+    /// Enter 仍然只插入一个换行（不能吞掉普通编辑键）。
+    #[gpui::test]
+    fn enter_without_completion_menu_still_inserts_newline(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, false);
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "pri\n",
+            "菜单不可见时 Enter 必须回到普通换行语义"
+        );
+    }
+
+    /// 回归：补全菜单可见时按 Tab 也只确认补全，不能同时插入缩进。
+    #[gpui::test]
+    fn tab_confirming_completion_does_not_indent(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, true);
+        cx.simulate_keystrokes("tab");
+
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "println",
+            "Tab 只能确认补全，不能再插入缩进"
+        );
+    }
+
+    /// 回归：补全菜单不可见时，Tab 仍然执行普通缩进。
+    #[gpui::test]
+    fn tab_without_completion_menu_still_indents(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, false);
+        cx.simulate_keystrokes("tab");
+
+        let text = input.read_with(cx, |state, _| state.text().to_string());
+        assert!(
+            text.starts_with("pri") && text.len() > 3 && !text.contains('\n'),
+            "菜单不可见时 Tab 必须回到普通缩进语义，实际 {text:?}"
+        );
+    }
+
+    /// 回归：Enter 没被 `CompletionConfirm` 键位接住时，必须走
+    /// `InputState::enter` 的兜底，交给 Editor 下一帧确认补全，而不是换行。
+    ///
+    /// 真实环境中键位上下文可能晚一帧（失焦/重渲染/用户覆盖键位），这条
+    /// 路径保证「菜单可见时按 Enter」永远不会退化成换行。
+    #[gpui::test]
+    fn enter_action_falls_back_to_completion_instead_of_newline(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, true);
+        // 绕过键位派发，直接走 `editor::Enter` 的 handler —— 模拟
+        // `CompletionConfirm` 没有被派发的情况。
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.enter(
+                    &crate::components::input::Enter { secondary: false },
+                    window,
+                    cx,
+                );
+            });
+        });
+        assert!(
+            !input
+                .read_with(&mut *cx, |state, _| state.text().to_string())
+                .contains('\n'),
+            "兜底路径本身不能插入换行"
+        );
+
+        // 下一帧由 Editor 取走 accept 请求并执行确认。
+        let _ = cx.refresh();
+        assert_eq!(
+            input.read_with(&mut *cx, |state, _| state.text().to_string()),
+            "println",
+            "Editor 必须把 Enter 兜底请求转成补全确认"
+        );
     }
 }
 

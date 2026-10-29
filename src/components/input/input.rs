@@ -145,6 +145,16 @@ impl RenderOnce for EditorInput {
             // 于是祖先再深也匹配不上。
             key_context.add(crate::vim::NO_VIM_CONTEXT);
         }
+        // 补全菜单可见时把状态写进键位上下文。
+        //
+        // 内置补全键现在无条件绑在 `Input` 上、由 handler 判断可见性；
+        // 这个上下文仍保留给用户键位表 / 将来的条件绑定使用，不能删。
+        if state
+            .completion_menu()
+            .is_some_and(|menu| !menu.candidates.is_empty())
+        {
+            key_context.add("showing_completions");
+        }
 
         let actions = div()
             .key_context(key_context)

@@ -25,6 +25,7 @@ use gpui::{
     SharedString, Subscription, UTF16Selection, WeakEntity, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
+use lsp_types::Url;
 use ropey::{Rope, RopeSlice};
 use serde::{Deserialize, Serialize};
 use std::ops::{Range, RangeInclusive};
@@ -697,8 +698,6 @@ pub struct InputState {
     hover_hide_deadline: Option<std::time::Instant>,
     /// LSP 补全候选的落地槽（同 `pending_hover` 的理由）。
     pending_completions: Option<crate::editor::completion::PendingCompletions>,
-    /// 补全要替换的字节区间。
-    pending_completion_range: std::ops::Range<usize>,
     /// LSP 文档符号的落地槽。
     pending_symbols: Option<lsp_types::DocumentSymbolResponse>,
     /// LSP 文档高亮（`documentHighlight`）的结果；优先于本地同词高亮。
@@ -713,6 +712,11 @@ pub struct InputState {
     completion_anchor: Option<usize>,
     /// 补全菜单快照（绘制用；`None` = 不显示）。
     completion_menu: Option<crate::editor::completion::CompletionMenu>,
+    /// Enter 落在补全菜单上、但 `CompletionConfirm` 键位没有接住时的兜底请求。
+    ///
+    /// 由 [`Self::enter`] 置位，`Editor::drain_lsp_results` 在下一帧取走并执行
+    /// 补全确认。这样无论键位上下文是否及时更新，Enter 都不会漏成换行。
+    completion_accept_requested: bool,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -833,13 +837,13 @@ impl InputState {
             hover_keyboard_takeover: false,
             hover_hide_deadline: None,
             pending_completions: None,
-            pending_completion_range: 0..0,
             pending_symbols: None,
             lsp_highlights: None,
             inlay_hints: std::collections::HashMap::new(),
             pending_folds: Vec::new(),
             completion_anchor: None,
             completion_menu: None,
+            completion_accept_requested: false,
             _pending_update: false,
             cursor_line_end_affinity: false,
             cursor_shape: CursorShape::default(),
@@ -1454,6 +1458,12 @@ impl InputState {
     pub fn clear_completion_menu(&mut self) {
         self.completion_anchor = None;
         self.completion_menu = None;
+        self.completion_accept_requested = false;
+    }
+
+    /// 取走「Enter 希望确认补全」的兜底请求（Editor 每帧调用）。
+    pub fn take_completion_accept_request(&mut self) -> bool {
+        std::mem::take(&mut self.completion_accept_requested)
     }
 
     /// 设置 LSP 折叠范围（供显示层合并进折叠状态）。
@@ -1635,42 +1645,51 @@ impl InputState {
         self.pending_hover.take()
     }
 
-    /// 存放后台补全请求的结果。
+    /// 存放后台补全请求的结果（含来源 uri 与 `isIncomplete`）。
     ///
-    /// `cursor_offset` 是**发请求时**的光标字节偏移，不是收到结果时的。
+    /// `cursor_offset` / `text_version` 都是**发请求时**的值，不是收到结果时
+    /// 的。
     ///
     /// 必须记下来：`drain_lsp_results` 在 `render` 里跑，而后台任务结束与
     /// 下一帧之间用户可能又敲了字符。那时若直接用「当前光标」去算
     /// `replace_range` 与菜单锚点，就会拿 A 位置的候选按 B 位置替换 ——
     /// 用户看到的正是「候选内容和光标处该有的东西对不上」。同理
-    /// [`Self::take_pending_completions`] 要靠它丢弃已过期的结果。
-    pub fn set_pending_completions(
+    /// [`Self::take_pending_completions`] 要靠它们丢弃已过期的结果。
+    pub fn set_pending_completions_from_request(
         &mut self,
         items: Vec<lsp_types::CompletionItem>,
         position: lsp_types::Position,
         cursor_offset: usize,
+        text_version: u64,
+        uri: Url,
+        incomplete: bool,
     ) {
         self.pending_completions = Some(crate::editor::completion::PendingCompletions {
             items,
             position,
             cursor_offset,
+            text_version,
+            uri,
+            incomplete,
         });
     }
 
-    /// 取走后台补全结果，**但光标已经移开时返回 `None`**。
+    /// 取走后台补全结果，**但光标/文本已经变化时返回 `None`**。
     ///
-    /// 光标一动，先前那份候选就不再适用：显示它会让用户看到与光标处不匹配
-    /// 的内容，按下去还会替换错区间。与其展示一个错的菜单，不如让下一次
-    /// 请求的结果直接接管（`isIncomplete` 时 rust-analyzer 会继续补全）。
+    /// 任何一处变化都说明候选是按旧文档取的：显示它会让用户看到与光标处
+    /// 不匹配的内容，按下去还会替换错区间。与其展示一个错的菜单，不如让
+    /// 下一次请求的结果直接接管（`isIncomplete` 时服务器会继续补全）。
     pub fn take_pending_completions(
         &mut self,
     ) -> Option<crate::editor::completion::PendingCompletions> {
         let pending = self.pending_completions.take()?;
-        if pending.cursor_offset != self.cursor() {
+        if pending.cursor_offset != self.cursor() || pending.text_version != self.text_version {
             log::debug!(
-                "lsp: completion 结果已过期（请求于 offset={}，当前 offset={}），丢弃 {} 个候选",
+                "lsp: completion 结果已过期（请求于 offset={}/v{}，当前 offset={}/v{}），丢弃 {} 个候选",
                 pending.cursor_offset,
+                pending.text_version,
                 self.cursor(),
+                self.text_version,
                 pending.items.len()
             );
             return None;
@@ -1678,32 +1697,18 @@ impl InputState {
         Some(pending)
     }
 
-    /// 按候选算出补全要替换的字节区间，并记下来供 `confirm` 使用。
-    pub fn completion_replace_range_for(
-        &mut self,
-        items: &[lsp_types::CompletionItem],
-    ) -> std::ops::Range<usize> {
-        let offset = self.cursor();
-        self.completion_replace_range_at(offset, items)
+    /// 当前文本版本（补全确认时用于判断替换区间是否仍然有效）。
+    pub fn text_version(&self) -> u64 {
+        self.text_version
     }
 
-    /// 与 [`Self::completion_replace_range_for`] 相同，但**显式指定**用哪个
-    /// 光标偏移来算。
+    /// 丢弃尚未取走的补全结果。
     ///
-    /// 补全菜单必须用它而不是「当前光标」：候选是按**请求时**的位置取的，
-    /// 两者必须同源。`take_pending_completions` 已经保证取出时光标没动，
-    /// 这里传进来的 `offset` 才是那次请求的真实位置。
-    pub fn completion_replace_range_at(
-        &mut self,
-        offset: usize,
-        items: &[lsp_types::CompletionItem],
-    ) -> std::ops::Range<usize> {
-        let range = match items.first() {
-            Some(item) => crate::lsp::features::completion_replace_range(self.text(), offset, item),
-            None => crate::lsp::features::word_range_before(self.text(), offset),
-        };
-        self.pending_completion_range = range.clone();
-        range
+    /// 收起菜单时必须调用：后台任务可能在收起**之前**就把结果写进槽里，
+    /// 只抬代号拦不住已经落地的 pending；下一帧 `drain_lsp_results` 会把它
+    /// 重新装进菜单（用户按 Esc / 确认后弹窗又出现）。
+    pub fn clear_pending_completions(&mut self) {
+        self.pending_completions = None;
     }
 
     /// 应用一条补全：主插入 + `additionalTextEdits`（如自动导入）。
@@ -1723,6 +1728,23 @@ impl InputState {
         range: std::ops::Range<usize>,
         new_text: &str,
         additional: &[lsp_types::TextEdit],
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.apply_completion_with_edits_and_metadata(range, new_text, additional, None, None, cx)
+    }
+
+    /// 带 snippet 光标/占位符选择的补全应用。
+    ///
+    /// `cursor` / `selection` 是相对 `new_text` 的**字节**偏移；插入完成后
+    /// 再换算成绝对位置。这样 `foo(${1:a})$0` 会选中参数 `a`，
+    /// `println!($0)` 会把光标放进括号，而不是停在整段文本末尾。
+    pub fn apply_completion_with_edits_and_metadata(
+        &mut self,
+        range: std::ops::Range<usize>,
+        new_text: &str,
+        additional: &[lsp_types::TextEdit],
+        cursor: Option<usize>,
+        selection: Option<std::ops::Range<usize>>,
         cx: &mut Context<Self>,
     ) -> bool {
         // 先把附加编辑换算成字节区间（基于当前文本），并从后往前排序。
@@ -1752,13 +1774,30 @@ impl InputState {
             let end = (range.end as i64 + shift).max(0) as usize;
             start..end
         };
+        let base = shifted.start;
 
-        self.apply_completion(shifted, new_text, cx)
-    }
+        if !self.apply_completion(shifted, new_text, cx) {
+            return false;
+        }
 
-    /// 记下的补全替换区间。
-    pub fn pending_completion_range(&self) -> std::ops::Range<usize> {
-        self.pending_completion_range.clone()
+        // `apply_completion` 默认把光标放到插入文本末尾；snippet 有 `$0`
+        // 或第一个 tabstop 时覆盖它。
+        let text_len = self.text.len();
+        if let Some(selection) = selection {
+            let start = (base + selection.start).min(text_len);
+            let end = (base + selection.end).min(text_len);
+            if start <= end && self.text.is_char_boundary(start) && self.text.is_char_boundary(end)
+            {
+                self.selected_range = (start..end).into();
+            }
+        } else if let Some(cursor) = cursor {
+            let pos = (base + cursor).min(text_len);
+            if self.text.is_char_boundary(pos) {
+                self.selected_range = (pos..pos).into();
+            }
+        }
+        self.update_preferred_column();
+        true
     }
 
     /// 应用一条 LSP 补全：按字节区间替换文本并把光标放到插入文本之后。
@@ -3982,6 +4021,22 @@ impl InputState {
     }
 
     pub(crate) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // 补全菜单可见时 Enter 归补全：正常情况下 `CompletionConfirm` 键位先
+        // 接住并在 handler 里 `stop_propagation`，这个分支不会执行。但键位
+        // 上下文可能比菜单晚一帧（失焦/重渲染/用户覆盖键位），一旦漏到这里，
+        // 绝不能插入换行——置位交给 Editor 下一帧确认，并吞掉本次 Enter。
+        if self.completion_menu.is_some() {
+            log::info!("lsp: completion Enter 兜底（CompletionConfirm 未接住）");
+            self.completion_accept_requested = true;
+            self.pause_blink_cursor(cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        log::debug!(
+            "lsp: completion InputState::enter 正常路径（菜单不可见）cursor={}",
+            self.cursor()
+        );
         if self.mode.is_multi_line() {
             if self.mode.is_code_editor() {
                 self.enter_with_smart_indent(window, cx);
@@ -4020,6 +4075,21 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 补全菜单可见时 Tab 归补全（正常由 CompletionConfirm 键位先接住）。
+        // 键位上下文晚一帧/被用户覆盖时也不能插入缩进，否则补全会被推到
+        // 下一行或行尾多出一截空白；置位交给 Editor 下一帧确认。
+        if self.completion_menu.is_some() {
+            log::info!("lsp: completion Tab 兜底（CompletionConfirm 未接住）");
+            self.completion_accept_requested = true;
+            self.pause_blink_cursor(cx);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        log::debug!(
+            "lsp: completion InputState::indent_inline 正常路径（菜单不可见）cursor={}",
+            self.cursor()
+        );
         self.indent_or_outdent_lines(false, window, cx);
     }
 
@@ -5014,6 +5084,13 @@ impl InputState {
     fn on_blur(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // NOTE: Do not cancel select, when blur.
         // Because maybe user want to copy the selected text by AppMenuBar (will take focus handle).
+
+        // 焦点离开编辑区时立即收起补全：菜单是 `defer_draw` 画在窗口层的，
+        // 只靠 Editor 每帧的 `validate` 不够——InputState 失焦只会重绘自己，
+        // 不保证 Editor 也重绘，浮窗会一直悬在界面上。
+        self.clear_completion_menu();
+        self.clear_pending_completions();
+        self.completion_request_generation = self.completion_request_generation.wrapping_add(1);
 
         self.blink_cursor.update(cx, |cursor, cx| {
             cursor.stop(cx);

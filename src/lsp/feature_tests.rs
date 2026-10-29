@@ -68,6 +68,66 @@ fn rust_project(name: &str) -> PathBuf {
     dir
 }
 
+/// 真实 rust-analyzer：声明 `snippetSupport` 后，函数补全必须带括号和
+/// tabstop；这条用例直接锁住「只插入函数名」的回归。
+#[test]
+fn rust_analyzer_function_snippet_completion() {
+    if !has_server("rust-analyzer") {
+        eprintln!("skipping: rust-analyzer not installed");
+        return;
+    }
+    let dir = rust_project("function-snippet");
+    let src = "fn foo(a: u32) -> u32 { a }\nfn main() {\n    fo\n}\n";
+    let file = dir.join("src").join("main.rs");
+    std::fs::write(&file, src).unwrap();
+
+    smol::block_on(async {
+        let client = LspClient::start("rust-analyzer", &[], dir.clone())
+            .await
+            .expect("start");
+        let uri = Url::from_file_path(&file).unwrap();
+        client
+            .did_open(&uri, "rust", 0, src)
+            .await
+            .expect("didOpen");
+
+        let budget = Duration::from_secs(60);
+        let pos = lsp_types::Position::new(2, 6);
+        let mut items = Vec::new();
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            let (got, _) = retry_until_ready(
+                &client,
+                || client.completion(&uri, pos, None),
+                "completion (function snippet)",
+                budget,
+            )
+            .await;
+            if got.iter().any(|item| item.label.starts_with("foo")) {
+                items = got;
+                break;
+            }
+            smol::Timer::after(Duration::from_millis(300)).await;
+        }
+
+        let foo = items
+            .iter()
+            .find(|item| item.label.starts_with("foo"))
+            .expect("completion list should contain `foo`");
+        let edit = features::completion_insert_edit(foo);
+        assert!(
+            edit.text.starts_with("foo(") && edit.text.ends_with(')'),
+            "function completion lost parentheses: {:?} (text_edit={:?})",
+            edit.text,
+            foo.text_edit
+        );
+        assert!(
+            edit.selection.is_some() || edit.cursor.is_some(),
+            "function snippet should carry a tabstop/cursor: {edit:?}"
+        );
+    });
+}
+
 /// rust-analyzer：hover / 补全 / 跳转定义 / 文档符号 / 格式化。
 ///
 /// 合成一个大测试而不是五个：每个都要等服务器冷启动（cargo metadata），
@@ -151,7 +211,6 @@ fn rust_analyzer_feature_requests() {
                 .any(|i| !features::completion_label(i).is_empty()),
             "no completion item had a label"
         );
-
         // --- 跳转定义：从 `add(1, 2)` 跳到 `fn add` ---
         let use_pos = lsp_types::Position::new(5, 15); // `add` in `add(1, 2)`
         let goto = retry_until_ready(

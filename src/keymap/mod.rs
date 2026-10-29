@@ -26,6 +26,12 @@ const PLATFORM_KEYMAP: &str = include_str!("../../assets/keymaps/default-macos.j
 const PLATFORM_KEYMAP: &str = include_str!("../../assets/keymaps/default-linux.json");
 /// vim 键位表。
 const VIM_KEYMAP: &str = include_str!("../../assets/keymaps/vim.json");
+/// LSP 补全菜单键位表。
+///
+/// 单独一份、且在 vim 表**之后**加载：补全菜单打开时 `enter`/`tab`/
+/// `escape`/方向键必须优先于普通编辑键与 vim 的 `escape`（退出插入模式），
+/// 否则「补全还没确认，模式先变了」。
+const COMPLETION_KEYMAP: &str = include_str!("../../assets/keymaps/completion.json");
 
 /// 初始化：加载内置键位表，并启动用户键位表的热重载。
 pub fn init(cx: &mut App) {
@@ -50,8 +56,8 @@ pub fn reload(cx: &mut App) {
 
     cx.clear_key_bindings();
 
-    // 先重放其它模块的绑定，再压上本模块管理的三层。
-    // 同深度下后加入者胜，所以内置 / vim / 用户的绑定优先级更高。
+    // 先重放其它模块的绑定，再压上本模块管理的四层。
+    // 同深度下后加入者胜，所以内置 / vim / 补全 / 用户的绑定优先级更高。
     let recorded = RECORDED.with(|r| r.borrow().clone());
     cx.bind_keys(recorded);
 
@@ -133,6 +139,9 @@ fn builtin_sources(cx: &App) -> Vec<(&'static str, &'static str)> {
     if vim_enabled {
         sources.push(("vim.json", VIM_KEYMAP));
     }
+    // 补全键位最后加载：同样的 `Input` 深度下，菜单打开时要压过
+    // `default.json` 的 enter/escape 与 vim insert 的 escape。
+    sources.push(("completion.json", COMPLETION_KEYMAP));
     sources
 }
 
@@ -146,12 +155,13 @@ fn log_errors(errors: &[String]) {
 mod tests {
     use super::*;
 
-    /// 平台无关 + 平台专属 + vim 三份文档。
-    fn builtin_documents() -> [(&'static str, &'static str); 3] {
+    /// 平台无关 + 平台专属 + vim + 补全四份文档。
+    fn builtin_documents() -> [(&'static str, &'static str); 4] {
         [
             ("default.json", DEFAULT_KEYMAP),
             ("default-platform.json", PLATFORM_KEYMAP),
             ("vim.json", VIM_KEYMAP),
+            ("completion.json", COMPLETION_KEYMAP),
         ]
     }
 
@@ -261,12 +271,20 @@ mod tests {
             // 迁移前由 `state.rs` 的 `cx.bind_keys` 提供；迁移后由 JSON 提供。
             assert_eq!(resolve(cx, "left").as_deref(), Some("editor::MoveLeft"));
             assert_eq!(resolve(cx, "right").as_deref(), Some("editor::MoveRight"));
-            assert_eq!(resolve(cx, "escape").as_deref(), Some("editor::Escape"));
-            assert_eq!(resolve(cx, "enter").as_deref(), Some("editor::Enter"));
+            // 补全拦截器无条件排在普通编辑键之前；菜单不可见时 handler
+            // 调用 `cx.propagate()` 放行，后续 `editor::Escape` /
+            // `editor::Enter` 仍会执行（见 `lsp_paint_tests` 的真实击键用例）。
+            assert_eq!(
+                resolve(cx, "escape").as_deref(),
+                Some("editor_panel::CompletionCancel")
+            );
+            assert_eq!(
+                resolve(cx, "enter").as_deref(),
+                Some("editor_panel::CompletionConfirm")
+            );
             assert_eq!(
                 resolve(cx, "shift-enter").as_deref(),
-                Some("editor::SearchPrevious"),
-                "迁移前的后写覆盖语义必须保持"
+                Some("editor_panel::CompletionConfirm")
             );
             assert_eq!(
                 resolve(cx, "alt-z").as_deref(),
@@ -299,6 +317,88 @@ mod tests {
                 );
                 assert_eq!(resolve(cx, "ctrl-a").as_deref(), Some("editor::SelectAll"));
             }
+        });
+    }
+
+    /// 补全快捷键必须排在普通编辑键之前，并由 handler 在菜单不可见时放行。
+    ///
+    /// 回归：这些键曾绑在 `EditorPanel` 上，而 `Input` 已经有
+    /// `enter`/`escape`/`up`/`down`——同深度下更深（Input）的绑定先派发，
+    /// 补全动作永远收不到。
+    #[gpui::test]
+    fn completion_keys_are_interceptors_before_editing_keys(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init(cx);
+
+            let resolve = |cx: &mut gpui::App, showing: bool, keystroke: &str| -> Option<String> {
+                let mut app_window = gpui::KeyContext::new_with_defaults();
+                app_window.add("AppWindow");
+                let mut panel = gpui::KeyContext::new_with_defaults();
+                panel.add("EditorPanel");
+                let mut input = gpui::KeyContext::new_with_defaults();
+                input.add("Input");
+                if showing {
+                    input.add("showing_completions");
+                }
+                let stack = [app_window, panel, input];
+                let keys: Vec<gpui::Keystroke> = keystroke
+                    .split_whitespace()
+                    .map(|key| gpui::Keystroke::parse(key).unwrap())
+                    .collect();
+                let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+            };
+
+            // 补全键位无条件注册在 `Input` 上，先于普通编辑键。菜单不可见时
+            // 这些 handler 直接返回、不消费事件，普通编辑键仍会执行；这里只
+            // 断言解析顺序，运行时门控由 handler + 真实击键用例覆盖。
+            for showing in [false, true] {
+                assert_eq!(
+                    resolve(cx, showing, "enter").as_deref(),
+                    Some("editor_panel::CompletionConfirm")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "tab").as_deref(),
+                    Some("editor_panel::CompletionConfirm")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "down").as_deref(),
+                    Some("editor_panel::CompletionNext")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "ctrl-n").as_deref(),
+                    Some("editor_panel::CompletionNext")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "up").as_deref(),
+                    Some("editor_panel::CompletionPrev")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "ctrl-p").as_deref(),
+                    Some("editor_panel::CompletionPrev")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "pageup").as_deref(),
+                    Some("editor_panel::CompletionFirst")
+                );
+                assert_eq!(
+                    resolve(cx, showing, "pagedown").as_deref(),
+                    Some("editor_panel::CompletionLast")
+                );
+            }
+
+            assert_eq!(
+                resolve(cx, true, "escape").as_deref(),
+                Some("editor_panel::CompletionCancel")
+            );
+
+            // 手动触发在任何时候都可用。
+            assert_eq!(
+                resolve(cx, false, "ctrl-space").as_deref(),
+                Some("editor_panel::TriggerCompletion")
+            );
         });
     }
 
@@ -665,7 +765,7 @@ mod tests {
     fn all_keymap_actions_resolve(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             crate::settings::SettingsStore::init_for_test(cx);
-            // 打开 vim，让三份表都被解析。
+            // 打开 vim，让四份表都被解析。
             crate::settings::SettingsStore::update_user(cx, |content| {
                 content.vim.enabled = true;
             });

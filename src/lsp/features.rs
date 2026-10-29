@@ -329,17 +329,49 @@ pub fn locations_of(response: &lsp_types::GotoDefinitionResponse) -> Vec<Locatio
 /// 补全项的展示文本（`label` 优先，回退 `insertText`/`textEdit` 的新文本）。
 ///
 /// `label` 为空的项在菜单里会显示成一条空白，直接过滤掉。
+/// LSP 允许 label 里带换行/制表符（部分服务器会把签名整段塞进 label），
+/// 菜单是单行列表，这里统一压成一行。
 pub fn completion_label(item: &lsp_types::CompletionItem) -> String {
-    if !item.label.is_empty() {
-        return item.label.clone();
-    }
-    if let Some(insert) = &item.insert_text {
-        return insert.clone();
-    }
-    if let Some(lsp_types::CompletionTextEdit::Edit(e)) = &item.text_edit {
-        return e.new_text.clone();
-    }
-    String::new()
+    let raw = if !item.label.is_empty() {
+        item.label.clone()
+    } else if let Some(new_text) = completion_text_edit_text(item) {
+        new_text
+    } else if let Some(insert) = &item.insert_text {
+        insert.clone()
+    } else {
+        String::new()
+    };
+    sanitize_completion_text(&raw)
+}
+
+/// 补全项的补充说明（右侧灰字）。
+///
+/// 与 Zed 的 `CodeLabelExt::fallback_for_completion` 同优先级：
+/// `detail` → `label_details.detail` → `label_details.description`。
+/// 与 label 完全相同的说明没有信息量，直接丢掉。
+pub fn completion_detail(item: &lsp_types::CompletionItem) -> Option<String> {
+    let label = completion_label(item);
+    let detail = item
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .or_else(|| {
+            item.label_details
+                .as_ref()
+                .and_then(|details| details.detail.as_deref())
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty())
+        })
+        .or_else(|| {
+            item.label_details
+                .as_ref()
+                .and_then(|details| details.description.as_deref())
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+        })?;
+    let detail = sanitize_completion_text(detail);
+    (!detail.is_empty() && detail != label).then_some(detail)
 }
 
 /// 补全项的排序键：sortText 优先，否则 label。
@@ -350,33 +382,291 @@ pub fn completion_sort_key(item: &lsp_types::CompletionItem) -> &str {
     item.sort_text.as_deref().unwrap_or(&item.label)
 }
 
+/// 补全项的过滤文本：`filterText` 优先，否则 label。
+///
+/// 与展示文本分开：服务器可以用 `filterText` 让 `Vec::new` 这种候选
+/// 同时被 `vec` / `new` 两种前缀命中。
+pub fn completion_filter_text(item: &lsp_types::CompletionItem) -> &str {
+    item.filter_text.as_deref().unwrap_or(&item.label)
+}
+
+/// `textEdit`（两种形态）里的新文本。
+fn completion_text_edit_text(item: &lsp_types::CompletionItem) -> Option<String> {
+    match item.text_edit.as_ref()? {
+        lsp_types::CompletionTextEdit::Edit(edit) => Some(edit.new_text.clone()),
+        lsp_types::CompletionTextEdit::InsertAndReplace(edit) => Some(edit.new_text.clone()),
+    }
+}
+
 /// 补全项要插入的文本。
 ///
 /// 优先 `textEdit.newText`（服务器精确指定了替换区间），
 /// 否则 `insertText`，最后回退 `label`。
+///
+/// **snippet 要转成纯文本**：客户端已声明 `snippet_support: true`，
+/// 服务器会返回 `foo(${1:a})$0` 这类文本；原样插入会把占位符写进代码，
+/// 这里降级成 `foo(a)` 并保留括号/参数。
 pub fn completion_insert_text(item: &lsp_types::CompletionItem) -> String {
-    if let Some(lsp_types::CompletionTextEdit::Edit(e)) = &item.text_edit {
-        return e.new_text.clone();
+    completion_insert_edit(item).text
+}
+
+/// 补全插入文本 + snippet 光标/占位符位置。
+///
+/// `completion_insert_text` 只返回文本；插入路径还需要知道 `$0` 在哪、
+/// 第一个 tabstop 选中哪段，才能像 Zed 一样把光标放进括号/选中参数。
+pub fn completion_insert_edit(item: &lsp_types::CompletionItem) -> SnippetEdit {
+    let raw = completion_text_edit_text(item)
+        .or_else(|| item.insert_text.clone())
+        .unwrap_or_else(|| item.label.clone());
+    // 统一行尾：后续的 `apply_completion` 按字节区间替换，CRLF 会在
+    // 行号/折行计算里留下一个不可见的 `\r`。
+    let raw = normalize_newlines(&raw);
+    if item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
+        parse_snippet(&raw)
+    } else {
+        SnippetEdit {
+            text: raw,
+            cursor: None,
+            selection: None,
+        }
     }
-    if let Some(insert) = &item.insert_text {
-        return insert.clone();
-    }
-    item.label.clone()
 }
 
 /// 补全项替换的字节区间。
 ///
 /// `textEdit` 带了区间就用它（服务器会吃掉用户已输入的前缀），
 /// 否则替换光标前的整个当前词——这是「无 textEdit」时的通用做法。
+///
+/// `InsertAndReplace` 用 `replace` 半区：我们不做「插入模式」的
+/// 差异化替换（没有声明 `insertReplaceSupport`），统一按替换语义处理。
 pub fn completion_replace_range(
     rope: &Rope,
     offset: usize,
     item: &lsp_types::CompletionItem,
 ) -> Range<usize> {
-    if let Some(lsp_types::CompletionTextEdit::Edit(e)) = &item.text_edit {
-        return range_to_bytes(rope, e.range);
+    let range = match &item.text_edit {
+        Some(lsp_types::CompletionTextEdit::Edit(edit)) => range_to_bytes(rope, edit.range),
+        Some(lsp_types::CompletionTextEdit::InsertAndReplace(edit)) => {
+            range_to_bytes(rope, edit.replace)
+        }
+        None => word_range_before(rope, offset),
+    };
+    // 服务器给的区间可能基于旧文档（请求在飞时用户又编辑过），钳制到
+    // 当前文本范围内。越界会让 `apply_completion` 静默丢弃整条候选。
+    let len = rope.len();
+    let start = range.start.min(len);
+    let end = range.end.min(len).max(start);
+    start..end
+}
+
+/// 单行化补全文本：换行/制表符 → 空格，连续空白压成一个。
+fn sanitize_completion_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len().min(512));
+    let mut last_was_space = false;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        let ch = if ch.is_control() || ch.is_whitespace() {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' {
+            if last_was_space || out.is_empty() {
+                continue;
+            }
+            last_was_space = true;
+        } else {
+            last_was_space = false;
+        }
+        out.push(ch);
+        count += 1;
+        if count >= 512 {
+            out.push('…');
+            break;
+        }
     }
-    word_range_before(rope, offset)
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// `\r\n` / `\r` → `\n`。
+fn normalize_newlines(text: &str) -> String {
+    if !text.contains('\r') {
+        return text.to_string();
+    }
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// 解析后的 snippet：纯文本 + 光标/占位符位置。
+///
+/// 当前编辑器还没有完整的 tabstop 编辑，但至少要做到和 Zed 一致的
+/// **插入结果**：`foo(${1:a})$0` 写入 `foo(a)` 并选中 `a`，
+/// `println!($0)` 写入 `println!()` 且光标停在括号内。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnippetEdit {
+    pub text: String,
+    /// `$0` / `${0}` 的最终光标（相对 `text` 的字节偏移）。
+    pub cursor: Option<usize>,
+    /// 第一个普通 tabstop（`$1` / `${1:...}`）的字节范围。
+    pub selection: Option<Range<usize>>,
+}
+
+/// LSP snippet 语法 → 纯文本（保留占位符位置，供插入后定位光标）。
+///
+/// 支持 `$1`、`${1}`、`${1:default}`、`${1|a,b|}`、`$0`、`\$` 转义；
+/// 变量（`$TM_FILENAME` 等）按空串处理。
+pub fn parse_snippet(snippet: &str) -> SnippetEdit {
+    let chars: Vec<char> = snippet.chars().collect();
+    let mut i = 0;
+    parse_snippet_segment(&chars, &mut i, false)
+}
+
+/// 只取 snippet 的纯文本（兼容旧调用/测试）。
+pub fn snippet_to_plain_text(snippet: &str) -> String {
+    parse_snippet(snippet).text
+}
+
+fn parse_snippet_segment(chars: &[char], i: &mut usize, stop_at_brace: bool) -> SnippetEdit {
+    let mut edit = SnippetEdit::default();
+    while *i < chars.len() {
+        match chars[*i] {
+            '}' if stop_at_brace => {
+                *i += 1;
+                break;
+            }
+            '\\' if *i + 1 < chars.len() => {
+                let next = chars[*i + 1];
+                if matches!(next, '$' | '}' | '\\') {
+                    edit.text.push(next);
+                    *i += 2;
+                } else {
+                    edit.text.push('\\');
+                    *i += 1;
+                }
+            }
+            '$' => {
+                *i += 1;
+                if *i >= chars.len() {
+                    edit.text.push('$');
+                    break;
+                }
+                match chars[*i] {
+                    // `$1` / `$0`
+                    c if c.is_ascii_digit() => {
+                        let index = parse_snippet_number(chars, i);
+                        let start = edit.text.len();
+                        record_tabstop(&mut edit, index, start, 0);
+                    }
+                    // `${1:default}` / `${1|a,b|}` / `${1}` / `${VAR}`
+                    '{' => {
+                        *i += 1;
+                        let index = parse_snippet_number(chars, i);
+                        match chars.get(*i) {
+                            Some(':') if index.is_some() => {
+                                *i += 1;
+                                let inner = parse_snippet_segment(chars, i, true);
+                                let start = edit.text.len();
+                                edit.text.push_str(&inner.text);
+                                record_tabstop(&mut edit, index, start, inner.text.len());
+                            }
+                            Some('|') if index.is_some() => {
+                                *i += 1;
+                                let choices = collect_snippet_choices(chars, i);
+                                let first = choices.split(',').next().unwrap_or("");
+                                let first_chars: Vec<char> = first.chars().collect();
+                                let mut j = 0;
+                                let inner = parse_snippet_segment(&first_chars, &mut j, false);
+                                let start = edit.text.len();
+                                edit.text.push_str(&inner.text);
+                                record_tabstop(&mut edit, index, start, inner.text.len());
+                                // 消费 `|` 后面的 `}`
+                                while *i < chars.len() && chars[*i] != '}' {
+                                    *i += 1;
+                                }
+                                if *i < chars.len() {
+                                    *i += 1;
+                                }
+                            }
+                            Some('}') if index.is_some() => {
+                                *i += 1;
+                                let start = edit.text.len();
+                                record_tabstop(&mut edit, index, start, 0);
+                            }
+                            _ => {
+                                // `${VAR}`：变量没有静态值，略过。
+                                while *i < chars.len() && chars[*i] != '}' {
+                                    *i += 1;
+                                }
+                                if *i < chars.len() {
+                                    *i += 1;
+                                }
+                            }
+                        }
+                    }
+                    // `$VAR`：略过变量名。
+                    c if c.is_ascii_alphabetic() || c == '_' => {
+                        while *i < chars.len()
+                            && (chars[*i].is_ascii_alphanumeric() || chars[*i] == '_')
+                        {
+                            *i += 1;
+                        }
+                    }
+                    _ => edit.text.push('$'),
+                }
+            }
+            c => {
+                edit.text.push(c);
+                *i += 1;
+            }
+        }
+    }
+    edit
+}
+
+fn parse_snippet_number(chars: &[char], i: &mut usize) -> Option<usize> {
+    let start = *i;
+    while *i < chars.len() && chars[*i].is_ascii_digit() {
+        *i += 1;
+    }
+    if *i == start {
+        return None;
+    }
+    chars[start..*i]
+        .iter()
+        .collect::<String>()
+        .parse::<usize>()
+        .ok()
+}
+
+/// 读取 `${1|a,b|}` 的选项原文，推进到收尾的 `|` 之后。
+fn collect_snippet_choices(chars: &[char], i: &mut usize) -> String {
+    let mut out = String::new();
+    while *i < chars.len() && chars[*i] != '|' {
+        if chars[*i] == '\\' && *i + 1 < chars.len() {
+            out.push(chars[*i]);
+            out.push(chars[*i + 1]);
+            *i += 2;
+        } else {
+            out.push(chars[*i]);
+            *i += 1;
+        }
+    }
+    if *i < chars.len() {
+        *i += 1;
+    }
+    out
+}
+
+fn record_tabstop(edit: &mut SnippetEdit, index: Option<usize>, start: usize, len: usize) {
+    match index {
+        Some(0) => edit.cursor = Some(start + len),
+        Some(_) if edit.selection.is_none() => {
+            edit.selection = Some(start..start + len);
+        }
+        _ => {}
+    }
 }
 
 /// 字符在「词」中的角色。对照 Zed 的 `language::CharKind`。
@@ -1008,6 +1298,156 @@ mod tests {
         };
         let text = rope("ab cd");
         assert_eq!(completion_replace_range(&text, 5, &item), 3..5);
+    }
+
+    /// `InsertAndReplace` 是 LSP 3.16 的第二种 `textEdit` 形态。
+    ///
+    /// 只认 `Edit` 会让这类候选的替换区间退回「光标前的整个词」，
+    /// 服务器要求的精确区间（例如 `foo.ba|` 只替换 `ba`）就丢了。
+    #[test]
+    fn completion_handles_insert_and_replace_edit() {
+        let item = lsp_types::CompletionItem {
+            label: "bar".into(),
+            text_edit: Some(lsp_types::CompletionTextEdit::InsertAndReplace(
+                lsp_types::InsertReplaceEdit {
+                    new_text: "bar()".into(),
+                    insert: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 8),
+                        lsp_types::Position::new(0, 8),
+                    ),
+                    replace: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 4),
+                        lsp_types::Position::new(0, 8),
+                    ),
+                },
+            )),
+            ..Default::default()
+        };
+        let text = rope("foo.bar");
+        assert_eq!(completion_replace_range(&text, 7, &item), 4..7);
+        assert_eq!(completion_insert_text(&item), "bar()");
+    }
+
+    #[test]
+    fn completion_snippet_is_flattened_to_plain_text() {
+        let item = lsp_types::CompletionItem {
+            label: "println".into(),
+            insert_text: Some("println!(\"${1:msg}\")${0}".into()),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            ..Default::default()
+        };
+        assert_eq!(completion_insert_text(&item), "println!(\"msg\")");
+    }
+
+    #[test]
+    fn snippet_metadata_tracks_cursor_and_first_placeholder() {
+        let with_arg = parse_snippet("foo(${1:a})$0");
+        assert_eq!(with_arg.text, "foo(a)");
+        assert_eq!(with_arg.selection, Some(4..5));
+        assert_eq!(with_arg.cursor, Some(6));
+
+        let no_arg = parse_snippet("println!($0)");
+        assert_eq!(no_arg.text, "println!()");
+        assert_eq!(no_arg.cursor, Some(9));
+        assert_eq!(no_arg.selection, None);
+
+        let multi = parse_snippet("for ${1:pat} in ${2:iter} {\n    $0\n}");
+        assert_eq!(multi.text, "for pat in iter {\n    \n}");
+        assert_eq!(multi.selection, Some(4..7));
+    }
+
+    /// 开启 `snippetSupport` 后，rust-analyzer 的函数补全是
+    /// `foo(${1:a})$0` / `foo($0)`；降级成纯文本时必须保留括号。
+    #[test]
+    fn function_snippet_keeps_parentheses() {
+        let with_arg = lsp_types::CompletionItem {
+            label: "foo(…)".into(),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: range(0, 0, 0, 2),
+                new_text: "foo(${1:a})$0".into(),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(completion_insert_text(&with_arg), "foo(a)");
+
+        let no_arg = lsp_types::CompletionItem {
+            label: "bar(…)".into(),
+            insert_text_format: Some(lsp_types::InsertTextFormat::SNIPPET),
+            text_edit: Some(lsp_types::CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: range(0, 0, 0, 3),
+                new_text: "bar($0)".into(),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(completion_insert_text(&no_arg), "bar()");
+    }
+
+    #[test]
+    fn snippet_choice_takes_first_option_and_unescapes() {
+        assert_eq!(
+            snippet_to_plain_text("${1|alpha,beta|}-${2:gamma}"),
+            "alpha-gamma"
+        );
+        assert_eq!(snippet_to_plain_text("\\$5"), "$5");
+        assert_eq!(snippet_to_plain_text("$TM_FILENAME"), "");
+    }
+
+    #[test]
+    fn completion_detail_prefers_detail_then_label_details() {
+        let with_detail = lsp_types::CompletionItem {
+            label: "foo".into(),
+            detail: Some("fn() -> i32".into()),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("ignored".into()),
+                description: Some("desc".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_detail(&with_detail).as_deref(),
+            Some("fn() -> i32")
+        );
+
+        let only_description = lsp_types::CompletionItem {
+            label: "foo".into(),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: None,
+                description: Some("std::collections".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            completion_detail(&only_description).as_deref(),
+            Some("std::collections")
+        );
+
+        let duplicate = lsp_types::CompletionItem {
+            label: "foo".into(),
+            detail: Some("foo".into()),
+            ..Default::default()
+        };
+        assert_eq!(completion_detail(&duplicate), None);
+    }
+
+    #[test]
+    fn completion_label_is_single_line() {
+        let item = lsp_types::CompletionItem {
+            label: "fn foo(\n  x: i32\n)".into(),
+            ..Default::default()
+        };
+        assert_eq!(completion_label(&item), "fn foo( x: i32 )");
+    }
+
+    #[test]
+    fn completion_filter_text_prefers_filter_text() {
+        let item = lsp_types::CompletionItem {
+            label: "Vec::new".into(),
+            filter_text: Some("new".into()),
+            ..Default::default()
+        };
+        assert_eq!(completion_filter_text(&item), "new");
+        assert_eq!(completion_sort_key(&item), "Vec::new");
     }
 
     #[test]

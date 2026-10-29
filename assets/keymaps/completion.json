@@ -1,0 +1,33 @@
+// 补全菜单的键位。
+//
+// 这些绑定**不依赖 `showing_completions` 上下文**，而是无条件排在 `Input`
+// 普通编辑键之前：
+//
+// - handler 内部先看补全状态是否可见；
+// - 不可见时调用 `cx.propagate()` 显式放行（GPUI 的动作在冒泡阶段
+//   默认阻断传播），后续 `editor::Enter` / `editor::IndentInline` /
+//   方向键照常执行；
+// - 可见时消费按键并确认/导航/关闭。
+//
+// 为什么不用 `Input && showing_completions`：键位上下文由上一帧的渲染决定，
+// 菜单快照与键位上下文之间可能差一帧（失焦、重渲染、旧进程、用户覆盖键位），
+// 一旦漏匹配，Enter/Tab 会先触发普通编辑动作（插入换行/缩进），随后补全再按
+// 新光标插入，表现为「用户输入留在上一行，补全写到下一行开头」。
+[
+  {
+    "context": "Input",
+    "bindings": {
+      "enter": "editor_panel::CompletionConfirm",
+      "shift-enter": "editor_panel::CompletionConfirm",
+      "tab": "editor_panel::CompletionConfirm",
+      "down": "editor_panel::CompletionNext",
+      "ctrl-n": "editor_panel::CompletionNext",
+      "up": "editor_panel::CompletionPrev",
+      "ctrl-p": "editor_panel::CompletionPrev",
+      "pageup": "editor_panel::CompletionFirst",
+      "pagedown": "editor_panel::CompletionLast",
+      "escape": "editor_panel::CompletionCancel",
+      "ctrl-space": "editor_panel::TriggerCompletion"
+    }
+  }
+]

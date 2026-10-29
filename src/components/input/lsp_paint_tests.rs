@@ -16,7 +16,8 @@
 //! `rendered_entity_stack` 才能算 `current_view()`）。
 
 use gpui::{
-    AppContext as _, Context, IntoElement, ParentElement as _, Render, Styled as _, Window, px,
+    AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    Styled as _, Window, px,
 };
 
 use crate::components::input::rope_ext::RopeExt as _;
@@ -105,7 +106,13 @@ fn completion_menu_paints_without_panic(cx: &mut gpui::TestAppContext) {
         let candidates: Vec<Candidate> = (0..3)
             .map(|i| Candidate {
                 label: format!("candidate_{i}"),
-                detail: None,
+                detail: Some("fn() -> i32".to_string()),
+                kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+                deprecated: false,
+                filter_text: format!("candidate_{i}"),
+                sort_text: format!("candidate_{i}"),
+                insert_text: format!("candidate_{i}()"),
+                replace_range: 16..16,
                 item: lsp_types::CompletionItem {
                     label: format!("candidate_{i}"),
                     ..Default::default()
@@ -116,6 +123,102 @@ fn completion_menu_paints_without_panic(cx: &mut gpui::TestAppContext) {
         state.set_completion_menu(candidates, 0);
     });
     assert!(input.read_with(cx, |s, _| s.completion_menu().is_some()));
+}
+
+/// 回归：补全菜单可见时按 Enter，只能触发补全确认，不能再插入换行。
+///
+/// 真实击键路径（`simulate_keystrokes`）会同时匹配补全键与 `Input` 的
+/// `editor::Enter`。补全 handler 必须 `stop_propagation()`，否则两个 action
+/// 都会执行：先插入候选、再换行。
+#[gpui::test]
+fn enter_on_visible_completion_menu_does_not_leak_to_newline(cx: &mut gpui::TestAppContext) {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use crate::editor::CompletionConfirm;
+    use crate::editor::completion::Candidate;
+
+    cx.update(|cx| {
+        crate::theme::init(cx);
+        crate::sidebar_view::font_settings::FontState::init(cx);
+        crate::keymap::init(cx);
+    });
+
+    struct KeyHost {
+        input: gpui::Entity<InputState>,
+        completions: Rc<Cell<usize>>,
+    }
+    impl Render for KeyHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            gpui::div()
+                .key_context("EditorPanel")
+                .size_full()
+                .on_action(cx.listener(|this, _: &CompletionConfirm, _window, cx| {
+                    this.completions.set(this.completions.get() + 1);
+                    // 与生产代码的 `completion_confirm` 相同：补全接管本次
+                    // 按键后必须阻止普通编辑键继续派发。
+                    cx.stop_propagation();
+                }))
+                .child(EditorInput::new(&self.input))
+        }
+    }
+
+    let cell = RefCell::new(None);
+    let hits = Rc::new(Cell::new(0));
+    let (host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| {
+            let mut state = InputState::new(window, cx)
+                .code_editor("rust")
+                .multi_line(true);
+            state.set_value("pri", window, cx);
+            state.selected_range = (3..3).into();
+            state.set_completion_anchor(3);
+            state.set_completion_menu(
+                vec![Candidate {
+                    label: "println".into(),
+                    detail: None,
+                    kind: Some(lsp_types::CompletionItemKind::FUNCTION),
+                    deprecated: false,
+                    filter_text: "println".into(),
+                    sort_text: "println".into(),
+                    insert_text: "println!".into(),
+                    replace_range: 0..3,
+                    item: lsp_types::CompletionItem {
+                        label: "println".into(),
+                        ..Default::default()
+                    },
+                }],
+                0,
+            );
+            state
+        });
+        *cell.borrow_mut() = Some(input.clone());
+        KeyHost {
+            input,
+            completions: hits.clone(),
+        }
+    });
+    let input = cell.into_inner().unwrap();
+
+    cx.update(|window, cx| {
+        input.update(cx, |state, cx| {
+            state.focus_handle.clone().focus(window, cx);
+        });
+    });
+    // 生成一帧：`EditorInput` 的键位上下文必须带上 `showing_completions`。
+    let _ = cx.refresh();
+    cx.simulate_keystrokes("enter");
+
+    assert_eq!(
+        host.read_with(cx, |host, _| host.completions.get()),
+        1,
+        "菜单可见时 Enter 必须派发 CompletionConfirm"
+    );
+    assert_eq!(
+        input.read_with(cx, |state, _| state.text().to_string()),
+        "pri",
+        "补全确认后不能继续触发 editor::Enter 插入换行"
+    );
 }
 
 /// hover 与补全同时存在（两个 deferred 元素）：都要能画出来。
@@ -133,6 +236,12 @@ fn both_popovers_paint_together(cx: &mut gpui::TestAppContext) {
             vec![Candidate {
                 label: "foo".to_string(),
                 detail: None,
+                kind: Some(lsp_types::CompletionItemKind::VARIABLE),
+                deprecated: false,
+                filter_text: "foo".to_string(),
+                sort_text: "foo".to_string(),
+                insert_text: "foo".to_string(),
+                replace_range: 16..16,
                 item: lsp_types::CompletionItem {
                     label: "foo".to_string(),
                     ..Default::default()
