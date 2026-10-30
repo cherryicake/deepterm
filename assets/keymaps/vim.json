@@ -222,6 +222,7 @@
     "bindings": {
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode",
+      ":": "editor_panel::ExCommandLine",
       "v": "vim::VisualChar",
       "shift-v": "vim::VisualLine",
       "o": "vim::VisualSwapEnds",

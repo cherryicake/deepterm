@@ -9,12 +9,12 @@
 //! 不实现 `:g`、`:normal`、`:!` 这类需要二次解析或 shell 的命令。
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Subscription, WeakEntity, Window, div, px};
+use gpui::{App, Context, Entity, Keystroke, Subscription, WeakEntity, Window, div, px};
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::{ExCancel, ExComplete, ExHistoryNext, ExHistoryPrev, ExSubmit};
-use crate::components::input::{EditorInput, InputState};
+use crate::components::input::{EditorInput, InputState, RopeExt as _};
 use crate::theme::ActiveTheme;
 
 /// 行地址。范围端点可以是当前行、末行、数字、标记或整个缓冲区。
@@ -103,6 +103,48 @@ pub(crate) fn parse(input: &str) -> Result<ExCommand, String> {
             name: "s".into(),
             bang: false,
             args,
+        });
+    }
+
+    // `:!cmd` / `:g/pat/cmd` / `:v/pat/cmd` / `:global/pat/cmd`。
+    if bytes[i] == b'!' {
+        return Ok(ExCommand {
+            range,
+            name: "!".into(),
+            bang: false,
+            args: rest[i + 1..].trim().to_string(),
+        });
+    }
+    let is_global = bytes[i] == b'g'
+        && bytes
+            .get(i + 1)
+            .is_some_and(|b| !b.is_ascii_alphanumeric() && !b.is_ascii_whitespace() || *b == b'!')
+        || bytes[i] == b'v'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|b| !b.is_ascii_alphanumeric() && !b.is_ascii_whitespace())
+        || rest[i..].starts_with("global")
+            && rest[i + 6..]
+                .chars()
+                .next()
+                .is_some_and(|b| !b.is_alphanumeric() && !b.is_whitespace());
+    if is_global {
+        let (name, bang, start) = if rest[i..].starts_with("global") {
+            ("global", false, i + 6)
+        } else if bytes[i] == b'g' {
+            if bytes.get(i + 1) == Some(&b'!') {
+                ("g", true, i + 2)
+            } else {
+                ("g", false, i + 1)
+            }
+        } else {
+            ("v", false, i + 1)
+        };
+        return Ok(ExCommand {
+            range,
+            name: name.into(),
+            bang,
+            args: rest[start..].trim().to_string(),
         });
     }
 
@@ -254,6 +296,14 @@ impl ExCommandPanel {
         panel
     }
 
+    /// Visual 模式打开时预填 `'<,'>`，让 `:d/:s/...` 默认作用到选区。
+    pub(crate) fn set_input(&self, value: &str, window: &mut Window, cx: &mut App) {
+        let value = value.to_string();
+        self.input.update(cx, |input, cx| {
+            input.set_value(value, window, cx);
+        });
+    }
+
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.read(cx).focus_handle.clone().focus(window, cx);
     }
@@ -356,6 +406,12 @@ impl ExCommandPanel {
                         });
                         self.focus(window, cx);
                         cx.notify();
+                    }
+                    ExOutcome::Normal { keys, rows } => {
+                        self.close(window, cx);
+                        if let Some(editor) = self.editor.upgrade() {
+                            run_normal_keys(&editor, &keys, rows, window, cx);
+                        }
                     }
                 }
             }
@@ -480,9 +536,246 @@ impl gpui::Render for ExCommandPanel {
 pub(crate) enum ExOutcome {
     Close,
     Message(String),
+    /// `:normal`：先收面板并把焦点还给编辑器，再由面板逐行派发普通模式键。
+    Normal {
+        keys: String,
+        rows: Option<Vec<usize>>,
+    },
 }
 
-/// 命令名 + 参数补全。
+/// 把 `:normal` 的字符序列转成击键。支持常见的 `<Esc>`/`<CR>`/`<Tab>`/`<Space>`。
+fn normal_keystrokes(keys: &str) -> Vec<Keystroke> {
+    let mut result = Vec::new();
+    let mut chars = keys.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut token = String::new();
+            let mut closed = false;
+            for next in chars.by_ref() {
+                if next == '>' {
+                    closed = true;
+                    break;
+                }
+                token.push(next);
+            }
+            if closed {
+                let key = match token.to_ascii_lowercase().as_str() {
+                    "esc" | "escape" => "escape",
+                    "cr" | "enter" => "enter",
+                    "tab" => "tab",
+                    "space" => "space",
+                    _ => "",
+                };
+                if !key.is_empty() {
+                    if let Ok(keystroke) = Keystroke::parse(key) {
+                        result.push(keystroke);
+                    }
+                    continue;
+                }
+                // 未识别的 `<...>` 按字面量回退。
+                result.push(key_for_char('<'));
+                for c in token.chars() {
+                    result.push(key_for_char(c));
+                }
+                result.push(key_for_char('>'));
+                continue;
+            }
+            result.push(key_for_char('<'));
+            for c in token.chars() {
+                result.push(key_for_char(c));
+            }
+            continue;
+        }
+        result.push(key_for_char(ch));
+    }
+    result
+}
+
+fn key_for_char(ch: char) -> Keystroke {
+    if ch == ' ' {
+        return Keystroke::parse("space").unwrap_or_default();
+    }
+    if ch.is_ascii_uppercase() {
+        let mut keystroke =
+            Keystroke::parse(&ch.to_ascii_lowercase().to_string()).unwrap_or_else(|_| Keystroke {
+                key: ch.to_ascii_lowercase().to_string(),
+                ..Default::default()
+            });
+        keystroke.modifiers.shift = true;
+        keystroke.key_char = Some(ch.to_string());
+        return keystroke;
+    }
+    Keystroke::parse(&ch.to_string()).unwrap_or_else(|_| Keystroke {
+        key: ch.to_string(),
+        key_char: Some(ch.to_string()),
+        ..Default::default()
+    })
+}
+
+/// 在面板关闭、焦点回到编辑器后执行 `:normal`。
+fn run_normal_keys(
+    editor: &Entity<super::Editor>,
+    keys: &str,
+    rows: Option<Vec<usize>>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(input) = editor.read(cx).active_text_editor(cx) else {
+        return;
+    };
+    let keystrokes = normal_keystrokes(keys);
+    let Some(mut rows) = rows else {
+        // 无范围：直接在当前光标处执行一次。
+        dispatch_normal_keystrokes(&input, &keystrokes, window, cx);
+        return;
+    };
+    rows.sort_unstable();
+    rows.dedup();
+
+    // 倒序处理：`dd`/`o` 等可能增删行，先处理靠后的行，靠前的行号不会被
+    // 后续编辑移动。
+    for row in rows.into_iter().rev() {
+        input.update(cx, |state, cx| {
+            let row = row.min(state.text().lines_len().saturating_sub(1));
+            let offset = state.text().line_start_offset(row);
+            state.selected_range = (offset..offset).into();
+            state.scroll_to_center(offset, cx);
+            cx.notify();
+        });
+        dispatch_normal_keystrokes(&input, &keystrokes, window, cx);
+    }
+}
+
+fn dispatch_normal_keystrokes(
+    input: &Entity<InputState>,
+    keystrokes: &[Keystroke],
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut sequence: Vec<Keystroke> = Vec::new();
+    for keystroke in keystrokes {
+        let vim = input.read(cx).vim.as_ref();
+        let mode = vim
+            .map(|vim| vim.mode)
+            .unwrap_or(crate::vim::VimMode::Normal);
+
+        // `f`/`t`/`r`/`m` 等正在等待一个字符：把它直接交给 vim 的 pending 处理器，
+        // 不能走键位解析（否则 `fo` 会变成 OpenLineBelow 之类的命令）。
+        if vim.is_some_and(|vim| vim.pending_char.is_some()) {
+            let ch = keystroke
+                .key_char
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .or_else(|| {
+                    (keystroke.key.chars().count() == 1)
+                        .then(|| keystroke.key.chars().next())
+                        .flatten()
+                });
+            if let Some(ch) = ch {
+                input.update(cx, |state, cx| {
+                    state.vim_do_apply_pending_char(ch, window, cx);
+                });
+            }
+            sequence.clear();
+            continue;
+        }
+
+        if matches!(
+            mode,
+            crate::vim::VimMode::Insert | crate::vim::VimMode::Replace
+        ) {
+            if keystroke.key == "escape" {
+                dispatch_action_by_name(input, "vim::NormalMode", window, cx);
+            } else if keystroke.key == "enter" {
+                input.update(cx, |state, cx| {
+                    state.replace_text_in_range_silent(None, "\n", window, cx);
+                });
+            } else if keystroke.key == "tab" {
+                input.update(cx, |state, cx| {
+                    state.replace_text_in_range_silent(None, "\t", window, cx);
+                });
+            } else if keystroke.key == "space" {
+                input.update(cx, |state, cx| {
+                    state.replace_text_in_range_silent(None, " ", window, cx);
+                });
+            } else {
+                let text = keystroke
+                    .key_char
+                    .clone()
+                    .or_else(|| (keystroke.key.chars().count() == 1).then(|| keystroke.key.clone()))
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    input.update(cx, |state, cx| {
+                        state.replace_text_in_range_silent(None, &text, window, cx);
+                    });
+                }
+            }
+            sequence.clear();
+            continue;
+        }
+
+        sequence.push(keystroke.clone());
+        let stack = vim_key_context(input, cx);
+        let (bindings, pending) = cx
+            .key_bindings()
+            .borrow()
+            .bindings_for_input(&sequence, &stack);
+        if pending {
+            continue;
+        }
+        if let Some(binding) = bindings.first() {
+            let name = binding.action().name().to_string();
+            dispatch_action_by_name(input, &name, window, cx);
+        }
+        sequence.clear();
+    }
+
+    // `normal i...` 结束后必须回到 Normal。
+    let mode = input.read(cx).vim.as_ref().map(|vim| vim.mode);
+    if mode.is_some_and(|mode| mode != crate::vim::VimMode::Normal) {
+        dispatch_action_by_name(input, "vim::NormalMode", window, cx);
+    }
+}
+
+fn vim_key_context(input: &Entity<InputState>, cx: &App) -> Vec<gpui::KeyContext> {
+    let mut context = gpui::KeyContext::new_with_defaults();
+    context.add("Input");
+    if let Some(vim) = input.read(cx).vim.as_ref() {
+        let mode = match vim.mode {
+            crate::vim::VimMode::Normal => "normal",
+            crate::vim::VimMode::Insert => "insert",
+            crate::vim::VimMode::Replace => "replace",
+            crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine => "visual",
+        };
+        if matches!(
+            vim.mode,
+            crate::vim::VimMode::Normal
+                | crate::vim::VimMode::Visual
+                | crate::vim::VimMode::VisualLine
+        ) {
+            context.add("VimControl");
+        }
+        context.set("vim_mode", mode);
+        context.set("vim_operator", vim.active_operator_id());
+    }
+    vec![context]
+}
+
+fn dispatch_action_by_name(
+    input: &Entity<InputState>,
+    name: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let Ok(action) = cx.build_action(name, None) else {
+        return false;
+    };
+    let focus = input.read(cx).focus_handle.clone();
+    focus.dispatch_action(action.as_ref(), window, cx);
+    true
+}
+
+/// 命令名 + 参数补全。/// 命令名 + 参数补全。
 fn complete(raw: &str) -> Vec<String> {
     const COMMANDS: &[&str] = &[
         "w",
@@ -503,6 +796,11 @@ fn complete(raw: &str) -> Vec<String> {
         "set",
         "marks",
         "registers",
+        "normal",
+        "g",
+        "v",
+        "global",
+        "!",
     ];
     let trimmed_start = raw.trim_start();
     if let Some(rest) = trimmed_start.strip_prefix("set ") {
@@ -532,6 +830,40 @@ fn replace_last_token(raw: &str, candidate: &str) -> String {
         Some(index) => format!("{}{}", &raw[..=index], candidate),
         None => candidate.to_string(),
     }
+}
+
+/// 解析 `g/pat/cmd` / `v/pat/cmd` 的参数。
+pub(crate) fn parse_global(args: &str) -> Result<(String, String), String> {
+    let mut chars = args.chars();
+    let delimiter = chars
+        .next()
+        .ok_or_else(|| "缺少全局命令分隔符".to_string())?;
+    if delimiter.is_alphanumeric() || delimiter.is_whitespace() {
+        return Err("全局命令分隔符不能是字母/空白".into());
+    }
+    let rest = &args[delimiter.len_utf8()..];
+    let mut pattern = String::new();
+    let mut escaped = false;
+    let mut command_start = None;
+    for (index, ch) in rest.char_indices() {
+        if escaped {
+            pattern.push('\\');
+            pattern.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == delimiter {
+            command_start = Some(index + ch.len_utf8());
+            break;
+        } else {
+            pattern.push(ch);
+        }
+    }
+    let command = command_start
+        .map(|start| rest[start..].trim().to_string())
+        .filter(|command| !command.is_empty())
+        .ok_or_else(|| "全局命令缺少要执行的命令".to_string())?;
+    Ok((pattern, command))
 }
 
 /// 解析 `s/pat/repl/[gi]` 的参数（第一个字符是分隔符，不要求是 `/`）。
@@ -611,6 +943,29 @@ mod tests {
         );
         assert_eq!(parse("set nu").unwrap().args, "nu");
         assert_eq!(parse("s/foo/bar/").unwrap().name, "s");
+    }
+
+    #[test]
+    fn parses_global_shell_and_visual_marks() {
+        let global = parse("g/^b/d").unwrap();
+        assert_eq!(global.name, "g");
+        assert_eq!(global.args, "/^b/d");
+        assert_eq!(
+            parse_global(&global.args).unwrap(),
+            ("^b".into(), "d".into())
+        );
+        assert_eq!(parse("v/foo/s/foo/bar/").unwrap().name, "v");
+        assert_eq!(parse("global/^a/d").unwrap().name, "global");
+        assert_eq!(parse("g!/foo/d").unwrap().bang, true);
+        let normal_bang = parse("normal! A;").unwrap();
+        assert_eq!(normal_bang.name, "normal");
+        assert!(normal_bang.bang);
+        assert_eq!(parse("!printf hi").unwrap().name, "!");
+        assert_eq!(parse("!printf hi").unwrap().args, "printf hi");
+        assert_eq!(
+            parse("'<,'>d").unwrap().range,
+            Some((LineExpr::Mark('<'), LineExpr::Mark('>')))
+        );
     }
 
     #[test]

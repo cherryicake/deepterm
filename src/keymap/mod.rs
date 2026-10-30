@@ -380,6 +380,35 @@ mod tests {
         });
     }
 
+    /// Visual 下 `:` 也必须解析到 Ex 命令行。
+    #[gpui::test]
+    fn colon_resolves_to_ex_command_in_visual_mode(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            reload(cx);
+            let mut input = gpui::KeyContext::new_with_defaults();
+            input.add("Input");
+            input.add("VimControl");
+            input.set("vim_mode", "visual");
+            input.set("vim_operator", "none");
+            let keys = vec![gpui::Keystroke::parse(":").unwrap()];
+            let (bindings, _) = cx
+                .key_bindings()
+                .borrow()
+                .bindings_for_input(&keys, &[input]);
+            assert_eq!(
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+                    .as_deref(),
+                Some("editor_panel::ExCommandLine")
+            );
+        });
+    }
+
     /// 补全快捷键必须排在普通编辑键之前，并由 handler 在菜单不可见时放行。
     ///
     /// 回归：这些键曾绑在 `EditorPanel` 上，而 `Input` 已经有

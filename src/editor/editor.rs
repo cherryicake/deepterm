@@ -1986,6 +1986,12 @@ impl Editor {
         let Some(editor) = self.active_text_editor(cx) else {
             return;
         };
+        let visual = editor.read(cx).vim.as_ref().is_some_and(|vim| {
+            matches!(
+                vim.mode,
+                crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine
+            )
+        });
         // `2:` 这类前缀不应把计数留到命令执行后的下一次移动。
         editor.update(cx, |state, cx| {
             if let Some(vim) = state.vim.as_mut() {
@@ -1995,6 +2001,9 @@ impl Editor {
         });
         self.completion.hide_in(&editor, cx);
         let panel = ex_command::ExCommandPanel::new(cx.entity().downgrade(), window, cx);
+        if visual {
+            panel.update(cx, |panel, cx| panel.set_input("'<,'>", window, cx));
+        }
         panel.update(cx, |panel, cx| panel.focus(window, cx));
         self.ex_command_panel = Some(panel);
         cx.notify();
@@ -2004,6 +2013,22 @@ impl Editor {
     pub(crate) fn close_ex_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.ex_command_panel.take();
         if let Some(editor) = self.active_text_editor(cx) {
+            // 从 Visual 进入 `:` 时，命令执行/取消后都应回到 Normal。
+            editor.update(cx, |state, cx| {
+                if let Some(vim) = state.vim.as_ref() {
+                    let was_visual = matches!(
+                        vim.mode,
+                        crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine
+                    );
+                    if was_visual {
+                        let cursor = state.cursor();
+                        state.selected_range = (cursor..cursor).into();
+                    }
+                }
+                if state.vim.is_some() {
+                    state.vim_switch_mode(crate::vim::VimMode::Normal, cx);
+                }
+            });
             editor.read(cx).focus_handle.clone().focus(window, cx);
         }
         cx.notify();
@@ -2017,6 +2042,22 @@ impl Editor {
         cx: &mut Context<Self>,
     ) -> Result<ex_command::ExOutcome, String> {
         let command = ex_command::parse(input)?;
+        self.execute_parsed_command(command, None, window, cx)
+    }
+
+    fn execute_parsed_command(
+        &mut self,
+        mut command: ex_command::ExCommand,
+        forced_row: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<ex_command::ExOutcome, String> {
+        if let Some(row) = forced_row {
+            command.range = Some((
+                ex_command::LineExpr::Number(row.saturating_add(1)),
+                ex_command::LineExpr::Number(row.saturating_add(1)),
+            ));
+        }
         let Some(editor) = self.active_text_editor(cx) else {
             return Err("当前没有可编辑的文本标签".into());
         };
@@ -2084,6 +2125,21 @@ impl Editor {
                 self.ex_sort_lines(&editor, start, end, window, cx)?;
                 Ok(ex_command::ExOutcome::Close)
             }
+            "normal" | "norm" => {
+                let keys = command.args.trim().to_string();
+                if keys.is_empty() {
+                    return Err(":normal 缺少要执行的按键".into());
+                }
+                let rows = if command.range.is_some() {
+                    let (start, end) = self.ex_default_range(&command, &editor, true, false, cx)?;
+                    Some((start..=end).collect())
+                } else {
+                    None
+                };
+                Ok(ex_command::ExOutcome::Normal { keys, rows })
+            }
+            "g" | "v" | "global" => self.ex_global(&command, &editor, window, cx),
+            "!" => self.ex_shell(&command, &editor, window, cx),
             "set" => self.ex_set(&command.args, window, cx),
             "marks" => Ok(ex_command::ExOutcome::Message(
                 self.ex_marks_message(&editor, cx),
@@ -2110,6 +2166,26 @@ impl Editor {
             ex_command::LineExpr::Current => text.offset_to_point(state.cursor()).row,
             ex_command::LineExpr::Last => last,
             ex_command::LineExpr::Number(number) => number.saturating_sub(1),
+            ex_command::LineExpr::Mark('<') | ex_command::LineExpr::Mark('>') => {
+                // Visual 命令 `:'<,'>`：取当前可视选区两端所在行。
+                // 面板打开不会清掉 InputState 的选区，所以执行时仍可读到。
+                let start_row = text
+                    .offset_to_point(state.selected_range.start.min(text.len()))
+                    .row;
+                let mut end_row = text
+                    .offset_to_point(state.selected_range.end.min(text.len()))
+                    .row;
+                if end_row > start_row
+                    && text.line_start_offset(end_row) == state.selected_range.end
+                {
+                    end_row = end_row.saturating_sub(1);
+                }
+                if matches!(expr, ex_command::LineExpr::Mark('<')) {
+                    start_row
+                } else {
+                    end_row
+                }
+            }
             ex_command::LineExpr::Mark(name) => {
                 let offset = crate::vim::Marks::global(cx)
                     .get(name)
@@ -2247,18 +2323,45 @@ impl Editor {
         }
         let path = self.open_files[index].path.clone();
         let ssh_config = self.open_files[index].ssh_config.clone();
-        let bytes = if let Some(config) = ssh_config.as_ref() {
-            crate::ssh::sftp_fs::read_file_bytes(config, &path)
-                .map_err(|e| format!("读取远程文件失败: {e}"))?
-                .ok_or_else(|| "文件不存在".to_string())?
-        } else {
-            std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?
-        };
-        let decoded = encoding::decode_bytes(&bytes);
-        let content = decoded.text;
-        let encoding = decoded.encoding;
+        let task = cx.background_spawn(async move {
+            let bytes = if let Some(config) = ssh_config.as_ref() {
+                crate::ssh::sftp_fs::read_file_bytes(config, &path)
+                    .map_err(|e| format!("读取远程文件失败: {e}"))?
+                    .ok_or_else(|| "文件不存在".to_string())?
+            } else {
+                std::fs::read(&path).map_err(|e| format!("读取文件失败: {e}"))?
+            };
+            let decoded = encoding::decode_bytes(&bytes);
+            Ok::<_, String>((decoded.text, decoded.encoding))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok((content, encoding)) => {
+                    this.apply_reloaded_content(id.as_ref(), content, encoding, cx);
+                }
+                Err(error) => {
+                    this.show_notification(error, NotificationKind::Warning, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        Ok(())
+    }
 
+    fn apply_reloaded_content(
+        &mut self,
+        id: &str,
+        content: String,
+        encoding: crate::editor::encoding::FileEncoding,
+        cx: &mut Context<Self>,
+    ) {
         self.flush_all_live_shadows(cx);
+        let Some(file) = self.open_files.iter().find(|f| f.id.as_ref() == id) else {
+            return;
+        };
+        let path = file.path.clone();
         let ids: Vec<SharedString> = self
             .open_files
             .iter()
@@ -2288,8 +2391,8 @@ impl Editor {
                 live.update(cx, |view, cx| view.set_text(&content, cx));
             }
         }
+        self.show_notification(format!("已重新加载 {path}"), NotificationKind::Success, cx);
         cx.notify();
-        Ok(())
     }
 
     fn ex_delete_lines(
@@ -2476,6 +2579,141 @@ impl Editor {
         let range = ex_line_byte_range(text, start, end);
         ex_replace_range(editor, range.clone(), &output, range.start, window, cx);
         Ok(())
+    }
+
+    fn ex_global(
+        &mut self,
+        command: &ex_command::ExCommand,
+        editor: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<ex_command::ExOutcome, String> {
+        let (pattern, inner_text) = ex_command::parse_global(&command.args)?;
+        let state = editor.read(cx);
+        let text = state.text();
+        let last = text.lines_len().saturating_sub(1);
+        let (start, end) = if command.range.is_some() {
+            self.ex_default_range(command, editor, false, false, cx)?
+        } else {
+            (0, last)
+        };
+        let case_insensitive = state.vim.as_ref().is_some_and(|vim| vim.ignore_case);
+        let regex = regex::RegexBuilder::new(&pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| format!("正则无效: {e}"))?;
+        let invert = command.name == "v" || command.bang;
+        let rows: Vec<usize> = (start..=end)
+            .filter(|row| {
+                let line = text.line(*row, ropey::LineType::LF).to_string();
+                let line = line.trim_end_matches(['\r', '\n']);
+                regex.is_match(line) != invert
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(ex_command::ExOutcome::Message("Pattern not found".into()));
+        }
+
+        let mut inner = ex_command::parse(&inner_text)?;
+        if inner.range.is_some() {
+            return Err(":g/:v 的内层命令不能再带范围".into());
+        }
+        if inner.name == "normal" || inner.name == "norm" {
+            if inner.args.trim().is_empty() {
+                return Err(":g/:v 的 :normal 缺少按键".into());
+            }
+            return Ok(ex_command::ExOutcome::Normal {
+                keys: inner.args.trim().to_string(),
+                rows: Some(rows),
+            });
+        }
+        if inner.name == "y" {
+            let mut yanked = String::new();
+            for row in &rows {
+                let range = ex_line_byte_range(text, *row, *row);
+                yanked.push_str(&text.slice(range).to_string());
+            }
+            cx.update_global::<crate::vim::Registers, _>(|registers, cx| {
+                registers.record_yank(&yanked, None, cx);
+            });
+            let first = *rows.first().unwrap_or(&start);
+            ex_goto_row(editor, first, cx);
+            return Ok(ex_command::ExOutcome::Close);
+        }
+        let supported = matches!(inner.name.as_str(), "d" | "s" | "j");
+        if !supported {
+            return Err(format!(":g/:v 暂不支持内层命令 :{}", inner.name));
+        }
+        for row in rows.into_iter().rev() {
+            inner.range = None;
+            self.execute_parsed_command(inner.clone(), Some(row), window, cx)?;
+        }
+        Ok(ex_command::ExOutcome::Close)
+    }
+
+    fn ex_shell(
+        &mut self,
+        command: &ex_command::ExCommand,
+        editor: &Entity<InputState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<ex_command::ExOutcome, String> {
+        let shell_command = command.args.trim();
+        if shell_command.is_empty() {
+            return Err(":! 缺少 shell 命令".into());
+        }
+        let range = if command.range.is_some() {
+            let (start, end) = self.ex_default_range(command, editor, false, false, cx)?;
+            Some(ex_line_byte_range(editor.read(cx).text(), start, end))
+        } else {
+            None
+        };
+        let mut process = shell_process(shell_command);
+        process.stdout(std::process::Stdio::piped());
+        process.stderr(std::process::Stdio::piped());
+        if let Some(range) = range {
+            process.stdin(std::process::Stdio::piped());
+            let input = editor.read(cx).text().slice(range.clone()).to_string();
+            let mut child = process
+                .spawn()
+                .map_err(|e| format!("无法启动 shell: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                stdin
+                    .write_all(input.as_bytes())
+                    .map_err(|e| format!("写入 shell stdin 失败: {e}"))?;
+            }
+            let output = child
+                .wait_with_output()
+                .map_err(|e| format!("等待 shell 失败: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("shell 退出码 {:?}: {stderr}", output.status.code()));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            ex_replace_range(editor, range.clone(), &stdout, range.start, window, cx);
+            return Ok(ex_command::ExOutcome::Close);
+        }
+
+        let output = process
+            .output()
+            .map_err(|e| format!("无法启动 shell: {e}"))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut message = String::new();
+        if !stdout.is_empty() {
+            message.push_str(&stdout);
+        }
+        if !stderr.is_empty() {
+            if !message.is_empty() && !message.ends_with('\n') {
+                message.push('\n');
+            }
+            message.push_str(&stderr);
+        }
+        if message.trim().is_empty() {
+            message = format!("shell 退出码 {:?}", output.status.code());
+        }
+        Ok(ex_command::ExOutcome::Message(message))
     }
 
     fn ex_set(
@@ -4101,7 +4339,7 @@ impl Editor {
     }
 
     /// 当前激活 tab 对应的文本编辑器（diff/图片/markdown 预览/实时返回 None）。
-    fn active_text_editor(&self, _cx: &App) -> Option<Entity<InputState>> {
+    pub(crate) fn active_text_editor(&self, _cx: &App) -> Option<Entity<InputState>> {
         let active_id = self.active_file_id.as_ref()?;
         let file = self.open_files.iter().find(|f| f.id == *active_id)?;
         if file.diff.is_some()
@@ -8651,6 +8889,21 @@ impl IntoElement for EditorResizeElement {
     }
 }
 
+fn shell_process(command: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        let mut process = std::process::Command::new("cmd");
+        process.arg("/C").arg(command);
+        process
+    }
+    #[cfg(not(windows))]
+    {
+        let mut process = std::process::Command::new("sh");
+        process.arg("-c").arg(command);
+        process
+    }
+}
+
 /// Ex 命令的行范围：把 0-based 行号（含末行）换算成字节区间。
 fn ex_line_byte_range(text: &ropey::Rope, start: usize, end: usize) -> std::ops::Range<usize> {
     let last = text.lines_len().saturating_sub(1);
@@ -10187,22 +10440,9 @@ mod tests {
         cx.simulate_keystrokes("2");
         cx.simulate_keystrokes("enter");
 
-        let state = editor.read_with(&mut *cx, |editor, cx| {
-            editor.ex_command_panel.as_ref().map(|panel| {
-                let panel = panel.read(cx);
-                (
-                    panel.input.read(cx).value().to_string(),
-                    panel.error.clone(),
-                )
-            })
-        });
-        eprintln!(
-            "panel_after={state:?} text={:?}",
-            input.read_with(cx, |state, _| state.text().to_string())
-        );
         assert!(
             editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_none()),
-            "执行后命令行面板应关闭: {state:?}"
+            "执行后命令行面板应关闭"
         );
         assert_eq!(
             input.read_with(cx, |state, _| state.cursor()),
@@ -10267,6 +10507,323 @@ mod tests {
         assert_eq!(
             input.read_with(cx, |state, _| state.text().to_string()),
             "a\nb\nc"
+        );
+    }
+
+    /// `:normal` 通过面板执行，并在关闭后把按键派发给编辑区。
+    #[gpui::test]
+    fn ex_normal_runs_via_panel(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| state.set_text("abc", cx));
+        input.update(&mut *cx, |state, _| {
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                if let Some(panel) = editor.ex_command_panel.as_ref() {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_input("normal x", window, cx);
+                    });
+                }
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let _ = cx.refresh();
+        let _ = cx.refresh();
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "bc",
+            ":normal x 应删除光标处字符"
+        );
+    }
+
+    /// `:normal` 支持操作符键序列（`dd`）。
+    #[gpui::test]
+    fn ex_normal_operator_sequence(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("abc\ndef", cx);
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                if let Some(panel) = editor.ex_command_panel.as_ref() {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_input("normal dd", window, cx);
+                    });
+                }
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "def"
+        );
+    }
+
+    /// `:normal` 行范围：每行执行一次，插入文本后自动回 Normal。
+    #[gpui::test]
+    fn ex_normal_range_applies_to_each_line(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("a\nb\nc", cx);
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                if let Some(panel) = editor.ex_command_panel.as_ref() {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_input("1,2normal A!", window, cx);
+                    });
+                }
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "a!\nb!\nc"
+        );
+    }
+
+    /// `:g/pat/normal`：匹配行逐行执行普通模式命令。
+    #[gpui::test]
+    fn ex_global_normal(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("a1\nb2\na3", cx);
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                if let Some(panel) = editor.ex_command_panel.as_ref() {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_input("g/^b/normal A!", window, cx);
+                    });
+                }
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "a1\nb2!\na3"
+        );
+    }
+
+    /// Visual 打开 `:` 时预填 `'<,'>`。
+    #[gpui::test]
+    fn ex_visual_panel_prefills_range(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("one\ntwo", cx);
+            state.vim = Some(crate::vim::VimState::default());
+            if let Some(vim) = state.vim.as_mut() {
+                vim.mode = crate::vim::VimMode::Visual;
+            }
+            state.selected_range = (0..3).into();
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let value = editor.read_with(&mut *cx, |editor, cx| {
+            editor
+                .ex_command_panel
+                .as_ref()
+                .map(|panel| panel.read(cx).input.read(cx).value().to_string())
+        });
+        assert_eq!(value.as_deref(), Some("'<,'>"));
+    }
+
+    /// `:g` / `:v` 全局命令。
+    #[gpui::test]
+    fn ex_global_and_invert(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| state.set_text("a1\nb2\na3", cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(editor.execute_ex_command("g/^a/d", window, cx).is_ok());
+            });
+        });
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "b2\n"
+        );
+
+        input.update(&mut *cx, |state, cx| state.set_text("a1\nb2\na3", cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(editor.execute_ex_command("v/^a/d", window, cx).is_ok());
+            });
+        });
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "a1\na3"
+        );
+
+        input.update(&mut *cx, |state, cx| state.set_text("foo\nbar\nfoo", cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(
+                    editor
+                        .execute_ex_command("g/^foo/s/foo/XX/", window, cx)
+                        .is_ok()
+                );
+            });
+        });
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "XX\nbar\nXX"
+        );
+
+        let message = cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                match editor.execute_ex_command("g/zzz/d", window, cx).unwrap() {
+                    crate::editor::ex_command::ExOutcome::Message(message) => message,
+                    _ => panic!("no match should report a message"),
+                }
+            })
+        });
+        assert!(message.contains("Pattern not found"));
+    }
+
+    /// Visual 选区 `:'<,'>` 范围。
+    #[gpui::test]
+    fn ex_visual_range_deletes_selection_lines(cx: &mut gpui::TestAppContext) {
+        let (_editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("one\ntwo\nthree", cx);
+            state.vim = Some(crate::vim::VimState::default());
+            if let Some(vim) = state.vim.as_mut() {
+                vim.mode = crate::vim::VimMode::VisualLine;
+            }
+            state.selected_range = (0..4).into();
+        });
+        cx.update(|window, cx| {
+            _editor.update(cx, |editor, cx| {
+                assert!(editor.execute_ex_command("'<,'>d", window, cx).is_ok());
+            });
+        });
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "two\nthree"
+        );
+    }
+
+    /// `:e!` 异步从磁盘重载。
+    #[gpui::test]
+    fn ex_reload_is_async(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        let path =
+            std::env::temp_dir().join(format!("deepterm-ex-reload-{}.txt", std::process::id()));
+        std::fs::write(&path, "disk").unwrap();
+        editor.update(&mut *cx, |editor, cx| {
+            let file = editor.open_files.first_mut().unwrap();
+            file.path = path.to_string_lossy().to_string();
+            file.original_content = "old".into();
+            file.dirty = false;
+            file.editor_state.update(cx, |state, cx| {
+                state.set_text("old", cx);
+            });
+        });
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(editor.execute_ex_command("e!", window, cx).is_ok());
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "disk"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `:!` 与范围过滤。
+    #[cfg(unix)]
+    #[gpui::test]
+    fn ex_shell_command_and_filter(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        let message = cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                match editor.execute_ex_command("!printf hi", window, cx).unwrap() {
+                    crate::editor::ex_command::ExOutcome::Message(message) => message,
+                    _ => panic!("shell command should return output"),
+                }
+            })
+        });
+        assert!(message.contains("hi"));
+
+        input.update(&mut *cx, |state, cx| state.set_text("abc\ndef", cx));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                assert!(
+                    editor
+                        .execute_ex_command("1!sed s/a/A/", window, cx)
+                        .is_ok()
+                );
+            });
+        });
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "Abc\ndef"
         );
     }
 
