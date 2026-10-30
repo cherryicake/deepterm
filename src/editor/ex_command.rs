@@ -238,7 +238,7 @@ impl ExHistory {
     }
 }
 
-/// 底部的 `:` 命令行面板。
+/// `:` 命令行状态。渲染在编辑器底部状态栏，而不是独立浮层输入框。
 pub(crate) struct ExCommandPanel {
     pub(crate) input: Entity<InputState>,
     editor: WeakEntity<super::Editor>,
@@ -260,9 +260,7 @@ impl ExCommandPanel {
         cx: &mut App,
     ) -> Entity<Self> {
         let input = cx.new(|cx| {
-            let mut input = InputState::new(window, cx)
-                .placeholder("输入 Vim 命令，例如 w / %s/foo/bar/g / 42")
-                .submit_on_enter(true);
+            let mut input = InputState::new(window, cx).submit_on_enter(true);
             input.set_extra_key_context(Some("ExCommandLine"));
             input
         });
@@ -458,49 +456,25 @@ impl ExCommandPanel {
 impl gpui::Render for ExCommandPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let mut panel = div()
-            .id("ex-command-panel")
-            .w(px(640.0))
-            .max_w(px(820.0))
+        let mut line = div()
+            .id("ex-command-line")
+            .w_full()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .px(px(10.0))
-            .py(px(7.0))
-            .rounded(px(10.0))
-            .bg(theme.menu_background)
-            .border_1()
-            .border_color(theme.menu_border)
-            .shadow_lg()
+            .gap(px(2.0))
             .text_size(px(12.5))
             .text_color(theme.text)
-            .occlude()
             .on_action(cx.listener(Self::on_submit))
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_complete))
             .on_action(cx.listener(Self::on_history_prev))
             .on_action(cx.listener(Self::on_history_next));
 
-        if let Some(error) = &self.error {
-            panel = panel.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(theme.error_foreground)
-                    .child(error.clone()),
-            );
-        } else if let Some(message) = &self.message {
-            panel = panel.child(
-                div()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_muted)
-                    .child(message.clone()),
-            );
-        }
-
         let mut row = div()
             .flex()
+            .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .child(
                 div()
                     .text_size(px(13.0))
@@ -528,7 +502,27 @@ impl gpui::Render for ExCommandPanel {
                     )),
             );
         }
-        panel.child(row)
+        line = line.child(row);
+
+        if let Some(error) = &self.error {
+            line = line.child(
+                div()
+                    .px(px(10.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.error_foreground)
+                    .child(error.clone()),
+            );
+        } else if let Some(message) = &self.message {
+            line = line.child(
+                div()
+                    .px(px(10.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(message.clone()),
+            );
+        }
+
+        line
     }
 }
 

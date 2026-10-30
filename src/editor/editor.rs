@@ -4949,6 +4949,26 @@ impl Editor {
         file.lsp.as_ref()
     }
 
+    /// Status bar position text: `81% 141:28` / `Top 1:1` / `Bot 174:28`.
+    fn format_status_position(line: usize, column: usize, total: usize) -> String {
+        let total = total.max(1);
+        let line = line.min(total.saturating_sub(1));
+        let percent = if total <= 1 {
+            0.0
+        } else {
+            line as f64 * 100.0 / (total - 1) as f64
+        };
+        let percent = percent.round() as usize;
+        let prefix = if percent == 0 {
+            "Top".to_string()
+        } else if percent >= 100 {
+            "Bot".to_string()
+        } else {
+            format!("{percent}%")
+        };
+        format!("{prefix} {}:{}", line + 1, column + 1)
+    }
+
     fn render_status_bar(
         &self,
         file: &EditorFile,
@@ -5012,6 +5032,7 @@ impl Editor {
                     .flex()
                     .flex_row()
                     .items_center()
+                    .flex_grow_1()
                     .gap(px(8.0))
                     // Vim 开关 + 模式徽章：放在最左，与 vim 的状态行位置一致。
                     // 未启用时也显示，点击即可开启——Linux 默认关闭，用户不必
@@ -5043,19 +5064,17 @@ impl Editor {
                             )
                             .child(vim_label)
                     })
-                    .child(format!(
-                        "行 {}, 列 {}",
-                        position.line + 1,
-                        position.character + 1
-                    ))
+                    // Ex command line sits right after the vim mode badge.
+                    .when_some(self.ex_command_panel.clone(), |this, panel| {
+                        this.child(div().flex_grow_1().min_w(px(120.0)).child(panel))
+                    })
                     .when(selected_len > 0, |this| {
                         this.child(
                             div()
                                 .text_color(theme.text_muted.opacity(0.8))
                                 .child(format!("已选 {selected_len} 字")),
                         )
-                    })
-                    .child(format!("共 {total} 行")),
+                    }),
             )
             .child(
                 div()
@@ -5124,6 +5143,18 @@ impl Editor {
                                 ),
                             )
                             .child(language_label),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .text_color(theme.text_muted)
+                            .child(Self::format_status_position(
+                                position.line as usize,
+                                position.character as usize,
+                                total,
+                            )),
                     ),
             )
             .into_any_element()
@@ -7924,19 +7955,6 @@ impl Render for Editor {
                                                 .child(panel),
                                         )
                                     })
-                                    // Vim `:` 命令行：底部居中
-                                    .when_some(self.ex_command_panel.clone(), |this, panel| {
-                                        this.child(
-                                            div()
-                                                .absolute()
-                                                .bottom(px(8.0))
-                                                .left_0()
-                                                .right_0()
-                                                .flex()
-                                                .justify_center()
-                                                .child(panel),
-                                        )
-                                    })
                                     // LSP 补全菜单：与 hover 同样在绘制阶段定位
                                     // （`TextElement::paint_completion_menu`）。
                                     // LSP 重命名输入：顶部居中
@@ -10241,6 +10259,14 @@ mod tests {
             LineEnding::detect("first\nsecond\r\nthird"),
             LineEnding::Unix
         );
+    }
+
+    #[test]
+    fn status_position_percent_top_bot() {
+        assert_eq!(Editor::format_status_position(140, 27, 174), "81% 141:28");
+        assert_eq!(Editor::format_status_position(0, 0, 174), "Top 1:1");
+        assert_eq!(Editor::format_status_position(173, 27, 174), "Bot 174:28");
+        assert_eq!(Editor::format_status_position(0, 0, 1), "Top 1:1");
     }
 
     #[test]
