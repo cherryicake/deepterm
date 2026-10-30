@@ -95,6 +95,17 @@ pub const AGENT_INTERRUPT_SETTLE: Duration = Duration::from_millis(1000);
 /// 「`Stop` 丢了」——否则状态点会永远停在蓝色。
 pub const AGENT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// 连续这么久没有 PTY 输出，就不再算「正在输出」。
+///
+/// 它与 [`crate::agent::AgentStatus::Working`] **不是一回事**：`Working` 是
+/// agent 上报的回合状态（一次工具调用可以安静跑几分钟），而这里描述的是
+/// 「屏幕上正在滚字」。tab 的扫光动画只该代表后者——它对应用户真正想知道的
+/// 「它还在干活吗」，也让 `Stop` 丢失时（旧版 opencode 桥接就没映射回合结束
+/// 事件）动画不至于一直转到 30 分钟的静默兜底才停。
+///
+/// 取 800ms：TUI 的流式输出远密于此；而思考/等工具时通常整秒没有字节。
+pub const AGENT_STREAM_WINDOW: Duration = Duration::from_millis(800);
+
 /// 终端类型 - 区分本地和远程终端
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalType {
@@ -1051,6 +1062,11 @@ pub struct Terminal {
     last_content: TerminalContent,
     pub content_generation: u64,
     content_dirty: bool,
+    /// 最近一次「有字节真的被解析进网格」的时刻（见 [`AGENT_STREAM_WINDOW`]）。
+    ///
+    /// 与 `content_generation` 同步更新：两者都是「输出发生了」的证据，只是
+    /// 一个用于缓存失效，一个用于时间窗判定（扫光动画 / agent 计时器）。
+    last_output_at: Option<std::time::Instant>,
     /// 连续多少次因为拿不到网格锁而跳过了快照刷新（见 `update_last_content`）。
     /// 超过 [`MAX_SNAPSHOT_LOCK_SKIPS`] 后退回公平锁，保证画面一定跟得上。
     snapshot_lock_skips: u32,
@@ -1237,6 +1253,7 @@ impl Terminal {
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
+            last_output_at: None,
             snapshot_lock_skips: 0,
             #[cfg(test)]
             incremental_snapshot_count: 0,
@@ -1445,6 +1462,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                last_output_at: None,
                 snapshot_lock_skips: 0,
                 #[cfg(test)]
                 incremental_snapshot_count: 0,
@@ -1617,6 +1635,7 @@ impl Terminal {
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
+            last_output_at: None,
             snapshot_lock_skips: 0,
             #[cfg(test)]
             incremental_snapshot_count: 0,
@@ -1938,6 +1957,7 @@ impl Terminal {
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
+                last_output_at: None,
                 snapshot_lock_skips: 0,
                 #[cfg(test)]
                 incremental_snapshot_count: 0,
@@ -2338,8 +2358,7 @@ impl Terminal {
         self.sync_kitty_state();
 
         // 标记内容已更新
-        self.content_dirty = true;
-        self.content_generation += 1;
+        self.note_output();
 
         // 远程路径不走本地读线程（`local_pty`），也不发 AlacTermEvent::Wakeup，
         // 在这里比对焦点上报模式位（本地终端的同类检查在 process_event）。
@@ -2371,6 +2390,31 @@ impl Terminal {
         cx.emit(Event::Wakeup);
     }
 
+    /// 记录一次「输出进网格」：快照失效 + 输出时刻 + 代际自增。
+    ///
+    /// 三件事永远一起发生——代际用于缓存/搜索失效，时刻用于扫光动画与
+    /// agent 计时器的时间窗。分开写迟早会有某个入口漏掉其中一件。
+    fn note_output(&mut self) {
+        self.content_dirty = true;
+        self.content_generation += 1;
+        self.last_output_at = Some(std::time::Instant::now());
+    }
+
+    /// 目前是否「正在持续输出」（见 [`AGENT_STREAM_WINDOW`]）。
+    pub fn output_streaming(&self, window: Duration) -> bool {
+        self.last_output_at.is_some_and(|at| at.elapsed() < window)
+    }
+
+    /// 距离「不再算正在输出」还有多久；已经停了（或从未输出）时返回 `None`。
+    ///
+    /// 给 agent 计时器用：正在输出时它要把唤醒点排在这个窗口的末尾，
+    /// 否则扫光的关闭要等到下一次事件或 30 分钟的静默兜底。
+    fn output_stream_remaining(&self, window: Duration) -> Option<Duration> {
+        let at = self.last_output_at?;
+        let elapsed = at.elapsed();
+        (elapsed < window).then(|| window - elapsed)
+    }
+
     /// 处理本地读线程的通知。
     ///
     /// 读线程只做 vte 解析（不需要 `Context`），凡涉及事件派发/重绘的
@@ -2391,8 +2435,7 @@ impl Terminal {
                 // （两条路径靠 `mem::take` 互斥，见 `KittyReplySink`）。
                 self.flush_kitty_replies();
                 self.sync_kitty_state();
-                self.content_generation += 1;
-                self.content_dirty = true;
+                self.note_output();
                 cx.emit(Event::Wakeup);
                 self.check_focus_mode_enabled();
             }
@@ -2402,8 +2445,7 @@ impl Terminal {
                 // 保证 drain 出来的最后一段输出能上屏。
                 self.flush_kitty_replies();
                 self.sync_kitty_state();
-                self.content_generation += 1;
-                self.content_dirty = true;
+                self.note_output();
                 cx.emit(Event::Wakeup);
                 let _ = status;
             }
@@ -3251,8 +3293,7 @@ impl Terminal {
                 cx.emit(Event::TitleChanged);
             }
             AlacTermEvent::Wakeup => {
-                self.content_generation += 1;
-                self.content_dirty = true;
+                self.note_output();
                 cx.emit(Event::Wakeup);
                 // 数据刚被 vte 处理：捕获应用 DECSET ?1004h 的开启时机
                 // （本地终端的解析发生在 `local_pty` 读线程，远程在
@@ -3931,6 +3972,10 @@ impl Terminal {
     ///
     /// 宽限窗未过时是亚秒级；只剩静默过期时是分钟级。下限 `min` 防止 0 间隔
     /// busy-loop，上限是静默过期本身的 30 分钟天花板。
+    ///
+    /// 正在输出时有第三个期限：输出窗口的末尾（用来把「正在输出」翻回 false，
+    /// 关掉 tab 扫光）。这个期限**不减半**——它是准确时刻而不是预估提前量，
+    /// 减半只会让它连续醒十几次才走到。
     pub fn agent_timer_delay(&self, min: Duration) -> Duration {
         let mut wait = AGENT_STALE_AFTER;
         if let Some(pending) = self.agent_interrupt_pending {
@@ -3947,7 +3992,11 @@ impl Terminal {
             wait = Duration::ZERO;
         }
         // 留一半余量：事件可能比预期早到，早醒一次比晚醒一次好。
-        (wait / 2).max(min).min(AGENT_STALE_AFTER)
+        let delay = (wait / 2).max(min).min(AGENT_STALE_AFTER);
+        match self.output_stream_remaining(AGENT_STREAM_WINDOW) {
+            Some(remaining) => delay.min(remaining.max(min)),
+            None => delay,
+        }
     }
 
     pub fn write(&mut self, data: &[u8]) {
@@ -5551,6 +5600,48 @@ mod tests {
         assert!(
             delay > Duration::from_secs(60),
             "回合刚开始时不该频繁醒来：{delay:?}"
+        );
+    }
+
+    /// 输出停下后，计时器必须排在输出窗口末尾醒来。
+    ///
+    /// 否则「不再输出」要等到下一个 hook 事件或 30 分钟的静默兜底才被看见，
+    /// tab 的扫光就会在 agent 安静下来以后继续转几十分钟。
+    #[test]
+    fn agent_timer_wakes_at_the_end_of_the_output_window() {
+        use crate::agent::{AgentSessionState, AgentStatus};
+        use std::time::Instant;
+
+        let min = Duration::from_millis(250);
+        let mut term = Terminal::create_error_terminal();
+        term.agent_session = Some(AgentSessionState {
+            status: AgentStatus::Working,
+            ..Default::default()
+        });
+        term.agent_last_event = Some(Instant::now());
+
+        // 刚有输出：窗口还剩 ~800ms，计时器必须在窗口末尾醒来。
+        term.last_output_at = Some(Instant::now());
+        assert!(
+            term.output_streaming(super::AGENT_STREAM_WINDOW),
+            "刚写入的终端必须算「正在输出」"
+        );
+        let delay = term.agent_timer_delay(min);
+        assert!(
+            delay <= super::AGENT_STREAM_WINDOW && delay >= Duration::from_millis(700),
+            "输出窗口的唤醒点不对：{delay:?}"
+        );
+
+        // 窗口已过：不再算正在输出，计时器回到长时间的静默等待。
+        term.last_output_at = Some(Instant::now() - super::AGENT_STREAM_WINDOW * 2);
+        assert!(
+            !term.output_streaming(super::AGENT_STREAM_WINDOW),
+            "超过窗口仍算「正在输出」，扫光会停不下来"
+        );
+        let delay = term.agent_timer_delay(min);
+        assert!(
+            delay > Duration::from_secs(60),
+            "输出已停时不该频繁醒来：{delay:?}"
         );
     }
 

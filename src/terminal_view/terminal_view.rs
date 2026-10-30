@@ -647,6 +647,12 @@ pub struct TerminalView {
     /// 就清掉自己；静止的 agent 不会让渲染循环空转。第二个字段是**计划醒来的
     /// 时刻**：更早的待办（比如用户按了 Esc）出现时要撤掉旧任务重排。
     agent_timer_task: Option<(Task<()>, Instant)>,
+    /// 上一次上报给宿主的「正在输出」判定（见
+    /// [`crate::terminal::AGENT_STREAM_WINDOW`]）。
+    ///
+    /// 只在边沿发事件：输出是高频的，每个 chunk 都发一次 `AgentChanged`
+    /// 会让整条 panel → workspace → tab 链白重绘上千次。
+    agent_streaming_reported: bool,
     // ── Bell visual flash ─────────────────────────────────────────────────
     /// 最近一次 BEL 到达时刻：驱动视区边缘的短促视觉闪烁。
     /// `None` 或距今超过 [`BELL_FLASH_MS`] 时不绘制。
@@ -1172,6 +1178,11 @@ impl TerminalView {
                     this.check_tab_label_changed(cx);
                     this.poll_wsl_cwd(cx);
                     cx.notify();
+                    // 输出边沿要把「正在滚字」同步给 tab（扫光动画用），
+                    // 并保证输出停下时有一个计时器把状态翻回去。
+                    if this.sync_agent_streaming(cx) {
+                        this.ensure_agent_timer(cx);
+                    }
                 }
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
                     this.on_working_directory_changed(cwd, cx);
@@ -1201,6 +1212,7 @@ impl TerminalView {
                     cx.notify();
                     this.maybe_prompt_hook_install(cx);
                     // 状态可能变成 Working/打断待决：把计时器拉起来。
+                    this.agent_streaming_reported = this.agent_output_streaming(cx);
                     this.ensure_agent_timer(cx);
                 }
                 // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent，
@@ -1287,6 +1299,7 @@ impl TerminalView {
             info_toast: None,
             info_toast_hide_task: None,
             agent_timer_task: None,
+            agent_streaming_reported: false,
             bell_flash_at: None,
             bell_flash_task: None,
             last_bell_at: None,
@@ -1441,6 +1454,9 @@ impl TerminalView {
                         this.check_remote_os(terminal.clone(), cx);
                         this.check_tab_label_changed(cx);
                         cx.notify();
+                        if this.sync_agent_streaming(cx) {
+                            this.ensure_agent_timer(cx);
+                        }
                     }
                     TerminalEvent::WorkingDirectoryChanged(cwd) => {
                         this.on_working_directory_changed(cwd, cx);
@@ -1474,6 +1490,7 @@ impl TerminalView {
                         cx.notify();
                         this.maybe_prompt_hook_install(cx);
                         // 状态可能变成 Working/打断待决：把计时器拉起来。
+                        this.agent_streaming_reported = this.agent_output_streaming(cx);
                         this.ensure_agent_timer(cx);
                     }
                     // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
@@ -1559,6 +1576,7 @@ impl TerminalView {
                 info_toast: None,
                 info_toast_hide_task: None,
                 agent_timer_task: None,
+                agent_streaming_reported: false,
                 bell_flash_at: None,
                 bell_flash_task: None,
                 last_bell_at: None,
@@ -1634,6 +1652,9 @@ impl TerminalView {
                     }
                     this.check_tab_label_changed(cx);
                     cx.notify();
+                    if this.sync_agent_streaming(cx) {
+                        this.ensure_agent_timer(cx);
+                    }
                 }
                 TerminalEvent::WorkingDirectoryChanged(cwd) => {
                     this.on_working_directory_changed(cwd, cx);
@@ -1668,6 +1689,7 @@ impl TerminalView {
                     cx.notify();
                     this.maybe_prompt_hook_install(cx);
                     // 状态可能变成 Working/打断待决：把计时器拉起来。
+                    this.agent_streaming_reported = this.agent_output_streaming(cx);
                     this.ensure_agent_timer(cx);
                 }
                 // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
@@ -2075,7 +2097,9 @@ impl TerminalView {
                         term.expire_stale_agent(cx);
                     });
                     if ours {
-                        // 还有没办完的（例如仍在 Working、静默计时没到）就再排一轮。
+                        // 输出窗口可能刚好到点：把「已经停了」补报给 tab，
+                        // 然后重排下一轮（静默过期 / 输出窗口）。
+                        this.sync_agent_streaming(cx);
                         this.ensure_agent_timer(cx);
                     }
                 });
@@ -2542,6 +2566,32 @@ impl TerminalView {
             .map(|session| session.status)
             .unwrap_or_default();
         (agent, status)
+    }
+
+    /// 这个 tab 此刻是否在「滚字」：`Working` **且** 最近有 PTY 输出。
+    ///
+    /// 与 [`Self::agent_tab_state`] 的状态分开是有意的：状态来自 agent 上报的
+    /// 回合事件，会被迟到的 `Stop`、甚至缺了回合结束映射的 agent 拖住
+    /// 几十分钟；而这里只看屏幕最近有没有真的在动。tab 的扫光用它，
+    /// 才不会在 agent 停下来以后继续转。
+    pub fn agent_output_streaming(&self, cx: &App) -> bool {
+        let term = self.terminal.read(cx);
+        term.agent_session()
+            .is_some_and(|session| session.status == AgentStatus::Working)
+            && term.output_streaming(crate::terminal::AGENT_STREAM_WINDOW)
+    }
+
+    /// 把「正在输出」的上报状态与真实状态对齐，返回是否发生了变化。
+    ///
+    /// 高频路径（每个 PTY chunk 都会调）：只有边沿才发 `AgentChanged`。
+    fn sync_agent_streaming(&mut self, cx: &mut Context<Self>) -> bool {
+        let streaming = self.agent_output_streaming(cx);
+        if streaming == self.agent_streaming_reported {
+            return false;
+        }
+        self.agent_streaming_reported = streaming;
+        cx.emit(Event::AgentChanged);
+        true
     }
 
     // ── Hook 安装引导 ──────────────────────────────────────────────────────

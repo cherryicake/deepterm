@@ -340,9 +340,22 @@ pub struct TabItem {
     ///
     /// `None` 表示「没有 agent」，此时不画状态点。
     pub agent_status: Option<AgentStatus>,
+    /// 这个 agent 此刻是否**真的在输出**（`Working` + 最近有 PTY 输出）。
+    ///
+    /// 与 [`Self::agent_status`] 分开：`Working` 是回合状态，会被迟到的
+    /// `Stop`（或不发 `Stop` 的 agent）拖住；扫光动画只在真的滚字时才转，
+    /// 所以它看的是这个字段，而不是 `agent_status == Working`。
+    pub agent_streaming: bool,
 }
 
 impl TabItem {
+    /// 是否该画「正在输出」的扫光：`Working` 是回合状态，`agent_streaming`
+    /// 才是「屏幕真的在动」。两者都为真才画——只认回合状态会让一个静默的
+    /// agent（或丢了 `Stop` 的 agent）把扫光一直转下去。
+    pub fn is_agent_streaming(&self) -> bool {
+        self.agent_streaming && self.agent_status == Some(AgentStatus::Working)
+    }
+
     pub fn new(id: impl Into<SharedString>, label: impl Into<SharedString>) -> Self {
         Self {
             id: id.into(),
@@ -353,6 +366,7 @@ impl TabItem {
             is_loading: false,
             needs_attention: false,
             agent_status: None,
+            agent_streaming: false,
         }
     }
 
@@ -811,6 +825,7 @@ impl TabBar {
         tab_id: &str,
         agent: Option<CLIAgent>,
         status: AgentStatus,
+        streaming: bool,
         fallback: Option<Icon>,
         cx: &mut Context<Self>,
     ) -> Option<AgentStatus> {
@@ -833,12 +848,13 @@ impl TabBar {
         };
 
         let previous = tab.agent_status;
-        if tab.agent_status == status && tab.icon == icon {
+        if tab.agent_status == status && tab.icon == icon && tab.agent_streaming == streaming {
             return previous;
         }
 
         tab.agent_status = status;
         tab.icon = icon;
+        tab.agent_streaming = streaming;
 
         cx.notify();
         previous
@@ -1626,12 +1642,10 @@ impl TabBar {
                         div()
                             .min_w_0()
                             .text_ellipsis()
-                            .when(tab.agent_status == Some(AgentStatus::Working), |this| {
-                                this.opacity(0.)
-                            })
+                            .when(tab.is_agent_streaming(), |this| this.opacity(0.))
                             .child(tab.label.clone()),
                     )
-                    .when(tab.agent_status == Some(AgentStatus::Working), |this| {
+                    .when(tab.is_agent_streaming(), |this| {
                         this.child(
                             div()
                                 .absolute()
@@ -2413,6 +2427,7 @@ mod tests {
                 "file-1",
                 Some(CLIAgent::Claude),
                 AgentStatus::Working,
+                true,
                 None,
                 cx,
             )
@@ -2447,6 +2462,7 @@ mod tests {
                 "tab-1",
                 Some(CLIAgent::Claude),
                 AgentStatus::Working,
+                true,
                 None,
                 cx,
             );
@@ -2503,6 +2519,45 @@ mod tests {
 
         // 有未保存改动 → 让位给灰点。
         assert!(!should_show_attention_dot(&base(true, true)));
+    }
+
+    /// 扫光只看「真的在输出」，不看回合状态。
+    ///
+    /// `Working` 是 agent 上报的回合状态，可能被迟到的 `Stop`（旧版 opencode
+    /// 桥接甚至没有映射回合结束事件）拖住几十分钟；扫光若只看它，agent
+    /// 安静下来后还会继续转。
+    #[test]
+    fn shimmer_requires_streaming_not_just_working() {
+        use crate::agent::AgentStatus;
+
+        let working = TabItem {
+            agent_status: Some(AgentStatus::Working),
+            agent_streaming: false,
+            ..TabItem::new("t", "terminal")
+        };
+        assert!(
+            !working.is_agent_streaming(),
+            "Working 但已停止输出时不该扫光"
+        );
+
+        let streaming = TabItem {
+            agent_streaming: true,
+            ..working
+        };
+        assert!(
+            streaming.is_agent_streaming(),
+            "Working 且正在输出时应当扫光"
+        );
+
+        let done = TabItem {
+            agent_status: Some(AgentStatus::Done),
+            agent_streaming: true,
+            ..TabItem::new("t", "terminal")
+        };
+        assert!(
+            !done.is_agent_streaming(),
+            "回合已结束时即便有残余输出也不该扫光"
+        );
     }
 
     /// **组合断言**：agent 跑完后，红点标志必须真的能画出来。

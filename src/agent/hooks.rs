@@ -1394,6 +1394,15 @@ export default {{
       "session.status.busy": "prompt-submit",
       "session.status.idle": "stop",
       "session.idle": "stop",
+      // opencode 2.2 的回合生命周期事件。必须一起接上：`session.status` 在
+      // 2.2.2 上只观测到 `busy`，`idle` 从不出现（实测 89MB 日志里 opencode
+      // 的 `stop` 次数为 0），于是 tab 会一直显示「工作中」直到 30 分钟的
+      // 静默兜底。这三个事件是 opencode 自己发完成通知时用的同一组，
+      // 语义就是「这一回合结束了」。
+      "session.execution.started": "prompt-submit",
+      "session.execution.succeeded": "stop",
+      "session.execution.interrupted": "stop",
+      "session.execution.failed": "stop",
       "permission.asked": "permission-request",
       "permission.replied": "prompt-submit",
     }}
@@ -1407,7 +1416,10 @@ export default {{
         if (event.type === "session.created" && data.parentID) children.add(data.sessionID)
         if (data.sessionID && children.has(data.sessionID)) continue
         await capture(data.sessionID)
-        const key = event.type === "session.status" ? `session.status.${{data.status?.type}}` : event.type
+        // `status` 在 V2 是 tagged union（`{{ type: "idle" | "busy" | "retry" }}`），
+        // 但早期版本直接给字符串。两种都认，免得一次字段改形就静默丢掉停止事件。
+        const status = typeof data.status === "string" ? data.status : data.status?.type
+        const key = event.type === "session.status" ? `session.status.${{status}}` : event.type
         const action = ACTION[key]
         if (action) await emit(action)
       }}
@@ -1821,6 +1833,39 @@ mod tests {
         assert!(
             js.contains("if (!process.env[\"DEEPTERM\"]) return"),
             "门控必须是提前返回"
+        );
+    }
+
+    /// opencode 必须在**回合真正结束**时上报 `stop`。
+    ///
+    /// 2.2 不再保证发 `session.status` 的 `idle`（实测只见到 `busy`），回合结束
+    /// 改由 `session.execution.succeeded/failed/interrupted` 表达。漏掉这三个，
+    /// tab 会一直停在「工作中」，扫光也停不下来——而这条链在编译期毫无提示。
+    #[test]
+    fn opencode_plugin_reports_turn_end() {
+        let js = opencode_plugin_js();
+        for event in [
+            "session.execution.succeeded",
+            "session.execution.failed",
+            "session.execution.interrupted",
+            "session.status.idle",
+            "session.idle",
+        ] {
+            assert!(
+                js.contains(&format!("\"{event}\": \"stop\"")),
+                "opencode 桥接必须把 `{event}` 映射成 stop"
+            );
+        }
+        for event in ["session.execution.started", "session.status.busy"] {
+            assert!(
+                js.contains(&format!("\"{event}\": \"prompt-submit\"")),
+                "opencode 桥接必须把 `{event}` 映射成 prompt-submit"
+            );
+        }
+        // `status` 的字符串形态也要能拼出 key，否则老版本会静默丢掉停止事件。
+        assert!(
+            js.contains("typeof data.status === \"string\""),
+            "session.status 的 key 必须同时兼容字符串与 tagged union"
         );
     }
 

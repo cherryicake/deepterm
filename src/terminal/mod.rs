@@ -20,6 +20,6 @@ mod terminal_memory_tests;
 pub const CTRL_V: u8 = 0x16;
 
 pub use terminal::{
-    DriverEvent, Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds, TerminalContent,
-    TerminalType,
+    AGENT_STREAM_WINDOW, DriverEvent, Event, IndexedCell, SelectionPhase, Terminal, TerminalBounds,
+    TerminalContent, TerminalType,
 };

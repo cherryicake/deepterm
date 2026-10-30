@@ -118,6 +118,9 @@ pub enum PanelEvent {
         panel_id: String,
         agent: Option<CLIAgent>,
         status: AgentStatus,
+        /// 此刻是否真的在输出（见 `TerminalView::agent_output_streaming`）。
+        /// tab 的扫光只看这个，不看 `status`。
+        streaming: bool,
     },
 }
 
@@ -326,10 +329,12 @@ impl Panel {
                     // 现场取快照而不是让事件带载荷：`AgentChanged` 只表示
                     // 「变了」，具体变成什么以 terminal 当前状态为准。
                     let (agent, status) = view.read(cx).agent_tab_state(cx);
+                    let streaming = view.read(cx).agent_output_streaming(cx);
                     cx.emit(PanelEvent::AgentStateChanged {
                         panel_id: close_panel_id.clone(),
                         agent,
                         status,
+                        streaming,
                     });
                 }
             },

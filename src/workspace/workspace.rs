@@ -1070,6 +1070,7 @@ impl Workspace {
                 panel_id,
                 agent,
                 status,
+                streaming,
             } => {
                 // 找到包含该 panel 的 tab，更新其 agent 图标 / 状态点。
                 let Some(tab_id) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
@@ -1087,7 +1088,7 @@ impl Workspace {
                 let is_active = tab_id == self.active_tab_id;
 
                 let previous = self.tab_bar.update(cx, |tab_bar, cx| {
-                    tab_bar.set_tab_agent(&tab_id, *agent, *status, fallback, cx)
+                    tab_bar.set_tab_agent(&tab_id, *agent, *status, *streaming, fallback, cx)
                 });
 
                 // 「需关注」红点只认 Working → Done 这个**边沿**，而不是
