@@ -1131,6 +1131,14 @@ impl InputState {
         }
 
         self.on_action_search(&crate::components::input::Search, window, cx);
+        // `*`/`#` 的搜索面板默认大小写不敏感；vim 的 `ignorecase` 打开时才
+        // 保持该行为，否则要显式改成大小写敏感。
+        let ignore_case = self.vim.as_ref().is_some_and(|vim| vim.ignore_case);
+        if let Some(panel) = self.search_panel.clone() {
+            panel.update(cx, |panel, cx| {
+                panel.set_case_insensitive(ignore_case, cx);
+            });
+        }
     }
 
     // ==================== 等待一个字符的命令 ====================

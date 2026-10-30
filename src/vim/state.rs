@@ -195,6 +195,8 @@ pub struct VimState {
     pub normal_cursor_shape: CursorShape,
     /// 是否随模式切换相对行号。
     pub relative_line_numbers: bool,
+    /// `:set ignorecase`：搜索/替换是否忽略大小写。
+    pub ignore_case: bool,
 }
 
 impl Default for VimState {
@@ -216,6 +218,7 @@ impl Default for VimState {
             last_change_awaits_insert: false,
             normal_cursor_shape: CursorShape::Block,
             relative_line_numbers: false,
+            ignore_case: false,
         }
     }
 }

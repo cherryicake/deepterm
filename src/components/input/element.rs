@@ -2885,6 +2885,11 @@ impl TextElement {
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
+            let relative_numbers = state
+                .vim
+                .as_ref()
+                .is_some_and(|vim| vim.relative_line_numbers);
+            let cursor_row = state.text.offset_to_point(state.cursor()).row;
             let mut line_numbers = Vec::with_capacity(last_layout.visible_buffer_lines.len());
             let other_line_runs = vec![TextRun {
                 len: line_number_len,
@@ -2930,6 +2935,13 @@ impl TextElement {
                     match labels.get(buffer_line).copied().flatten() {
                         Some(n) => format!("{:>width$}", n + 1, width = line_number_len).into(),
                         None => " ".repeat(line_number_len).into(),
+                    }
+                } else if relative_numbers {
+                    if buffer_line == cursor_row {
+                        format!("{:>width$}", buffer_line + 1, width = line_number_len).into()
+                    } else {
+                        let distance = buffer_line.abs_diff(cursor_row);
+                        format!("{:>width$}", distance, width = line_number_len).into()
                     }
                 } else {
                     format!("{:>width$}", buffer_line + 1, width = line_number_len).into()

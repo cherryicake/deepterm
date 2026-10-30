@@ -1,0 +1,18 @@
+// Vim `:` 命令行键位。
+//
+// 面板输入框是普通 `Input`（带 `NoVim`），所以这里**不能**加 `!NoVim`；
+// 用独立的 `ExCommandLine` 上下文锁定范围。加载顺序在 completion.json
+// 之后，同深度下后加载者优先，确保 Enter/Tab/方向键先落到命令行。
+[
+  {
+    "context": "Input && ExCommandLine",
+    "bindings": {
+      "enter": "editor_panel::ExSubmit",
+      "escape": "editor_panel::ExCancel",
+      "ctrl-c": "editor_panel::ExCancel",
+      "tab": "editor_panel::ExComplete",
+      "up": "editor_panel::ExHistoryPrev",
+      "down": "editor_panel::ExHistoryNext"
+    }
+  }
+]

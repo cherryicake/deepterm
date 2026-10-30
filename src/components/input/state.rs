@@ -468,6 +468,12 @@ impl LastLayout {
 /// InputState to keep editing state of the [`super::Input`].
 pub struct InputState {
     pub(crate) focus_handle: FocusHandle,
+    /// 额外的键位上下文标识（例如 `ExCommandLine`）。
+    ///
+    /// 必须写在**输入框自己的** KeyContext 上，不能只挂祖先 div：
+    /// gpui 的 `A && B` 谓词只在同一层上下文里同时求值，祖先层的
+    /// `ExCommandLine` 与输入框层的 `Input` 不会组合成匹配。
+    pub(crate) extra_key_context: Option<&'static str>,
     pub(crate) mode: InputMode,
     pub(crate) text: Rope,
     pub(crate) display_map: DisplayMap,
@@ -765,6 +771,7 @@ impl InputState {
 
         let state = Self {
             focus_handle: focus_handle.clone(),
+            extra_key_context: None,
             text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
@@ -1031,6 +1038,22 @@ impl InputState {
     }
 
     /// Set enable/disable line number, only for [`InputMode::CodeEditor`] mode.
+    /// 设置额外的键位上下文（例如 `ExCommandLine`）。
+    pub(crate) fn set_extra_key_context(&mut self, context: Option<&'static str>) {
+        self.extra_key_context = context;
+    }
+
+    /// 运行时开关行号（`:set nu` / `:set nonu`）。
+    pub(crate) fn set_line_number(&mut self, line_number: bool) {
+        if let InputMode::CodeEditor {
+            line_number: current,
+            ..
+        } = &mut self.mode
+        {
+            *current = line_number;
+        }
+    }
+
     pub fn line_number(mut self, line_number: bool) -> Self {
         debug_assert!(self.mode.is_code_editor() && self.mode.is_multi_line());
         if let InputMode::CodeEditor { line_number: l, .. } = &mut self.mode {

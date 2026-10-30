@@ -20,6 +20,9 @@
   {
     "context": "Input && !NoVim && VimControl && vim_mode == normal && vim_operator == none",
     "bindings": {
+      // Ex 命令行
+      ":": "editor_panel::ExCommandLine",
+
       // 模式切换
       "escape": "vim::NormalMode",
       "ctrl-[": "vim::NormalMode",

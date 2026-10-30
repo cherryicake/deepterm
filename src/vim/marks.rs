@@ -45,6 +45,13 @@ impl Marks {
     pub fn get(&self, name: char) -> Option<usize> {
         self.marks.get(&name.to_ascii_lowercase()).copied()
     }
+
+    /// 所有标记，按名称排序（`:marks` 使用）。
+    pub fn entries(&self) -> Vec<(char, usize)> {
+        let mut entries: Vec<_> = self.marks.iter().map(|(k, v)| (*k, *v)).collect();
+        entries.sort_by_key(|(name, _)| *name);
+        entries
+    }
 }
 
 #[cfg(test)]

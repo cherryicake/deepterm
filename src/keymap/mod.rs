@@ -32,6 +32,8 @@ const VIM_KEYMAP: &str = include_str!("../../assets/keymaps/vim.json");
 /// `escape`/方向键必须优先于普通编辑键与 vim 的 `escape`（退出插入模式），
 /// 否则「补全还没确认，模式先变了」。
 const COMPLETION_KEYMAP: &str = include_str!("../../assets/keymaps/completion.json");
+/// Vim `:` 命令行键位表。
+const EX_COMMAND_KEYMAP: &str = include_str!("../../assets/keymaps/ex-command.json");
 
 /// 初始化：加载内置键位表，并启动用户键位表的热重载。
 pub fn init(cx: &mut App) {
@@ -139,9 +141,10 @@ fn builtin_sources(cx: &App) -> Vec<(&'static str, &'static str)> {
     if vim_enabled {
         sources.push(("vim.json", VIM_KEYMAP));
     }
-    // 补全键位最后加载：同样的 `Input` 深度下，菜单打开时要压过
-    // `default.json` 的 enter/escape 与 vim insert 的 escape。
+    // 补全 / Ex 命令行键位最后加载：同样的 `Input` 深度下，菜单或命令行
+    // 打开时要压过 `default.json` 的 enter/escape 与 vim insert 的 escape。
     sources.push(("completion.json", COMPLETION_KEYMAP));
+    sources.push(("ex-command.json", EX_COMMAND_KEYMAP));
     sources
 }
 
@@ -155,13 +158,14 @@ fn log_errors(errors: &[String]) {
 mod tests {
     use super::*;
 
-    /// 平台无关 + 平台专属 + vim + 补全四份文档。
-    fn builtin_documents() -> [(&'static str, &'static str); 4] {
+    /// 平台无关 + 平台专属 + vim + 补全 + Ex 命令行五份文档。
+    fn builtin_documents() -> [(&'static str, &'static str); 5] {
         [
             ("default.json", DEFAULT_KEYMAP),
             ("default-platform.json", PLATFORM_KEYMAP),
             ("vim.json", VIM_KEYMAP),
             ("completion.json", COMPLETION_KEYMAP),
+            ("ex-command.json", EX_COMMAND_KEYMAP),
         ]
     }
 
@@ -317,6 +321,62 @@ mod tests {
                 );
                 assert_eq!(resolve(cx, "ctrl-a").as_deref(), Some("editor::SelectAll"));
             }
+        });
+    }
+
+    /// `:` 命令行上下文必须把 Enter/Tab/Esc/方向键解析到 Ex action。
+    #[gpui::test]
+    fn ex_command_context_resolves(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            init(cx);
+            let mut ex = gpui::KeyContext::new_with_defaults();
+            ex.add("Input");
+            ex.add("ExCommandLine");
+            let stack = [ex];
+            let resolve = |cx: &mut gpui::App, key: &str| -> Option<String> {
+                let keys = vec![gpui::Keystroke::parse(key).unwrap()];
+                let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
+                bindings.first().map(|b| b.action().name().to_string())
+            };
+            assert_eq!(
+                resolve(cx, "enter").as_deref(),
+                Some("editor_panel::ExSubmit")
+            );
+            assert_eq!(
+                resolve(cx, "tab").as_deref(),
+                Some("editor_panel::ExComplete")
+            );
+            assert_eq!(
+                resolve(cx, "up").as_deref(),
+                Some("editor_panel::ExHistoryPrev")
+            );
+        });
+    }
+
+    /// Vim Normal 下 `:` 必须解析到打开 Ex 命令行。
+    #[gpui::test]
+    fn colon_resolves_to_ex_command_in_normal_mode(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            reload(cx);
+            let mut input = gpui::KeyContext::new_with_defaults();
+            input.add("Input");
+            input.add("VimControl");
+            input.set("vim_mode", "normal");
+            input.set("vim_operator", "none");
+            let stack = [input];
+            let keys = vec![gpui::Keystroke::parse(":").unwrap()];
+            let (bindings, _) = cx.key_bindings().borrow().bindings_for_input(&keys, &stack);
+            assert_eq!(
+                bindings
+                    .first()
+                    .map(|binding| binding.action().name().to_string())
+                    .as_deref(),
+                Some("editor_panel::ExCommandLine")
+            );
         });
     }
 

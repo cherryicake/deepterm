@@ -617,6 +617,15 @@ impl<T: SearchTarget> SearchPanel<T> {
         });
     }
 
+    /// `:set ic` / `:set noic`：更新大小写敏感度并立即重算匹配。
+    pub(crate) fn set_case_insensitive(&mut self, value: bool, cx: &mut Context<Self>) {
+        if self.case_insensitive != value {
+            self.case_insensitive = value;
+            self.update_search_query(cx);
+            cx.notify();
+        }
+    }
+
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().to_string();
         let visible_range_offset = self.editor.read(cx).anchor_offset();

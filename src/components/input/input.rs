@@ -134,6 +134,9 @@ impl RenderOnce for EditorInput {
         // `VimControl` / `vim_mode` / `vim_operator` 供键位表匹配。
         let mut key_context = gpui::KeyContext::new_with_defaults();
         key_context.add(super::CONTEXT);
+        if let Some(extra) = state.extra_key_context {
+            key_context.add(extra);
+        }
         if let Some(vim) = state.vim.as_ref() {
             vim.extend_key_context(&mut key_context);
         } else {

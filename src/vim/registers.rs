@@ -140,6 +140,33 @@ impl Registers {
     pub fn is_system(name: Option<char>) -> bool {
         matches!(name, Some('+') | Some('*'))
     }
+
+    /// `:registers` 展示用的快照。
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let mut entries = Vec::new();
+        if !self.unnamed.is_empty() {
+            entries.push(("\"".to_string(), self.unnamed.clone()));
+        }
+        if !self.yank.is_empty() {
+            entries.push(("0".to_string(), self.yank.clone()));
+        }
+        for (index, value) in self.deletes.iter().enumerate() {
+            if !value.is_empty() {
+                entries.push(((index + 1).to_string(), value.clone()));
+            }
+        }
+        if !self.small_delete.is_empty() {
+            entries.push(("-".to_string(), self.small_delete.clone()));
+        }
+        let mut named: Vec<_> = self
+            .named
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect();
+        named.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.extend(named);
+        entries
+    }
 }
 
 #[cfg(test)]
