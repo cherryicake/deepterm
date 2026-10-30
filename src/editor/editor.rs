@@ -10552,6 +10552,44 @@ mod tests {
         );
     }
 
+    /// `:normal` 支持 `f`/`t` 的 pending 字符。
+    #[gpui::test]
+    fn ex_normal_pending_char(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("abxc", cx);
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.open_ex_command(&ExCommandLine, window, cx);
+            });
+        });
+        let _ = cx.refresh();
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                if let Some(panel) = editor.ex_command_panel.as_ref() {
+                    panel.update(cx, |panel, cx| {
+                        panel.set_input("normal fxx", window, cx);
+                    });
+                }
+            });
+        });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(
+            input.read_with(cx, |state, _| state.text().to_string()),
+            "abc"
+        );
+    }
+
     /// `:normal` 支持操作符键序列（`dd`）。
     #[gpui::test]
     fn ex_normal_operator_sequence(cx: &mut gpui::TestAppContext) {
