@@ -31,6 +31,7 @@
       "shift-end": "editor::SelectToEndOfLine",
       // 软换行开关。Zed 是 `cmd-k z`，但本仓没有命令面板、`cmd-k` 已被 ShowSshPicker 全局占用，这里用 VSCode 同款的 `alt-z`。
       "alt-z": "editor::ToggleSoftWrap",
+      "ctrl-alt-v": "editor_panel::ToggleVim",
       "alt-up": "editor::MoveLineUp",
       "alt-down": "editor::MoveLineDown",
       "alt-shift-up": "editor::DuplicateLine",

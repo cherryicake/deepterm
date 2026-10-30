@@ -123,6 +123,8 @@ actions!(
         FormatDocument,
         /// 手动触发补全（ctrl-space）。
         TriggerCompletion,
+        /// 切换 Vim 模式（状态栏徽章 / 快捷键）。
+        ToggleVim,
         /// 打开 Vim `:` 命令行。
         ExCommandLine,
         /// `:` 命令行：提交。
@@ -1970,6 +1972,24 @@ impl Editor {
             self.content_bottom_padding = content_bottom;
             cx.notify();
         }
+    }
+
+    /// 切换 Vim 模式。与 Zed 的 `vim::ToggleVimMode` 一致：状态栏徽章可点，
+    /// 键位也可绑定 `editor_panel::ToggleVim`。Linux 默认关闭，但用户不必手改
+    /// settings.json。
+    fn toggle_vim(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if cx.try_global::<crate::settings::SettingsStore>().is_none() {
+            return;
+        }
+        let enabled = crate::vim::enabled(cx);
+        crate::settings::SettingsStore::update_user(cx, |content| {
+            content.vim.enabled = !enabled;
+        });
+        // `settings::observe` 在正常启动路径也会做这两件事；这里显式调用是为了
+        // 组件测试/嵌入式渲染没有注册 observe 时也能立刻生效。
+        crate::keymap::reload(cx);
+        crate::vim::disable_all(cx);
+        cx.notify();
     }
 
     /// `:`：打开 Vim Ex 命令行。
@@ -4993,19 +5013,35 @@ impl Editor {
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    // vim 模式徽章：只在 vim 启用时出现。放在最左，与 vim 的
-                    // 状态行位置一致，扫一眼就知道当前是 Normal 还是 Insert。
-                    .when_some(state.vim.as_ref(), |this, vim| {
-                        let mode = vim.mode;
-                        this.child(
-                            div()
-                                .px(px(6.0))
-                                .py(px(1.0))
-                                .rounded(px(4.0))
-                                .bg(theme.accent.opacity(0.15))
-                                .text_color(theme.accent)
-                                .child(mode.indicator()),
-                        )
+                    // Vim 开关 + 模式徽章：放在最左，与 vim 的状态行位置一致。
+                    // 未启用时也显示，点击即可开启——Linux 默认关闭，用户不必
+                    // 手改 settings.json 才能用 `:`。
+                    .child({
+                        let vim_label = state
+                            .vim
+                            .as_ref()
+                            .map(|vim| vim.mode.indicator())
+                            .unwrap_or("Vim");
+                        div()
+                            .id("vim-status-chip-hit")
+                            .cursor_pointer()
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded(px(4.0))
+                            .when_some(state.vim.as_ref(), |this, _| {
+                                this.bg(theme.accent.opacity(0.15)).text_color(theme.accent)
+                            })
+                            .when(state.vim.is_none(), |this| {
+                                this.bg(theme.panel_background.opacity(0.4))
+                            })
+                            .hover(|this| this.bg(theme.tab_hover_background))
+                            .on_mouse_down(
+                                gpui::MouseButton::Left,
+                                cx.listener(move |this, _: &gpui::MouseDownEvent, window, cx| {
+                                    this.toggle_vim(window, cx);
+                                }),
+                            )
+                            .child(vim_label)
                     })
                     .child(format!(
                         "行 {}, 列 {}",
@@ -8011,6 +8047,9 @@ impl Render for Editor {
                 .on_action(cx.listener(|this, _: &GotoLine, window, cx| {
                     this.toggle_goto_line(&GotoLine, window, cx);
                 }))
+                .on_action(cx.listener(|this, _: &ToggleVim, window, cx| {
+                    this.toggle_vim(window, cx);
+                }))
                 .on_action(cx.listener(|this, _: &ExCommandLine, window, cx| {
                     this.open_ex_command(&ExCommandLine, window, cx);
                 }))
@@ -10507,6 +10546,50 @@ mod tests {
         assert_eq!(
             input.read_with(cx, |state, _| state.text().to_string()),
             "a\nb\nc"
+        );
+    }
+
+    /// 状态栏 Vim 徽章/快捷键切换：Linux 默认关闭时应能一键开启。
+    #[gpui::test]
+    fn toggle_vim_from_status_bar(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        cx.update(|_, cx| crate::settings::SettingsStore::init_for_test(cx));
+        assert!(!cx.update(|_, cx| crate::vim::enabled(cx)));
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| editor.toggle_vim(window, cx));
+        });
+        assert!(cx.update(|_, cx| crate::vim::enabled(cx)));
+        assert!(input.read_with(cx, |state, _| state.vim.is_some()));
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| editor.toggle_vim(window, cx));
+        });
+        assert!(!cx.update(|_, cx| crate::vim::enabled(cx)));
+        assert!(input.read_with(cx, |state, _| state.vim.is_none()));
+    }
+
+    /// 真实按 `:` 应打开 Ex 面板（而不是只验证键位表解析）。
+    #[gpui::test]
+    fn colon_key_opens_ex_panel(cx: &mut gpui::TestAppContext) {
+        let (editor, input, cx) = completion_key_fixture(cx, false);
+        input.update(&mut *cx, |state, cx| {
+            state.set_text("one", cx);
+            state.vim = Some(crate::vim::VimState::default());
+        });
+        cx.update(|_, cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::settings::SettingsStore::update_user(cx, |content| {
+                content.vim.enabled = true;
+            });
+            crate::keymap::reload(cx);
+        });
+        let _ = cx.refresh();
+        let focus = input.read_with(&mut *cx, |state, _| state.focus_handle.clone());
+        cx.update(|window, cx| focus.focus(window, cx));
+        cx.simulate_keystrokes(":");
+        assert!(
+            editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_some()),
+            "Vim Normal 下按 : 应打开 Ex 面板"
         );
     }
 

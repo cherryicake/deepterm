@@ -191,13 +191,13 @@ mod tests {
     ///
     /// 迁移前有 106 条 `KeyBinding::new`：30 条平台无关、46 条 macOS、
     /// 30 条非 macOS。同一平台只生效一半（`#[cfg]` 互斥），且 `shift-enter`
-    /// 被后写的 `SearchPrevious` 覆盖，故：
-    /// - macOS：29 + 46 = 75
-    /// - 其它：29 + 30 = 59
+    /// 被后写的 `SearchPrevious` 覆盖；之后又补了 `ctrl-alt-v`（ToggleVim），故：
+    /// - macOS：30 + 46 = 76
+    /// - 其它：30 + 30 = 60
     #[test]
     fn default_keymaps_cover_all_migrated_bindings() {
         let total = binding_count(DEFAULT_KEYMAP) + binding_count(PLATFORM_KEYMAP);
-        let expected = if cfg!(target_os = "macos") { 75 } else { 59 };
+        let expected = if cfg!(target_os = "macos") { 76 } else { 60 };
         assert_eq!(
             total, expected,
             "迁移后键位数应与原 state.rs 的有效键位一致"
