@@ -1180,7 +1180,7 @@ fn hover_popover_covers_drives_debounce_restart(cx: &mut gpui::TestAppContext) {
     });
     let input = cell.into_inner().unwrap();
 
-    input.update(cx, |state, _| {
+    input.update(cx, |state, cx| {
         state.set_hover_popover(
             4,
             crate::editor::hover::HoverInfo {
@@ -1188,6 +1188,8 @@ fn hover_popover_covers_drives_debounce_restart(cx: &mut gpui::TestAppContext) {
                 range: Some(4..8),
                 markdown: None,
                 scroll_handle: gpui::ScrollHandle::new(),
+                scroll_bar_state: cx
+                    .new(|_| crate::editor::markdown_live::scrollbar::ScrollBarState::default()),
             },
         );
     });

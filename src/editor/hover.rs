@@ -57,6 +57,7 @@ use lsp_types::Url;
 use ropey::Rope;
 
 use crate::components::input::InputState;
+use crate::editor::markdown_live::scrollbar::{BAR_THICKNESS, ScrollBarState, scroll_bar};
 use crate::lsp::features::{self, hover_contents};
 use crate::theme::ActiveTheme as _;
 
@@ -105,6 +106,17 @@ pub struct HoverInfo {
     /// 浮层每帧都是新建的元素，若句柄也每帧新建，滚动位置会被重置成 0，
     /// 于是「滚一点就弹回顶部」，滚动根本用不了。
     pub scroll_handle: gpui::ScrollHandle,
+    /// 纵向滚动条的**拖拽状态**实体。
+    ///
+    /// 与 [`Self::scroll_handle`] 同因同解：浮层元素每帧重建，若拖拽状态也
+    /// 每帧新建（"按下的指针坐标/滚动偏移" 存进新实体），拖到第二帧 grab
+    /// 就丢了 —— 滚动条拖一下就断。存进 `HoverInfo` 的生命周期里（一次
+    /// hover 一份），拖拽期间稳定。
+    ///
+    /// 状态本身是 `markdown_live::scrollbar::ScrollBarState`（自绘滚动条的
+    /// 轴无关组件），markdown 编辑器/代码编辑器的滚动条与此条共用同一套
+    /// 几何与配色。
+    pub(crate) scroll_bar_state: Entity<ScrollBarState>,
 }
 
 /// 鼠标移出编辑区后，延迟多久收起 hover 浮层。
@@ -850,13 +862,17 @@ pub fn init_keystroke_interceptor(cx: &mut App) {
 ///    压扁，行高塌陷 -> 文字互相重叠。这也是「格式错乱」的真正原因，与
 ///    换行符无关。
 ///
-/// 现在：markdown 条目内联渲染 + 外层 `overflow_y_scroll`，行高由
+/// 现在：markdown 条目内联渲染 + 内层滚动容器（`hover-card-scroll`，
+/// `overflow_y_scroll` + `track_scroll`），行高由
 /// [`crate::editor::markdown::MarkdownStyle::hover_style`] 的 `line_height`
-/// 明确给定（必须大于字号），并给每个子项 `flex_shrink_0()` 兜底。
+/// 明确给定，并给每个子项 `flex_shrink_0()` 兜底。卡片根节点只挂外观
+/// （圆角/边框/阴影）与遮挡、事件，纵向滚动条则作为 absolute 覆盖层挂在
+/// 根节点与滚动容器**之间**（必须避开滚动容器的 `with_element_offset`，
+/// 否则会跟着内容滚走，见下方三层拆分的理由）。
 ///
 /// 对照 Zed `hover_popover.rs::InfoPopover::render`：它同样是
-/// `MarkdownElement` 内联 + `.overflow_y_scroll()` + `.track_scroll(...)`，
-/// 样式取自独立的 `hover_markdown_style`。
+/// `MarkdownElement` 内联 + `.overflow_y_scroll()` + `.track_scroll(...)` +
+/// `custom_scrollbars`（右缘滚动条），样式取自独立的 `hover_markdown_style`。
 ///
 /// `width` 是**显式给定的卡片宽度**（`None` = 由内容撑开的 shrink-to-fit）。
 ///
@@ -890,8 +906,10 @@ pub fn render_hover_card(
         .unwrap_or_else(|| "Menlo".to_string());
 
     // 内容区：可纵向滚动，并绑定**稳定**的句柄（浮层元素每帧重建，句柄不能
-    // 每帧新建，否则滚动位置永远被重置回顶部）。
+    // 每帧新建，否则滚动位置永远被重置回顶部）。滚动条的拖拽状态同理，见
+    // [`HoverInfo::scroll_bar_state`]。
     let scroll_handle = info.scroll_handle.clone();
+    let scroll_bar_state = info.scroll_bar_state.clone();
     let body = div().flex().flex_col().w_full().children(
         info.markdown
             .as_ref()
@@ -911,11 +929,66 @@ pub fn render_hover_card(
             .map(|item| div().flex_shrink_0().w_full().child(item)),
     );
 
+    // 滚动容器（卡片内层）。`overflow_y_scroll` **不能**再直接挂在下面的卡片
+    // 根节点上：gpui 把滚动容器的**全部**子元素（含 absolute 定位的覆盖层）
+    // 放进 `with_element_offset` 里随内容平移（`div.rs` 的 prepaint），滚动条
+    // 要钉在视口右缘、不跟着内容滚走，就必须挂在滚动容器**之外** —— 与
+    // `markdown_live::view` 的纵向条是同一坑同一解。于是卡片拆成三层：
+    // 根节点（外观 + occlude + 鼠标事件）→ 滚动容器 → 滚动条覆盖层。
+    //
+    // 高度链：根节点 `max_h`（taffy 会把内容超限时钳到上限），滚动容器是其
+    // 唯一的在流 flex 子项（覆盖层是 absolute，不参与布局）；滚动容器的
+    // 「automatic min size」为 0（overflow 不是 visible 时 taffy/CSS 同规），
+    // 所以它总能被钳到可滚高度 —— `max_offset > 0`，滚轮/拖拽才用得起来。
+    //
+    // `.id(...)` 也不是装饰：`track_scroll` 只在 `StatefulInteractiveElement`
+    // 上有实现。内层只管滚动，根节点管遮挡与事件，两层各有 id。
+    let scroll_area = div()
+        .id("hover-card-scroll")
+        .flex()
+        .flex_col()
+        .w_full()
+        .overflow_y_scroll()
+        // 横向兜底裁剪：换行之后仍可能有**不可断**的长串（长 URL、无空格的
+        // 类型路径）超出卡片；`overflow_y_scroll` 只管纵轴，横轴不裁就会画到
+        // 卡片外面去。
+        .overflow_x_hidden()
+        .track_scroll(&scroll_handle)
+        .py(px(8.0))
+        .px(px(10.0))
+        .child(body);
+
+    // 纵向滚动条：贴卡片右缘的覆盖层，与代码编辑器 / markdown 编辑器同款
+    // （自绘常显 + thumb 拖拽，几何尺寸配色全取自
+    // `markdown_live::scrollbar`）。挂根节点**里**、滚动容器**外**（原因见上）。
+    //
+    // 内容不溢出时 `scroll_bar` 的 `thumb_metrics` 返回 None：不画 thumb，
+    // 事件监听也命中不到任何矩形 —— 等于不存在，不必在此判溢出。
+    //
+    // `paging = false`（只认 thumb，不认轨道空白翻页）：轨道压在正文右缘，
+    // 认轨道会把「点行尾」的点击吃掉 —— markdown 编辑器同款取舍。
+    let scrollbar_strip = div()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right_0()
+        .w(BAR_THICKNESS)
+        .child(scroll_bar(
+            gpui::Axis::Vertical,
+            scroll_bar_state,
+            scroll_handle.clone(),
+            theme.border.opacity(0.7),
+            theme.border_strong,
+            false,
+        ));
+
     let mut card = div()
-        // `.id(...)` 不是装饰：它把 `Div` 变成 `Stateful<Div>`，而
-        // `overflow_y_scroll` / `track_scroll` 只在 `StatefulInteractiveElement`
-        // 上有实现。少这一行整个滚动容器就编译不过。
+        // `.id(...)` 不是装饰：遮挡（`occlude`）与鼠标回调挂在这一层的元素
+        // 状态上。原实现它身兼滚动容器；拆层后滚动让给内层（`hover-card-scroll`）。
         .id("hover-card")
+        // 覆盖层的定位锚：滚动条要贴本卡右缘。taffy 对 absolute 子元素的
+        // inset 是相对**直接父容器**解析的，`relative` + `right_0` 才稳。
+        .relative()
         // **挡住底下的一切鼠标交互**（Zed `InfoPopover::render` 同款
         // `.occlude()`，`hover_popover.rs`）。卡片是 `defer_draw` 的，它的
         // hitbox 比编辑器内容**后**插入，`occlude` 让命中测试在卡片处就停下：
@@ -945,14 +1018,6 @@ pub fn render_hover_card(
     let card = card
         .flex()
         .flex_col()
-        .overflow_y_scroll()
-        // 横向兜底裁剪：换行之后仍可能有**不可断**的长串（长 URL、无空格的
-        // 类型路径）超出卡片；`overflow_y_scroll` 只管纵轴，横轴不裁就会画到
-        // 卡片外面去。
-        .overflow_x_hidden()
-        .track_scroll(&scroll_handle)
-        .py(px(8.0))
-        .px(px(10.0))
         .rounded(px(8.0))
         .bg(theme.panel_background)
         .border_1()
@@ -960,7 +1025,8 @@ pub fn render_hover_card(
         .shadow_lg()
         .text_size(px(12.0))
         .text_color(theme.text)
-        .child(body)
+        .child(scroll_area)
+        .child(scrollbar_strip)
         // 键盘接管（`K` 第二次按下）**不走真焦点**：卡片是 `defer_draw` 到
         // 窗口层上的，从不经过 prepaint，也就进不了 GPUI 的 dispatch 树 ——
         // `window.focus()` 在它身上是空操作（查不到节点就回退到根，按键照样
@@ -1009,15 +1075,21 @@ pub fn render_hover_card(
             }
         });
     //
-    // 浮层自己的滚动由 GPUI 为 `overflow: Scroll` 容器自动注册的 listener
-    // （`div.rs::paint_scroll_listener`）完成，它**不会** `stop_propagation`，
-    // 所以事件会继续冒泡到 `InputState::on_scroll_wheel` 把编辑器滚走。
+    // 浮层自身的滚轮滚动由 GPUI 为滚动容器（`overflow: Scroll`）自动注册的
+    // listener（`div.rs::paint_scroll_listener`，挂在内层 `hover-card-scroll`
+    // 上）完成，它**不会** `stop_propagation`，所以事件会继续冒泡到
+    // `InputState::on_scroll_wheel` 把编辑器滚走。
     // 拦这件事放在**编辑器侧**做（`InputState::hover_popover_contains` +
     // `on_scroll_wheel`）：那里有浮层的实际矩形，判断可靠。
     //
-    // 在卡片上挂 listener 反而会坏事：用户 listener 与 GPUI 内置 listener
-    // 谁先跑取决于 paint 顺序，一旦自己先 `stop_propagation`，浮层就滚不动了
-    // —— 变成「浮层和编辑器都不滚」，比穿透更糟。
+    // 拖滚动条那条路径反过来：滚动条的监听是它的 canvas 在 paint 时注册的
+    // **窗口级**事件（`markdown_live::scrollbar::scroll_bar`），注册晚于卡片
+    // 上的回调，冒泡阶段反向先跑；命中 thumb 后 `stop_propagation`，
+    // 于是拖拽不再把 pointer-inside 状态搅乱，也不给编辑器添乱。
+    //
+    // 在卡片上挂 wheel listener 反而会坏事：用户 listener 与 GPUI 内置
+    // listener 谁先跑取决于 paint 顺序，一旦自己先 `stop_propagation`，浮层
+    // 就滚不动了 —— 变成「浮层和编辑器都不滚」，比穿透更糟。
 
     Some(card.into_any_element())
 }
@@ -1042,6 +1114,7 @@ impl HoverInfo {
             range: None,
             markdown,
             scroll_handle: gpui::ScrollHandle::new(),
+            scroll_bar_state: cx.new(|_| ScrollBarState::default()),
         }
     }
 }
@@ -1065,5 +1138,6 @@ pub fn hover_info(rope: &Rope, hover: &lsp_types::Hover, cx: &mut App) -> HoverI
         range: features::hover_range(rope, hover),
         markdown,
         scroll_handle: gpui::ScrollHandle::new(),
+        scroll_bar_state: cx.new(|_| ScrollBarState::default()),
     }
 }
