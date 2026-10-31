@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use gpui::prelude::*;
 use gpui::{
     AnimationExt as _, AnyElement, Context, ElementId, Entity, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, WeakEntity, Window, div, px,
+    MouseButton, ParentElement, Pixels, Render, WeakEntity, Window, div, px,
 };
 
 use crate::components::title_bar::TITLE_BAR_HEIGHT;
@@ -30,6 +30,23 @@ const BELL_PANEL_SLIDE_PX: f32 = 8.0;
 const BELL_RIGHT_MARGIN: f32 = 14.0;
 /// 铃铛按钮内整体进度条与按钮左缘的间距（像素）。
 const BELL_PROGRESS_LEFT: f32 = 4.0;
+
+/// 弹窗右缘相对铃铛按钮容器右缘的偏移（像素）。
+///
+/// macOS 上铃铛右侧直接是窗口边缘，`BELL_RIGHT_MARGIN` 就能让弹窗贴住窗口
+/// 右缘；Windows/Linux 上铃铛右侧还有最小化 / 最大化 / 关闭三个窗口控制按钮
+/// （每个宽 `TITLE_BAR_HEIGHT`），需要把这组按钮的宽度补偿掉，弹窗才会和
+/// macOS 一样贴住窗口右缘，而不是缩在按钮组左侧。
+fn popover_right_offset() -> Pixels {
+    #[cfg(target_os = "macos")]
+    {
+        px(BELL_RIGHT_MARGIN)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        px(BELL_RIGHT_MARGIN) - TITLE_BAR_HEIGHT * 3.0
+    }
+}
 
 /// 传输任务铃铛：触发按钮 + 传输列表面板（popover）。
 pub struct TransferBellPanel {
@@ -408,9 +425,11 @@ impl TransferBellPanel {
         let popover = gpui::deferred(
             div()
                 .absolute()
-                // 面板出现在标题栏正下方（TITLE_BAR_HEIGHT），右缘对齐铃铛按钮。
+                // 面板出现在标题栏正下方（TITLE_BAR_HEIGHT）；右缘按平台补偿
+                // 窗口控制按钮组后与窗口右缘保持 `BELL_RIGHT_MARGIN` 间距，
+                // 与 macOS 下的位置一致。
                 .top(TITLE_BAR_HEIGHT)
-                .right(px(BELL_RIGHT_MARGIN))
+                .right(popover_right_offset())
                 .child(animated_panel),
         )
         .with_priority(1);
