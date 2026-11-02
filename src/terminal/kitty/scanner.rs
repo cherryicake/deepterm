@@ -541,6 +541,14 @@ impl PtyScanner for KittyGraphicsScanner {
         //
         // 在**整块** `data` 上一次性扫描（而非按切片），因此不存在「序列被两个
         // emit 切片切开」的连续性隐患。
+        // `CSI 3 J` 清空 scrollback：锚在历史负行号的放置随历史一起删除。
+        // 放在这里（整块数据、vte 之前）能保证同块后续字节看到干净的存储。
+        if memchr::memmem::find(data, b"\x1b[3J").is_some()
+            && self.store.remove_history_placements()
+        {
+            self.sink.images_changed();
+        }
+
         let removals = self.handle_probe_sequences(data);
 
         // OSC 与 APC 必须**单趟按位置推进**处理，不能「先把 OSC 全摘掉、

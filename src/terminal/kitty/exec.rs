@@ -276,6 +276,11 @@ impl ImageStore {
         self.terminal_cols = terminal_cols;
     }
 
+    /// 清空 scrollback 时删除历史区放置（扫描器检测 `CSI 3 J` 调用）。
+    pub fn remove_history_placements(&mut self) -> bool {
+        self.with_storage_mut(|s| s.remove_history_placements())
+    }
+
     /// 取走本命令产生的光标推进；每条命令至多一次。
     pub fn take_cursor_advance(&mut self) -> Option<(u32, u32)> {
         self.cursor_advance.take()

@@ -847,6 +847,29 @@ impl Storage {
         removed
     }
 
+    /// 清空 scrollback（`CSI 3 J`）时删除落在历史区的放置。
+    ///
+    /// 对齐 Ghostty `eraseHistory`：历史行被擦除后，锚在负行号的图像
+    /// 没有内容可依，必须一起删除；屏幕内的放置保留。相对子放置由
+    /// `remove_placement` 的父链级联一并清理。
+    pub fn remove_history_placements(&mut self) -> bool {
+        let mut to_remove: Vec<PlacementKey> = Vec::new();
+        for (id, stored) in self.images.iter() {
+            for (pid, p) in stored.placements.iter() {
+                if p.row < 0 {
+                    to_remove.push((*id, *pid));
+                }
+            }
+        }
+        if to_remove.is_empty() {
+            return false;
+        }
+        for (id, pid) in to_remove {
+            self.remove_placement(id, pid);
+        }
+        true
+    }
+
     /// 删除**屏幕上可见**的放置（`d=a`/`d=A`）。返回是否发生了变化。
     ///
     /// 对齐 ghostty `graphics_storage.zig:1414` 的 `deleteVisiblePlacements` 与
@@ -1811,5 +1834,17 @@ mod tests {
         let ids: Vec<u32> = s.virtual_placements(1).iter().map(|(p, _)| *p).collect();
         assert_eq!(ids, vec![1, 9], "只列虚拟放置，且按 id 升序");
         assert!(s.virtual_placements(42).is_empty(), "不存在的图像返回空");
+    }
+
+    #[test]
+    fn clear_history_removes_history_placements_only() {
+        let mut s = Storage::new(1024);
+        s.insert(1, img(1, 1), None, false);
+        s.place(1, 1, placement(-3, 2));
+        s.place(1, 2, placement(1, 2));
+        assert!(s.remove_history_placements());
+        let stored = s.get(1).unwrap();
+        assert!(stored.placements.get(&1).is_none(), "历史区放置应删除");
+        assert!(stored.placements.get(&2).is_some(), "屏幕内放置应保留");
     }
 }
