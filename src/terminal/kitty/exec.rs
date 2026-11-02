@@ -580,18 +580,32 @@ impl ImageStore {
         use std::io::{Read as _, Seek as _, SeekFrom};
 
         let fs_path = std::path::Path::new(path);
+
+        // Windows 上某些路径连 open 都不能做（UNC 会解析主机并做 SMB 认证，
+        // 设备/NT 命名空间会打开裸卷或命名管道）。必须在 open 之前做纯
+        // 字符串检查；POSIX 的 /proc、/sys、/dev 则在 open 后用规范路径检查。
+        #[cfg(windows)]
+        if !windows_path_is_safe(path) {
+            return Err(ExecutionError::InvalidData);
+        }
+
         // 先打开再校验，避免 TOCTOU（对齐 ghostty "Open our file right away
         // before we do validation"）。
         let mut file = std::fs::File::open(fs_path).map_err(|_| ExecutionError::InvalidData)?;
+
+        // 规范路径来自已经打开的句柄，后续临时目录/敏感路径判断都基于它。
+        let canonical = fs_path
+            .canonicalize()
+            .map_err(|_| ExecutionError::InvalidData)?;
+        if !Self::is_allowed_file_path(&canonical) {
+            return Err(ExecutionError::InvalidData);
+        }
 
         let mut delete_after = false;
         if medium == Medium::TemporaryFile {
             let Some(temp_dir) = self.policy.temporary_directory.as_ref() else {
                 return Err(ExecutionError::TemporaryFileNotInTempDir);
             };
-            let canonical = fs_path
-                .canonicalize()
-                .map_err(|_| ExecutionError::InvalidData)?;
             if !Self::is_allowed_temporary_path(&canonical, temp_dir) {
                 return Err(ExecutionError::TemporaryFileNotInTempDir);
             }
@@ -634,6 +648,33 @@ impl ImageStore {
             let _ = std::fs::remove_file(fs_path);
         }
         Ok(bytes)
+    }
+
+    /// 文件介质的敏感路径黑名单（POSIX）。
+    ///
+    /// 对齐 Ghostty/Kitty：`/proc`、`/sys` 以及 `/dev` 下的设备节点都可能
+    /// 阻塞或泄漏内核信息；`/dev/shm` 是共享内存，允许作为普通文件读取。
+    fn is_allowed_file_path(canonical: &std::path::Path) -> bool {
+        #[cfg(unix)]
+        {
+            let s = canonical.to_string_lossy();
+            if s.starts_with("/proc/") || s.starts_with("/sys/") {
+                return false;
+            }
+            if s.starts_with("/dev/") && !s.starts_with("/dev/shm/") {
+                return false;
+            }
+        }
+        #[cfg(windows)]
+        {
+            // canonicalize 可能带 `\\?\` 前缀；去掉后再要求盘符绝对路径。
+            let text = canonical.to_string_lossy();
+            let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+            if !windows_is_drive_absolute(text) || !windows_path_is_safe(text) {
+                return false;
+            }
+        }
+        true
     }
 
     /// `t=t` 允许的临时目录：配置的 temp dir，以及常见系统临时根。
@@ -1811,6 +1852,66 @@ impl ImageStore {
     }
 }
 
+/// Windows 路径纯字符串安全检查（不触碰文件系统）。
+///
+/// 移植 Ghostty `kitty/windows.zig::checkPath`：
+/// - 拒绝 UNC（`\\server\share`，任意分隔符混合）；
+/// - 拒绝 Win32 设备/NT 命名空间（`\\?\`、`\\.\`、`\??\`）；
+/// - 拒绝任意组件里的 DOS 保留设备名（CON/NUL/COM1/LPT1…）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_path_is_safe(path: &str) -> bool {
+    let b = path.as_bytes();
+    let sep = |c: u8| c == b'\\' || c == b'/';
+
+    if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
+        // `\\?\` / `\\.\` 是设备命名空间；其余双分隔符是 UNC。
+        // 两者都拒绝。
+        return false;
+    }
+    if b.len() >= 4 && sep(b[0]) && b[1] == b'?' && b[2] == b'?' && sep(b[3]) {
+        return false;
+    }
+
+    for component in path.split(['\\', '/']) {
+        if windows_reserved_device_name(component) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_is_drive_absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_reserved_device_name(component: &str) -> bool {
+    // 名字在扩展名或流分隔符处结束，末尾空格忽略（Windows 解析规则）。
+    let end = component.find(['.', ':']).unwrap_or(component.len());
+    let stem = component[..end].trim_end_matches(' ');
+    if stem.len() < 3 {
+        return false;
+    }
+    let (base, rest) = stem.split_at(3);
+    if rest.is_empty() {
+        return base.eq_ignore_ascii_case("CON")
+            || base.eq_ignore_ascii_case("PRN")
+            || base.eq_ignore_ascii_case("AUX")
+            || base.eq_ignore_ascii_case("NUL");
+    }
+    if !base.eq_ignore_ascii_case("COM") && !base.eq_ignore_ascii_case("LPT") {
+        return false;
+    }
+    match rest.as_bytes() {
+        [b] => b.is_ascii_digit(),
+        // U+00B9 / U+00B2 / U+00B3（¹ ² ³）的 UTF-8 编码。
+        [0xC2, 0xB9] | [0xC2, 0xB2] | [0xC2, 0xB3] => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2213,6 +2314,54 @@ mod tests {
         let r = run(&mut store, "a=T,i=22,f=32,s=1,v=1,C=1;/wAA/w==", (5, 3)).unwrap();
         assert!(r.images_changed);
         assert_eq!(store.take_cursor_advance(), None, "C=1 明确禁止光标移动");
+    }
+
+    #[test]
+    fn windows_path_rules_reject_unc_devices_and_reserved_names() {
+        for bad in [
+            r"\\server\share\image.png",
+            "//server/share/image.png",
+            r"\\?\C:\Windows\Temp\image.png",
+            r"\\.\pipe\image",
+            r"\??\C:\image.png",
+            r"C:\Temp\CON",
+            r"C:\Temp\com1.png",
+            r"C:\dir\NUL.txt",
+            r"C:\dir\LPT9:stream",
+        ] {
+            assert!(!windows_path_is_safe(bad), "应拒绝: {bad}");
+        }
+        for good in [
+            r"C:\Windows\Temp\image.png",
+            "C:/Windows/Temp/image.png",
+            r"C:image.png",
+            r"\Windows\Temp\image.png",
+            "image.png",
+            r"C:\Device\HarddiskVolume1\image.png",
+            r"C:\dir\console.png",
+        ] {
+            assert!(windows_path_is_safe(good), "应接受: {good}");
+        }
+        assert!(windows_is_drive_absolute(r"C:\image.png"));
+        assert!(!windows_is_drive_absolute(r"\\server\share\image.png"));
+    }
+
+    #[test]
+    fn posix_sensitive_file_paths_are_rejected() {
+        use std::path::Path;
+        assert!(!ImageStore::is_allowed_file_path(Path::new(
+            "/proc/self/environ"
+        )));
+        assert!(!ImageStore::is_allowed_file_path(Path::new(
+            "/sys/kernel/notes"
+        )));
+        assert!(!ImageStore::is_allowed_file_path(Path::new("/dev/urandom")));
+        assert!(ImageStore::is_allowed_file_path(Path::new(
+            "/dev/shm/image.png"
+        )));
+        assert!(ImageStore::is_allowed_file_path(Path::new(
+            "/tmp/image.png"
+        )));
     }
 
     #[test]
