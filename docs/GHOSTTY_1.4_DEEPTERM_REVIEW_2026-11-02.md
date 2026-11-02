@@ -536,16 +536,19 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
 | macOS 上 `t=t` 文件在 `/tmp`（实际 `/private/tmp`）被误拒 | 临时目录白名单加入 `/tmp`、`/private/tmp`、`/dev/shm` |
 | `t=f` + `o=z` 被按原始像素大小截断 | zlib 负载读完整文件再解压 |
 | `C=` 光标移动完全没有实现，`a=T` 后光标不动 | 默认按 Ghostty 语义移到图像右下角，`C=1` 禁止；在 APC 处理的同一时刻应用，同一 read 里后续文本从新光标继续；虚拟放置不移动 |
+| 相对放置（`P=`/`Q=`/`H=`/`V=`）完全没有 | 创建时解析父链、校验 8 层/自引用/环，折算成绝对行列；父放置删除时级联删除子放置，父放置重新放置时子放置跟随平移 |
+| `t=f` 可读 `/proc`、`/sys`、`/dev`，Windows 可打开 UNC/设备命名空间 | POSIX 用已打开文件的规范路径拒绝敏感前缀；Windows 在 open 前拒绝 UNC/`\\?\\`/`\\.\\`/`\??\` 与 CON/COM1 等保留名，规范路径必须是盘符绝对路径 |
+| OSC 5522 完全未接入 | 新增 `kitty/clipboard.rs`：`write`/`wdata`/`walias` 事务、严格 base64、`text/plain` 读写、4096 字节分片、`.` targets 列表；接入 GPUI 系统剪贴板 |
+| `CSI 3 J` 清空 scrollback 后历史放置残留 | 扫描器检测 `CSI 3 J`，`Storage::remove_history_placements` 删除负行号放置，子放置随父链级联 |
 
-验证：`cargo test --release --lib kitty::exec` 98 passed；`cargo test --release --lib kitty` 311 passed（另 1 个 `debug_assert` 用例在 release 下不触发，属既有测试写法）。新增 shm、文件 offset/size、zlib 文件、非直传中止、delete 中止、quiet 继承、`/tmp` 临时文件、`C=` 光标推进及本地 PTY 端到端用例。
+验证：`cargo test --release --lib kitty::exec` 104 passed；`cargo test --release --lib kitty` 325 passed（另 1 个 `debug_assert` 用例在 release 下不触发，属既有测试写法）；clipboard 单测 5 条 + GPUI 写入集成 1 条。新增 shm、文件 offset/size、zlib 文件、非直传中止、delete 中止、quiet 继承、`/tmp` 临时文件、`C=` 光标推进、相对放置/父链删除/父重放、路径安全、历史清理用例。
 
 仍未实现（明确记录，不在本轮强行做）：
 
-- **Kitty clipboard（OSC 5522）**：MIME/多段 `wdata`、`walias`、权限 grant、分块读响应都没有；这是独立的一套协议，工作量与图形图像相当。
-- **Kitty DnD 协议**：未实现。
-- **相对放置**：`P=`/父放置链、`H=`/`V=` 的 relative placement 还没有；当前只有锚点与虚拟两种。
-- **erase scrollback / erase history 时移除历史放置**：Ghostty 有专门实现，DeepTerm 尚未挂接滚动历史裁剪路径。
-- **Windows 文件路径安全校验**（Ghostty #14189）：`t=f` 在 Windows 仍直接交给 `File::open`。
+- **Kitty DnD（OSC 72）**：未实现；需要 GPUI 拖拽源/目标生命周期，不是纯字节协议。
+- **Kitty clipboard 的图片/富文本与权限 grant（OTP）**：当前只接了 `text/plain`，读取沿用 OSC 52 的既有信任模型，没有权限弹窗。
+- **相对放置挂到虚拟父放置**：虚拟父的真实位置由占位符决定，当前明确返回 `EINVAL`，不静默画错。
+- **历史放置的边界精确裁剪**：当前 `CSI 3 J` 删除所有负行号放置；Ghostty 支持按 `bl` 边界只删被擦除的部分。
 
 ## 附录 A：关键代码位置速查
 
