@@ -9,6 +9,7 @@
 //! - [`exec`]：命令执行与响应生成。
 
 pub mod animation;
+pub mod clipboard;
 pub mod command;
 pub mod exec;
 pub mod image;

@@ -660,6 +660,16 @@ impl Storage {
 
     /// 写入一个放置。
     pub fn place(&mut self, id: ImageId, placement_id: u32, placement: Placement) -> bool {
+        let parent_key = ParentRef {
+            image_id: id,
+            placement_id,
+        };
+        let old = self
+            .images
+            .get(&id)
+            .and_then(|stored| stored.placements.get(&placement_id))
+            .cloned();
+
         let Some(stored) = self.images.get_mut(&id) else {
             return false;
         };
@@ -671,8 +681,50 @@ impl Storage {
         {
             stored.placements.remove(&oldest);
         }
+        let new_row = placement.row;
+        let new_col = placement.col;
         stored.placements.insert(placement_id, placement);
+
+        // 重新放置父放置时，子相对放置跟着父原点平移（真实客户端会反复
+        // 重发 `a=p` 更新同一放置；不更新子放置会让它们留在旧位置）。
+        if let Some(old) = old {
+            let dr = new_row.saturating_sub(old.row);
+            let dc = i64::from(new_col) - i64::from(old.col);
+            if dr != 0 || dc != 0 {
+                self.shift_relative_children(parent_key, dr, dc);
+            }
+        }
         true
+    }
+
+    /// 把直接/间接挂在 `parent` 下的相对放置按 `(dr, dc)` 平移。
+    fn shift_relative_children(&mut self, parent: ParentRef, dr: i32, dc: i64) {
+        let mut pending = vec![parent];
+        let mut seen = 0usize;
+        while let Some(parent) = pending.pop() {
+            seen += 1;
+            if seen > 4096 {
+                return;
+            }
+            let mut children: Vec<ParentRef> = Vec::new();
+            for (id, stored) in self.images.iter_mut() {
+                for (pid, placement) in stored.placements.iter_mut() {
+                    if placement.relative_parent == Some(parent) {
+                        placement.row = placement.row.saturating_add(dr);
+                        placement.col = if dc >= 0 {
+                            placement.col.saturating_add(dc as u32)
+                        } else {
+                            placement.col.saturating_sub((-dc) as u32)
+                        };
+                        children.push(ParentRef {
+                            image_id: *id,
+                            placement_id: *pid,
+                        });
+                    }
+                }
+            }
+            pending.extend(children);
+        }
     }
 
     /// 取图像。

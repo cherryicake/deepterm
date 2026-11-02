@@ -1206,6 +1206,8 @@ pub struct Terminal {
     /// 本地路径的扫描发生在读线程内，UI 线程只读结果；远程路径的字节本来
     /// 就在 UI 线程解析，因此扫描器也放在这里（`None` = 本地/headless）。
     kitty_scanner: Option<crate::terminal::kitty::scanner::KittyGraphicsScanner>,
+    /// Kitty clipboard（OSC 5522）的写入事务状态。
+    kitty_clipboard: crate::terminal::kitty::clipboard::ClipboardState,
     last_content: TerminalContent,
     pub content_generation: u64,
     content_dirty: bool,
@@ -1403,6 +1405,7 @@ impl Terminal {
             kitty_generation: 0,
             last_kitty_generation: 0,
             kitty_scanner: None,
+            kitty_clipboard: Default::default(),
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -1620,6 +1623,7 @@ impl Terminal {
                 kitty_generation: 0,
                 last_kitty_generation: 0,
                 kitty_scanner: None,
+                kitty_clipboard: Default::default(),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
@@ -1798,6 +1802,7 @@ impl Terminal {
             kitty_generation: 0,
             last_kitty_generation: 0,
             kitty_scanner: None,
+            kitty_clipboard: Default::default(),
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -2132,6 +2137,7 @@ impl Terminal {
                 kitty_images_dirty: kitty_images_dirty.clone(),
                 kitty_generation: 0,
                 last_kitty_generation: 0,
+                kitty_clipboard: Default::default(),
                 kitty_scanner: Some(
                     crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage_and_geometry(
                         images.storage(),
@@ -3219,6 +3225,37 @@ impl Terminal {
         self.write_raw(&replies);
     }
 
+    /// 处理 Kitty clipboard（OSC 5522）请求。
+    ///
+    /// 写入/读取都走当前 GPUI 剪贴板；读取沿用 OSC 52 的既有信任模型
+    /// （应用运行在终端里即可读），不额外弹权限窗。协议错误由解析层编码
+    /// 成 `EINVAL`/`EFBIG` 回包。
+    fn handle_kitty_clipboard(&mut self, cx: &mut Context<Self>, content: &[u8]) {
+        use crate::terminal::kitty::clipboard::{self, Request};
+
+        let request = self.kitty_clipboard.handle(content);
+        if let Some(reply) = self.kitty_clipboard.take_reply() {
+            self.write_raw(&reply);
+        }
+        match request {
+            Request::None => {}
+            Request::Write { text, .. } => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            Request::Read {
+                id,
+                mimes,
+                list,
+                primary,
+            } => {
+                let text = cx.read_from_clipboard().and_then(|item| item.text());
+                let reply =
+                    clipboard::encode_read_response(&id, &mimes, list, primary, text.as_deref());
+                self.write_raw(&reply);
+            }
+        }
+    }
+
     /// 判定一条 OSC 是否由应用层消费。
     ///
     /// `cursor_at_sequence`：序列出现时刻的网格光标，由**读线程**在字节流里
@@ -3234,6 +3271,13 @@ impl Terminal {
         require_local_osc7_host: bool,
         cursor_at_sequence: Option<(i32, u32)>,
     ) -> bool {
+        // Kitty clipboard（OSC 5522）：解析/事务/应答编码在
+        // `kitty::clipboard`，这里只负责系统剪贴板读写与回写 PTY。
+        if let Some(rest) = osc_content.strip_prefix(b"5522;") {
+            self.handle_kitty_clipboard(cx, rest);
+            return true;
+        }
+
         // agent 事件与桌面通知**共用** OSC 777 信道，所以这一判定必须排在
         // `parse_notification_osc` 之前。理由（已核实）：后者在 `777;notify;`
         // 分支里会把 sentinel 负载切成 `title="deepterm://cli-agent"`、
@@ -6170,6 +6214,26 @@ mod tests {
             let consumed = t.try_handle_osc_sequence(cx, b"777;notify;Build;done", true, None);
             assert!(consumed, "本地 OSC 777 通知应由应用层消费");
         });
+    }
+
+    /// Kitty clipboard 的写入事务经 OSC 5522 提交后，系统剪贴板必须更新。
+    #[gpui::test]
+    fn kitty_clipboard_write_updates_system_clipboard(cx: &mut TestAppContext) {
+        use crate::terminal::kitty::command::encode_base64;
+
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            let mime = encode_base64(b"text/plain");
+            let payload = encode_base64(b"hello kitty");
+            let write = format!("5522;type=write:mime={mime};{payload}");
+            assert!(t.try_handle_osc_sequence(cx, write.as_bytes(), true, None));
+            assert!(t.try_handle_osc_sequence(cx, b"5522;type=wdata;", true, None));
+        });
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .expect("剪贴板应有文本");
+        assert_eq!(text, "hello kitty");
     }
 
     /// 应用层不认识的 OSC（调色板、标题、超链接…）必须被判为"未消费"。

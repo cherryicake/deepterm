@@ -2433,6 +2433,18 @@ mod tests {
     }
 
     #[test]
+    fn re_placing_parent_moves_relative_children() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (2, 3)).unwrap();
+        run(&mut store, "a=p,i=1,p=2,P=1,Q=1,H=1,V=1,C=1", (0, 0)).unwrap();
+        // 用同一个 p=1 重新放置父图到 (4,5)。
+        run(&mut store, "a=p,i=1,p=1,C=1", (4, 5)).unwrap();
+        let guard = store.lock_storage();
+        let child = guard.get(1).unwrap().placements.get(&2).unwrap();
+        assert_eq!((child.row, child.col), (5, 6), "子放置应跟随父原点平移");
+    }
+
+    #[test]
     fn relative_placement_reports_missing_parent() {
         let mut store = ImageStore::new(1024 * 1024);
         run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (0, 0)).unwrap();
