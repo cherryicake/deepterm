@@ -57,6 +57,32 @@ use crate::terminal::mappings::mouse::{
 /// 最大滚动缓冲区行数限制
 const MAX_SCROLLBACK_LINES: usize = 100000;
 
+/// 未配置时默认的 scrollback 行数（与旧行为一致）。
+const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+
+/// 单终端 scrollback 的物理字节预算。
+///
+/// alacritty 按“行”限额，宽窗口（250 列）会线性放大到 60 MB+；这里再按
+/// `32 + 24*cols` 折算行数，把每个终端的回滚内存压到约 32 MB 以内。
+/// 只缩不涨：窗口变窄时不重新分配，避免一次性申请几千行造成 RSS 尖峰。
+const SCROLLBACK_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// 按列数把“请求行数”折算到字节预算内。
+fn scrollback_lines_for_cols(requested: usize, cols: usize) -> usize {
+    let per_row = 32usize.saturating_add(cols.saturating_mul(24));
+    let by_budget = SCROLLBACK_BUDGET_BYTES / per_row.max(1);
+    requested.min(by_budget).min(MAX_SCROLLBACK_LINES)
+}
+
+/// 从设置读取请求的 scrollback 行数（设置未初始化时用默认值）。
+fn settings_scrollback_lines(cx: &App) -> usize {
+    cx.try_global::<crate::settings::SettingsStore>()
+        .and_then(|store| store.get::<crate::settings::content::TerminalContent>())
+        .map(|content| content.scrollback_lines)
+        .unwrap_or(DEFAULT_SCROLLBACK_LINES)
+        .min(MAX_SCROLLBACK_LINES)
+}
+
 /// 渲染侧连续跳过多少次网格锁之后，退回公平锁（见 `update_last_content`）。
 ///
 /// 取 4：足够吸收「读线程正在喂一个 chunk」的短暂窗口（一跳就是一帧），
@@ -760,6 +786,15 @@ pub struct TerminalContent {
     /// 当前生效调色板快照（主题基色 + 应用 OSC 4/10/11/12 改色叠加）。
     /// 见 [`crate::terminal::mappings::colors::TerminalPalette`]。
     pub palette: crate::terminal::mappings::colors::TerminalPalette,
+    /// 调色板内容指纹；行缓存复用必须同时比对它，否则 OSC 改色后
+    /// 会复用旧颜色。
+    pub palette_hash: u64,
+    /// 每个可见行的内容指纹（不含行号/坐标），供渲染层在全量 damage 时
+    /// 复用未变化的行缓存。长度恒等于 `row_ranges`。
+    pub row_hashes: Vec<u64>,
+    /// 本帧内容相对上一帧的滚动位移：`new[i] == old[i + scroll_shift]`。
+    /// 0 表示没有可识别的整体滚动（清屏/重绘/resize 等）。
+    pub scroll_shift: isize,
 }
 
 impl Default for TerminalContent {
@@ -778,7 +813,107 @@ impl Default for TerminalContent {
             viewport_lines: 24,
             selection_range: None,
             palette: Default::default(),
+            palette_hash: 0,
+            row_hashes: Vec::new(),
+            scroll_shift: 0,
         }
+    }
+}
+
+/// FNV-1a 混合一个 u64。
+#[inline]
+fn hash_mix(hash: &mut u64, value: u64) {
+    *hash ^= value;
+    *hash = hash.wrapping_mul(0x100_0000_01b3);
+}
+
+/// 把 `Color` 的判别式与负载混进指纹（vte 的 Color 没有实现 Hash）。
+#[inline]
+fn hash_color(hash: &mut u64, color: alacritty_terminal::vte::ansi::Color) {
+    use alacritty_terminal::vte::ansi::Color;
+    match color {
+        Color::Named(named) => {
+            hash_mix(hash, 0);
+            hash_mix(hash, named as u32 as u64);
+        }
+        Color::Spec(rgb) => {
+            hash_mix(hash, 1);
+            hash_mix(
+                hash,
+                u64::from(u32::from(rgb.r) << 16 | u32::from(rgb.g) << 8 | u32::from(rgb.b)),
+            );
+        }
+        Color::Indexed(index) => {
+            hash_mix(hash, 2);
+            hash_mix(hash, u64::from(index));
+        }
+    }
+}
+
+/// 一行可见内容的指纹：只覆盖影响排版/配色的字段，不含行号与坐标。
+///
+/// `hyperlink` 用 Arc 指针做身份：滚动的行是同一批 `IndexedCell` 的拷贝，
+/// Arc 不变；真正换了链接时指针会变，正是我们要的“内容变了”。
+fn row_content_hash(cells: &[IndexedCell]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for cell in cells {
+        let packed = &cell.cell;
+        hash_mix(&mut hash, packed.c as u64);
+        hash_color(&mut hash, packed.fg);
+        hash_color(&mut hash, packed.bg);
+        hash_mix(&mut hash, u64::from(packed.flags.bits()));
+        match packed.underline_color {
+            Some(color) => {
+                hash_mix(&mut hash, 1);
+                hash_color(&mut hash, color);
+            }
+            None => hash_mix(&mut hash, 0),
+        }
+        match cell.zerowidth {
+            Some(chars) => {
+                hash_mix(&mut hash, 1);
+                for ch in chars {
+                    hash_mix(&mut hash, ch as u64);
+                }
+            }
+            None => hash_mix(&mut hash, 0),
+        }
+        match &cell.hyperlink {
+            Some(link) => hash_mix(&mut hash, link.uri().as_ptr() as usize as u64),
+            None => hash_mix(&mut hash, 0),
+        }
+    }
+    hash
+}
+
+/// 在旧/新两帧的行指纹里找整体滚动位移。
+///
+/// 命中条件：至少 3/4 的行满足 `new[i] == old[i + shift]`。滚动 1 行时
+/// 59 行里通常有 58 行命中；清屏/全量重绘则接近 0，退回 0（不复用）。
+fn detect_scroll_shift(old: &[u64], new: &[u64]) -> isize {
+    let rows = old.len();
+    if rows < 4 || new.len() != rows {
+        return 0;
+    }
+    let mut best_shift = 0isize;
+    let mut best_matches = 0usize;
+    for shift in -(rows as isize - 1)..=(rows as isize - 1) {
+        let mut matches = 0usize;
+        for (index, new_hash) in new.iter().enumerate() {
+            let source = index as isize + shift;
+            if source >= 0 && (source as usize) < rows && *new_hash == old[source as usize] {
+                matches += 1;
+            }
+        }
+        if matches > best_matches {
+            best_matches = matches;
+            best_shift = shift;
+        }
+    }
+    if best_matches * 4 >= rows * 3 {
+        best_shift
+    } else {
+        0
     }
 }
 
@@ -953,7 +1088,7 @@ impl KittyImages {
 
     /// 只读访问存储（渲染/测试用）。持锁期间执行，勿在其中再取 `term` 锁。
     pub fn with_storage<R>(&self, f: impl FnOnce(&KittyStorage) -> R) -> R {
-        let guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        let guard = crate::terminal::kitty::storage::lock_unpoisoned(&self.storage);
         f(&guard)
     }
 
@@ -961,7 +1096,7 @@ impl KittyImages {
     /// 永远只读，因此这里的可变借用不会与渲染路径冲突。同样勿在其中取
     /// `term` 锁。
     pub fn with_storage_mut<R>(&self, f: impl FnOnce(&mut KittyStorage) -> R) -> R {
-        let mut guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        let mut guard = crate::terminal::kitty::storage::lock_unpoisoned(&self.storage);
         f(&mut guard)
     }
 }
@@ -974,6 +1109,14 @@ impl Default for KittyImages {
 
 pub struct Terminal {
     term: Arc<FairMutex<Term<ZedListener>>>,
+    /// 事件通道发送端，留在 UI 侧。
+    ///
+    /// `Term` 本身也持有一份，但读线程/解析线程退出时会 drop 它手里的
+    /// 最后一份（如果 UI 不持），`futures::mpsc` 关闭通道会唤醒 GPUI 任务，
+    /// 而这个唤醒发生在工作线程上——`#[gpui::test]` 会判成非确定性线程活动，
+    /// 真实运行时也会把终端生命周期绑在读线程退出顺序上。UI 持有发送端后，
+    /// 通道只在 `Terminal` 析构时关闭。
+    _listener: ZedListener,
     /// 本地 PTY 启动出来的首个子进程 pid，通常就是 shell 进程。
     pub child_process_id: Option<u32>,
     /// shell 所在的进程组 id，用来判断当前前台程序是否仍然是 shell。
@@ -1043,6 +1186,10 @@ pub struct Terminal {
     /// 本地读线程句柄。持有它以保证读线程存活至终端析构。
     /// 字段本身不被读取，故以下划线前缀标记。
     _local_reader: Option<crate::terminal::local_pty::LocalReader>,
+    /// PTY 模式 SSH 的句柄。`kill()` 必须显式 `close()`：只 drop 回调闭包
+    /// 会让事件循环的 sender 断开，alacritty 在收到 `Disconnected` 时
+    /// `panic!("event loop channel closed")`，而 `ssh` 子进程也可能挂着。
+    ssh_pty_terminal: Option<SshPtyTerminal>,
     /// Kitty 图形协议已存储的图像（本地路径：读线程写入，UI 线程只读渲染）。
     ///
     /// 远程路径下扫描发生在 UI 线程，直接由这里的扫描器更新。
@@ -1172,6 +1319,9 @@ pub struct Terminal {
     pub scrollbar_drag_offset: Rc<Cell<Option<Pixels>>>,
     /// Last time the terminal was scrolled (for scrollbar auto-hide)
     pub last_scroll_time: Cell<Instant>,
+    /// 用户/默认请求的 scrollback 行数；实际行数还会按
+    /// [`SCROLLBACK_BUDGET_BYTES`] 随列数折算。
+    scrollback_requested: usize,
     /// 终端类型（本地或远程）
     terminal_type: TerminalType,
     /// 远程终端输入回调（用于发送数据到SSH）
@@ -1185,16 +1335,13 @@ pub struct Terminal {
     /// 上一次 Wakeup 时观察到的焦点上报模式（DECSET ?1004）状态。
     /// 用于检测「应用刚开启焦点上报」的跳变，补发初始 `CSI I`。
     focus_mode_reported: bool,
+    /// Wakeup 时抢不到网格锁，焦点模式检查被推迟到下一次快照。
+    /// 这样 Wakeup 路径完全不阻塞在 `FairMutex` 上（9/25 采样主线程
+    /// 46.5% 的 `__psynch_cvwait` 就来自这里）。
+    focus_check_pending: bool,
 }
 
 impl Terminal {
-    /// scrollback 固定 10000 行（`MAX_SCROLLBACK_LINES` 内）。内存测量
-    /// （见 docs/PERF_*.md）表明这是占用与可用性的默认折中；测试与基准
-    /// 通过 [`Terminal::new_headless`] 参数化覆盖此值。
-    fn default_terminal_config() -> Config {
-        Self::terminal_config_with_scrollback(10_000)
-    }
-
     fn terminal_config_with_scrollback(scrollback_lines: usize) -> Config {
         Config {
             scrolling_history: scrollback_lines.min(MAX_SCROLLBACK_LINES),
@@ -1221,10 +1368,15 @@ impl Terminal {
         let listener = ZedListener(events_tx);
         let default_bounds = TerminalBounds::default();
         let config = Self::terminal_config_with_scrollback(scrollback_lines);
-        let term = Arc::new(FairMutex::new(Term::new(config, &default_bounds, listener)));
+        let term = Arc::new(FairMutex::new(Term::new(
+            config,
+            &default_bounds,
+            listener.clone(),
+        )));
 
         cx.new(|_cx| Self {
             term,
+            _listener: listener,
             child_process_id: None,
             #[cfg(unix)]
             shell_process_group_id: None,
@@ -1244,6 +1396,7 @@ impl Terminal {
             window_title: None,
             local_sender: None,
             _local_reader: None,
+            ssh_pty_terminal: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1285,12 +1438,14 @@ impl Terminal {
             scroll_px: px(0.0),
             scrollbar_drag_offset: Rc::new(Cell::new(None)),
             last_scroll_time: Cell::new(Instant::now()),
+            scrollback_requested: scrollback_lines.min(MAX_SCROLLBACK_LINES),
             terminal_type: TerminalType::Local,
             remote_input_callback: None,
             remote_resize_callback: None,
             russh_handle: None,
             focused: true,
             focus_mode_reported: false,
+            focus_check_pending: false,
         })
     }
 
@@ -1343,8 +1498,11 @@ impl Terminal {
                 return cx.new(|_cx| Self::create_error_terminal());
             }
         };
+        let scrollback_requested = settings_scrollback_lines(cx);
+        let scrollback_lines =
+            scrollback_lines_for_cols(scrollback_requested, default_bounds.num_columns());
         let term = Arc::new(FairMutex::new(Term::new(
-            Self::default_terminal_config(),
+            Self::terminal_config_with_scrollback(scrollback_lines),
             &default_bounds,
             listener.clone(),
         )));
@@ -1391,6 +1549,7 @@ impl Terminal {
             }),
         )
         .with_mode_1016_shared(local_mode_1016.clone());
+        let terminal_listener = listener.clone();
         let (local_reader, local_notices) = match crate::terminal::local_pty::LocalReader::spawn(
             pty,
             term.clone(),
@@ -1434,6 +1593,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                _listener: terminal_listener,
                 child_process_id,
                 #[cfg(unix)]
                 shell_process_group_id,
@@ -1453,6 +1613,7 @@ impl Terminal {
                 window_title: None,
                 local_sender: local_reader.as_ref().map(|r| r.sender()),
                 _local_reader: local_reader,
+                ssh_pty_terminal: None,
                 images,
                 kitty_replies,
                 kitty_images_dirty,
@@ -1496,12 +1657,14 @@ impl Terminal {
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
+                scrollback_requested,
                 terminal_type: TerminalType::Local,
                 remote_input_callback: None,
                 remote_resize_callback: None,
                 russh_handle: None,
                 focused: true,
                 focus_mode_reported: false,
+                focus_check_pending: false,
             }
         })
     }
@@ -1599,14 +1762,16 @@ impl Terminal {
     }
 
     fn create_error_terminal() -> Self {
+        let listener = ZedListener(unbounded().0);
         let term = Arc::new(FairMutex::new(Term::new(
             Config::default(),
             &TerminalBounds::default(),
-            ZedListener(unbounded().0),
+            listener.clone(),
         )));
 
         Self {
             term,
+            _listener: listener,
             child_process_id: None,
             #[cfg(unix)]
             shell_process_group_id: None,
@@ -1626,6 +1791,7 @@ impl Terminal {
             window_title: None,
             local_sender: None,
             _local_reader: None,
+            ssh_pty_terminal: None,
             images: KittyImages::default(),
             kitty_replies: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             kitty_images_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1667,12 +1833,14 @@ impl Terminal {
             scroll_px: px(0.0),
             scrollbar_drag_offset: Rc::new(Cell::new(None)),
             last_scroll_time: Cell::new(Instant::now()),
+            scrollback_requested: DEFAULT_SCROLLBACK_LINES,
             terminal_type: TerminalType::Local,
             remote_input_callback: None,
             remote_resize_callback: None,
             russh_handle: None,
             focused: true,
             focus_mode_reported: false,
+            focus_check_pending: false,
         }
     }
 
@@ -1715,9 +1883,12 @@ impl Terminal {
         let driver_listener = DriverListener(driver_tx);
 
         let default_bounds = TerminalBounds::default();
+        let scrollback_requested = settings_scrollback_lines(cx);
+        let scrollback_lines =
+            scrollback_lines_for_cols(scrollback_requested, default_bounds.num_columns());
 
         let term = Arc::new(FairMutex::new(Term::new(
-            Self::default_terminal_config(),
+            Self::terminal_config_with_scrollback(scrollback_lines),
             &default_bounds,
             listener.clone(),
         )));
@@ -1745,10 +1916,12 @@ impl Terminal {
             cx,
             ssh_config,
             term.clone(),
+            listener,
             events_rx,
             driver_rx,
             move |data| russh_for_input.write(data),
             move |cols, rows, _scale| russh_for_resize.resize(cols, rows),
+            scrollback_requested,
             Some(russh_for_status),
         )
     }
@@ -1765,13 +1938,17 @@ impl Terminal {
         let (driver_tx, driver_rx) = async_channel::bounded(2);
         let listener = ZedListener(events_tx.clone());
         let default_bounds = TerminalBounds::default();
+        let scrollback_requested = settings_scrollback_lines(cx);
+        let scrollback_lines =
+            scrollback_lines_for_cols(scrollback_requested, default_bounds.num_columns());
 
         let term = Arc::new(FairMutex::new(Term::new(
-            Self::default_terminal_config(),
+            Self::terminal_config_with_scrollback(scrollback_lines),
             &default_bounds,
             listener.clone(),
         )));
 
+        let terminal_listener = listener.clone();
         let (pty_terminal, proxy_outcome) = match SshPtyTerminal::new(
             ssh_config,
             default_bounds,
@@ -1838,10 +2015,11 @@ impl Terminal {
         // 未配置：丢掉发送端，driver_rx 立即结束（与改动前行为一致）。
         drop(driver_tx);
 
-        Self::create_remote_terminal(
+        let terminal = Self::create_remote_terminal(
             cx,
             ssh_config,
             term,
+            terminal_listener,
             events_rx,
             driver_rx,
             move |data| pty_input.write(data),
@@ -1859,8 +2037,15 @@ impl Terminal {
                 );
                 pty_resize.resize(bounds, scale);
             },
+            scrollback_requested,
             None,
-        )
+        );
+        // 保存一份句柄供 `kill()` 显式 close；输入/尺寸闭包里的克隆仍然
+        // 只是借用同一个 sender。
+        terminal.update(cx, |terminal, _| {
+            terminal.ssh_pty_terminal = Some(pty_terminal);
+        });
+        terminal
     }
 
     /// 通用远程终端实体创建（抽取 create_russh_terminal 和 create_ssh_pty_terminal 的公共部分）
@@ -1868,10 +2053,12 @@ impl Terminal {
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
         term: Arc<FairMutex<Term<ZedListener>>>,
+        listener: ZedListener,
         events_rx: UnboundedReceiver<AlacTermEvent>,
         driver_rx: async_channel::Receiver<DriverEvent>,
         input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
         resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
+        scrollback_requested: usize,
         russh_handle: Option<RusshTerminal>,
     ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
@@ -1915,6 +2102,7 @@ impl Terminal {
 
             Self {
                 term: term_clone,
+                _listener: listener,
                 child_process_id: None,
                 #[cfg(unix)]
                 shell_process_group_id: None,
@@ -1934,6 +2122,7 @@ impl Terminal {
                 window_title: None,
                 local_sender: None,
                 _local_reader: None,
+                ssh_pty_terminal: None,
                 // 复用上面交给扫描器的那三份共享句柄：扫描器（写）与渲染/
                 // 应答路径（读）必须是**同一个** `Arc`，否则 SSH 下图像永远
                 // 渲染不出来、应答也发不出去。它们在外层创建，此处克隆
@@ -1989,6 +2178,7 @@ impl Terminal {
                 scroll_px: px(0.0),
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
+                scrollback_requested,
                 terminal_type: TerminalType::Remote {
                     host: ssh_config_clone.host.clone(),
                     username: ssh_config_clone.username.clone(),
@@ -1999,6 +2189,7 @@ impl Terminal {
                 russh_handle,
                 focused: true,
                 focus_mode_reported: false,
+            focus_check_pending: false,
             }
         })
     }
@@ -2263,12 +2454,11 @@ impl Terminal {
     }
 
     /// 若应用已开启焦点上报，按当前聚焦状态发送一次 `CSI I` / `CSI O`。
+    ///
+    /// 用最后一次快照里的 mode，而不是再取一次 `term.lock()`：焦点切换
+    /// 可能发生在读线程持 lease 期间，这里排队等锁会把整个 UI 卡住。
     fn report_focus_state(&mut self) {
-        let mode = {
-            let term = self.term.lock();
-            *term.mode()
-        };
-        if mode.contains(TermMode::FOCUS_IN_OUT) {
+        if self.last_content.mode.contains(TermMode::FOCUS_IN_OUT) {
             // write_raw：应用应答通道不应维护输入区锚点。
             let bytes: &[u8] = if self.focused { b"\x1b[I" } else { b"\x1b[O" };
             self.write_raw(bytes);
@@ -2367,14 +2557,32 @@ impl Terminal {
 
     /// 比较焦点上报模式位与上次快照，捕获应用 DECSET ?1004h 的开启跳变，
     /// 按需补发当前焦点状态（xterm 约定：开启时立即上报一次基线）。
+    ///
+    /// Wakeup 路径不能阻塞在网格锁上：`try_lock_unfair` 拿不到就置
+    /// `focus_check_pending`，等下一次 `update_last_content` 持锁时补检。
+    /// 这样既不会漏掉「应用刚开启 1004」的跳变沿，也不会让读线程的 lease
+    /// 把 UI 卡在 `__psynch_cvwait`（9/25 采样 46.5%）。
     fn check_focus_mode_enabled(&mut self) {
-        let focus_mode_now = {
-            let term = self.term.lock();
-            term.mode().contains(TermMode::FOCUS_IN_OUT)
+        let mode = match self.term.try_lock_unfair() {
+            Some(term) => *term.mode(),
+            None => {
+                self.focus_check_pending = true;
+                return;
+            }
         };
+        self.apply_focus_mode(mode);
+    }
+
+    /// 根据一份已读到的 mode 更新焦点上报状态。
+    fn apply_focus_mode(&mut self, mode: TermMode) {
+        self.focus_check_pending = false;
+        let focus_mode_now = mode.contains(TermMode::FOCUS_IN_OUT);
         if focus_mode_now != self.focus_mode_reported {
             self.focus_mode_reported = focus_mode_now;
             if focus_mode_now {
+                // `report_focus_state` 只读 last_content.mode，不会再加锁；
+                // 这里把刚读到的 mode 先写进快照，保证基线报得出去。
+                self.last_content.mode = mode;
                 self.report_focus_state();
             }
         }
@@ -2845,6 +3053,13 @@ impl Terminal {
         // 把合法序列透传给 vte 而丢失图像。
         const MAX_PENDING_APC: usize = crate::terminal::kitty::command::MAX_COMMAND_BYTES;
 
+        // 纯文本快速路径：没有 ESC 且没有残尾时，不可能出现 OSC/APC/CSI，
+        // 直接喂 vte。旧代码仍会跑 3 次 memmem 查找，且每次都重建 searcher。
+        if self.pending_osc.is_empty() && memchr::memchr(0x1b, data).is_none() {
+            self.advance_vte(data);
+            return;
+        }
+
         // 有跨 chunk 残尾时先拼接（拷贝一次，仅在有残尾时发生）。
         let pending = std::mem::take(&mut self.pending_osc);
         let joined: Vec<u8>;
@@ -2855,9 +3070,9 @@ impl Terminal {
             joined.as_slice()
         };
 
-        let next_osc = memchr::memmem::find(data, escape_scan::OSC_START);
-        let next_apc = memchr::memmem::find(data, escape_scan::APC_START);
-        let next_csi = memchr::memmem::find(data, escape_scan::CSI_START);
+        let next_osc = escape_scan::OSC_FINDER.find(data);
+        let next_apc = escape_scan::APC_FINDER.find(data);
+        let next_csi = escape_scan::CSI_FINDER.find(data);
         if next_osc.is_none() && next_apc.is_none() && next_csi.is_none() {
             self.advance_vte(data);
             return;
@@ -2880,8 +3095,8 @@ impl Terminal {
         let mut pos = 0;
         loop {
             // 下一个起始符（OSC / APC 中较早者）。
-            let osc_offset = memchr::memmem::find(&data[pos..], escape_scan::OSC_START);
-            let apc_offset = memchr::memmem::find(&data[pos..], escape_scan::APC_START);
+            let osc_offset = escape_scan::OSC_FINDER.find(&data[pos..]);
+            let apc_offset = escape_scan::APC_FINDER.find(&data[pos..]);
             let (offset, is_apc) = match (osc_offset, apc_offset) {
                 (Some(o), Some(a)) => {
                     if a < o {
@@ -3524,6 +3739,8 @@ impl Terminal {
 
         let content = term.renderable_content();
         let display_offset = content.display_offset;
+        // 先拷贝 mode：快照结束、锁释放后还要用它补检焦点上报跳变。
+        let mode = content.mode;
 
         // ── 视口快照：只有 `Partial` damage 时按行增量刷新 ──────────────────
         //
@@ -3542,10 +3759,14 @@ impl Terminal {
         //   这里仍显式比对一次，作为不依赖上游实现的自身防线；
         // - 视口行列数变了（resize 的 reflow 可能早于 damage 被观察）同样是
         //   全量，否则行切片长度会对不上。
-        let geometry_changed = self.last_content.cols != num_cols
-            || self.last_content.rows != num_rows
-            || self.last_content.display_offset != display_offset;
+        let size_changed = self.last_content.cols != num_cols || self.last_content.rows != num_rows;
+        let offset_changed = self.last_content.display_offset != display_offset;
+        let geometry_changed = size_changed || offset_changed;
         let rebuild_all = full_damage || geometry_changed;
+
+        // 全量重建前留下上一帧的行指纹，用于识别“滚动位移”；部分更新
+        // 没有整体位移，直接按新行重算。
+        let previous_row_hashes = std::mem::take(&mut self.last_content.row_hashes);
 
         let cells = &mut self.last_content.cells;
         let row_ranges = &mut self.last_content.row_ranges;
@@ -3603,6 +3824,33 @@ impl Terminal {
             }
         }
 
+        // 行指纹：全量帧用于识别滚动位移（把整行缓存平移复用），
+        // 部分帧也重算一遍，保证下一帧的滚动检测有正确的 old 基准。
+        let (row_hashes, scroll_shift) = if rebuild_all {
+            let mut hashes = Vec::with_capacity(row_ranges.len());
+            for (start, end) in row_ranges.iter() {
+                hashes.push(row_content_hash(&cells[*start..*end]));
+            }
+            // 只有视口行列变化时不能复用；display_offset 变化（用户滚动）
+            // 正是行缓存平移最该生效的场景。
+            let shift = if size_changed {
+                0
+            } else {
+                detect_scroll_shift(&previous_row_hashes, &hashes)
+            };
+            (hashes, shift)
+        } else {
+            // 部分更新复用上一帧的 Vec，保证「无变化帧零分配」仍然成立。
+            let mut hashes = previous_row_hashes;
+            hashes.clear();
+            for (start, end) in row_ranges.iter() {
+                hashes.push(row_content_hash(&cells[*start..*end]));
+            }
+            (hashes, 0)
+        };
+        self.last_content.row_hashes = row_hashes;
+        self.last_content.scroll_shift = scroll_shift;
+
         self.last_content.cursor = content.cursor.point;
         let cursor_grid_cell: &alacritty_terminal::term::cell::Cell =
             &term.grid()[content.cursor.point];
@@ -3622,12 +3870,21 @@ impl Terminal {
         // term lock a second time per frame.
         self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
         // 调色板快照：OSC 4/10/11/12 改色 / 重置与主题切换都在此同步到渲染路径。
-        self.last_content.palette =
+        let palette =
             crate::terminal::mappings::colors::TerminalPalette::from_colors(term.colors());
+        self.last_content.palette_hash = palette.hash_u64();
+        self.last_content.palette = palette;
 
         // 链接（URL / OSC8 / 文件路径）不再随每帧输出维护缓存：
         // 消费方只有 hover 命中测试，按需用 `last_content.cells` 现算，
         // 既不会因为「缓存由过期快照重建」而认错，也省掉了每帧扫描。
+
+        // Wakeup 时抢不到锁而推迟的焦点模式检查，在这里补上（此时锁在手，
+        // 但报告只读快照，不会二次加锁）。
+        drop(term);
+        if self.focus_check_pending {
+            self.apply_focus_mode(mode);
+        }
 
         // 快照已与本帧的网格对齐（调用方据此清除 `content_dirty`）。
         true
@@ -4094,11 +4351,16 @@ impl Terminal {
     /// - 本地 PTY：向读线程发送 `Shutdown`，读线程退出并释放 `Pty`（回收 shell 子进程）。
     /// - russh 远程：发送 `InputMsg::Close`（连接任务仅在收到 Close 或发送端断开时退出；
     ///   仅 drop `RusshTerminal` 无法终止连接，因为 `state` 被任务自身持有）。
-    /// - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，随 `Terminal` 析构自动释放。
+    /// - PTY 模式远程：显式 `close()` 发 `Shutdown`；只靠 drop 回调闭包会让
+    ///   alacritty 事件循环在 channel 断开时 panic，且 ssh 子进程可能挂着。
     pub fn kill(&mut self) {
         // 本地终端：通知读线程退出，释放 PTY / 回收 shell 子进程。
         if let Some(sender) = &self.local_sender {
             sender.shutdown();
+        }
+        // PTY 模式 SSH：显式关闭事件循环与 ssh 子进程。
+        if let Some(pty) = &self.ssh_pty_terminal {
+            pty.close();
         }
         // russh 远程：显式关闭 SSH 连接
         if let Some(russh) = &self.russh_handle {
@@ -4207,6 +4469,14 @@ impl Terminal {
         if grid_changed {
             {
                 let mut term = self.term.lock();
+                // 宽窗口会把“按行”的历史线性放大（250 列 × 10k 行 ≈ 60 MB）。
+                // 必须在 reflow **之前**按新列数缩历史：否则 resize 会先把
+                // 10k 行全部扩到 250 列，峰值仍然顶到 60 MB，缩完才降下来。
+                // 只缩不涨，避免窗口变窄时重新申请几千行。
+                let desired = scrollback_lines_for_cols(self.scrollback_requested, cols);
+                if term.grid().history_size() > desired {
+                    term.set_options(Self::terminal_config_with_scrollback(desired));
+                }
                 term.resize(alacritty_terminal::term::test::TermSize::new(cols, rows));
             }
             // 对应 ghostty `Terminal.resize` 尾部的 `flags.dirty.clear = true`：
@@ -4265,6 +4535,28 @@ impl Terminal {
 
     pub fn last_content(&self) -> &TerminalContent {
         &self.last_content
+    }
+
+    /// 每个可见行的内容指纹（与 `last_content().row_ranges` 等长）。
+    pub fn row_hashes(&self) -> &[u64] {
+        &self.last_content.row_hashes
+    }
+
+    /// 本帧相对上一帧的滚动位移；0 = 无整体滚动。
+    pub fn scroll_shift(&self) -> isize {
+        self.last_content.scroll_shift
+    }
+
+    /// 释放可重建的视口快照缓冲（隐藏标签用）。
+    ///
+    /// 只丢弃 `cells/row_ranges/row_hashes` 的堆容量，不碰网格；下一帧
+    /// `content_dirty` 会走全量重建。
+    pub fn release_snapshot_buffers(&mut self) {
+        self.last_content.cells = Vec::new();
+        self.last_content.row_ranges = Vec::new();
+        self.last_content.row_hashes = Vec::new();
+        self.last_content.scroll_shift = 0;
+        self.content_dirty = true;
     }
 
     /// 收集视口里的 Unicode 占位符单元格（Kitty 图形协议 `U=1`）。
@@ -5021,7 +5313,7 @@ impl Drop for Terminal {
         //   （触发 SIGHUP / `ClosePseudoConsole`，回收 shell 子进程）。
         // - russh 远程：连接任务仅在收到 `InputMsg::Close`（或发送端断开）时退出，
         //   仅 drop `RusshTerminal` 无法终止连接，必须显式 `close()`。
-        // - PTY 模式远程：`SshPtyTerminal` 由 remote 回调闭包持有，会随 `Terminal` 析构释放。
+        // - PTY 模式远程：显式 `close()`，否则事件循环在 sender 断开时 panic。
         self.kill();
     }
 }
@@ -5196,6 +5488,76 @@ mod tests {
     use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[gpui::test]
+    fn focus_check_never_blocks_on_grid_lock(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |terminal, _cx| {
+            // 模拟读线程持 lease/网格锁：Wakeup 里的检查必须立刻返回并置
+            // pending，而不是排队等锁。克隆 Arc 只是为了让 guard 不借用
+            // `terminal` 本身，避免与下面的 `&mut` 调用冲突。
+            let term = terminal.term.clone();
+            let guard = term.lock();
+            let started = std::time::Instant::now();
+            terminal.check_focus_mode_enabled();
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "拿不到网格锁时不应阻塞"
+            );
+            assert!(terminal.focus_check_pending);
+            drop(guard);
+
+            // 锁释放后的下一轮检查应清掉 pending，并正常应用模式。
+            terminal.check_focus_mode_enabled();
+            assert!(!terminal.focus_check_pending);
+        });
+    }
+
+    #[test]
+    fn scrollback_budget_shrinks_wide_windows_only() {
+        // 31 列默认几何下 10k 行仍在 32 MB 预算内。
+        assert_eq!(super::scrollback_lines_for_cols(10_000, 31), 10_000);
+        // 250 列：每行 32 + 24*250 = 6032 B，32 MB / 6032 ≈ 5563 行。
+        let wide = super::scrollback_lines_for_cols(10_000, 250);
+        assert!((5_000..=5_800).contains(&wide), "wide={wide}");
+        // 用户显式配置更小时不放大。
+        assert_eq!(super::scrollback_lines_for_cols(2_000, 31), 2_000);
+        // 不允许超过全局上限。
+        assert!(super::scrollback_lines_for_cols(usize::MAX, 31) <= super::MAX_SCROLLBACK_LINES);
+    }
+
+    #[gpui::test]
+    fn user_scroll_exposes_positive_shift(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            let mut bytes = Vec::new();
+            for i in 0..80 {
+                bytes.extend_from_slice(format!("line {i}\r\n").as_bytes());
+            }
+            t.handle_remote_data(&bytes, cx);
+            t.sync_for_test(cx);
+            assert!(t.scroll_shift() == 0, "首次快照不应有位移");
+
+            t.scroll_line_up();
+            t.sync_for_test(cx);
+            // 视口向历史方向移动：新第 i 行 = 旧第 i-1 行，位移是 -1。
+            assert_eq!(t.scroll_shift(), -1, "上滚一行应识别为 -1");
+        });
+    }
+
+    #[test]
+    fn detect_scroll_shift_recognizes_one_line_and_clear() {
+        let old = [1u64, 2, 3, 4, 5, 6];
+        // 上滚一行：新行 = 旧行 i+1，最后一行是全新内容。
+        let new = [2u64, 3, 4, 5, 6, 99];
+        assert_eq!(super::detect_scroll_shift(&old, &new), 1);
+        // 下滚一行：新行 = 旧行 i-1。
+        let new = [99u64, 1, 2, 3, 4, 5];
+        assert_eq!(super::detect_scroll_shift(&old, &new), -1);
+        // 清屏/无关重绘：不应误判成滚动。
+        let new = [99u64, 98, 97, 96, 95, 94];
+        assert_eq!(super::detect_scroll_shift(&old, &new), 0);
+    }
 
     #[test]
     fn search_finds_matches_across_scrollback_case_folded() {
@@ -5558,6 +5920,10 @@ mod tests {
                 "本地终端必须持有 LocalReader 的 sender，否则输入被静默丢弃"
             );
         });
+        // 显式 drop：LocalReader 会 join gather/parse，确保线程在 GPUI 测试
+        // 调度器检查前退出；否则 parser 线程退出时 drop listener 唤醒 UI
+        // 任务，会被 `#[gpui::test]` 判成「非确定性线程活动」。
+        drop(terminal);
     }
 
     /// 计时器的等待时间必须按「离待办还有多久」算。
@@ -7550,6 +7916,9 @@ mod tests {
             viewport_lines: 4,
             selection_range: None,
             palette: Default::default(),
+            palette_hash: 0,
+            row_hashes: Vec::new(),
+            scroll_shift: 0,
         };
         let renderable = term.renderable_content();
         content

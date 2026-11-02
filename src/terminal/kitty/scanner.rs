@@ -472,6 +472,37 @@ impl PtyScanner for KittyGraphicsScanner {
         emit: &mut dyn FnMut(&[u8]),
         grid: &mut dyn FnMut() -> GridState,
     ) {
+        // APC 残尾的增量追加：大图分片会跨几十次 read，旧逻辑每次把整个
+        // pending 复制/重扫一遍（O(n²)）。这里只追加新字节，并只在新增部分
+        // 找 ST；完整后再把序列之后的剩余字节递归走正常扫描。
+        if pending.starts_with(escape_scan::APC_START) {
+            let old_len = pending.len();
+            pending.extend_from_slice(data);
+            if pending.len() > MAX_PENDING_APC {
+                // 残尾过大：放弃这条 APC，原样交给 vte（与旧逻辑一致）。
+                emit(pending);
+                pending.clear();
+                return;
+            }
+            // 从旧尾部前 1 字节开始找：ESC 可能正好落在上次读的最后一个字节。
+            let search_from = old_len.saturating_sub(1).max(escape_scan::APC_START.len());
+            if let Some(offset) = escape_scan::APC_END_FINDER.find(&pending[search_from..]) {
+                let end = search_from + offset;
+                let state = grid();
+                self.cursor = state.cursor;
+                self.store.set_visible_rows(Some(state.visible));
+                self.handle_apc(&pending[escape_scan::APC_START.len()..end]);
+                let consumed = end + 2;
+                let remainder = pending[consumed..].to_vec();
+                pending.clear();
+                if !remainder.is_empty() {
+                    self.scan(&remainder, pending, emit, grid);
+                }
+                return;
+            }
+            return;
+        }
+
         // 有跨读残尾时先拼接（仅在确有残尾时拷贝一次）。
         let joined: Vec<u8>;
         let data: &[u8] = if pending.is_empty() {
@@ -482,6 +513,15 @@ impl PtyScanner for KittyGraphicsScanner {
             joined = v;
             joined.as_slice()
         };
+
+        // 纯文本快速路径：没有 ESC 就不可能有 OSC/APC/CSI/探测序列。
+        // 旧代码在这条路径上仍要跑 6 组探测查找 + 2 次 OSC/APC 查找，
+        // 每块付 8 次 `Finder` 构建；`cat`/日志/`yes` 这类负载里这是
+        // 读线程最大的无谓开销（9/25 采样 12× 微基准）。
+        if memchr::memchr(0x1b, data).is_none() {
+            emit(data);
+            return;
+        }
 
         // 探测类序列（`CSI 16 t` / `DECSET ?2048` / XTVERSION / DA2）先处理
         // 并摘除。
@@ -497,8 +537,8 @@ impl PtyScanner for KittyGraphicsScanner {
         // OSC 与 APC 必须**单趟按位置推进**处理，不能「先把 OSC 全摘掉、
         // 再走 APC 循环」：两条序列可能交替出现，两趟扫描会让某一趟看到的位置
         // 与另一趟错位，跨读残尾（`pending`）也会被写成后一趟的错误后缀。
-        let next_osc = memchr::memmem::find(data, escape_scan::OSC_START);
-        let next_apc = memchr::memmem::find(data, escape_scan::APC_START);
+        let next_osc = escape_scan::OSC_FINDER.find(data);
+        let next_apc = escape_scan::APC_FINDER.find(data);
 
         // 两者都没有：整段透传（摘下尺寸序列后）。
         if next_osc.is_none() && next_apc.is_none() {
@@ -508,8 +548,8 @@ impl PtyScanner for KittyGraphicsScanner {
 
         let mut pos = 0;
         loop {
-            let osc_offset = memchr::memmem::find(&data[pos..], escape_scan::OSC_START);
-            let apc_offset = memchr::memmem::find(&data[pos..], escape_scan::APC_START);
+            let osc_offset = escape_scan::OSC_FINDER.find(&data[pos..]);
+            let apc_offset = escape_scan::APC_FINDER.find(&data[pos..]);
             let (offset, is_apc) = match (osc_offset, apc_offset) {
                 (Some(o), Some(a)) => {
                     if a < o {
@@ -1210,6 +1250,32 @@ mod tests {
     /// 与 printf 的分片大小（4096 + 头尾）不对齐，`scan` 每次都要把
     /// `pending` 和半截 APC 拼起来。若残尾处理有偏差，整条流会被当成
     /// 一个巨大 APC 消费掉，既不进 vte 也进不了存储。
+    #[test]
+    fn apc_pending_incremental_path_handles_many_tiny_chunks() {
+        let storage = shared_storage();
+        let mut scanner = KittyGraphicsScanner::with_storage(
+            storage.clone(),
+            true,
+            Box::new(CollectingSink::default()),
+        );
+
+        // 1x1 RGBA，走 f=24 直传；切成 2 字节一块，保证起始符 `ESC _`
+        // 不被拆开，同时强制 payload 每次都走 APC 残尾路径。
+        let apc = b"\x1b_Ga=t,f=24,s=1,v=1,i=42;AAAA\x1b\\";
+        let chunks: Vec<&[u8]> = apc.chunks(2).collect();
+        let (emitted, pendings) = run_scan_chunked(&mut scanner, &chunks);
+
+        assert!(emitted.is_empty(), "APC 不应进入 vte");
+        assert!(
+            pendings
+                .iter()
+                .all(|p| p.starts_with(b"\x1b_") || p.is_empty()),
+            "残尾必须始终以 APC 起始符开头"
+        );
+        let guard = crate::terminal::kitty::storage::lock_unpoisoned(&storage);
+        assert!(guard.get(42).is_some(), "完整 APC 应写入存储");
+    }
+
     #[test]
     fn chunked_protocol_across_read_boundaries_survives() {
         let storage = shared_storage();

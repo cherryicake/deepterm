@@ -1758,6 +1758,20 @@ impl TerminalView {
         self.kitty_image_cache.take_all()
     }
 
+    /// 标签页被切到后台时释放可重建的渲染缓冲（视口快照 + 行缓存）。
+    ///
+    /// 不杀进程、不清终端网格；重新切回时 `content_dirty` 会让下一帧重建
+    /// 快照。隐藏标签通常有几十个，每个省 1–2 MB，长期挂很多标签时是可观
+    /// 的常驻内存。Kitty GPU 纹理需要 `Window` 才能 `drop_image`，单独在
+    /// 关闭路径处理。
+    pub fn release_background_memory(&mut self, cx: &mut Context<Self>) {
+        self.row_render_cache.clear();
+        self.flattened_render_cache = Default::default();
+        self.terminal.update(cx, |terminal, _| {
+            terminal.release_snapshot_buffers();
+        });
+    }
+
     pub fn working_directory(&self) -> Option<&PathBuf> {
         self.working_directory.as_ref()
     }

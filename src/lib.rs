@@ -757,9 +757,11 @@ impl AppWindow {
         // 关窗会销毁本窗口的 AppWindow，防抖任务随之丢失，必须同步落盘。
         let app_window_weak = cx.entity().downgrade();
         workspace.update(cx, |ws, _cx| {
-            ws.set_on_last_tab_close(Box::new(move |cx| {
+            ws.set_on_last_tab_close(Box::new(move |cx, default_state| {
                 if let Some(app) = app_window_weak.upgrade() {
-                    app.update(cx, |app, cx| app.flush_pending_save(cx));
+                    app.update(cx, |app, cx| {
+                        app.flush_pending_save_with_default(default_state, cx)
+                    });
                 }
             }));
         });
@@ -826,7 +828,16 @@ impl AppWindow {
         self.sync_sidebar_tab_groups(cx);
     }
 
-    fn session_state(&self, cx: &mut Context<Self>) -> AppSessionState {
+    /// 构造完整窗口会话状态；默认标签页组的状态由调用方提供。
+    ///
+    /// 关窗路径上 `default_workspace` 正在被 `do_tab_close` 更新，不能再
+    /// `read(cx)`；调用方（`Workspace::before_window_remove`）已经在自己
+    /// 的 `&mut self` 里算好了这份状态。
+    fn session_state_with_default(
+        &self,
+        default_state: WorkspaceSessionState,
+        cx: &mut Context<Self>,
+    ) -> AppSessionState {
         let active_group_id = self.active_tab_group_id();
         let mut groups = Vec::with_capacity(self.tab_group_workspaces.len() + 1);
 
@@ -834,7 +845,7 @@ impl AppWindow {
             id: DEFAULT_TAB_GROUP_ID.to_string(),
             label: Some("标签页".to_string()),
             collapsed: false,
-            workspace: Some(self.default_workspace.read(cx).session_state(cx)),
+            workspace: Some(default_state),
         });
 
         let sidebar_groups = self.sidebar.read(cx).tab_group_states();
@@ -869,13 +880,24 @@ impl AppWindow {
     }
 
     fn save_session(&mut self, cx: &mut Context<Self>) {
+        let default_state = self.default_workspace.read(cx).session_state(cx);
+        self.save_session_with_default(default_state, cx);
+    }
+
+    /// 落盘会话；默认标签页组的状态由调用方提供，避免重入读
+    /// `default_workspace`（关窗路径正在 `&mut` 更新它）。
+    fn save_session_with_default(
+        &mut self,
+        default_state: WorkspaceSessionState,
+        cx: &mut Context<Self>,
+    ) {
         // 只有主窗口写盘：多窗口共用 session_state.json，
         // 若各窗口都写，后写者会整体覆盖其他窗口的标签页与 SSH 会话。
         if !self.ensure_session_ownership(cx) {
             log::debug!("跳过会话落盘：本窗口不是主窗口");
             return;
         }
-        let session = self.session_state(cx);
+        let session = self.session_state_with_default(default_state, cx);
         if let Err(error) = self.persistence.save_session(&session) {
             log::warn!("Failed to save session state: {error}");
         }
@@ -946,8 +968,20 @@ impl AppWindow {
     /// 同步落盘会话并取消防抖任务。退出/关窗前调用，
     /// 避免防抖窗口内的最后变更丢失。
     pub fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
+        let default_state = self.default_workspace.read(cx).session_state(cx);
+        self.flush_pending_save_with_default(default_state, cx);
+    }
+
+    /// 与 [`Self::flush_pending_save`] 相同，但默认标签页组状态由
+    /// `Workspace::before_window_remove` 预先算好，避免在 Workspace
+    /// 正在更新时重入 `read(cx)`。
+    pub fn flush_pending_save_with_default(
+        &mut self,
+        default_state: WorkspaceSessionState,
+        cx: &mut Context<Self>,
+    ) {
         self.pending_save_task.take();
-        self.save_session(cx);
+        self.save_session_with_default(default_state, cx);
     }
 
     fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {

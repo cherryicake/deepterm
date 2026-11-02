@@ -1212,6 +1212,10 @@ impl TextElement {
             if runs_len < text_bytes {
                 runs.push(base_style.clone().to_run(text_bytes - runs_len));
             }
+            // 语法高亮 span 可能重叠（同一段被多个 style 覆盖），拼出的
+            // runs 会超过行文本长度；不截断会在 GPUI shape_line 里
+            // split_at 越界 panic。
+            normalize_runs_for_text(&mut runs, &line_text);
 
             let shaped_text = window.text_system().shape_line(
                 SharedString::from(line_text),
@@ -1811,7 +1815,7 @@ impl TextElement {
                 } else {
                     Vec::new()
                 };
-                let runs = if tail_runs.is_empty() {
+                let mut runs = if tail_runs.is_empty() {
                     vec![TextRun {
                         len: tail_text.len(),
                         font: text_style.font(),
@@ -1823,6 +1827,9 @@ impl TextElement {
                 } else {
                     tail_runs
                 };
+                // 折叠 tail 的 highlight spans 可能相互重叠，拼出的 runs
+                // 会超过 tail_text；截断，避免 shape_line 的 split_at 越界。
+                normalize_runs_for_text(&mut runs, tail_text.as_ref());
                 Some(
                     window
                         .text_system()
@@ -1957,12 +1964,12 @@ impl TextElement {
         let buffer_lines = state.display_map.lines();
 
         if is_single_line {
-            let shaped_line = window.text_system().shape_line(
-                display_text.to_string().into(),
-                font_size,
-                runs,
-                None,
-            );
+            let text: SharedString = display_text.to_string().into();
+            let mut owned_runs = runs.to_vec();
+            normalize_runs_for_text(&mut owned_runs, text.as_ref());
+            let shaped_line = window
+                .text_system()
+                .shape_line(text, font_size, &owned_runs, None);
 
             let line_layout = LineLayout::new()
                 .lines(smallvec::smallvec![shaped_line])
@@ -1976,12 +1983,13 @@ impl TextElement {
             return text
                 .split("\n")
                 .map(|line| {
-                    let shaped_line = window.text_system().shape_line(
-                        SharedString::from(line.to_string()),
-                        font_size,
-                        runs,
-                        None,
-                    );
+                    let text: SharedString = line.to_string().into();
+                    let mut owned_runs = runs.to_vec();
+                    normalize_runs_for_text(&mut owned_runs, text.as_ref());
+                    let shaped_line =
+                        window
+                            .text_system()
+                            .shape_line(text, font_size, &owned_runs, None);
                     LineLayout::new()
                         .lines(smallvec::smallvec![shaped_line])
                         .with_whitespaces(whitespace_indicators.clone())
@@ -2022,7 +2030,7 @@ impl TextElement {
             let mut wrapped_lines = SmallVec::with_capacity(1);
 
             for range in &line_item.wrapped_lines {
-                let line_runs = runs_for_range(runs, run_offset, range);
+                let mut line_runs = runs_for_range(runs, run_offset, range);
 
                 // Defensive checks to avoid panics from out-of-sync display map
                 if range.start > line_text.len()
@@ -2059,6 +2067,10 @@ impl TextElement {
                         first_line_start
                     );
                 }
+                // 高亮 span 与文本失同步时 runs 可能比 sub_line 长；
+                // GPUI 的 layout_line 会按 run.len 逐段 split_at，
+                // 超长即 slice_error_fail abort。这里必须先截断再整形。
+                normalize_runs_for_text(&mut line_runs, sub_line.as_ref());
                 let shaped_line = window
                     .text_system()
                     .shape_line(sub_line, font_size, &line_runs, None);
@@ -3734,7 +3746,10 @@ impl TextElement {
                         gpui::SharedString::from(hint.text.clone()),
                         inlay_font_size,
                         &[TextRun {
-                            len: hint.text.chars().count(),
+                            // TextRun.len 是 UTF-8 字节数，不是字符数：中文
+                            // inlay hint 用 chars().count() 会少算字节，尾部字符
+                            // 拿不到字体/颜色。
+                            len: hint.text.len(),
                             font: inlay_font.clone(),
                             color: cx.theme().ui.text_muted,
                             background_color: None,
@@ -4674,6 +4689,32 @@ fn visible_row_for_offset(offsets: &[usize], offset: usize, visible_end: usize) 
         let end = offsets.get(i + 1).copied().unwrap_or(visible_end);
         (offset >= *start && offset < end).then_some(i)
     })
+}
+
+/// 把 runs 归一化为「累计长度不超过 `text`，且每段都落在 char 边界」。
+///
+/// GPUI 的 `AppleTextSystem::layout_line` 会对每个 run 做
+/// `text.split_at(run.len)`；累计长度超过文本字节数、或切点落在多字节
+/// 字符中间，都会触发 `slice_error_fail` 并 abort 整个应用。高亮/折叠/
+/// 粘性行等路径的 span 来自缓存或与文本不同步时，完全可能拼出这种 runs，
+/// 所以进入 `shape_line` 前统一做一次防御性归一化。
+pub(super) fn normalize_runs_for_text(runs: &mut Vec<TextRun>, text: &str) {
+    let max_len = text.len();
+    let mut offset = 0;
+    runs.retain_mut(|run| {
+        if offset >= max_len {
+            return false;
+        }
+        let mut len = run.len.min(max_len - offset);
+        // 向下对齐到 char 边界；多减的字节会由下一个 run 覆盖，样式最多
+        // 偏移一个字符，不会 panic / 丢字形。
+        while len > 0 && !text.is_char_boundary(offset + len) {
+            len -= 1;
+        }
+        run.len = len;
+        offset += len;
+        len > 0
+    });
 }
 
 /// Get the runs for the given range.
@@ -5967,5 +6008,75 @@ mod tests_runs_for_range {
         // 与 tail 不相交的 span 不产生覆盖
         let overrides = TextElement::rainbow_overrides_in_range(&spans, &(50..60), dark, error);
         assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn normalize_runs_never_exceeds_text_len() {
+        let run = TextRun {
+            len: 0,
+            font: gpui::font(".SystemUIFont"),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+
+        // 超长：截到 15 字节，最后一个 run 只保留 5 字节。
+        let mut runs = vec![
+            TextRun {
+                len: 10,
+                ..run.clone()
+            },
+            TextRun {
+                len: 10,
+                ..run.clone()
+            },
+            TextRun {
+                len: 10,
+                ..run.clone()
+            },
+        ];
+        normalize_runs_for_text(&mut runs, "xxxxxxxxxxxxxxx");
+        assert_eq!(runs.iter().map(|r| r.len).sum::<usize>(), 15);
+        assert_eq!(runs.iter().map(|r| r.len).collect::<Vec<_>>(), vec![10, 5]);
+
+        // 刚好/不足：不改变原 runs。
+        let mut runs = vec![TextRun {
+            len: 3,
+            ..run.clone()
+        }];
+        normalize_runs_for_text(&mut runs, "xxxxxxxxxx");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].len, 3);
+
+        // 目标长度为 0：全部丢弃，shape_line 不会拿到任何超长 run。
+        let mut runs = vec![TextRun {
+            len: 3,
+            ..run.clone()
+        }];
+        normalize_runs_for_text(&mut runs, "");
+        assert!(runs.is_empty());
+
+        // 多字节字符：run 切点落在 char 中间时必须向下对齐，否则
+        // `split_at` 会以非 char boundary panic。
+        let mut runs = vec![
+            TextRun {
+                len: 1,
+                ..run.clone()
+            },
+            TextRun {
+                len: 1,
+                ..run.clone()
+            },
+        ];
+        normalize_runs_for_text(&mut runs, "é"); // 2 字节
+        assert!(runs.is_empty(), "两个 1 字节 run 都切在 é 中间，应被丢弃");
+
+        let mut runs = vec![TextRun {
+            len: 2,
+            ..run.clone()
+        }];
+        normalize_runs_for_text(&mut runs, "é");
+        assert_eq!(runs[0].len, 2, "对齐到完整字符时保持原长度");
     }
 }

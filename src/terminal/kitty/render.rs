@@ -631,7 +631,13 @@ pub fn to_render_image_from(width: u32, height: u32, rgba: &[u8]) -> gpui::Rende
     for pixel in rgba.chunks_exact_mut(4) {
         gpui::swap_rgba_pa_to_bgra(pixel);
     }
-    let buffer = image::RgbaImage::from_raw(width, height, rgba).expect("尺寸与缓冲长度一致");
+    // 损坏帧/动画换帧的尺寸与缓冲不一致时，`from_raw` 返回 None。
+    // 以前这里 expect 会在 UI 线程直接 panic；现在退化成 1×1 透明图，
+    // 最多少显示一帧，不拖垮整个终端。
+    let buffer = image::RgbaImage::from_raw(width, height, rgba).unwrap_or_else(|| {
+        log::warn!("kitty 图像尺寸与缓冲不一致（{width}x{height}），丢弃该帧");
+        image::RgbaImage::new(1, 1)
+    });
     gpui::RenderImage::new(vec![image::Frame::new(buffer)])
 }
 
@@ -751,7 +757,7 @@ pub fn paint_images(
     if placed.iter().all(|p| p.below_text != below) {
         return;
     }
-    let guard = storage.lock().expect("kitty 图像存储锁被投毒");
+    let guard = crate::terminal::kitty::storage::lock_unpoisoned(storage);
 
     for item in placed.iter().filter(|p| p.below_text == below) {
         let Some(stored) = guard.get(item.id) else {

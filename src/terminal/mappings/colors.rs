@@ -44,6 +44,32 @@ impl TerminalPalette {
         Self { entries }
     }
 
+    /// 调色板内容指纹，用于行缓存失效。
+    ///
+    /// 行缓存复用只看 cell 内容指纹；OSC 4/10/11/12 改色不改变 cell 的
+    /// `Color` 枚举，却会改变最终解析出的颜色。没有这个指纹，改色后的
+    /// 全量 damage 会复用旧颜色，TUI 调色板看起来“串色/叠色”。
+    pub fn hash_u64(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for entry in &self.entries {
+            match entry {
+                Some(rgb) => {
+                    hash ^= 1;
+                    hash = hash.wrapping_mul(0x100_0000_01b3);
+                    hash ^= u64::from(
+                        u32::from(rgb.r) << 16 | u32::from(rgb.g) << 8 | u32::from(rgb.b),
+                    );
+                    hash = hash.wrapping_mul(0x100_0000_01b3);
+                }
+                None => {
+                    hash ^= 0;
+                    hash = hash.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+        }
+        hash
+    }
+
     /// 查询指定索引（0..=255 为调色板 / 256..=268 为命名扩展色），
     /// 未被设置（None）时返回 None，由调用方回退主题。
     #[inline]
@@ -149,4 +175,24 @@ pub fn theme_color_overrides(theme: &TerminalTheme) -> Vec<(usize, Rgb)> {
         hsla_to_rgb888(theme.dim_foreground),
     ));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn palette_hash_changes_when_osc_override_changes() {
+        let base = TerminalPalette::default().hash_u64();
+        let mut colors = alacritty_terminal::term::color::Colors::default();
+        colors[1] = Some(Rgb { r: 1, g: 2, b: 3 });
+        let overridden = TerminalPalette::from_colors(&colors).hash_u64();
+        assert_ne!(base, overridden, "OSC 改色必须改变调色板指纹");
+        colors[1] = Some(Rgb { r: 1, g: 2, b: 4 });
+        assert_ne!(
+            overridden,
+            TerminalPalette::from_colors(&colors).hash_u64(),
+            "颜色值变化也必须改变指纹"
+        );
+    }
 }

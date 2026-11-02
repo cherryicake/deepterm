@@ -72,7 +72,12 @@ const FONT_SIZE_MAX: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
 
 /// 最后一个 tab 关闭时的回调（不需要跨线程，故无 `Send + Sync`）。
-type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App)>;
+///
+/// 回调接收**已经算好的** `WorkspaceSessionState`：调用发生在
+/// `Workspace::do_tab_close` 的 `&mut self` 更新过程中，若回调里再去
+/// `AppWindow::default_workspace.read(cx)` 会触发 GPUI 的
+/// "cannot read ... while it is already being updated" panic。
+type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App, WorkspaceSessionState)>;
 /// 可选 [`LastTabCloseCallback`]。
 type OptionalLastTabCloseCallback = Option<LastTabCloseCallback>;
 
@@ -270,7 +275,12 @@ struct ClosedTab {
 }
 
 /// undo 关闭 tab 的栈上限：超过后逐出最旧并 kill 其终端。
-const MAX_CLOSED_TABS: usize = 10;
+///
+/// 每个条目保活一个完整终端（PTY 线程 + 回滚 + Kitty 图片），250×59、
+/// 10k 行时单个可达 60 MB 级。原先 10 个能把“关掉的标签”累积到 600 MB，
+/// 是“关了很多标签内存不降”的第一解释；降到 3 个把上限压到约 180 MB，
+/// 同时保留最近三次撤销能力。
+const MAX_CLOSED_TABS: usize = 3;
 
 /// Resize拖拽状态
 #[derive(Clone)]
@@ -662,15 +672,27 @@ impl Workspace {
     }
 
     /// 注入「最后一个 tab 关闭、窗口即将移除」回调（AppWindow 用它同步落盘会话）。
-    pub fn set_on_last_tab_close(&mut self, callback: Box<dyn Fn(&mut gpui::App)>) {
+    pub fn set_on_last_tab_close(
+        &mut self,
+        callback: Box<dyn Fn(&mut gpui::App, WorkspaceSessionState)>,
+    ) {
         self.on_last_tab_close = Some(callback);
     }
 
     /// 注入后调用此辅助：关窗前同步落盘。
+    ///
+    /// 会话状态必须在**进入回调之前**、由 `&mut self` 自己算好：
+    /// 回调会去 `AppWindow::session_state` 里读 `default_workspace`，
+    /// 而此刻同一个 Workspace 正在被 `do_tab_close` 更新，重入读会 panic。
+    /// 这里算状态只读 `self.tabs`/`tab_bar`/各 panel，不会重入 Workspace。
     fn before_window_remove(&mut self, cx: &mut Context<Self>) {
+        if self.on_last_tab_close.is_none() {
+            return;
+        }
+        let default_state = self.session_state(cx);
         if let Some(callback) = self.on_last_tab_close.take() {
             // &mut Context 经 DerefMut 强转为 &mut App
-            callback(cx);
+            callback(cx, default_state);
         }
     }
 
@@ -1982,6 +2004,32 @@ impl Workspace {
 
     pub fn switch_to_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.tabs.contains_key(tab_id) {
+            // 切走的标签释放视口快照/行缓存（1–2 MB/标签）；再切回来时
+            // content_dirty 会重建。只处理当前标签，避免每次切换遍历全部。
+            let previous_tab = self.active_tab_id.clone();
+            if previous_tab != tab_id
+                && let Some(tab_info) = self.tabs.get(&previous_tab)
+            {
+                let views: Vec<_> = tab_info
+                    .container
+                    .collect_panels_vec()
+                    .into_iter()
+                    .filter_map(|panel| panel.read(cx).content().terminal_view().cloned())
+                    .collect();
+                let window_handle = cx.active_window();
+                for view in views {
+                    view.update(cx, |view, cx| {
+                        view.release_background_memory(cx);
+                    });
+                    // GPU 纹理必须用 Window::drop_image 释放；CPU 图像仍留在
+                    // 存储里，切回来时 paint 会按需重新上传。
+                    if let Some(window_handle) = window_handle {
+                        let _ = cx.update_window(window_handle, |_, window, cx| {
+                            Self::drop_view_kitty_textures(&view, window, cx);
+                        });
+                    }
+                }
+            }
             self.active_tab_id = tab_id.to_string();
             let active_tab_id = self.active_tab_id.clone();
             self.tab_bar.update(cx, |tab_bar, cx| {

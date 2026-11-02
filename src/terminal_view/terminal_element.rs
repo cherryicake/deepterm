@@ -246,6 +246,63 @@ pub struct RowRenderCache {
     /// Last hovered URL column range used to build `layout`. When this changes,
     /// the cached layout must be invalidated so underline styles are recomputed.
     pub hovered_url_cols: Option<(usize, usize)>,
+    /// 生成该缓存时的行内容指纹（来自 `Terminal::row_hashes`）。
+    ///
+    /// 全量 damage（滚动/清屏/批量输出）时用它判断「这一行内容其实没变」，
+    /// 直接复用旧缓存；滚动场景配合 `Terminal::scroll_shift` 先把整行缓存
+    /// 平移，只重建真正新进入视口的行。
+    pub fingerprint: Option<u64>,
+    /// 生成该缓存时的调色板指纹；与 `fingerprint` 一起决定能否复用。
+    pub palette_hash: u64,
+}
+
+/// 把缓存里记录的绝对行号改成当前遍历行号。
+///
+/// 滚动复用会把某一行的缓存整体平移到另一个视口下标；`BackgroundSpan` /
+/// `BoxDrawingCell` / 选区 span 里的 `row` 只用于一致性校验和光标例外判断，
+/// 平移后必须重标，否则校验/光标会认错行。
+fn retarget_row_cache(cache: &mut RowRenderCache, row: usize) {
+    if let Some(spans) = cache.background_spans.as_mut() {
+        for span in spans {
+            span.row = row;
+        }
+    }
+    if let Some(spans) = cache.selection_spans.as_mut() {
+        for span in spans {
+            span.row = row;
+        }
+    }
+    if let Some(cells) = cache.box_cells.as_mut() {
+        for cell in cells {
+            cell.row = row;
+        }
+    }
+}
+
+/// 按滚动位移平移行缓存：`new[i] = old[i + shift]`，越界行留空待重建。
+fn rotate_row_caches(
+    caches: Vec<RowRenderCache>,
+    shift: isize,
+    rows: usize,
+) -> Vec<RowRenderCache> {
+    if shift == 0 || rows == 0 {
+        return caches;
+    }
+    let mut slots: Vec<Option<RowRenderCache>> = caches.into_iter().map(Some).collect();
+    let mut rotated = Vec::with_capacity(rows);
+    for index in 0..rows {
+        let source = index as isize + shift;
+        let cache = if source >= 0 {
+            slots
+                .get_mut(source as usize)
+                .and_then(Option::take)
+                .unwrap_or_default()
+        } else {
+            RowRenderCache::default()
+        };
+        rotated.push(cache);
+    }
+    rotated
 }
 
 /// 盒子绘制字符 / 块元素单元格。
@@ -457,35 +514,49 @@ pub struct ShapedSegment {
 #[derive(Clone, Debug)]
 pub struct BatchedTextRun {
     pub start_col: usize,
-    pub start_row: usize,
     pub cell_count: usize,
     pub shaped_line: std::sync::Arc<gpui::ShapedLine>,
 }
 
 impl BatchedTextRun {
-    fn new(row: usize, col: usize, cell_count: usize, shaped_line: gpui::ShapedLine) -> Self {
+    fn new(col: usize, cell_count: usize, shaped_line: gpui::ShapedLine) -> Self {
         BatchedTextRun {
             start_col: col,
-            start_row: row,
             cell_count,
             shaped_line: std::sync::Arc::new(shaped_line),
         }
     }
 }
 
+/// 文本 run 的绘制原点。`row` 必须由调用方按当前遍历下标传入。
+fn run_paint_origin(
+    origin: Point<Pixels>,
+    start_col: usize,
+    row: usize,
+    cell_width: Pixels,
+    line_height: Pixels,
+) -> Point<Pixels> {
+    Point::new(
+        origin.x + start_col as f32 * cell_width,
+        origin.y + row as f32 * line_height,
+    )
+}
+
 impl BatchedTextRun {
+    /// `row` 由调用方按遍历下标显式传入，不能缓存在 run 里。
+    ///
+    /// 行缓存会在滚动时整行平移到另一个视口下标；若 run 自带旧行号，
+    /// paint 会把这一行画回旧 y 坐标，表现为“同一个提示符出现两次”。
     pub fn paint(
         &self,
         origin: Point<Pixels>,
+        row: usize,
         cell_width: Pixels,
         line_height: Pixels,
         window: &mut Window,
         cx: &mut gpui::App,
     ) {
-        let pos = Point::new(
-            origin.x + self.start_col as f32 * cell_width,
-            origin.y + self.start_row as f32 * line_height,
-        );
+        let pos = run_paint_origin(origin, self.start_col, row, cell_width, line_height);
 
         let _ = self
             .shaped_line
@@ -625,7 +696,6 @@ pub struct TerminalElement {
 
 impl TerminalElement {
     fn flush_text_batch(
-        row_idx: usize,
         batched_runs: &mut Vec<BatchedTextRun>,
         current_batch: &mut Option<(usize, String, TextRun, usize)>,
         window: &mut Window,
@@ -639,12 +709,7 @@ impl TerminalElement {
                 std::slice::from_ref(&style),
                 Some(cell_width),
             );
-            batched_runs.push(BatchedTextRun::new(
-                row_idx,
-                start_col,
-                cell_count,
-                shaped_line,
-            ));
+            batched_runs.push(BatchedTextRun::new(start_col, cell_count, shaped_line));
         }
     }
 
@@ -738,7 +803,6 @@ impl TerminalElement {
         selection_range: &Option<SelectionRange>,
     ) {
         let full_entry = Self::layout_row(
-            row_idx,
             row_cells.iter(),
             None,
             window,
@@ -784,9 +848,7 @@ impl TerminalElement {
     }
 
     /// Compute the layout for a single visible row.
-    /// `row_idx` is 0-based from the top of the visible viewport.
     fn layout_row<'a>(
-        row_idx: usize,
         cells: impl IntoIterator<Item = &'a IndexedCell>,
         hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
@@ -820,7 +882,6 @@ impl TerminalElement {
                 || box_drawing::is_box_drawing_char(ch)
             {
                 Self::flush_text_batch(
-                    row_idx,
                     &mut batched_runs,
                     &mut current_batch,
                     window,
@@ -858,7 +919,6 @@ impl TerminalElement {
                 }
             } else {
                 Self::flush_text_batch(
-                    row_idx,
                     &mut batched_runs,
                     &mut current_batch,
                     window,
@@ -884,7 +944,6 @@ impl TerminalElement {
         }
 
         Self::flush_text_batch(
-            row_idx,
             &mut batched_runs,
             &mut current_batch,
             window,
@@ -1179,7 +1238,6 @@ impl TerminalElement {
     /// 调用方据此丢弃该区间内的旧装饰 span——只回写 runs 会让装饰停留在旧状态
     /// （新增下划线画不出、撤掉的还在画）。
     fn try_update_runs_in_range(
-        row_idx: usize,
         cached_runs: &[BatchedTextRun],
         cells: &[IndexedCell],
         range: (usize, usize),
@@ -1250,7 +1308,6 @@ impl TerminalElement {
             .iter()
             .filter(|cell| (rebuild_left..=rebuild_right).contains(&cell.point.column.0));
         let dirty_entry = Self::layout_row(
-            row_idx,
             dirty_cells,
             hovered_url_cols,
             window,
@@ -1628,13 +1685,26 @@ impl Element for TerminalElement {
         let content = terminal.last_content();
         let content_cells = &content.cells;
         let row_ranges = &content.row_ranges;
+        let row_hashes = &content.row_hashes;
+
+        // 全量 damage 时若识别出整体滚动，先把旧行缓存平移到新下标；
+        // 之后逐行用内容指纹判断是否还需要重排。metrics 变化时缓存已清空，
+        // 不做平移。
+        if !metrics_changed && content.scroll_shift != 0 {
+            row_caches = rotate_row_caches(row_caches, content.scroll_shift, viewport_lines);
+        }
 
         #[cfg(debug_assertions)]
         let validate_row_cache = std::env::var_os("DEEPTERM_VALIDATE_ROW_CACHE").is_some();
 
         // `row_caches` 在上面已 resize 到 `viewport_lines`，逐行迭代等价于按下标遍历。
         for (row_idx, row_cache) in row_caches.iter_mut().enumerate() {
-            let is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true);
+            // 发生整体滚动时，即使 damage 没把这一行标脏，平移到新下标的
+            // 缓存也必须重新过一遍指纹；调色板变化同样要强制重建（cell 的
+            // Color 枚举没变，最终颜色却变了）。
+            let mut is_dirty = dirty_rows.get(row_idx).copied().unwrap_or(true)
+                || content.scroll_shift != 0
+                || row_cache.palette_hash != content.palette_hash;
             let row_cells: &[IndexedCell] = if let Some((start, end)) = row_ranges.get(row_idx) {
                 &content_cells[*start..*end]
             } else {
@@ -1648,7 +1718,21 @@ impl Element for TerminalElement {
             // so that underline styles are recomputed even if terminal content is clean.
             if row_cache.hovered_url_cols != hovered_url_cols {
                 row_cache.layout = None;
+                row_cache.fingerprint = None;
                 row_cache.hovered_url_cols = hovered_url_cols;
+            }
+
+            // 全量 damage（滚动/清屏/批量输出）时，行内容可能完全没变。
+            // 指纹命中就跳过重排，只把 span 里的行号重标到当前下标。
+            let row_hash = row_hashes.get(row_idx).copied();
+            if is_dirty
+                && row_hash.is_some()
+                && row_cache.fingerprint == row_hash
+                && row_cache.palette_hash == content.palette_hash
+                && row_cache.layout.is_some()
+            {
+                retarget_row_cache(row_cache, row_idx);
+                is_dirty = false;
             }
 
             if is_dirty || row_cache.layout.is_none() {
@@ -1663,7 +1747,6 @@ impl Element for TerminalElement {
                 {
                     if let Some((rebuilt_left, rebuilt_right, updated_runs, updated_decorations)) =
                         Self::try_update_runs_in_range(
-                            row_idx,
                             &cached_entry.runs,
                             row_cells,
                             range,
@@ -1689,7 +1772,6 @@ impl Element for TerminalElement {
                         cached_entry
                     } else {
                         Self::layout_row(
-                            row_idx,
                             row_cells.iter(),
                             hovered_url_cols,
                             window,
@@ -1702,7 +1784,6 @@ impl Element for TerminalElement {
                     }
                 } else {
                     Self::layout_row(
-                        row_idx,
                         row_cells.iter(),
                         hovered_url_cols,
                         window,
@@ -1714,8 +1795,15 @@ impl Element for TerminalElement {
                     )
                 };
                 row_cache.layout = Some(entry);
+                row_cache.fingerprint = row_hash;
+                row_cache.palette_hash = content.palette_hash;
             } else {
                 cache_hit_count += 1;
+                // 缓存本来就命中时也补齐指纹，下一帧滚动检测才能用上。
+                if row_cache.layout.is_some() {
+                    row_cache.fingerprint = row_hash;
+                    row_cache.palette_hash = content.palette_hash;
+                }
             }
 
             if row_cache.box_cells.is_none() {
@@ -2307,7 +2395,7 @@ impl Element for TerminalElement {
 
             if let Some(layout) = row_cache.layout.as_ref() {
                 for batch in &layout.runs {
-                    batch.paint(origin, *cell_width, *line_height, window, cx);
+                    batch.paint(origin, row_idx, *cell_width, *line_height, window, cx);
                 }
 
                 // 自绘下划线装饰（SGR 4:3 / 4:4 / 4:5：双下划线、点线、虚线）。
@@ -2373,7 +2461,7 @@ impl Element for TerminalElement {
         // 只 prune HashMap 的话，被替换/删除/换帧的图像会在 Metal 图集里永久残留
         // tile（统一内存上直接计进程内存，持续刷新的页面几分钟即达 GB 级）。
         {
-            let guard = kitty_storage.lock().expect("kitty 图像存储锁被投毒");
+            let guard = crate::terminal::kitty::storage::lock_unpoisoned(&kitty_storage);
             let freed = kitty_cache.prune(&guard);
             if !freed.is_empty() {
                 log::debug!(
@@ -2510,6 +2598,61 @@ mod tests {
     fn cursor_thickness_matches_alacritty_scaling() {
         assert_eq!(cursor_thickness(px(9.0)), px(1.0));
         assert_eq!(cursor_thickness(px(20.0)), px(3.0));
+    }
+
+    #[test]
+    fn run_paint_origin_uses_passed_row_not_cached_row() {
+        let origin = point(px(10.0), px(20.0));
+        let pos = run_paint_origin(origin, 2, 7, px(8.0), px(16.0));
+        assert_eq!(pos.x, px(10.0 + 2.0 * 8.0));
+        assert_eq!(pos.y, px(20.0 + 7.0 * 16.0));
+        // 同一个 run 换一个行下标，y 必须跟着变；这是滚动复用行缓存时
+        // 「提示符出现两次」的直接回归点。
+        let moved = run_paint_origin(origin, 2, 3, px(8.0), px(16.0));
+        assert_ne!(pos.y, moved.y);
+        assert_eq!(moved.y, px(20.0 + 3.0 * 16.0));
+    }
+
+    #[test]
+    fn rotate_row_caches_moves_content_and_retargets_spans() {
+        let mut caches = vec![
+            RowRenderCache {
+                fingerprint: Some(1),
+                background_spans: Some(vec![BackgroundSpan {
+                    start_col: 0,
+                    row: 0,
+                    width: 1,
+                    color: gpui::black(),
+                }]),
+                ..Default::default()
+            },
+            RowRenderCache {
+                fingerprint: Some(2),
+                ..Default::default()
+            },
+            RowRenderCache {
+                fingerprint: Some(3),
+                ..Default::default()
+            },
+        ];
+        // 上滚一行：新 0/1 行来自旧 1/2 行，新 2 行是新内容。
+        caches = rotate_row_caches(caches, 1, 3);
+        assert_eq!(caches[0].fingerprint, Some(2));
+        assert_eq!(caches[1].fingerprint, Some(3));
+        assert_eq!(caches[2].fingerprint, None);
+
+        // 平移后必须把 span 的绝对行号重标到新下标。
+        let mut cache = RowRenderCache {
+            background_spans: Some(vec![BackgroundSpan {
+                start_col: 0,
+                row: 0,
+                width: 1,
+                color: gpui::black(),
+            }]),
+            ..Default::default()
+        };
+        retarget_row_cache(&mut cache, 7);
+        assert_eq!(cache.background_spans.unwrap()[0].row, 7);
     }
 
     fn test_color(l: f32) -> Hsla {

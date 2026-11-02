@@ -312,13 +312,13 @@ impl ImageStore {
     /// 回调形式而非返回引用：锁由调用方申请、在回调返回后释放，避免把
     /// `MutexGuard` 泄漏到调用点（`Mutex` 的锁不可重入，泄漏会导致死锁）。
     pub fn with_storage<R>(&self, f: impl FnOnce(&Storage) -> R) -> R {
-        let guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        let guard = crate::terminal::kitty::storage::lock_unpoisoned(&self.storage);
         f(&guard)
     }
 
     /// 可变访问存储（回调形式，理由同上）。
     pub fn with_storage_mut<R>(&mut self, f: impl FnOnce(&mut Storage) -> R) -> R {
-        let mut guard = self.storage.lock().expect("kitty 图像存储锁被投毒");
+        let mut guard = crate::terminal::kitty::storage::lock_unpoisoned(&self.storage);
         f(&mut guard)
     }
 
@@ -329,7 +329,7 @@ impl ImageStore {
     /// 生产代码请用回调形式，避免 guard 逃逸出可控范围。
     #[cfg(test)]
     pub fn lock_storage(&self) -> std::sync::MutexGuard<'_, Storage> {
-        self.storage.lock().expect("kitty 图像存储锁被投毒")
+        crate::terminal::kitty::storage::lock_unpoisoned(&self.storage)
     }
 
     /// 当前占用字节数。

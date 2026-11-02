@@ -1,4 +1,4 @@
-//! 本地 PTY 读线程。
+//! 本地 PTY gather→parse 两级流水。
 //!
 //! 替代 alacritty 的 `EventLoop`，让本地终端的字节流走与 SSH 相同的
 //! 「应用层扫描 → vte 解析」管线，从而能拦截 APC 序列（Kitty 图形协议）。
@@ -14,10 +14,16 @@
 //! 才能上屏。两个二进制随仓库放在 `windows/conpty/`，由 `build.rs` 拷到
 //! 运行目录，安装包见 `windows/deepterm.iss`。
 //!
-//! 线程模型与 alacritty 保持一致：**解析在读线程**（持有 `Term` 的 lease），
-//! 因此不引入额外的 UI 跃点，`cat` 大文件类负载无吞吐回归。
+//! 线程模型是 **gather → parse 两级流水**：gather 线程独占 `Pty`/`Poller`，
+//! 只读字节、处理输入/尺寸/子进程事件；parse 线程持有 `Term` 的 lease，
+//! 只做 vte/扫描器解析。两者之间是 4 块 × 64 KiB 的有界环，PTY 读与解析
+//! 真正并行，任何一侧变慢都会把背压传回内核而不是无限堆内存。
 
-use std::{io::Read as _, sync::Arc};
+use std::{
+    io::Read as _,
+    sync::Arc,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use alacritty_terminal::{
     event::{Event as AlacTermEvent, EventListener as _, OnResize, WindowSize},
@@ -32,12 +38,14 @@ use polling::{Event as PollEvent, Events, PollMode, Poller};
 use super::terminal::ZedListener;
 use crate::terminal::escape_scan::{self, GridState, PtyScanner};
 
-/// 单次 read 的缓冲上限（对齐 alacritty `event_loop.rs` 的 `READ_BUFFER_SIZE`）。
-const READ_BUFFER_SIZE: usize = 0x10_0000;
-
 /// 单次持锁解析的字节上限，用于保证解析不长时间阻塞其他线程
 /// （对齐 alacritty 的 `MAX_LOCKED_READ`）。
 const MAX_LOCKED_READ: usize = u16::MAX as usize;
+
+/// gather→parse 环里的单块容量。4 块环 = 256 KiB 在途上限，和 Ghostty
+/// 1.4 的 4×64 KiB 同量级；比旧的单块 1 MiB 缓冲更小，也足以吸收突发输出。
+const PARSE_BUFFER_SIZE: usize = MAX_LOCKED_READ;
+const PARSE_QUEUE_DEPTH: usize = 4;
 
 /// PTY 读写端点的轮询 token。
 ///
@@ -185,6 +193,11 @@ pub enum LocalMsg {
 pub struct LocalSender {
     tx: async_channel::Sender<LocalMsg>,
     poller: Arc<Poller>,
+    /// 关停请求。不能只依赖 `LocalMsg::Shutdown`：`try_send` 在通道满时
+    /// 会丢弃消息，读线程就会永久阻塞在 poller 上，连带 PTY fd、shell 子进程
+    /// 和 `Term` 一起泄漏。原子标志 + `notify()` 不占通道容量，保证关停
+    /// 一定能被看见。
+    shutdown: Arc<AtomicBool>,
 }
 
 impl LocalSender {
@@ -199,8 +212,13 @@ impl LocalSender {
     }
 
     /// 请求读线程退出。
+    ///
+    /// 先置原子标志再 `notify`：即使 `try_send` 因通道满失败，读线程也会
+    /// 在 poll 返回后看到标志并退出。
     pub fn shutdown(&self) {
-        self.send(LocalMsg::Shutdown);
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = self.poller.notify();
+        let _ = self.tx.try_send(LocalMsg::Shutdown);
     }
 
     /// 压入消息并唤醒读线程，避免消息在 poller 阻塞期间滞留。
@@ -253,20 +271,44 @@ pub enum LocalNotice {
 /// 因此接收端不留在本结构内（避免读线程之外还持有一个消费方）。
 pub struct LocalReader {
     sender: LocalSender,
-    /// 读线程句柄：仅用于保持线程存活（`LocalReader` drop 即 join）,
-    /// 字段本身不被读取，故以下划线前缀标记。
-    _thread: Option<std::thread::JoinHandle<()>>,
+    /// 事件通道发送端，故意留在 UI 侧直到两个线程 join 完。
+    ///
+    /// 若只让 parse 线程的 `Term` 持有最后一份，线程退出时会在 parse 线程上
+    /// 关闭 futures 通道并唤醒 GPUI 任务；`#[gpui::test]` 会把它判成
+    /// “非确定性线程活动”，真实运行时也让通道生命周期依赖工作线程退出顺序。
+    _listener: ZedListener,
+    /// 通知通道发送端，同样留到 UI 侧 join 完再关。
+    _notice: async_channel::Sender<LocalNotice>,
+    /// 采集线程：持有 `Pty`/`Poller`，只负责读字节、输入/尺寸与子进程事件。
+    gather_thread: Option<std::thread::JoinHandle<()>>,
+    /// 解析线程：持有 `Term` 的 lease、vte `Processor` 与扫描器。
+    parse_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LocalReader {
+    fn drop(&mut self) {
+        self.sender.shutdown();
+        // 先等 gather 退出（它会 drop `msg_tx`），再等 parser 看到断开/关停。
+        // 两个线程都可能在 `write_all_retry` 或锁上短暂停留；正常路径是
+        // 毫秒级，最坏由 `shutdown` 标志 + 通道 timeout 兜底。
+        if let Some(thread) = self.gather_thread.take() {
+            let _ = thread.join();
+        }
+        if let Some(thread) = self.parse_thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// `LocalReader::spawn` 的返回值。
 pub struct LocalReaderParts {
     pub reader: LocalReader,
-    /// 读线程通知的接收端，由 UI 线程的泵任务消费。
+    /// gather/parse 线程通知的接收端，由 UI 线程的泵任务消费。
     pub notices: async_channel::Receiver<LocalNotice>,
 }
 
 impl LocalReader {
-    /// 启动读线程。
+    /// 启动 gather 与 parse 两个线程。
     ///
     /// `term` 与最终 `Terminal` 上持有的 `term` 是同一个 `Arc`（alacritty 的
     /// `Term` 本就设计为跨线程共享）；`listener` 用于发送 `Event::Wakeup` /
@@ -287,14 +329,14 @@ impl LocalReader {
         let (tx, rx) = async_channel::bounded::<LocalMsg>(256);
         let (notice_tx, notice_rx) = async_channel::bounded::<LocalNotice>(256);
 
-        // 读线程摘到的 OSC 要经通知通道交给 UI 线程判定（见 [`NoticeOscSink`]）。
-        // 通道发送端克隆一份给扫描器；`notice_tx` 本体仍归 `run_loop`
+        // 解析线程摘到的 OSC 要经通知通道交给 UI 线程判定（见 [`NoticeOscSink`]）。
+        // 通道发送端克隆一份给扫描器；`notice_tx` 本体归 parse 线程
         // （重绘/退出/错误通知走那条）。
         scanner.set_osc_sink(Box::new(NoticeOscSink::new(notice_tx.clone())));
 
         let poller = Arc::new(Poller::new()?);
 
-        // SAFETY（中文）：`pty` 被 move 进读线程闭包并存活至线程结束，
+        // SAFETY（中文）：`pty` 被 move 进 gather 线程闭包并存活至线程结束，
         // 注册到 poller 的 file/signals 因此始终有效；线程退出前会 deregister。
         //
         // 只注册可读：PTY 主设备写侧恒可写，若一并注册可写会在电平触发下
@@ -307,13 +349,62 @@ impl LocalReader {
             )?;
         }
 
-        // 发送端需要 poller 来唤醒阻塞中的读线程，先克隆一份。
+        // 发送端需要 poller 来唤醒阻塞中的 gather 线程，先克隆一份。
         let sender_poller = poller.clone();
+        let shutdown = Arc::new(AtomicBool::new(false));
 
-        let thread = std::thread::Builder::new()
-            .name("local-pty-reader".to_string())
+        // ── gather → parse 两级流水 ──────────────────────────────────────
+        //
+        // gather：`Pty` + `Poller`，只做「读字节 / 写输入 / 尺寸 / 子进程事件」。
+        // parse：`Term` + vte + 扫描器，只做「持锁解析」。
+        //
+        // 两者之间是 4 块 × 64 KiB 的有界环：PTY 读与 vte 解析真正并行，
+        // 且任何一侧变慢都会通过有界通道把背压传回内核，不会无限堆内存。
+        let (msg_tx, msg_rx) = std::sync::mpsc::sync_channel::<ParseMsg>(PARSE_QUEUE_DEPTH);
+        let (free_tx, free_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(PARSE_QUEUE_DEPTH);
+        for _ in 0..PARSE_QUEUE_DEPTH {
+            // 预填满空闲环；parse 用完一块就还回来。
+            let _ = free_tx.send(vec![0u8; PARSE_BUFFER_SIZE]);
+        }
+        let (reply_tx, reply_rx) = async_channel::bounded::<Vec<u8>>(64);
+        let gather_free_tx = free_tx.clone();
+        let gather_notice = notice_tx.clone();
+
+        let parse_shutdown = shutdown.clone();
+        let parse_poller = sender_poller.clone();
+        let reader_listener = listener.clone();
+        let reader_notice = notice_tx.clone();
+        let parse_thread = std::thread::Builder::new()
+            .name("local-pty-parser".to_string())
             .spawn(move || {
-                run_loop(pty, poller, term, listener, notice_tx, rx, scanner);
+                parse_loop(
+                    term,
+                    listener,
+                    notice_tx,
+                    msg_rx,
+                    free_tx,
+                    reply_tx,
+                    scanner,
+                    parse_poller,
+                    parse_shutdown,
+                );
+            })?;
+
+        let gather_shutdown = shutdown.clone();
+        let gather_thread = std::thread::Builder::new()
+            .name("local-pty-gather".to_string())
+            .spawn(move || {
+                gather_loop(
+                    pty,
+                    poller,
+                    rx,
+                    msg_tx,
+                    free_rx,
+                    gather_free_tx,
+                    reply_rx,
+                    gather_notice,
+                    gather_shutdown,
+                );
             })?;
 
         Ok(LocalReaderParts {
@@ -321,8 +412,12 @@ impl LocalReader {
                 sender: LocalSender {
                     tx,
                     poller: sender_poller,
+                    shutdown,
                 },
-                _thread: Some(thread),
+                _listener: reader_listener,
+                _notice: reader_notice,
+                gather_thread: Some(gather_thread),
+                parse_thread: Some(parse_thread),
             },
             notices: notice_rx,
         })
@@ -334,49 +429,83 @@ impl LocalReader {
     }
 }
 
-fn run_loop(
+/// gather 线程发往 parse 线程的消息。
+///
+/// 数据与生命周期事件走**同一个有界通道**，保证顺序：子进程退出前读到的
+/// 最后一批字节一定先于 `ChildExit` 被解析。
+enum ParseMsg {
+    /// 一块最多 64 KiB 的原始 PTY 输出；缓冲区解析后归还空闲环。
+    Data(Vec<u8>),
+    /// 扫描器几何变化（cell 物理像素）。
+    Resize(escape_scan::TermGeometry),
+    /// 子进程退出（`None` 表示被信号杀死，拿不到状态）。
+    ChildExit(Option<std::process::ExitStatus>),
+    /// gather 侧致命错误，交给 parse 线程上报 UI。
+    Error(String),
+}
+
+/// gather 线程：只碰 `Pty`/`Poller`，不碰 `Term`/vte。
+///
+/// 这样 PTY 的阻塞读永远不需要等网格锁，parse 线程持锁解析时也永远不需要
+/// 等 PTY 读——两级流水真正并行。
+fn gather_loop(
     mut pty: Pty,
     poller: Arc<Poller>,
-    term: Arc<FairMutex<Term<ZedListener>>>,
-    listener: ZedListener,
-    notice: async_channel::Sender<LocalNotice>,
     rx: async_channel::Receiver<LocalMsg>,
-    mut scanner: Box<dyn PtyScanner>,
+    msg_tx: std::sync::mpsc::SyncSender<ParseMsg>,
+    free_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    reply_rx: async_channel::Receiver<Vec<u8>>,
+    notice: async_channel::Sender<LocalNotice>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    let mut processor = Processor::<StdSyncHandler>::new();
-    let mut buf = vec![0u8; READ_BUFFER_SIZE];
-    // 跨读残尾（未完成的 OSC/APC 序列）。
-    let mut pending: Vec<u8> = Vec::new();
-    // 事件容量：单次最多 2 个源（PTY 读写 fd + 子进程信号 fd）。
     let mut events =
         Events::with_capacity(std::num::NonZeroUsize::new(4).expect("事件容量恒为非零"));
 
     'event_loop: loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break 'event_loop;
+        }
         events.clear();
-        if let Err(err) = poller.wait(&mut events, None) {
-            let _ = notice.try_send(LocalNotice::Error(format!("poll failed: {err}")));
+        if let Err(err) = poller.wait(&mut events, Some(std::time::Duration::from_millis(100))) {
+            let message = format!("poll failed: {err}");
+            let _ = notice.try_send(LocalNotice::Error(message.clone()));
+            let _ = msg_tx.try_send(ParseMsg::Error(message));
             break;
         }
-        // 先处理控制指令（输入/尺寸/退出）。
+        if shutdown.load(Ordering::SeqCst) {
+            break 'event_loop;
+        }
+
+        // 控制指令（输入/尺寸/退出）。
         while let Ok(msg) = rx.try_recv() {
+            if shutdown.load(Ordering::SeqCst) {
+                break 'event_loop;
+            }
             match msg {
                 LocalMsg::Input(bytes) => {
                     if let Err(err) = write_all_retry(pty.writer(), &bytes) {
                         let _ =
-                            notice.try_send(LocalNotice::Error(format!("pty write failed: {err}")));
+                            msg_tx.try_send(ParseMsg::Error(format!("pty write failed: {err}")));
+                        break 'event_loop;
                     }
                 }
                 LocalMsg::Resize(size) => {
                     pty.on_resize(size);
-                    // 几何也要告知扫描器：尺寸上报（`CSI 16 t` / in-band
-                    // size reports）需要单元格**物理像素**尺寸。这两处同源自
-                    // `TerminalBounds::window_size`，所以口径天然一致。
-                    scanner.set_geometry(escape_scan::TermGeometry {
+                    let geometry = escape_scan::TermGeometry {
                         rows: size.num_lines,
                         cols: size.num_cols,
                         cell_width: size.cell_width,
                         cell_height: size.cell_height,
-                    });
+                    };
+                    // 几何必须送达扫描器；队列满时短暂等待，避免 resize
+                    // 在高峰输出期间被静默丢掉。
+                    if send_parse_msg(&msg_tx, ParseMsg::Resize(geometry), &shutdown).is_err() {
+                        let _ = notice.try_send(LocalNotice::Error(
+                            "parse thread exited before resize".to_string(),
+                        ));
+                        break 'event_loop;
+                    }
                 }
                 LocalMsg::Shutdown => break 'event_loop,
             }
@@ -386,24 +515,25 @@ fn run_loop(
             match event.key {
                 PTY_CHILD_EVENT_TOKEN => {
                     if let Some(ChildEvent::Exited(status)) = pty.next_child_event() {
-                        // `Option` 为 None 表示进程被信号杀死（try_wait 拿不到状态）。
-                        if let Some(status) = status {
-                            listener.send_event(AlacTermEvent::ChildExit(status));
+                        // 退出前读完残余输出，按顺序排在 ChildExit 之前。
+                        for _ in 0..16 {
+                            match gather_read(&mut pty, &msg_tx, &free_rx, &free_tx, &shutdown) {
+                                Ok(0) => break,
+                                Ok(_) => continue,
+                                Err(err) => {
+                                    let message = format!("pty drain failed: {err}");
+                                    let _ = notice.try_send(LocalNotice::Error(message.clone()));
+                                    let _ = msg_tx.try_send(ParseMsg::Error(message));
+                                    break;
+                                }
+                            }
                         }
-                        // drain_on_exit：退出前读完残余输出，
-                        // 否则最后一行提示符可能丢失。
-                        let _ = pty_read(
-                            &mut pty,
-                            &mut processor,
-                            &term,
-                            &mut buf,
-                            &mut pending,
-                            &mut *scanner,
-                            None,
-                        );
-                        term.lock().exit();
-                        listener.send_event(AlacTermEvent::Wakeup);
-                        let _ = notice.try_send(LocalNotice::ChildExit(status));
+                        if send_parse_msg(&msg_tx, ParseMsg::ChildExit(status), &shutdown).is_err()
+                        {
+                            let _ = notice.try_send(LocalNotice::Error(
+                                "parse thread exited before child exit".to_string(),
+                            ));
+                        }
                         break 'event_loop;
                     }
                 }
@@ -412,20 +542,11 @@ fn run_loop(
                         continue;
                     }
                     if event.readable {
-                        match pty_read(
-                            &mut pty,
-                            &mut processor,
-                            &term,
-                            &mut buf,
-                            &mut pending,
-                            &mut *scanner,
-                            Some(&notice),
-                        ) {
-                            Ok(()) => {}
+                        match gather_read(&mut pty, &msg_tx, &free_rx, &free_tx, &shutdown) {
+                            Ok(_) => {}
                             Err(err) => {
-                                let _ = notice.try_send(LocalNotice::Error(format!(
-                                    "pty read failed: {err}"
-                                )));
+                                let _ = msg_tx
+                                    .try_send(ParseMsg::Error(format!("pty read failed: {err}")));
                                 break 'event_loop;
                             }
                         }
@@ -435,23 +556,179 @@ fn run_loop(
             }
         }
 
-        // 应答回写：放在事件循环尾部的**每轮**执行，而不是嵌在"可读"分支里。
-        //
-        // 扫描器的应答不一定由"读到字节"产生——resize 转发的几何变化也会产生
-        // （in-band size reports 在启用期间每次尺寸变化都要重新上报）。那种情况
-        // 下 poller 被 `notify()` 唤醒、控制消息被排空，但**没有读事件**，若把
-        // 回写挂在 `if event.readable` 内就会一直攒着不发。
-        let replies = scanner.take_replies();
-        if !replies.is_empty()
-            && let Err(err) = write_all_retry(pty.writer(), &replies)
-        {
-            let _ = notice.try_send(LocalNotice::Error(format!("pty reply write failed: {err}")));
-            break 'event_loop;
+        // 扫描器的应答（尺寸上报等）由 parse 线程算好，gather 负责写回。
+        while let Ok(replies) = reply_rx.try_recv() {
+            if let Err(err) = write_all_retry(pty.writer(), &replies) {
+                let _ = msg_tx.try_send(ParseMsg::Error(format!("pty reply write failed: {err}")));
+                break 'event_loop;
+            }
         }
     }
 
     // 显式注销，避免 poller 持有已释放 fd；随后 drop(pty) 触发 SIGHUP。
     let _ = pty.deregister(&poller);
+}
+
+/// 把一条控制消息送进 parse 队列；队列满时阻塞等待并持续检查关停。
+///
+/// Resize/ChildExit 不能像数据那样丢弃：前者会让 shell 永远停在旧尺寸，
+/// 后者会让 UI 收不到退出通知。队列容量只有 4，但 parse 线程持续消费，
+/// 正常不会形成长等待。
+fn send_parse_msg(
+    tx: &std::sync::mpsc::SyncSender<ParseMsg>,
+    msg: ParseMsg,
+    shutdown: &AtomicBool,
+) -> Result<(), ()> {
+    let mut msg = Some(msg);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        match tx.try_send(msg.take().expect("消息只发送一次")) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                msg = Some(returned);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Err(()),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// gather 侧读一块（最多 64 KiB）：读到 EAGAIN 就返回已读字节数。
+///
+/// 交互式输出只有 1 KiB 时，第一次 read 后的 EAGAIN 立即返回，不额外等；
+/// 大输出则会把 64 KiB 缓冲填满再交给 parse，摊薄锁/扫描开销。
+fn gather_read(
+    pty: &mut Pty,
+    msg_tx: &std::sync::mpsc::SyncSender<ParseMsg>,
+    free_rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    free_tx: &std::sync::mpsc::SyncSender<Vec<u8>>,
+    shutdown: &AtomicBool,
+) -> std::io::Result<usize> {
+    let mut buf = loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(0);
+        }
+        match free_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(buf) => break buf,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(std::io::Error::other("parse thread exited"));
+            }
+        }
+    };
+
+    let mut filled = 0usize;
+    loop {
+        if filled >= buf.len() {
+            break;
+        }
+        match pty.reader().read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(got) => filled += got,
+            Err(err) => match err.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock => break,
+                _ => return Err(err),
+            },
+        }
+    }
+
+    if filled == 0 {
+        // 空读（EAGAIN/EOF）必须把缓冲还回环，否则 4 块很快被吃光，
+        // gather 会永久卡在 `free_rx` 上。
+        let _ = free_tx.try_send(buf);
+        return Ok(0);
+    }
+    buf.truncate(filled);
+    let mut msg = Some(ParseMsg::Data(buf));
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(filled);
+        }
+        match msg_tx.try_send(msg.take().expect("数据只发送一次")) {
+            Ok(()) => return Ok(filled),
+            Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                msg = Some(returned);
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(std::io::Error::other("parse thread exited"));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+/// parse 线程：持 lease + 网格锁，把 gather 送来的块交给 vte/扫描器。
+fn parse_loop(
+    term: Arc<FairMutex<Term<ZedListener>>>,
+    listener: ZedListener,
+    notice: async_channel::Sender<LocalNotice>,
+    msg_rx: std::sync::mpsc::Receiver<ParseMsg>,
+    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    reply_tx: async_channel::Sender<Vec<u8>>,
+    mut scanner: Box<dyn PtyScanner>,
+    poller: Arc<Poller>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let mut processor = Processor::<StdSyncHandler>::new();
+    let mut pending: Vec<u8> = Vec::new();
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        match msg_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(ParseMsg::Data(mut buf)) => {
+                let parsed = parse_batch(&buf, &mut processor, &term, &mut pending, &mut *scanner);
+                if parsed && processor.sync_bytes_count() < buf.len() {
+                    let _ = notice.try_send(LocalNotice::Wakeup);
+                }
+                flush_scanner_replies(&mut *scanner, &reply_tx, &poller);
+                // 归还环缓冲：下一块继续用同一块 64 KiB 堆内存。
+                buf.clear();
+                buf.resize(PARSE_BUFFER_SIZE, 0);
+                let _ = free_tx.try_send(buf);
+            }
+            Ok(ParseMsg::Resize(geometry)) => {
+                scanner.set_geometry(geometry);
+                flush_scanner_replies(&mut *scanner, &reply_tx, &poller);
+            }
+            Ok(ParseMsg::ChildExit(status)) => {
+                if let Some(status) = status {
+                    listener.send_event(AlacTermEvent::ChildExit(status));
+                }
+                term.lock().exit();
+                listener.send_event(AlacTermEvent::Wakeup);
+                let _ = notice.try_send(LocalNotice::ChildExit(status));
+                break;
+            }
+            Ok(ParseMsg::Error(err)) => {
+                let _ = notice.try_send(LocalNotice::Error(err));
+                break;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
+fn flush_scanner_replies(
+    scanner: &mut dyn PtyScanner,
+    reply_tx: &async_channel::Sender<Vec<u8>>,
+    poller: &Poller,
+) {
+    let replies = scanner.take_replies();
+    if !replies.is_empty() {
+        if reply_tx.try_send(replies).is_err() {
+            log::warn!("PTY 应答通道已满/关闭，丢弃一次扫描器应答");
+        } else {
+            // 应答是异步产生的，gather 可能正阻塞在 poller 上；必须唤醒，
+            // 否则 DA2 / CSI 16 t 的客户端要等到下一次 PTY 输出才拿到回复。
+            let _ = poller.notify();
+        }
+    }
 }
 
 /// 扫描回调的借用上下文。
@@ -508,93 +785,54 @@ impl ScanCtx<'_> {
     }
 }
 
-/// 从 PTY 读取并解析，复刻 alacritty `EventLoop::pty_read` 的语义：
-/// 持锁解析、按 `MAX_LOCKED_READ` 让出。
+/// 持 lease + 网格锁解析一块（最多 64 KiB）原始 PTY 字节。
 ///
-/// `notice` 为 `None` 时（退出前的 drain）不发重绘通知。
-fn pty_read(
-    pty: &mut Pty,
+/// 返回 `true` 表示这批数据里有非同步更新的有效字节，调用方应通知重绘。
+fn parse_batch(
+    data: &[u8],
     processor: &mut Processor<StdSyncHandler>,
     term: &Arc<FairMutex<Term<ZedListener>>>,
-    buf: &mut [u8],
     pending: &mut Vec<u8>,
     scanner: &mut dyn PtyScanner,
-    notice: Option<&async_channel::Sender<LocalNotice>>,
-) -> std::io::Result<()> {
-    let mut unprocessed = 0;
-    let mut processed = 0;
+) -> bool {
+    let terminal_lease = term.lease();
+    let mut terminal = match term.try_lock_unfair() {
+        Some(terminal) => terminal,
+        // 数据已经在手，不能丢：短暂排队等 UI 放锁。
+        None => term.lock_unfair(),
+    };
 
-    let _terminal_lease = Some(term.lease());
-    let mut locked = None;
-
-    loop {
-        match pty.reader().read(&mut buf[unprocessed..]) {
-            Ok(0) if unprocessed == 0 => break,
-            Ok(got) => unprocessed += got,
-            Err(err) => match err.kind() {
-                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => {
-                    if unprocessed == 0 {
-                        break;
-                    }
-                }
-                _ => return Err(err),
-            },
-        }
-
-        let terminal = match &mut locked {
-            Some(terminal) => terminal,
-            None => locked.insert(match term.try_lock_unfair() {
-                // 缓冲满时必须阻塞等待，不能丢字节。
-                None if unprocessed >= READ_BUFFER_SIZE => term.lock_unfair(),
-                None => continue,
-                Some(terminal) => terminal,
-            }),
-        };
-
-        // 应用层扫描：普通文本经 `emit` 即时喂给 vte，需消费的序列（OSC/APC）
-        // 被摘除，未完成的尾部留在 `pending` 等下次拼接。
+    // 应用层扫描：普通文本经 `emit` 即时喂给 vte，需消费的序列（OSC/APC）
+    // 被摘除，未完成的尾部留在 `pending` 等下次拼接。
+    //
+    // 扫描器不能自己碰 `Term`（锁已被本函数持有），所以文本喂入与网格
+    // 状态查询都以闭包形式由这里提供。这样 APC 处理时看到的网格状态已经
+    // 包含了同一 batch 里在它之前的文本（如 `CSI 3;5H` 定位）。
+    {
+        // 两个闭包都借用同一份 `Term`/`Processor`，而借用检查器无法
+        // 证明 `scan` 不会并发调用它们（实际上 `scan` 是顺序调用的：
+        // 一次 `emit` 或一次 `grid`，绝不同时）。
         //
-        // 扫描器不能自己碰 `Term`（锁已被本函数持有），所以文本喂入与网格
-        // 状态查询都以闭包形式由这里提供。这样 APC 处理时看到的网格状态已经
-        // 包含了同一 chunk 里在它之前的文本（如 `CSI 3;5H` 定位）。
-        {
-            // 两个闭包都借用同一份 `Term`/`Processor`，而借用检查器无法
-            // 证明 `scan` 不会并发调用它们（实际上 `scan` 是顺序调用的：
-            // 一次 `emit` 或一次 `grid`，绝不同时）。
-            //
-            // 因此把上下文放进 `RefCell`，闭包各自 `borrow_mut` 一小段；
-            // 若真的发生重入会 panic（而不是未定义行为），比裸指针安全。
-            let ctx = std::cell::RefCell::new(ScanCtx {
-                processor: &mut *processor,
-                terminal,
-            });
-            let mut emit = |bytes: &[u8]| ctx.borrow_mut().emit(bytes);
-            let mut grid = || {
-                let mut ctx = ctx.borrow_mut();
-                ctx.flush_sync_update();
-                ctx.grid_state()
-            };
-            scanner.scan(&buf[..unprocessed], pending, &mut emit, &mut grid);
-        }
-
-        processed += unprocessed;
-        unprocessed = 0;
-
-        if processed >= MAX_LOCKED_READ {
-            break;
-        }
+        // 因此把上下文放进 `RefCell`，闭包各自 `borrow_mut` 一小段；
+        // 若真的发生重入会 panic（而不是未定义行为），比裸指针安全。
+        let ctx = std::cell::RefCell::new(ScanCtx {
+            processor: &mut *processor,
+            terminal: &mut *terminal,
+        });
+        let mut emit = |bytes: &[u8]| ctx.borrow_mut().emit(bytes);
+        let mut grid = || {
+            let mut ctx = ctx.borrow_mut();
+            ctx.flush_sync_update();
+            ctx.grid_state()
+        };
+        scanner.scan(data, pending, &mut emit, &mut grid);
     }
+    drop(terminal);
+    drop(terminal_lease);
 
     // 仅在解析到非「同步更新」字节时通知重绘（对齐 alacritty：同步更新
     // 期间不应重绘，直到收到结束标记）。
-    if processed > 0
-        && processor.sync_bytes_count() < processed
-        && let Some(notice) = notice
-    {
-        let _ = notice.try_send(LocalNotice::Wakeup);
-    }
-
-    Ok(())
+    processor.sync_bytes_count() < data.len()
 }
 
 /// `NoticeOscSink` 的测试与平台无关（不依赖真实 PTY），单独成模块。
@@ -673,6 +911,35 @@ mod tests {
             self.seen.lock().unwrap().extend_from_slice(data);
             emit(data);
         }
+    }
+
+    #[test]
+    fn parse_batch_feeds_bytes_into_grid_without_pty() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &TermSize::new(20, 4),
+            ZedListener(events_tx),
+        )));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut scanner = RecordingScanner { seen: seen.clone() };
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut pending = Vec::new();
+
+        assert!(parse_batch(
+            b"hello",
+            &mut processor,
+            &term,
+            &mut pending,
+            &mut scanner
+        ));
+        assert_eq!(&seen.lock().unwrap()[..], b"hello");
+        let term = term.lock();
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, 'h');
+        assert_eq!(term.grid()[Line(0)][Column(4)].c, 'o');
     }
 
     /// 轮询等待条件成立，避免固定 sleep 造成的偶发失败。
@@ -2486,6 +2753,35 @@ mod windows_tests {
             self.seen.lock().unwrap().extend_from_slice(data);
             emit(data);
         }
+    }
+
+    #[test]
+    fn parse_batch_feeds_bytes_into_grid_without_pty() {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &TermSize::new(20, 4),
+            ZedListener(events_tx),
+        )));
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let mut scanner = RecordingScanner { seen: seen.clone() };
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut pending = Vec::new();
+
+        assert!(parse_batch(
+            b"hello",
+            &mut processor,
+            &term,
+            &mut pending,
+            &mut scanner
+        ));
+        assert_eq!(&seen.lock().unwrap()[..], b"hello");
+        let term = term.lock();
+        assert_eq!(term.grid()[Line(0)][Column(0)].c, 'h');
+        assert_eq!(term.grid()[Line(0)][Column(4)].c, 'o');
     }
 
     /// 轮询等待条件成立，避免固定 sleep 造成的偶发失败。

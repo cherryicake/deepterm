@@ -1,9 +1,19 @@
 //! 图像与放置的存储：上限控制、淘汰策略、删除语义。
 
 use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard};
 
 use super::animation::Animation;
 use super::image::{DecodedImage, ImageId};
+
+/// 取图像存储锁；锁被投毒时恢复内部数据而不是 panic。
+///
+/// 读线程在持锁的 decode/execute 路径上 panic 一次就会毒化这把锁；旧代码
+/// 之后的每个 `expect` 都会让 UI 线程继续 panic，整个终端窗口不可用。
+/// 图像缓存丢一帧最多是画面短暂缺失，远好过进程崩溃。
+pub fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// 放置标识：`(图像 id, 放置 id)`。
 ///
@@ -15,6 +25,13 @@ pub type PlacementKey = (ImageId, u32);
 /// kitty 语义是 `z < 0` 在文字下、`z >= 0` 在文字上（`z=0` 也在文字上），
 /// 这里用常量把该判断集中到一处，避免渲染层重复硬编码。
 pub const Z_BELOW_TEXT_LIMIT: i32 = 0;
+
+/// 单张图像允许的放置上限。
+///
+/// 客户端可以用不同 `p=` 对同一图像反复 `a=p` 而不删除，旧实现会让
+/// `HashMap` 无界增长（每个 placement 还带尺寸/偏移，几百字节起）。
+/// 4096 已远超正常用法；超出时淘汰一个旧 placement，图像数据本身不动。
+const MAX_PLACEMENTS_PER_IMAGE: usize = 4096;
 
 /// 放置的位置类型。
 ///
@@ -565,6 +582,12 @@ impl Storage {
         };
         // 一旦被放置就不再是"临时"的——影响淘汰优先级。
         stored.transient = false;
+        if !stored.placements.contains_key(&placement_id)
+            && stored.placements.len() >= MAX_PLACEMENTS_PER_IMAGE
+            && let Some(oldest) = stored.placements.keys().next().copied()
+        {
+            stored.placements.remove(&oldest);
+        }
         stored.placements.insert(placement_id, placement);
         true
     }
@@ -1107,6 +1130,18 @@ mod tests {
         let b = s.allocate_implicit_id();
         assert_ne!(a, b);
         assert_eq!(b, u32::MAX - 1);
+    }
+
+    #[test]
+    fn placements_are_capped_per_image() {
+        let mut s = Storage::new(8 * 1024 * 1024);
+        s.insert(1, img(1, 1), None, false);
+        let placement = Placement::default();
+        for id in 0..(MAX_PLACEMENTS_PER_IMAGE as u32 + 10) {
+            assert!(s.place(1, id, placement.clone()));
+        }
+        let guard = s.get(1).expect("图像还在");
+        assert_eq!(guard.placements.len(), MAX_PLACEMENTS_PER_IMAGE);
     }
 
     #[test]

@@ -12,10 +12,24 @@
 //! conpty 路径都按同一条「抽取 → 交出普通文本 → 查询网格」的契约扫描，
 //! 因此契约定义在本模块，实现在调用方一侧。
 
+use std::sync::LazyLock;
+
+use memchr::memmem::Finder;
+
 /// OSC 起始符 `ESC ]`。
 pub const OSC_START: &[u8] = b"\x1b]";
 /// APC 起始符（Kitty 图形协议为 `ESC _ G`）。
 pub const APC_START: &[u8] = b"\x1b_";
+
+// `memchr::memmem::find` 是便捷函数，内部每次 `Finder::new(needle)`。
+// 终端扫描在同一个 needle 上反复查找，必须复用 Finder；否则纯文本输出
+// 每块都要重建 8 次 searcher（9/25 采样占读线程 self-time 约 27%）。
+pub(crate) static OSC_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(OSC_START));
+pub(crate) static APC_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(APC_START));
+pub(crate) static APC_END_FINDER: LazyLock<Finder<'static>> =
+    LazyLock::new(|| Finder::new(b"\x1b\\"));
+pub(crate) static CSI_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(CSI_START));
+static CSI_16_T_FINDER: LazyLock<Finder<'static>> = LazyLock::new(|| Finder::new(b"\x1b[16t"));
 
 /// 抽取结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,7 +302,9 @@ pub fn find_csi_16_t(data: &[u8]) -> Option<(usize, usize)> {
     /// `ESC [ 1 6 t`
     const NEEDLE: &[u8] = b"\x1b[16t";
 
-    memchr::memmem::find(data, NEEDLE).map(|offset| (offset, NEEDLE.len()))
+    CSI_16_T_FINDER
+        .find(data)
+        .map(|offset| (offset, NEEDLE.len()))
 }
 
 /// 在 `data` 中查找 XTVERSION 查询：`CSI > {Ps} q`（终端自报名称/版本）。
@@ -356,8 +372,11 @@ fn find_csi_with_intermediate(
     needle[..CSI_START.len()].copy_from_slice(CSI_START);
     needle[CSI_START.len()] = intermediate;
 
+    // 同一个 needle（intermediate/final 固定）只建一次 Finder；旧代码在
+    // while 条件里每轮 `Finder::new`，DA2/XTVERSION 探测会反复付构建成本。
+    let finder = Finder::new(&needle);
     let mut search_from = 0;
-    while let Some(offset) = memchr::memmem::find(&data[search_from..], &needle) {
+    while let Some(offset) = finder.find(&data[search_from..]) {
         let start = search_from + offset;
         let mut i = start + needle.len();
         // 参数字节：数字与分号；其余（中间字节/最终字节）在此止步。
@@ -392,7 +411,7 @@ fn find_csi_with_intermediate(
 /// 应答。ghostty 自己实现了它们（`terminal/modes.zig`），这里照做。
 pub fn find_private_mode(data: &[u8], mode: &[u8]) -> Option<PrivateModeHit> {
     let mut search_from = 0;
-    while let Some(offset) = memchr::memmem::find(&data[search_from..], CSI_START) {
+    while let Some(offset) = CSI_FINDER.find(&data[search_from..]) {
         let start = search_from + offset;
         let body_start = start + CSI_START.len();
 
@@ -485,7 +504,7 @@ pub fn find_dec_rqm_private(data: &[u8], mode: &[u8]) -> Option<(usize, usize)> 
     const SUFFIX: &[u8] = b"$p";
 
     let mut search_from = 0;
-    while let Some(offset) = memchr::memmem::find(&data[search_from..], CSI_START) {
+    while let Some(offset) = CSI_FINDER.find(&data[search_from..]) {
         let start = search_from + offset;
         let body_start = start + CSI_START.len();
 
