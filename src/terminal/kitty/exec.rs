@@ -87,6 +87,11 @@ struct LoadingImage {
     medium: Medium,
     width: Option<u32>,
     height: Option<u32>,
+    /// `O=` 字节偏移 / `S=` 读取长度（0 表示自动）。
+    offset: u32,
+    size: u32,
+    /// 首片的 quiet 级别；续片未显式 `q>=1` 时必须继承它。
+    quiet: Quiet,
     /// 首片的控制对与动作。
     ///
     /// 末片只带 `m`/`q`（kitty 规范），但显示语义全在首片：`a=T` 决定要不要
@@ -227,6 +232,11 @@ pub struct ImageStore {
     terminal_cols: u32,
     /// 当前可见的网格行窗口（`d=a`/`d=A` 只删屏幕内可见的放置）。
     visible_rows: Option<VisibleRows>,
+    /// 本命令执行后需要推进的光标：`(rows, target_col)`。
+    ///
+    /// Kitty 的 `C=` 语义是“显示后光标移动到图像右下角”；默认执行，
+    /// `C=1` 时禁止。这里只记录，由扫描器/终端在持锁路径应用。
+    cursor_advance: Option<(u32, u32)>,
 }
 
 /// 共享的图像存储句柄。
@@ -251,6 +261,7 @@ impl ImageStore {
             geometry: None,
             terminal_cols: 0,
             visible_rows: None,
+            cursor_advance: None,
         }
     }
 
@@ -260,6 +271,11 @@ impl ImageStore {
     pub fn set_geometry(&mut self, geometry: CellGeometry, terminal_cols: u32) {
         self.geometry = Some(geometry);
         self.terminal_cols = terminal_cols;
+    }
+
+    /// 取走本命令产生的光标推进；每条命令至多一次。
+    pub fn take_cursor_advance(&mut self) -> Option<(u32, u32)> {
+        self.cursor_advance.take()
     }
 
     /// 更新当前可见的网格行窗口（`d=a` 判定"屏幕上可见"用）。
@@ -350,7 +366,14 @@ impl ImageStore {
             return Ok(Response::default());
         }
 
-        let quiet = cmd.quiet;
+        // 非直传介质不可能成为分片续片；delete 也会中止加载。必须先
+        // 丢弃旧 loading 再算 quiet，否则新命令会继承上一条加载的 q。
+        self.abandon_chunked_load(&cmd);
+        self.cursor_advance = None;
+        let quiet = match (&self.loading, cmd.control.u32(b'q')) {
+            (Some(loading), None | Some(0)) => loading.quiet,
+            _ => cmd.quiet,
+        };
         let (mut response, succeeded) = match self.execute_inner(&cmd, cursor) {
             Ok(resp) => (resp, true),
             Err(err) => (
@@ -370,6 +393,25 @@ impl ImageStore {
         }
 
         Ok(response)
+    }
+
+    /// 非直传的传输/帧命令，以及 delete，都会中止未完成的分片加载。
+    ///
+    /// 对齐 ghostty #14811：协议只允许 `t=d` 分片，文件/临时文件/共享内存
+    /// 命令到达时若继续当作续片，会把路径当像素数据拼进去。
+    fn abandon_chunked_load(&mut self, cmd: &Command) {
+        if self.loading.is_none() {
+            return;
+        }
+        match cmd.action {
+            Action::Delete => self.loading = None,
+            Action::Transmit | Action::TransmitAndDisplay | Action::TransmitAnimationFrame => {
+                if matches!(cmd.control.byte(b't'), Some(b'f' | b't' | b's')) {
+                    self.loading = None;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn execute_inner(
@@ -473,34 +515,84 @@ impl ImageStore {
         encoded: &[u8],
         medium: Medium,
         compression: Compression,
+        offset: u32,
+        size: u32,
+        format: Format,
+        width: Option<u32>,
+        height: Option<u32>,
     ) -> Result<Vec<u8>, ExecutionError> {
         if medium == Medium::Direct {
             return Self::payload_bytes(encoded, compression);
         }
 
-        // 路径本身是 base64 文本；压缩键只作用于文件**内容**。
+        // 路径/共享内存名本身是 base64 文本；压缩键只作用于**内容**。
         let raw_path = decode_base64(encoded)?;
         if raw_path.contains(&0) {
-            // POSIX 路径不允许内嵌 NUL。
             return Err(ExecutionError::InvalidData);
         }
         let path = std::str::from_utf8(&raw_path).map_err(|_| ExecutionError::InvalidData)?;
-        let fs_path = std::path::Path::new(path);
 
+        let bytes = match medium {
+            Medium::File | Medium::TemporaryFile => self.read_file_payload(
+                path,
+                medium,
+                offset,
+                size,
+                format,
+                width,
+                height,
+                compression,
+            )?,
+            Medium::SharedMemory => self.read_shared_memory_payload(
+                path,
+                offset,
+                size,
+                format,
+                width,
+                height,
+                compression,
+            )?,
+            Medium::Direct => unreachable!(),
+        };
+
+        match compression {
+            Compression::None => Ok(bytes),
+            Compression::Zlib => image::decompress_zlib(&bytes).map_err(ExecutionError::Decode),
+        }
+    }
+
+    /// 从文件介质读取 `O=` / `S=` 指定的字节区间。
+    ///
+    /// 之前这里直接 `fs::read` 整个文件，忽略 `O=`/`S=`：客户端传“文件内
+    /// 偏移 + 长度”时会读到噪声，PNG 直接坏掉。现在按 kitty 规范先 seek、
+    /// 再按长度读取，`t=t` 仍在读后删除临时文件。
+    fn read_file_payload(
+        &self,
+        path: &str,
+        medium: Medium,
+        offset: u32,
+        size: u32,
+        format: Format,
+        width: Option<u32>,
+        height: Option<u32>,
+        compression: Compression,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+
+        let fs_path = std::path::Path::new(path);
         // 先打开再校验，避免 TOCTOU（对齐 ghostty "Open our file right away
         // before we do validation"）。
-        let file = std::fs::File::open(fs_path).map_err(|_| ExecutionError::InvalidData)?;
+        let mut file = std::fs::File::open(fs_path).map_err(|_| ExecutionError::InvalidData)?;
 
         let mut delete_after = false;
         if medium == Medium::TemporaryFile {
             let Some(temp_dir) = self.policy.temporary_directory.as_ref() else {
                 return Err(ExecutionError::TemporaryFileNotInTempDir);
             };
-            // 用 canonicalize 解析符号链接后再比较，避免借链接逃出临时目录。
             let canonical = fs_path
                 .canonicalize()
                 .map_err(|_| ExecutionError::InvalidData)?;
-            if !canonical.starts_with(temp_dir) {
+            if !Self::is_allowed_temporary_path(&canonical, temp_dir) {
                 return Err(ExecutionError::TemporaryFileNotInTempDir);
             }
             if !canonical
@@ -519,18 +611,174 @@ impl ImageStore {
             return Err(ExecutionError::InvalidData);
         }
 
-        let bytes = std::fs::read(fs_path).map_err(|_| ExecutionError::InvalidData)?;
+        let range = Self::payload_range(
+            meta.len() as usize,
+            offset,
+            size,
+            format,
+            width,
+            height,
+            compression,
+        )?;
+        file.seek(SeekFrom::Start(range.start as u64))
+            .map_err(|_| ExecutionError::InvalidData)?;
+        let mut bytes = Vec::with_capacity(range.len());
+        file.take(range.len() as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ExecutionError::InvalidData)?;
+        if bytes.len() != range.len() {
+            return Err(ExecutionError::InvalidData);
+        }
 
         if delete_after {
-            // 删除失败不影响本次读取结果。
             let _ = std::fs::remove_file(fs_path);
         }
+        Ok(bytes)
+    }
 
-        // 压缩作用于文件内容。
-        match compression {
-            Compression::None => Ok(bytes),
-            Compression::Zlib => image::decompress_zlib(&bytes).map_err(ExecutionError::Decode),
+    /// `t=t` 允许的临时目录：配置的 temp dir，以及常见系统临时根。
+    ///
+    /// macOS 的 `/tmp` 是 `/private/tmp` 的符号链接，Kitty 客户端常把
+    /// 文件写到 `/tmp`；`canonicalize` 后只剩 `/private/tmp`，只比对
+    /// `std::env::temp_dir()`（通常是 `/var/folders/...`）会误拒。
+    /// `/dev/shm` 是 Linux 上常见的临时文件位置，一并接受。
+    fn is_allowed_temporary_path(canonical: &std::path::Path, temp_dir: &std::path::Path) -> bool {
+        if canonical.starts_with(temp_dir) {
+            return true;
         }
+        for root in ["/tmp", "/private/tmp", "/dev/shm"] {
+            if canonical.starts_with(root) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 从 POSIX 共享内存读取 `O=` / `S=` 指定的区间。
+    ///
+    /// 这里以前把 `t=s` 当成文件路径处理，客户端用 shm 传图必然失败。
+    /// 对齐 ghostty：名字原样交给 `shm_open`（允许无前导 `/` 的 sandbox
+    /// app-group 名称），读取后 `shm_unlink`；Windows/Android 不支持。
+    #[cfg(unix)]
+    fn read_shared_memory_payload(
+        &self,
+        name: &str,
+        offset: u32,
+        size: u32,
+        format: Format,
+        width: Option<u32>,
+        height: Option<u32>,
+        compression: Compression,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let valid =
+            !name.is_empty() && name != "/" && name.len() <= 255 && !name.as_bytes().contains(&0);
+        if !valid {
+            return Err(ExecutionError::InvalidData);
+        }
+        let c_name = std::ffi::CString::new(name).map_err(|_| ExecutionError::InvalidData)?;
+        // SAFETY：c_name 是合法 NUL 结尾字符串；shm_open 不持有它。
+        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
+        if fd < 0 {
+            return Err(ExecutionError::InvalidData);
+        }
+        // SAFETY：fd 由 shm_open 返回且非负，所有权移交给 File。
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        // 按 kitty 要求读取后 unlink；先 unlink 不影响到已打开句柄的读取。
+        // SAFETY：c_name 生命周期覆盖调用。
+        unsafe {
+            libc::shm_unlink(c_name.as_ptr());
+        }
+
+        let len = file
+            .metadata()
+            .map_err(|_| ExecutionError::InvalidData)?
+            .len() as usize;
+        if len == 0 {
+            return Err(ExecutionError::InvalidData);
+        }
+        let range = Self::payload_range(len, offset, size, format, width, height, compression)?;
+        // macOS 的 shm fd 不可 seek、也不支持普通 read/write；Ghostty 用
+        // mmap 读整段再切片。这里照做，兼容 Linux/macOS。
+        // SAFETY：mmap 的参数均来自已校验的 shm 句柄与长度；映射只读。
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(ExecutionError::InvalidData);
+        }
+        // SAFETY：mmap 成功返回 len 字节只读映射。
+        let mapped = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        let bytes = mapped[range].to_vec();
+        // SAFETY：ptr/len 与上面 mmap 相同。
+        unsafe {
+            libc::munmap(ptr, len);
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(not(unix))]
+    fn read_shared_memory_payload(
+        &self,
+        _name: &str,
+        _offset: u32,
+        _size: u32,
+        _format: Format,
+        _width: Option<u32>,
+        _height: Option<u32>,
+    ) -> Result<Vec<u8>, ExecutionError> {
+        Err(ExecutionError::UnsupportedMedium)
+    }
+
+    /// 计算 `[offset, offset+size)`，`size=0` 时按格式推导或读到末尾。
+    ///
+    /// 共享内存/文件可能比图像数据大（页对齐、前缀偏移），非 PNG 未压缩
+    /// 图像用 `w*h*bpp` 精确裁剪；PNG/zlib 则交给解码器处理剩余字节。
+    fn payload_range(
+        total: usize,
+        offset: u32,
+        size: u32,
+        format: Format,
+        width: Option<u32>,
+        height: Option<u32>,
+        compression: Compression,
+    ) -> Result<std::ops::Range<usize>, ExecutionError> {
+        let start = offset as usize;
+        if start > total {
+            return Err(ExecutionError::InvalidData);
+        }
+        let available = total - start;
+        let bpp = match format {
+            Format::Rgb => Some(3usize),
+            Format::Rgba => Some(4usize),
+            Format::Png => None,
+        };
+        let expected = match (bpp, width, height) {
+            (Some(bpp), Some(width), Some(height)) => (width as usize)
+                .checked_mul(height as usize)
+                .and_then(|pixels| pixels.checked_mul(bpp)),
+            _ => None,
+        };
+        let requested = if size > 0 {
+            size as usize
+        } else if compression == Compression::None {
+            expected.unwrap_or(available)
+        } else {
+            // zlib 压缩后长度与 w*h*bpp 无关，读到末尾交给解压器。
+            available
+        };
+        if requested > available || requested > image::MAX_LOADING_ENCODED_BYTES {
+            return Err(ExecutionError::Decode(DecodeError::TooLarge));
+        }
+        Ok(start..start + requested)
     }
 
     /// 处理传输（`a=t` / `a=T`）。
@@ -542,6 +790,8 @@ impl ImageStore {
     /// 存储却永远不建立放置（grok 悬浮预览"一直 Loading"的根因）。
     fn transmit(&mut self, cmd: &Command, cursor: (i32, u32)) -> Result<Response, ExecutionError> {
         let (medium, format, compression, width, height) = self.transmission_params(cmd)?;
+        let offset = cmd.control.u32(b'O').unwrap_or(0);
+        let size = cmd.control.u32(b'S').unwrap_or(0);
 
         // 是否还有后续分片（仅直传介质支持）。
         let more = medium.supports_chunking() && cmd.control.u32(b'm').is_some_and(|v| v > 0);
@@ -574,6 +824,9 @@ impl ImageStore {
                         medium,
                         width,
                         height,
+                        offset: cmd.control.u32(b'O').unwrap_or(0),
+                        size: cmd.control.u32(b'S').unwrap_or(0),
+                        quiet: cmd.quiet,
                         control: cmd.control.clone(),
                         action: cmd.action,
                         encoded: cmd.encoded.clone(),
@@ -596,8 +849,16 @@ impl ImageStore {
                 // 末片同样计入累积上限（`loading` 是 take 出来的 owned 值，
                 // `?` 失败时它随栈释放，部分缓冲即被丢弃）。
                 loading.push_chunk(&cmd.encoded)?;
-                let payload =
-                    self.payload_for_medium(&loading.encoded, loading.medium, loading.compression)?;
+                let payload = self.payload_for_medium(
+                    &loading.encoded,
+                    loading.medium,
+                    loading.compression,
+                    loading.offset,
+                    loading.size,
+                    loading.format,
+                    loading.width,
+                    loading.height,
+                )?;
                 let tuple = (
                     loading.id,
                     payload,
@@ -614,7 +875,16 @@ impl ImageStore {
                     .unwrap_or_else(|| self.with_storage_mut(|s| s.allocate_implicit_id()));
                 (
                     id,
-                    self.payload_for_medium(&cmd.encoded, medium, compression)?,
+                    self.payload_for_medium(
+                        &cmd.encoded,
+                        medium,
+                        compression,
+                        offset,
+                        size,
+                        format,
+                        width,
+                        height,
+                    )?,
                     format,
                     width,
                     height,
@@ -711,8 +981,30 @@ impl ImageStore {
             },
         };
 
-        if !self.with_storage_mut(|s| s.place(id, placement_id, placement)) {
+        if !self.with_storage_mut(|s| s.place(id, placement_id, placement.clone())) {
             return Err(ExecutionError::InvalidChunk);
+        }
+
+        // Kitty 默认在显示后把光标移到图像右下角；`C=1` 明确禁止。
+        // 虚拟放置由占位符驱动，不移动光标。
+        if control.u32(b'C') != Some(1)
+            && placement.location == PlacementLocation::Anchor
+            && let Some(geometry) = self.geometry
+            && let Some((cols, rows)) =
+                self.with_storage(|s| s.get(id).map(|st| placement.grid_size(&st.image, geometry)))
+            && cols > 0
+        {
+            let target_x = u64::from(cursor.1) + u64::from(cols);
+            let wraps = self.terminal_cols > 0 && target_x >= u64::from(self.terminal_cols);
+            let rows_to_move = rows.saturating_sub(1).saturating_add(u32::from(wraps));
+            let target_col = if wraps {
+                0
+            } else {
+                target_x.min(u64::from(u32::MAX)) as u32
+            };
+            // 防止客户端用超大 c=/r= 让 linefeed 循环过久；一屏以内足够
+            // 表达正常图像，超出部分按 Ghostty 的有界处理思路截断。
+            self.cursor_advance = Some((rows_to_move.min(1024), target_col));
         }
         Ok(())
     }
@@ -792,6 +1084,9 @@ impl ImageStore {
             medium,
             width,
             height,
+            offset: cmd.control.u32(b'O').unwrap_or(0),
+            size: cmd.control.u32(b'S').unwrap_or(0),
+            quiet: cmd.quiet,
             control: cmd.control.clone(),
             action: cmd.action,
             encoded: cmd.encoded.clone(),
@@ -1560,6 +1855,195 @@ mod tests {
         path.canonicalize().expect("canonicalize 失败")
     }
 
+    /// 非直传命令不能成为分片续片：它应中止旧 load，并按新命令执行。
+    ///
+    /// 对齐 ghostty #14811；旧实现会把文件路径当成像素数据拼进旧图。
+    #[test]
+    fn non_direct_transmission_abandons_chunked_load() {
+        let mut store = ImageStore::new(1024 * 1024);
+        // 开始一张 1x1 RGBA 的两片传输。
+        run(&mut store, "a=t,i=1,f=32,s=1,v=1,m=1;AAAA", (0, 0)).unwrap();
+        assert!(store.loading.is_some());
+
+        let payload = [1u8, 2, 3, 4];
+        let path = write_temp_payload("non-direct-abort", &payload);
+        let encoded_path =
+            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+        let r = run(
+            &mut store,
+            &format!("a=t,i=2,t=f,f=32,s=1,v=1;{encoded_path}"),
+            (0, 0),
+        )
+        .unwrap();
+
+        assert!(r.images_changed);
+        assert!(store.loading.is_none(), "新介质命令必须终止旧分片");
+        let guard = store.lock_storage();
+        assert!(guard.get(1).is_none(), "旧分片图像不应入存储");
+        let stored = guard.get(2).expect("新文件图像应入存储");
+        assert_eq!(stored.image.rgba, payload);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn delete_aborts_chunked_load() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=t,i=1,f=32,s=1,v=1,m=1;AAAA", (0, 0)).unwrap();
+        assert!(store.loading.is_some());
+        let _ = run(&mut store, "a=d,d=a", (0, 0)).unwrap();
+        assert!(store.loading.is_none(), "delete 必须中止未完成的分片加载");
+    }
+
+    /// 分片续片没有 `q` 时必须继承首片 quiet；否则 q=2 的加载在中途出错
+    /// 仍会回错误，客户端可能把应答误当成图像帧数据。
+    #[test]
+    fn chunked_continuation_inherits_first_chunk_quiet() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=t,i=1,f=32,s=1,v=1,q=2,m=1;AAAA", (0, 0)).unwrap();
+        // 只剩 3 字节，解码必然长度不符；首片 q=2 应让错误也保持静默。
+        let r = run(&mut store, "m=0;AAAA", (0, 0)).unwrap();
+        assert!(r.reply.is_empty(), "q=2 的分片加载错误也不应回包");
+        assert!(store.loading.is_none());
+    }
+
+    /// `O=`/`S=` 必须只读文件中的指定区间；旧实现读整个文件，前缀噪声
+    /// 会让解码长度不符。
+    #[test]
+    fn file_medium_honors_offset_and_size() {
+        let mut store = ImageStore::new(1024 * 1024);
+        let path = write_temp_payload("file-range", &[9, 9, 9, 1, 2, 3, 4]);
+        let encoded_path =
+            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+        let r = run(
+            &mut store,
+            &format!("a=t,i=7,t=f,f=32,s=1,v=1,O=3,S=4;{encoded_path}"),
+            (0, 0),
+        )
+        .unwrap();
+
+        assert!(r.images_changed);
+        let guard = store.lock_storage();
+        assert_eq!(
+            guard.get(7).expect("图像应入存储").image.rgba,
+            vec![1, 2, 3, 4]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// POSIX 共享内存介质（`t=s`）读取；名字故意不带前导 `/`，覆盖
+    /// sandbox app-group 名称。共享内存按页对齐，`S=0` 时必须按 w*h*bpp
+    /// 精确裁剪，不能把页尾 0 当像素。
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_medium_reads_and_unlinks() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let mut store = ImageStore::new(1024 * 1024);
+        let name = format!("deepterm-test-shm-{}", std::process::id());
+        let c_name = std::ffi::CString::new(name.clone()).unwrap();
+        // SAFETY：测试内创建/销毁自己的共享内存对象。
+        let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
+        assert!(fd >= 0, "shm_open failed");
+        // SAFETY：fd 非负且归本测试所有。
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.set_len(4096).unwrap();
+        // macOS 的 shm fd 不支持 write，用 mmap 写入测试数据。
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert!(ptr != libc::MAP_FAILED, "mmap write failed");
+        unsafe {
+            std::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), ptr.cast::<u8>(), 4);
+            libc::msync(ptr, 4096, libc::MS_SYNC);
+            libc::munmap(ptr, 4096);
+        }
+        drop(file);
+
+        let encoded_name = crate::terminal::kitty::command::encode_base64(name.as_bytes());
+        let r = run(
+            &mut store,
+            &format!("a=t,i=8,t=s,f=32,s=1,v=1;{encoded_name}"),
+            (0, 0),
+        )
+        .unwrap();
+        assert!(r.images_changed, "shm 图像应入存储: reply={:?}", r.reply);
+        let guard = store.lock_storage();
+        assert_eq!(
+            guard.get(8).expect("shm 图像应入存储").image.rgba,
+            vec![1, 2, 3, 4],
+            "页尾填充不能被当成像素"
+        );
+        drop(guard);
+        // 生产代码读后已 unlink；这里兜底清理。
+        unsafe {
+            libc::shm_unlink(c_name.as_ptr());
+        }
+    }
+
+    /// `o=z` 的文件负载：压缩后长度与 w*h*bpp 无关，`S=0` 时必须读到
+    /// 文件末尾再解压，不能按原始像素大小截断。
+    #[test]
+    fn zlib_file_medium_reads_full_compressed_stream() {
+        use std::io::Write as _;
+
+        let raw = [0u8, 1, 2, 255];
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let path = write_temp_payload("zlib-file", &compressed);
+        let encoded_path =
+            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+
+        let mut store = ImageStore::new(1024 * 1024);
+        let r = run(
+            &mut store,
+            &format!("a=t,i=11,t=f,f=32,o=z,s=1,v=1;{encoded_path}"),
+            (0, 0),
+        )
+        .unwrap();
+        assert!(r.images_changed);
+        let guard = store.lock_storage();
+        assert_eq!(guard.get(11).expect("压缩文件图像应入存储").image.rgba, raw);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// macOS 的 `/tmp` 指向 `/private/tmp`；Kitty 客户端常把 `t=t` 文件
+    /// 写在这里，不能因为 temp_dir 是 `/var/folders` 就误拒。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn temporary_file_in_private_tmp_is_accepted() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/tty-graphics-protocol-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&path, [1u8, 2, 3, 4]).unwrap();
+        let encoded_path =
+            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+
+        let mut store = ImageStore::new(1024 * 1024);
+        let r = run(
+            &mut store,
+            &format!("a=t,i=12,t=t,f=32,s=1,v=1;{encoded_path}"),
+            (0, 0),
+        )
+        .unwrap();
+        assert!(r.images_changed);
+        assert!(!path.exists(), "t=t 读后必须删除临时文件");
+        let guard = store.lock_storage();
+        assert_eq!(
+            guard.get(12).expect("tmp 临时文件图像应入存储").image.rgba,
+            [1, 2, 3, 4]
+        );
+    }
+
     #[test]
     fn zlib_single_chunk_transmits_and_displays() {
         // terminal-browser 的传帧形态：a=T,f=32,o=z,s=..,v=..（单片、压缩）。
@@ -1695,6 +2179,40 @@ mod tests {
         assert!(String::from_utf8_lossy(&r.reply).contains("decompression failed"));
         assert!(!r.images_changed);
         assert!(store.lock_storage().get(1).is_none(), "坏流不得入存储");
+    }
+
+    /// Kitty 默认把光标移到图像右下角；`C=1` 禁止移动。
+    #[test]
+    fn display_advances_cursor_unless_c1() {
+        use crate::terminal::kitty::storage::CellGeometry;
+
+        let mut store = ImageStore::new(1024 * 1024);
+        store.set_geometry(
+            CellGeometry {
+                cell_width: 10,
+                cell_height: 20,
+            },
+            80,
+        );
+        // 1x2 格图像放在 (5,3)。
+        let raw = vec![0u8; 10 * 40 * 4];
+        let payload = crate::terminal::kitty::command::encode_base64(&raw);
+        let r = run(
+            &mut store,
+            &format!("a=T,i=21,f=32,s=10,v=40;{payload}"),
+            (5, 3),
+        )
+        .unwrap();
+        assert!(r.images_changed);
+        assert_eq!(
+            store.take_cursor_advance(),
+            Some((1, 4)),
+            "默认 C=0：下移 1 行到图像底，列停在图像右侧"
+        );
+
+        let r = run(&mut store, "a=T,i=22,f=32,s=1,v=1,C=1;/wAA/w==", (5, 3)).unwrap();
+        assert!(r.images_changed);
+        assert_eq!(store.take_cursor_advance(), None, "C=1 明确禁止光标移动");
     }
 
     #[test]
@@ -2165,6 +2683,9 @@ mod tests {
                 medium: Medium::Direct,
                 width: Some(1),
                 height: Some(1),
+                offset: 0,
+                size: 0,
+                quiet: Quiet::Never,
                 control: ControlPairs::default(),
                 action: Action::Transmit,
                 encoded: vec![0u8; encoded_len],

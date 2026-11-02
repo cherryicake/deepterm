@@ -175,6 +175,7 @@ pub trait PtyScanner: Send {
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
         grid: &mut dyn FnMut() -> GridState,
+        move_cursor: &mut dyn FnMut(u32, u32),
     );
 
     /// 取走扫描器攒下的、需要回写给终端应用的应答字节。

@@ -179,13 +179,18 @@ impl KittyGraphicsScanner {
         sink: Box<dyn ReplySink>,
         geometry: escape_scan::TermGeometry,
     ) -> Self {
-        Self::build(
+        let mut scanner = Self::build(
             storage,
             enabled,
             sink,
             Some(geometry),
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
+        );
+        // build() 只保存扫描器自己的几何；删除/光标推进依赖 ImageStore
+        // 的几何，必须在这里同步一次，否则启动时带几何的扫描器执行
+        // d=c/C= 会退回“1 格/不动”的退化行为。
+        scanner.set_geometry(geometry);
+        scanner
     }
 
     fn build(
@@ -255,8 +260,8 @@ impl KittyGraphicsScanner {
 
     /// 处理一条**完整**的 APC 内容（远程路径：UI 线程已在
     /// `process_pty_data` 里完成序列切分，无需再扫描字节流）。
-    pub fn scan_apc(&mut self, content: &[u8]) {
-        self.handle_apc(content);
+    pub fn scan_apc(&mut self, content: &[u8], move_cursor: &mut dyn FnMut(u32, u32)) {
+        self.handle_apc(content, move_cursor);
     }
 
     /// 更新终端几何。
@@ -423,7 +428,7 @@ impl KittyGraphicsScanner {
     }
 
     /// 处理一条完整的 APC 内容。
-    fn handle_apc(&mut self, content: &[u8]) {
+    fn handle_apc(&mut self, content: &[u8], move_cursor: &mut dyn FnMut(u32, u32)) {
         let Some(payload) = escape_scan::kitty_graphics_payload(content) else {
             // 非图形协议的 APC：直接忽略。
             return;
@@ -449,6 +454,9 @@ impl KittyGraphicsScanner {
 
         match self.store.execute(cmd, self.cursor) {
             Ok(response) => {
+                if let Some((rows, target_col)) = self.store.take_cursor_advance() {
+                    move_cursor(rows, target_col);
+                }
                 if !response.reply.is_empty() {
                     self.sink.reply(&response.reply);
                 }
@@ -471,6 +479,7 @@ impl PtyScanner for KittyGraphicsScanner {
         pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
         grid: &mut dyn FnMut() -> GridState,
+        move_cursor: &mut dyn FnMut(u32, u32),
     ) {
         // APC 残尾的增量追加：大图分片会跨几十次 read，旧逻辑每次把整个
         // pending 复制/重扫一遍（O(n²)）。这里只追加新字节，并只在新增部分
@@ -491,12 +500,12 @@ impl PtyScanner for KittyGraphicsScanner {
                 let state = grid();
                 self.cursor = state.cursor;
                 self.store.set_visible_rows(Some(state.visible));
-                self.handle_apc(&pending[escape_scan::APC_START.len()..end]);
+                self.handle_apc(&pending[escape_scan::APC_START.len()..end], move_cursor);
                 let consumed = end + 2;
                 let remainder = pending[consumed..].to_vec();
                 pending.clear();
                 if !remainder.is_empty() {
-                    self.scan(&remainder, pending, emit, grid);
+                    self.scan(&remainder, pending, emit, grid, move_cursor);
                 }
                 return;
             }
@@ -578,7 +587,7 @@ impl PtyScanner for KittyGraphicsScanner {
                         self.store.set_visible_rows(Some(state.visible));
                         // 图形 APC 被消费，不进入 vte（vte 会丢弃内容，但序列
                         // 本身仍会走一遍状态机——提前摘除更干净）。
-                        self.handle_apc(content);
+                        self.handle_apc(content, move_cursor);
                         pos = seq_pos + len;
                     }
                     Extract::Incomplete => {
@@ -712,6 +721,7 @@ mod tests {
             &mut pending,
             &mut |bytes| emitted.extend_from_slice(bytes),
             &mut grid_state_fixture,
+            &mut |_, _| {},
         );
         assert!(pending.is_empty(), "测试输入不应留下跨读残尾");
         (emitted, scanner.take_replies())
@@ -735,6 +745,7 @@ mod tests {
                 &mut pending,
                 &mut |bytes| emitted.extend_from_slice(bytes),
                 &mut grid_state_fixture,
+                &mut |_, _| {},
             );
             pendings.push(pending.clone());
         }
@@ -1078,6 +1089,7 @@ mod tests {
             &mut pending,
             &mut |bytes| emitted.extend_from_slice(bytes),
             &mut grid_state_fixture,
+            &mut |_, _| {},
         );
         processor.advance(&mut term, &emitted);
         assert!(pending.is_empty(), "完整输入不应留下残尾");
@@ -1169,6 +1181,7 @@ mod tests {
                     ),
                 }
             },
+            &mut |_, _| {},
         );
         assert!(pending.is_empty(), "完整输入不应留下残尾");
 
@@ -1277,6 +1290,31 @@ mod tests {
     }
 
     #[test]
+    fn graphics_display_exposes_cursor_advance_to_terminal() {
+        let mut scanner = scanner_with_geometry();
+        // 9x36 像素 = 1x2 格（单元格 9x18）；光标从 (0,0) 应移到 (1,1)。
+        let raw = vec![0u8; 9 * 36 * 4];
+        let payload = crate::terminal::kitty::command::encode_base64(&raw);
+        let seq = format!("\x1b_Ga=T,i=31,f=32,s=9,v=36;{payload}\x1b\\");
+        let mut pending = Vec::new();
+        let mut emitted = Vec::new();
+        let mut advance = None;
+        scanner.scan(
+            seq.as_bytes(),
+            &mut pending,
+            &mut |bytes| emitted.extend_from_slice(bytes),
+            &mut grid_state_fixture,
+            &mut |rows, col| advance = Some((rows, col)),
+        );
+        assert!(pending.is_empty() && emitted.is_empty());
+        assert_eq!(
+            advance,
+            Some((1, 1)),
+            "扫描器必须把 C= 默认的右下角光标移动交给终端应用"
+        );
+    }
+
+    #[test]
     fn chunked_protocol_across_read_boundaries_survives() {
         let storage = shared_storage();
         let mut scanner = KittyGraphicsScanner::with_storage(
@@ -1327,6 +1365,7 @@ mod tests {
                 &mut pending,
                 &mut |bytes| emitted.extend_from_slice(bytes),
                 &mut grid_state_fixture,
+                &mut |_, _| {},
             );
         }
         assert!(pending.is_empty(), "最终不应有残尾：{}", pending.len());

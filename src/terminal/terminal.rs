@@ -3198,7 +3198,16 @@ impl Terminal {
         };
         scanner.set_cursor(cursor.0, cursor.1);
         scanner.set_visible_rows(visible);
-        scanner.scan_apc(content);
+        // 与本地路径相同：光标推进在 APC 处理时立即完成，后续文本
+        // 才会从正确的位置继续。
+        let term = &self.term;
+        scanner.scan_apc(content, &mut |rows, target_col| {
+            let mut term = term.lock();
+            for _ in 0..rows {
+                term.linefeed();
+            }
+            term.goto_col(target_col as usize);
+        });
     }
 
     /// 把扫描器攒下的协议应答回写给 PTY/SSH。

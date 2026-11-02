@@ -457,7 +457,7 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
 
 ## 8. 本轮已实装（2026-11-02）
 
-按第 6 节“阶段 0”先落了 5 个 P0，随后补齐 9 个 P1（R1/R2、M1–M3、R3、P1、K1、A1），均不改变终端语义：
+按第 6 节“阶段 0”先落了 5 个 P0，随后补齐 10 个 P1（R1/R2、M1–M3、R3、P1、K1、K2、A1），均不改变终端语义：
 
 | 项 | 实装内容 | 文件 |
 |---|---|---|
@@ -474,6 +474,7 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
 | P1-R3 滚动行缓存复用 | 每行内容指纹（字符/颜色/flags/下划线/zerowidth/hyperlink）；全量帧检测 `new[i]==old[i+shift]` 的滚动位移，平移行缓存并只重排新进入视口的行；同时比对 `palette_hash`，OSC 改色后强制重建；不依赖 alacritty 提供滚动 damage | `src/terminal/terminal.rs`、`src/terminal_view/terminal_element.rs` |
 | P1-P1 PTY 两级流水 | gather 线程独占 `Pty`/`Poller`，只读字节、处理输入/尺寸/子进程事件；parse 线程独占 `Term`+vte+扫描器；4×64 KiB 有界环（PARSE_QUEUE_DEPTH=4）；扫描器应答经 reply channel + `poller.notify()` 回到 gather 写回 | `src/terminal/local_pty.rs` |
 | P1-K1 Kitty 健壮性 | 存储锁中毒改 `into_inner()` 恢复；`RgbaImage::from_raw` 失败退化为 1×1 透明帧而非 panic；单图像 placement 上限 4096 | `src/terminal/kitty/storage.rs`、`src/terminal/kitty/render.rs`、`src/terminal/kitty/exec.rs` |
+| P1-K2 Kitty 介质/分片完整性 | `t=s` 走 POSIX `shm_open`+`mmap`+`shm_unlink`（允许无前导 `/`）；文件/临时文件/共享内存支持 `O=`/`S=` 区间；非直传命令与 delete 中止未完成分片；续片继承首片 `q`；macOS `/private/tmp` 临时目录；zlib 文件负载读完整流 | `src/terminal/kitty/exec.rs` |
 | P1-A1 APC 残尾增量 | 待续 APC 不再每次 `take+extend+全量重扫`；只追加新字节、只在新增尾部找 ST，完整后把余下字节递归走正常扫描；2 字节分片 × 26 块的测试覆盖 | `src/terminal/kitty/scanner.rs`、`src/terminal/escape_scan.rs` |
 
 验证：
@@ -483,6 +484,7 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
 - `cargo test --lib tests_runs_for_range`：5 passed。
 - `cargo test --lib escape_scan`：37 passed。
 - `cargo test --lib kitty::scanner`：26 passed。
+- `cargo test --release --lib kitty::exec`：97 passed（含 shm、O/S、zlib 文件、非直传中止、delete 中止、quiet 继承、`/private/tmp`）。
 - `cargo test --lib focus_check_never_blocks_on_grid_lock`：1 passed（持锁时 Wakeup 检查不阻塞、置 pending，释放后恢复）。
 - `cargo test --lib scrollback_budget_shrinks_wide_windows_only`：1 passed（250 列 ≈ 5.5k 行；窄窗口不放大）。
 - `cargo test --lib detect_scroll_shift_recognizes_one_line_and_clear`：1 passed（上滚/下滚/清屏三态）。
@@ -520,6 +522,30 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
    行指纹只覆盖 cell 的 `Color` 枚举，OSC 4/10/11/12 改色不改变枚举、却改变最终颜色；复用会保留旧色。新增 `TerminalPalette::hash_u64()`，把 `TerminalContent.palette_hash` 纳入行缓存复用条件。
 
 复核但未再发现同类问题的区域：PTY gather→parse 的顺序/尺寸应答/Wakeup、APC 残尾增量、隐藏标签快照与 GPU 纹理释放、scrollback 预算裁剪、search 后台化。PTY 20 条真实端到端用例仍全绿。
+
+## 9. Kitty 协议完整性复核（2026-11-02，第二批）
+
+对照 Ghostty 最近一年的 kitty 提交（文件/共享内存介质、分片中断、临时目录、Kitty clipboard）逐项核对后，本轮先修图形协议里最影响真实客户端的缺口：
+
+| 缺口 | 修复 |
+|---|---|
+| `t=s`（POSIX 共享内存）被当成文件路径读，客户端用 shm 传图必然失败 | Unix 走 `shm_open` + `mmap` + `shm_unlink`；名字允许无前导 `/`（macOS app-group 形式）；Windows 保持 ENOTSUP |
+| `O=`/`S=` 被忽略，文件/临时文件/共享内存总是读整段 | 按 offset/size 读取区间；非 PNG 未压缩图像用 `w*h*bpp` 精确裁剪（去掉 shm 页尾填充），zlib/PNG 读到末尾交给解码器 |
+| 分片加载期间收到非直传命令时，把路径当像素拼进旧图 | 非直传的 transmit/animation 命令先丢弃旧 loading，按新命令执行（对齐 Ghostty #14811）；delete 也中止加载 |
+| 续片未带 `q` 时没有继承首片 quiet | `LoadingImage` 保存首片 quiet；续片 q 缺省/0 时继承，q>=1 覆盖 |
+| macOS 上 `t=t` 文件在 `/tmp`（实际 `/private/tmp`）被误拒 | 临时目录白名单加入 `/tmp`、`/private/tmp`、`/dev/shm` |
+| `t=f` + `o=z` 被按原始像素大小截断 | zlib 负载读完整文件再解压 |
+| `C=` 光标移动完全没有实现，`a=T` 后光标不动 | 默认按 Ghostty 语义移到图像右下角，`C=1` 禁止；在 APC 处理的同一时刻应用，同一 read 里后续文本从新光标继续；虚拟放置不移动 |
+
+验证：`cargo test --release --lib kitty::exec` 98 passed；`cargo test --release --lib kitty` 311 passed（另 1 个 `debug_assert` 用例在 release 下不触发，属既有测试写法）。新增 shm、文件 offset/size、zlib 文件、非直传中止、delete 中止、quiet 继承、`/tmp` 临时文件、`C=` 光标推进及本地 PTY 端到端用例。
+
+仍未实现（明确记录，不在本轮强行做）：
+
+- **Kitty clipboard（OSC 5522）**：MIME/多段 `wdata`、`walias`、权限 grant、分块读响应都没有；这是独立的一套协议，工作量与图形图像相当。
+- **Kitty DnD 协议**：未实现。
+- **相对放置**：`P=`/父放置链、`H=`/`V=` 的 relative placement 还没有；当前只有锚点与虚拟两种。
+- **erase scrollback / erase history 时移除历史放置**：Ghostty 有专门实现，DeepTerm 尚未挂接滚动历史裁剪路径。
+- **Windows 文件路径安全校验**（Ghostty #14189）：`t=f` 在 Windows 仍直接交给 `File::open`。
 
 ## 附录 A：关键代码位置速查
 

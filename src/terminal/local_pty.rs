@@ -31,7 +31,7 @@ use alacritty_terminal::{
     sync::FairMutex,
     term::Term,
     tty::{ChildEvent, EventedPty, EventedReadWrite, Pty},
-    vte::ansi::{Processor, StdSyncHandler},
+    vte::ansi::{Handler as _, Processor, StdSyncHandler},
 };
 use polling::{Event as PollEvent, Events, PollMode, Poller};
 
@@ -118,6 +118,7 @@ impl PtyScanner for PassThroughScanner {
         _pending: &mut Vec<u8>,
         emit: &mut dyn FnMut(&[u8]),
         _grid: &mut dyn FnMut() -> GridState,
+        _move_cursor: &mut dyn FnMut(u32, u32),
     ) {
         emit(data);
     }
@@ -825,7 +826,17 @@ fn parse_batch(
             ctx.flush_sync_update();
             ctx.grid_state()
         };
-        scanner.scan(data, pending, &mut emit, &mut grid);
+        // Kitty `C=` 语义：显示后光标移到图像右下角（默认），`C=1` 不动。
+        // 必须在 APC 处理的那一刻应用，不能等整段扫描结束——同一 read 里
+        // APC 之后的文本要从新光标继续，否则会覆盖图像。
+        let mut move_cursor = |rows: u32, target_col: u32| {
+            let mut ctx = ctx.borrow_mut();
+            for _ in 0..rows {
+                ctx.terminal.linefeed();
+            }
+            ctx.terminal.goto_col(target_col as usize);
+        };
+        scanner.scan(data, pending, &mut emit, &mut grid, &mut move_cursor);
     }
     drop(terminal);
     drop(terminal_lease);
@@ -907,6 +918,7 @@ mod tests {
             _pending: &mut Vec<u8>,
             emit: &mut dyn FnMut(&[u8]),
             _grid: &mut dyn FnMut() -> GridState,
+            _move_cursor: &mut dyn FnMut(u32, u32),
         ) {
             self.seen.lock().unwrap().extend_from_slice(data);
             emit(data);
@@ -975,6 +987,7 @@ mod tests {
                 pending: &mut Vec<u8>,
                 emit: &mut dyn FnMut(&[u8]),
                 _grid: &mut dyn FnMut() -> GridState,
+                _move_cursor: &mut dyn FnMut(u32, u32),
             ) {
                 // 只摘 OSC 777：其余原样透传，让提示符/回显照常进 vte。
                 let mut rest = data;
@@ -1523,6 +1536,72 @@ mod tests {
         );
 
         parts.reader.sender().shutdown();
+    }
+
+    /// Kitty 默认 `C=0`：显示后光标移到图像右下角，且必须在 APC 处理
+    /// 的**同一时刻**生效——同一 batch 里紧随其后的文本要从新光标继续。
+    #[test]
+    fn kitty_display_advances_cursor_before_following_text() {
+        use crate::terminal::escape_scan::TermGeometry;
+        use crate::terminal::kitty::scanner::{KittyGraphicsScanner, ReplySink};
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::test::TermSize;
+
+        #[derive(Default)]
+        struct Sink;
+        impl ReplySink for Sink {
+            fn reply(&mut self, _bytes: &[u8]) {}
+            fn images_changed(&mut self) {}
+        }
+
+        let (events_tx, _events_rx) = futures::channel::mpsc::unbounded();
+        let term = Arc::new(FairMutex::new(Term::new(
+            alacritty_terminal::term::Config::default(),
+            &TermSize::new(20, 4),
+            ZedListener(events_tx),
+        )));
+        let storage = Arc::new(StdMutex::new(
+            crate::terminal::kitty::storage::Storage::new(1024 * 1024),
+        ));
+        let mut scanner = KittyGraphicsScanner::with_storage_and_geometry(
+            storage,
+            true,
+            Box::new(Sink),
+            TermGeometry {
+                rows: 4,
+                cols: 20,
+                cell_width: 9,
+                cell_height: 18,
+            },
+        );
+
+        // 9x36 像素 = 1x2 格；光标从 (0,0) 移到 (1,1)，随后 X 落在 (1,1)。
+        let raw = vec![0u8; 9 * 36 * 4];
+        let payload = crate::terminal::kitty::command::encode_base64(&raw);
+        let input = format!("\x1b_Ga=T,i=33,f=32,s=9,v=36;{payload}\x1b\\X");
+        let mut processor = Processor::<StdSyncHandler>::new();
+        let mut pending = Vec::new();
+        assert!(parse_batch(
+            input.as_bytes(),
+            &mut processor,
+            &term,
+            &mut pending,
+            &mut scanner,
+        ));
+
+        let term = term.lock_unfair();
+        assert_eq!(
+            term.grid()[Line(1)][Column(1)].c,
+            'X',
+            "APC 之后的文本必须从推进后的光标开始"
+        );
+        assert_eq!(
+            (
+                term.grid().cursor.point.line.0,
+                term.grid().cursor.point.column.0
+            ),
+            (1, 2)
+        );
     }
 
     /// 端到端验证：真实 PNG 经协议分片（`m=1`）跨多次 `printf` 传输，
@@ -2749,6 +2828,7 @@ mod windows_tests {
             _pending: &mut Vec<u8>,
             emit: &mut dyn FnMut(&[u8]),
             _grid: &mut dyn FnMut() -> GridState,
+            _move_cursor: &mut dyn FnMut(u32, u32),
         ) {
             self.seen.lock().unwrap().extend_from_slice(data);
             emit(data);
