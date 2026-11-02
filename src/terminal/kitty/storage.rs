@@ -20,6 +20,13 @@ pub fn lock_unpoisoned<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 /// 同一图像可以有多个放置（不同位置/尺寸），`p=` 区分它们。
 pub type PlacementKey = (ImageId, u32);
 
+/// 相对放置的父引用（`P=` 父图像 / `Q=` 父放置）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ParentRef {
+    pub image_id: ImageId,
+    pub placement_id: u32,
+}
+
 /// z 层级分界：小于该值的放置画在文字**下方**。
 ///
 /// kitty 语义是 `z < 0` 在文字下、`z >= 0` 在文字上（`z=0` 也在文字上），
@@ -145,6 +152,9 @@ pub struct Placement {
     pub z: i32,
     /// 位置类型（`U=`）。虚拟放置不直接绘制。
     pub location: PlacementLocation,
+    /// 相对放置的父链（`P=`/`Q=`）。位置在创建时已折算成绝对行列，
+    /// 这里保留父引用用于父放置删除时级联清理子放置。
+    pub relative_parent: Option<ParentRef>,
 }
 
 impl Placement {
@@ -575,6 +585,79 @@ impl Storage {
         min_delay
     }
 
+    /// 解析相对放置的父引用并返回父放置的绝对原点。
+    ///
+    /// `child` 为将要创建的放置 key（`p=0` 时仍以 0 参与自引用检测）；
+    /// `parent_placement_id == 0` 时选择父图像 id 最小的放置（确定性等价于
+    /// Ghostty 的 preferredOver，DeepTerm 的放置 id 全由客户端给出）。
+    pub fn resolve_parent_origin(
+        &self,
+        child: PlacementKey,
+        parent_image_id: ImageId,
+        parent_placement_id: u32,
+    ) -> Result<(ParentRef, (i32, u32)), &'static str> {
+        let parent_image = self
+            .images
+            .get(&parent_image_id)
+            .ok_or("ENOPARENT: parent image not found")?;
+        let parent_pid = if parent_placement_id > 0 {
+            parent_placement_id
+        } else {
+            parent_image
+                .placements
+                .keys()
+                .copied()
+                .min()
+                .ok_or("ENOPARENT: parent placement not found")?
+        };
+        let parent = parent_image
+            .placements
+            .get(&parent_pid)
+            .ok_or("ENOPARENT: parent placement not found")?;
+        // DeepTerm 目前把相对放置折算成绝对行列，虚拟父放置的真实位置由
+        // 占位符决定，无法在这里静态求值；明确拒绝而不是静默画错位置。
+        if parent.is_virtual() {
+            return Err("EINVAL: relative to virtual placement unsupported");
+        }
+
+        // 自引用与环检测：沿父链走，最多 8 条 link。
+        if (parent_image_id, parent_pid) == child {
+            return Err("EINVAL: placement cannot be its own parent");
+        }
+        let mut key = ParentRef {
+            image_id: parent_image_id,
+            placement_id: parent_pid,
+        };
+        let mut depth = 1usize;
+        loop {
+            if (key.image_id, key.placement_id) == child {
+                return Err("ECYCLE: parent chain creates a cycle");
+            }
+            let p = self
+                .images
+                .get(&key.image_id)
+                .and_then(|img| img.placements.get(&key.placement_id))
+                .ok_or("ENOPARENT: ancestor not found")?;
+            match p.relative_parent {
+                Some(parent) => {
+                    if depth >= 8 {
+                        return Err("ETOODEEP: parent chain too deep");
+                    }
+                    depth += 1;
+                    key = parent;
+                }
+                None => break,
+            }
+        }
+        Ok((
+            ParentRef {
+                image_id: parent_image_id,
+                placement_id: parent_pid,
+            },
+            (parent.row, parent.col),
+        ))
+    }
+
     /// 写入一个放置。
     pub fn place(&mut self, id: ImageId, placement_id: u32, placement: Placement) -> bool {
         let Some(stored) = self.images.get_mut(&id) else {
@@ -656,6 +739,26 @@ impl Storage {
 
     /// 移除一张图像及其全部放置。
     pub fn remove(&mut self, id: ImageId) -> Option<StoredImage> {
+        // 先删除所有以本图像放置为父的相对放置，避免留下悬空父链。
+        let mut children: Vec<ParentRef> = Vec::new();
+        for (child_id, child) in self.images.iter() {
+            if *child_id == id {
+                continue;
+            }
+            for (pid, p) in child.placements.iter() {
+                if p.relative_parent
+                    .is_some_and(|parent| parent.image_id == id)
+                {
+                    children.push(ParentRef {
+                        image_id: *child_id,
+                        placement_id: *pid,
+                    });
+                }
+            }
+        }
+        for child in children {
+            self.remove_placement(child.image_id, child.placement_id);
+        }
         let removed = self.images.remove(&id)?;
         self.total_bytes = self.total_bytes.saturating_sub(removed.byte_len());
         Some(removed)
@@ -663,9 +766,33 @@ impl Storage {
 
     /// 移除某个放置。图像本身保留。
     pub fn remove_placement(&mut self, id: ImageId, placement_id: u32) -> bool {
-        self.images
-            .get_mut(&id)
-            .is_some_and(|stored| stored.placements.remove(&placement_id).is_some())
+        let key = ParentRef {
+            image_id: id,
+            placement_id,
+        };
+        let mut pending = vec![key];
+        let mut removed = false;
+        while let Some(parent) = pending.pop() {
+            let Some(stored) = self.images.get_mut(&parent.image_id) else {
+                continue;
+            };
+            if stored.placements.remove(&parent.placement_id).is_none() {
+                continue;
+            }
+            removed = true;
+            // 父放置删除后，所有直接挂在它下面的相对放置一并删除。
+            for (child_id, child) in self.images.iter() {
+                for (pid, p) in child.placements.iter() {
+                    if p.relative_parent == Some(parent) {
+                        pending.push(ParentRef {
+                            image_id: *child_id,
+                            placement_id: *pid,
+                        });
+                    }
+                }
+            }
+        }
+        removed
     }
 
     /// 删除**屏幕上可见**的放置（`d=a`/`d=A`）。返回是否发生了变化。

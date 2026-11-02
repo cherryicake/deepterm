@@ -36,11 +36,13 @@ pub enum ExecutionError {
     TemporaryFileNotNamedCorrectly,
     /// 分片状态错乱（未开始的续传、id 不匹配等）。
     InvalidChunk,
-    /// 动画协议错误：带自定义 kitty 错误消息。
+    /// 动画/布局协议错误：带自定义 kitty 错误消息。
     ///
-    /// 动画的错误码种类多（`ENOENT`/`ENOSPC`/`EINVAL` 各有若干具体原因），
-    /// 用固定枚举会退化掉客户端排查所需的信息，因此这里直接携带文本。
+    /// 错误码种类多（`ENOENT`/`ENOSPC`/`EINVAL`/`ENOPARENT` 各有若干具体
+    /// 原因），用固定枚举会退化掉客户端排查所需的信息，因此直接携带文本。
     Animation(&'static str),
+    /// 相对放置父链错误（`ENOPARENT`/`ECYCLE`/`ETOODEEP`）。
+    Protocol(&'static str),
 }
 
 impl ExecutionError {
@@ -55,6 +57,7 @@ impl ExecutionError {
             Self::TemporaryFileNotNamedCorrectly => "EINVAL: temporary file not named correctly",
             Self::InvalidChunk => "EINVAL: invalid chunk",
             Self::Animation(msg) => msg,
+            Self::Protocol(msg) => msg,
         }
     }
 }
@@ -1004,22 +1007,52 @@ impl ImageStore {
         let x_offset = control.u32(b'X').unwrap_or(0);
         let y_offset = control.u32(b'Y').unwrap_or(0);
 
+        // `U=1` 建虚拟放置：图像不落在光标处，而是等网格里出现 U+10EEEE
+        // 占位符时按占位符的位置绘制。行列数在这里只作为"铺进网格多大"
+        // 的尺寸说明（见 `unicode` / `render::placeholder_rect`）。
+        let location = if control.u32(b'U') == Some(1) {
+            PlacementLocation::Virtual
+        } else {
+            PlacementLocation::Anchor
+        };
+
+        // 相对放置：`P=` 父图像、`Q=` 父放置、`H=`/`V=` 网格偏移。
+        // 创建时把父原点折算成绝对行列；父链保留用于级联删除。
+        let parent_image = control.u32(b'P').unwrap_or(0);
+        let parent_placement = control.u32(b'Q').unwrap_or(0);
+        if parent_image == 0 && parent_placement > 0 {
+            return Err(ExecutionError::Protocol("ENOPARENT: parent image required"));
+        }
+        let mut row = cursor.0;
+        let mut col = cursor.1;
+        let mut relative_parent = None;
+        if parent_image > 0 {
+            if location == PlacementLocation::Virtual {
+                return Err(ExecutionError::Protocol(
+                    "EINVAL: virtual placement cannot be relative",
+                ));
+            }
+            let child = (id, placement_id);
+            let (parent, (parent_row, parent_col)) = self
+                .with_storage(|s| s.resolve_parent_origin(child, parent_image, parent_placement))
+                .map_err(ExecutionError::Protocol)?;
+            let vertical = control.i32(b'V').unwrap_or(0);
+            let horizontal = control.i32(b'H').unwrap_or(0);
+            row = parent_row.saturating_add(vertical);
+            col = parent_col.saturating_add_signed(horizontal);
+            relative_parent = Some(parent);
+        }
+
         let placement = Placement {
-            row: cursor.0,
-            col: cursor.1,
+            row,
+            col,
             columns: control.u32(b'c').filter(|v| *v != 0),
             rows: control.u32(b'r').filter(|v| *v != 0),
             x_offset,
             y_offset,
             z: control.i32(b'z').unwrap_or(0),
-            // `U=1` 建虚拟放置：图像不落在光标处，而是等网格里出现 U+10EEEE
-            // 占位符时按占位符的位置绘制。行列数在这里只作为"铺进网格多大"
-            // 的尺寸说明（见 `unicode` / `render::placeholder_rect`）。
-            location: if control.u32(b'U') == Some(1) {
-                PlacementLocation::Virtual
-            } else {
-                PlacementLocation::Anchor
-            },
+            location,
+            relative_parent,
         };
 
         if !self.with_storage_mut(|s| s.place(id, placement_id, placement.clone())) {
@@ -1030,6 +1063,7 @@ impl ImageStore {
         // 虚拟放置由占位符驱动，不移动光标。
         if control.u32(b'C') != Some(1)
             && placement.location == PlacementLocation::Anchor
+            && placement.relative_parent.is_none()
             && let Some(geometry) = self.geometry
             && let Some((cols, rows)) =
                 self.with_storage(|s| s.get(id).map(|st| placement.grid_size(&st.image, geometry)))
@@ -2362,6 +2396,70 @@ mod tests {
         assert!(ImageStore::is_allowed_file_path(Path::new(
             "/tmp/image.png"
         )));
+    }
+
+    /// 相对放置：`P=` 父图像、`Q=` 父放置、`H=`/`V=` 网格偏移。
+    #[test]
+    fn relative_placement_resolves_parent_origin() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (2, 3)).unwrap();
+        // 子放置挂在 (1,1) 上，右移 2 格、下移 1 格。
+        let r = run(&mut store, "a=p,i=1,p=2,P=1,Q=1,H=2,V=1,C=1", (0, 0)).unwrap();
+        assert!(r.images_changed);
+        let guard = store.lock_storage();
+        let child = guard.get(1).unwrap().placements.get(&2).unwrap();
+        assert_eq!((child.row, child.col), (3, 5));
+        assert_eq!(
+            child.relative_parent,
+            Some(crate::terminal::kitty::storage::ParentRef {
+                image_id: 1,
+                placement_id: 1
+            })
+        );
+    }
+
+    /// 删除父放置必须级联删除子放置，不能留下悬空父链。
+    #[test]
+    fn deleting_parent_placement_removes_relative_children() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (2, 3)).unwrap();
+        run(&mut store, "a=p,i=1,p=2,P=1,Q=1,H=1,V=1,C=1", (0, 0)).unwrap();
+        assert!(store.lock_storage().remove_placement(1, 1));
+        let guard = store.lock_storage();
+        assert!(
+            guard.get(1).unwrap().placements.get(&2).is_none(),
+            "父放置删除后子放置必须一起删除"
+        );
+    }
+
+    #[test]
+    fn relative_placement_reports_missing_parent() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (0, 0)).unwrap();
+        let r = run(&mut store, "a=p,i=1,p=2,P=99,Q=1,C=1", (0, 0)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&r.reply).contains("ENOPARENT"),
+            "不存在的父图像应回 ENOPARENT: {:?}",
+            String::from_utf8_lossy(&r.reply)
+        );
+    }
+
+    #[test]
+    fn relative_placement_rejects_self_parent_and_cycles() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, "a=T,i=1,p=1,f=32,s=1,v=1,C=1;/wAA/w==", (0, 0)).unwrap();
+        // 自己挂自己。
+        let r = run(&mut store, "a=p,i=1,p=1,P=1,Q=1,C=1", (0, 0)).unwrap();
+        assert!(String::from_utf8_lossy(&r.reply).contains("cannot be its own parent"));
+
+        // 1 -> 2，然后 2 试图反向挂到 1 的放置 2 上，形成环。
+        run(&mut store, "a=p,i=1,p=2,P=1,Q=1,C=1", (0, 0)).unwrap();
+        let r = run(&mut store, "a=p,i=1,p=1,P=1,Q=2,C=1", (0, 0)).unwrap();
+        assert!(
+            String::from_utf8_lossy(&r.reply).contains("ECYCLE"),
+            "父链成环应回 ECYCLE: {:?}",
+            String::from_utf8_lossy(&r.reply)
+        );
     }
 
     #[test]
