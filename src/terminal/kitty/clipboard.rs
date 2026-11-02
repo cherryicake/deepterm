@@ -145,24 +145,30 @@ impl ClipboardState {
                 if self.write.is_none() {
                     return Request::None;
                 }
-                let Some(alias) = meta.get("mime").cloned() else {
+                // `mime` 是承载数据的真实 MIME；payload 是空白分隔的别名表
+                // （每个别名都指向该真实 MIME）。
+                let Some(target) = meta.get("mime").cloned() else {
                     self.fail("EINVAL");
                     return Request::None;
                 };
-                let Some(target) = decode_base64_strict(payload) else {
+                let Some(decoded) = decode_base64_strict(payload) else {
                     self.fail("EINVAL");
                     return Request::None;
                 };
-                let Ok(target) = String::from_utf8(target) else {
+                let Ok(decoded) = String::from_utf8(decoded) else {
                     self.fail("EINVAL");
                     return Request::None;
                 };
                 let txn = self.write.as_mut().expect("checked above");
-                if alias.len() + target.len() > 512 || txn.aliases.len() >= MAX_MIMES {
-                    self.fail("EFBIG");
-                    return Request::None;
+                for alias in decoded.split_whitespace() {
+                    if alias.len() > 256 {
+                        continue;
+                    }
+                    txn.aliases.insert(alias.to_string(), target.clone());
+                    if txn.aliases.len() >= MAX_MIMES {
+                        break;
+                    }
                 }
-                txn.aliases.insert(alias, target);
                 Request::None
             }
             "read" => {
@@ -205,8 +211,17 @@ impl ClipboardState {
         // 优先 text/plain 及其 charset 变体；别名解析后同样生效。
         let mut chosen: Option<&str> = None;
         for mime in txn.entries.keys() {
-            let resolved = txn.aliases.get(mime).map(String::as_str).unwrap_or(mime);
-            if resolved == "text/plain" || resolved.starts_with("text/plain;") {
+            // 数据 MIME 本身是 text/*，或 text/plain 通过 walias 指向它。
+            let direct = mime == "text/plain" || mime.starts_with("text/plain;");
+            let aliased = txn
+                .aliases
+                .get("text/plain")
+                .is_some_and(|target| target == mime)
+                || txn
+                    .aliases
+                    .get("text/plain;charset=utf-8")
+                    .is_some_and(|target| target == mime);
+            if direct || aliased {
                 chosen = Some(mime);
                 break;
             }
@@ -445,13 +460,13 @@ mod tests {
     fn alias_resolves_text_mime() {
         let mut state = ClipboardState::default();
         state.handle(
-            format!("type=write:mime={};{}", b64("text/plain"), b64("via-alias")).as_bytes(),
+            format!("type=write:mime={};{}", b64("text/html"), b64("via-alias")).as_bytes(),
         );
         let req = state.handle(
             format!(
                 "type=walias:mime={};{}",
-                b64("text/plain"),
-                b64("text/plain")
+                b64("text/html"),
+                b64("text/plain text/csv")
             )
             .as_bytes(),
         );
