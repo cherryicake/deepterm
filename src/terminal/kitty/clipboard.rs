@@ -19,13 +19,28 @@ const MAX_WRITE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MIMES: usize = 64;
 const READ_CHUNK: usize = 4096;
 
+/// 一次写入提交的内容。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Content {
+    Text(String),
+    Image { mime: String, data: Vec<u8> },
+}
+
+/// 系统剪贴板当前可供读取的内容。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadData {
+    pub text: Option<String>,
+    /// `(MIME, 原始图片字节)`。
+    pub image: Option<(String, Vec<u8>)>,
+}
+
 /// 一次剪贴板请求的解析结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
     None,
     Write {
         id: String,
-        text: String,
+        content: Content,
     },
     Read {
         id: String,
@@ -208,10 +223,10 @@ impl ClipboardState {
         let Some(txn) = self.write.take() else {
             return Request::None;
         };
-        // 优先 text/plain 及其 charset 变体；别名解析后同样生效。
-        let mut chosen: Option<&str> = None;
+        // 优先 text/plain；没有文本时接受常见图片 MIME。
+        let mut text_mime: Option<&str> = None;
+        let mut image_mime: Option<&str> = None;
         for mime in txn.entries.keys() {
-            // 数据 MIME 本身是 text/*，或 text/plain 通过 walias 指向它。
             let direct = mime == "text/plain" || mime.starts_with("text/plain;");
             let aliased = txn
                 .aliases
@@ -222,23 +237,44 @@ impl ClipboardState {
                     .get("text/plain;charset=utf-8")
                     .is_some_and(|target| target == mime);
             if direct || aliased {
-                chosen = Some(mime);
+                text_mime = Some(mime);
                 break;
             }
+            if image_mime.is_none()
+                && matches!(
+                    mime.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                )
+            {
+                image_mime = Some(mime);
+            }
         }
-        let Some(mime) = chosen else {
+        let content = if let Some(mime) = text_mime {
+            let Some(bytes) = decode_base64_strict(txn.entries[mime].encoded.as_bytes()) else {
+                self.fail("EINVAL");
+                return Request::None;
+            };
+            let Ok(text) = String::from_utf8(bytes) else {
+                self.fail("EINVAL");
+                return Request::None;
+            };
+            Content::Text(text)
+        } else if let Some(mime) = image_mime {
+            let Some(bytes) = decode_base64_strict(txn.entries[mime].encoded.as_bytes()) else {
+                self.fail("EINVAL");
+                return Request::None;
+            };
+            Content::Image {
+                mime: mime.to_string(),
+                data: bytes,
+            }
+        } else {
             return Request::None;
         };
-        let encoded = &txn.entries[mime].encoded;
-        let Some(bytes) = decode_base64_strict(encoded.as_bytes()) else {
-            self.fail("EINVAL");
-            return Request::None;
-        };
-        let Ok(text) = String::from_utf8(bytes) else {
-            self.fail("EINVAL");
-            return Request::None;
-        };
-        Request::Write { id: txn.id, text }
+        Request::Write {
+            id: txn.id,
+            content,
+        }
     }
 
     fn fail(&mut self, status: &str) {
@@ -260,12 +296,18 @@ pub fn encode_read_response(
     mimes: &[String],
     list: bool,
     primary: bool,
-    text: Option<&str>,
+    data: &ReadData,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     encode_packet(&mut out, "read", "OK", id, primary, None, None);
+
+    let available = available_mimes(data);
     if list {
-        let available = if text.is_some() { "text/plain\n" } else { "" };
+        let mut text = String::new();
+        for mime in &available {
+            text.push_str(mime);
+            text.push('\n');
+        }
         encode_packet(
             &mut out,
             "read",
@@ -273,16 +315,20 @@ pub fn encode_read_response(
             id,
             primary,
             Some("."),
-            Some(available.as_bytes()),
+            Some(text.as_bytes()),
         );
     }
-    let wants_text = mimes.is_empty()
-        || mimes
-            .iter()
-            .any(|m| m == "text/plain" || m.starts_with("text/plain;"));
-    if let Some(text) = text.filter(|_| wants_text) {
-        let data = text.as_bytes();
-        for chunk in data.chunks(READ_CHUNK) {
+
+    let wants = |mime: &str| {
+        mimes.is_empty()
+            || mimes
+                .iter()
+                .any(|m| m == mime || (mime == "text/plain" && m.starts_with("text/plain;")))
+    };
+    if wants("text/plain")
+        && let Some(text) = data.text.as_deref()
+    {
+        for chunk in text.as_bytes().chunks(READ_CHUNK) {
             encode_packet(
                 &mut out,
                 "read",
@@ -294,7 +340,33 @@ pub fn encode_read_response(
             );
         }
     }
+    if let Some((mime, bytes)) = data.image.as_ref()
+        && wants(mime)
+    {
+        for chunk in bytes.chunks(READ_CHUNK) {
+            encode_packet(
+                &mut out,
+                "read",
+                "DATA",
+                id,
+                primary,
+                Some(mime),
+                Some(chunk),
+            );
+        }
+    }
     encode_packet(&mut out, "read", "DONE", id, primary, None, None);
+    out
+}
+
+fn available_mimes(data: &ReadData) -> Vec<&str> {
+    let mut out = Vec::new();
+    if data.text.is_some() {
+        out.push("text/plain");
+    }
+    if let Some((mime, _)) = data.image.as_ref() {
+        out.push(mime.as_str());
+    }
     out
 }
 
@@ -434,7 +506,7 @@ mod tests {
             req,
             Request::Write {
                 id: String::new(),
-                text: "hello".into()
+                content: Content::Text("hello".into())
             }
         );
     }
@@ -451,7 +523,7 @@ mod tests {
             req,
             Request::Write {
                 id: String::new(),
-                text: "hello world".into()
+                content: Content::Text("hello world".into())
             }
         );
     }
@@ -476,9 +548,47 @@ mod tests {
             req,
             Request::Write {
                 id: String::new(),
-                text: "via-alias".into()
+                content: Content::Text("via-alias".into())
             }
         );
+    }
+
+    #[test]
+    fn write_commits_png_content() {
+        let mut state = ClipboardState::default();
+        let png = b"\x89PNG\r\n\x1a\n";
+        state.handle(
+            format!(
+                "type=write:mime={};{}",
+                b64("image/png"),
+                encode_base64(png)
+            )
+            .as_bytes(),
+        );
+        let req = state.handle(b"type=wdata;");
+        assert_eq!(
+            req,
+            Request::Write {
+                id: String::new(),
+                content: Content::Image {
+                    mime: "image/png".into(),
+                    data: png.to_vec()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn read_response_serves_png_when_requested() {
+        let data = ReadData {
+            text: None,
+            image: Some(("image/png".into(), b"pngbytes".to_vec())),
+        };
+        let bytes = encode_read_response("r2", &["image/png".into()], false, false, &data);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("status=DATA"));
+        assert!(text.contains(&encode_base64(b"image/png")));
+        assert!(text.contains(&encode_base64(b"pngbytes")));
     }
 
     #[test]
@@ -498,7 +608,10 @@ mod tests {
             &[".".into(), "text/plain".into()],
             true,
             false,
-            Some("hello"),
+            &ReadData {
+                text: Some("hello".into()),
+                image: None,
+            },
         );
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("type=read:status=OK"));

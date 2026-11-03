@@ -3309,7 +3309,7 @@ impl Terminal {
     /// （应用运行在终端里即可读），不额外弹权限窗。协议错误由解析层编码
     /// 成 `EINVAL`/`EFBIG` 回包。
     fn handle_kitty_clipboard(&mut self, cx: &mut Context<Self>, content: &[u8]) {
-        use crate::terminal::kitty::clipboard::{self, Request};
+        use crate::terminal::kitty::clipboard::{self, Content, ReadData, Request};
 
         let request = self.kitty_clipboard.handle(content);
         if let Some(reply) = self.kitty_clipboard.take_reply() {
@@ -3317,18 +3317,39 @@ impl Terminal {
         }
         match request {
             Request::None => {}
-            Request::Write { text, .. } => {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            Request::Write { content, .. } => match content {
+                Content::Text(text) => {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                Content::Image { mime, data } => {
+                    let format = match mime.as_str() {
+                        "image/jpeg" => gpui::ImageFormat::Jpeg,
+                        "image/webp" => gpui::ImageFormat::Webp,
+                        "image/gif" => gpui::ImageFormat::Gif,
+                        _ => gpui::ImageFormat::Png,
+                    };
+                    let image = gpui::Image::from_bytes(format, data);
+                    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+                }
+            },
             Request::Read {
                 id,
                 mimes,
                 list,
                 primary,
             } => {
-                let text = cx.read_from_clipboard().and_then(|item| item.text());
-                let reply =
-                    clipboard::encode_read_response(&id, &mimes, list, primary, text.as_deref());
+                let item = cx.read_from_clipboard();
+                let text = item.as_ref().and_then(|item| item.text());
+                let image = item.as_ref().and_then(|item| {
+                    item.entries.iter().find_map(|entry| match entry {
+                        ClipboardEntry::Image(image) => {
+                            Some((image.format.mime_type().to_string(), image.bytes.clone()))
+                        }
+                        _ => None,
+                    })
+                });
+                let data = ReadData { text, image };
+                let reply = clipboard::encode_read_response(&id, &mimes, list, primary, &data);
                 self.write_raw(&reply);
             }
         }
