@@ -542,7 +542,7 @@ cargo test --lib terminal_scrollback_footprint -- --nocapture --test-threads=1
 | OSC 72（Kitty DnD）完全未接入 | 新增 `kitty/dnd.rs` drop-target：`t=a`/`t=A` 注册注销、`t=q` 查询、原生文件拖入发 `t=M`（`text/uri-list` + `text/plain`）、`t=r:x=N` 分片供数、`t=r:o=N` 结束、drag-out 回 `EPERM` |
 | `CSI 3 J` 清空 scrollback 后历史放置残留 | 扫描器检测 `CSI 3 J`，`Storage::remove_history_placements` 删除负行号放置，子放置随父链级联 |
 
-验证：`cargo test --release --lib kitty::exec` 104 passed；`cargo test --release --lib kitty` 326 passed（另 1 个 `debug_assert` 用例在 release 下不触发，属既有测试写法）；clipboard 单测 7 条 + GPUI 写入集成 1 条；DnD 单测 5 条。新增 shm、文件 offset/size、zlib 文件、非直传中止、delete 中止、quiet 继承、`/tmp` 临时文件、`C=` 光标推进、相对放置/父链删除/父重放、路径安全、历史清理用例。
+验证：`cargo test --release --lib kitty::exec` 104 passed；`cargo test --release --lib kitty` 333 passed（另 1 个 `debug_assert` 用例在 release 下不触发，属既有测试写法）；clipboard 单测 7 条 + GPUI 写入集成 1 条；DnD 单测 5 条。新增 shm、文件 offset/size、zlib 文件、非直传中止、delete 中止、quiet 继承、`/tmp` 临时文件、`C=` 光标推进、相对放置/父链删除/父重放、路径安全、历史清理用例。
 
 仍未实现（明确记录，不在本轮强行做）：
 
