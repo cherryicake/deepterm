@@ -5028,6 +5028,16 @@ impl TerminalView {
     fn add_paths_to_terminal(&mut self, paths: &[std::path::PathBuf], cx: &mut Context<Self>) {
         use itertools::Itertools;
 
+        // 应用注册了 Kitty DnD 时，文件拖入必须走 OSC 72，而不是把路径
+        // 当文本粘贴到 shell。
+        if self.terminal.read(cx).kitty_dnd_registered() {
+            let paths = paths.to_vec();
+            self.terminal.update(cx, |terminal, _| {
+                terminal.kitty_dnd_begin_file_drop(&paths, (0, 0), (0, 0));
+            });
+            return;
+        }
+
         // 构建路径字符串，参考 alacritty 的实现：path + " "
         let text = paths
             .iter()

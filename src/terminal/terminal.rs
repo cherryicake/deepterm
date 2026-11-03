@@ -670,6 +670,25 @@ impl TerminalBounds {
 /// `scale_factor()` 正常返回 1.0/2.0 这类值，但 headless 测试或平台初始化
 /// 早期可能拿到 0 或 NaN——那种情况下 `cell * scale` 会算出 0 或垃圾值，
 /// 让终端应用按 0×0 建 surface。退化为 1.0 至少保持上一轮修复前的行为。
+/// 把本地路径编码成 `file://` URI（供 DnD `text/uri-list` 使用）。
+fn file_uri(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::from("file://");
+    if !text.starts_with('/') {
+        out.push('/');
+    }
+    for byte in text.bytes() {
+        let keep =
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':');
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn normalize_scale(scale: f32) -> f32 {
     if scale.is_finite() && scale > 0.0 {
         scale
@@ -1208,6 +1227,8 @@ pub struct Terminal {
     kitty_scanner: Option<crate::terminal::kitty::scanner::KittyGraphicsScanner>,
     /// Kitty clipboard（OSC 5522）的写入事务状态。
     kitty_clipboard: crate::terminal::kitty::clipboard::ClipboardState,
+    /// Kitty DnD（OSC 72）注册与 drop-target 状态。
+    kitty_dnd: crate::terminal::kitty::dnd::DndState,
     last_content: TerminalContent,
     pub content_generation: u64,
     content_dirty: bool,
@@ -1406,6 +1427,7 @@ impl Terminal {
             last_kitty_generation: 0,
             kitty_scanner: None,
             kitty_clipboard: Default::default(),
+            kitty_dnd: Default::default(),
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -1624,6 +1646,7 @@ impl Terminal {
                 last_kitty_generation: 0,
                 kitty_scanner: None,
                 kitty_clipboard: Default::default(),
+                kitty_dnd: Default::default(),
                 last_content: TerminalContent::default(),
                 content_generation: 0,
                 content_dirty: false,
@@ -1803,6 +1826,7 @@ impl Terminal {
             last_kitty_generation: 0,
             kitty_scanner: None,
             kitty_clipboard: Default::default(),
+            kitty_dnd: Default::default(),
             last_content: TerminalContent::default(),
             content_generation: 0,
             content_dirty: false,
@@ -2138,6 +2162,7 @@ impl Terminal {
                 kitty_generation: 0,
                 last_kitty_generation: 0,
                 kitty_clipboard: Default::default(),
+                kitty_dnd: Default::default(),
                 kitty_scanner: Some(
                     crate::terminal::kitty::scanner::KittyGraphicsScanner::with_storage_and_geometry(
                         images.storage(),
@@ -3225,6 +3250,59 @@ impl Terminal {
         self.write_raw(&replies);
     }
 
+    /// 处理 Kitty DnD（OSC 72）命令。
+    fn handle_kitty_dnd(&mut self, content: &[u8]) {
+        let (reply, _action) = self.kitty_dnd.handle(content);
+        if !reply.is_empty() {
+            self.write_raw(&reply);
+        }
+    }
+
+    /// 客户端是否已注册 Kitty DnD drop target。
+    pub fn kitty_dnd_registered(&self) -> bool {
+        self.kitty_dnd.is_registered()
+    }
+
+    /// 把原生文件拖入转成 Kitty `t=M` drop 事件；未注册时返回 false。
+    ///
+    /// GPUI 的 `on_drop` 不提供指针坐标，这里用 (0,0) 作为网格/像素位置；
+    /// 客户端仍可从 `text/uri-list` 读取文件。hover/accept 阶段尚未接入。
+    pub fn kitty_dnd_begin_file_drop(
+        &mut self,
+        paths: &[std::path::PathBuf],
+        cell: (i32, i32),
+        pixel: (i32, i32),
+    ) -> bool {
+        use crate::terminal::kitty::dnd::Item;
+
+        if paths.is_empty() {
+            return false;
+        }
+        let mut uris = String::new();
+        let mut plain = String::new();
+        for path in paths {
+            uris.push_str(&file_uri(path));
+            uris.push_str("\r\n");
+            plain.push_str(&path.to_string_lossy());
+            plain.push('\n');
+        }
+        let items = vec![
+            Item {
+                mime: "text/uri-list".to_string(),
+                data: uris.into_bytes(),
+            },
+            Item {
+                mime: "text/plain".to_string(),
+                data: plain.into_bytes(),
+            },
+        ];
+        let Some(reply) = self.kitty_dnd.begin_drop(items, cell, pixel) else {
+            return false;
+        };
+        self.write_raw(&reply);
+        true
+    }
+
     /// 处理 Kitty clipboard（OSC 5522）请求。
     ///
     /// 写入/读取都走当前 GPUI 剪贴板；读取沿用 OSC 52 的既有信任模型
@@ -3271,6 +3349,11 @@ impl Terminal {
         require_local_osc7_host: bool,
         cursor_at_sequence: Option<(i32, u32)>,
     ) -> bool {
+        // Kitty DnD（OSC 72）：注册/查询/drop-target 数据请求。
+        if let Some(rest) = osc_content.strip_prefix(b"72;") {
+            self.handle_kitty_dnd(rest);
+            return true;
+        }
         // Kitty clipboard（OSC 5522）：解析/事务/应答编码在
         // `kitty::clipboard`，这里只负责系统剪贴板读写与回写 PTY。
         if let Some(rest) = osc_content.strip_prefix(b"5522;") {

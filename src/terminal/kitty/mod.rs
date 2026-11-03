@@ -11,6 +11,7 @@
 pub mod animation;
 pub mod clipboard;
 pub mod command;
+pub mod dnd;
 pub mod exec;
 pub mod image;
 pub mod render;
