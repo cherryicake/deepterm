@@ -15,6 +15,10 @@
 //! ```
 //! HTML 报告：`target/criterion/report/index.html`
 //!
+//! Windows 提示：先设置 `CARGO_TARGET_DIR` 指向仓库的 `target`。criterion
+//! 缺少该变量时会调用 `cargo metadata` 解析 git 依赖，启动阶段可能长时间
+//! 无输出（看起来像卡死）。
+//!
 //! 判读方式：把三档规模的读数并列比较。
 //! - `frame_blink_*`：空转重绘（blink / 闲置）。**必须近似常数** ——
 //!   它不含任何视口变化，若随行数增长说明又有 O(文档) 工作回到帧路径。

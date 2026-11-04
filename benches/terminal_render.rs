@@ -8,6 +8,10 @@
 //!
 //! 运行：`cargo bench --bench terminal_render`
 //! HTML 报告：`target/criterion/report/index.html`
+//!
+//! Windows 提示：先设置 `CARGO_TARGET_DIR`（如 `$env:CARGO_TARGET_DIR` 指向
+//! 仓库的 `target`）。criterion 找不到该环境变量时会执行 `cargo metadata`
+//! 来定位输出目录，本项目解析 git 依赖较慢，bench 会看起来卡在启动阶段。
 
 use deepterm::sidebar_view::font_settings::FontState;
 use deepterm::terminal::Terminal;

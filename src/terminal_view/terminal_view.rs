@@ -601,6 +601,9 @@ pub struct TerminalView {
     /// 跨帧存活才有意义。内容代际不变时复用同一张 `RenderImage`，避免每帧
     /// 对大图做 RGBA→BGRA 的全量重写。见 [`crate::terminal::kitty::render`]。
     pub kitty_image_cache: crate::terminal::kitty::render::ImageCache,
+    /// Kitty image generation at the last texture-cache prune. Idle frames
+    /// must not take the storage lock and walk the cache again.
+    pub(crate) kitty_prune_generation: u64,
     /// Kitty 动画帧的时钟与唤醒调度。
     ///
     /// GPUI 只在有变化时重绘，不像专用终端渲染器那样每 vsync 都驱动一遍
@@ -1284,6 +1287,7 @@ impl TerminalView {
             scratch_dirty_rows: Vec::new(),
             scratch_dirty_row_bounds: Vec::new(),
             kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
+            kitty_prune_generation: 0,
             kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
             cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             scrollbar_thumb_y: px(0.0),
@@ -1561,6 +1565,7 @@ impl TerminalView {
                 scratch_dirty_rows: Vec::new(),
                 scratch_dirty_row_bounds: Vec::new(),
                 kitty_image_cache: crate::terminal::kitty::render::ImageCache::new(),
+                kitty_prune_generation: 0,
                 kitty_animation_clock: crate::terminal::kitty::AnimationClock::new(),
                 cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
                 scrollbar_thumb_y: px(0.0),
@@ -3255,6 +3260,13 @@ impl TerminalView {
     ///   到点 `cx.notify()` 触发下一帧——这就是动画唯一的驱动力；
     /// - 没有动画在跑就什么都不做，渲染循环保持静止（不会空转）。
     fn tick_kitty_animations(&mut self, cx: &mut Context<Self>) {
+        // Generation 0 means this terminal has never stored a Kitty image;
+        // skip the storage lock every idle frame. Once an image exists the
+        // generation is non-zero, so this only short-circuits the common case.
+        if self.terminal.read(cx).kitty_generation() == 0 {
+            self.kitty_animation_task = None;
+            return;
+        }
         if self.kitty_animation_clock.is_pending() && !self.kitty_animation_clock.due() {
             return;
         }
@@ -5425,11 +5437,18 @@ impl Render for TerminalView {
         // 首帧与主题切换时把当前主题灌入 Term.colors：查询应答与渲染回退
         // 均以此为准（应用改色写入 Term.colors 的实时生效也经由渲染层快照）。
         {
-            let active_theme_id = crate::theme::ThemeState::global(cx)
-                .active_theme()
-                .id
-                .clone();
-            if self.applied_theme_id.as_ref() != Some(&active_theme_id) {
+            let theme_changed = self.applied_theme_id.as_deref()
+                != Some(
+                    crate::theme::ThemeState::global(cx)
+                        .active_theme()
+                        .id
+                        .as_str(),
+                );
+            if theme_changed {
+                let active_theme_id = crate::theme::ThemeState::global(cx)
+                    .active_theme()
+                    .id
+                    .clone();
                 let theme = crate::theme::ThemeState::global(cx).active_theme().terminal;
                 self.terminal.update(cx, |terminal, _| {
                     terminal.apply_theme_colors(&theme);
@@ -5523,7 +5542,15 @@ impl Render for TerminalView {
             self.scrollbar_hide_scheduled_at = None;
         }
 
-        let terminal_mouse_mode = self.terminal.read(cx).mouse_mode(false);
+        // Read the mode from the per-frame snapshot instead of taking the
+        // fair `term` mutex: the render path must never queue behind the PTY
+        // reader's parse lease (see `Terminal::update_last_content`). The
+        // snapshot is refreshed on every wakeup, so it is current enough for
+        // choosing the cursor style.
+        let terminal_mouse_mode = {
+            let mode = self.terminal.read(cx).last_content().mode;
+            mode.intersects(TermMode::MOUSE_MODE) && !mode.contains(TermMode::VI)
+        };
 
         // 终端进入 mouse mode 时，鼠标事件已经由 ncurses、vim、tmux、lazygit 等 TUI 应用接管，
         // 此时用户在屏幕上的拖拽并不是 DeepTerm 本地文本选择，而是需要原样转发给远端应用的终端鼠标协议。

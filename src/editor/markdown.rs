@@ -319,7 +319,10 @@ impl MarkdownSelection {
 
 pub struct Markdown {
     source: SharedString,
-    events: Vec<(Range<usize>, MarkdownEvent)>,
+    /// Parsed events shared by all list items. `render_item` only needs a
+    /// slice per item; using `Rc` avoids cloning the item's whole event vector
+    /// before `build()` (which already clones individual events it consumes).
+    events: Rc<Vec<(Range<usize>, MarkdownEvent)>>,
     item_ranges: Vec<Range<usize>>,
     pub(crate) focus_handle: FocusHandle,
     copied_code_blocks: std::collections::HashSet<usize>,
@@ -366,7 +369,7 @@ impl Markdown {
         let _subscriptions = vec![cx.observe(&image_cache, |_, _, cx| cx.notify())];
         let mut this = Self {
             source: SharedString::default(),
-            events: Vec::new(),
+            events: Rc::new(Vec::new()),
             item_ranges: Vec::new(),
             focus_handle,
             copied_code_blocks: std::collections::HashSet::new(),
@@ -400,7 +403,7 @@ impl Markdown {
     }
 
     fn parse(&mut self) {
-        self.events = parse_markdown(&self.source);
+        self.events = Rc::new(parse_markdown(&self.source));
         self.item_ranges = compute_item_ranges(&self.events);
         self.list_state.reset(self.item_ranges.len());
     }
@@ -551,7 +554,7 @@ impl Markdown {
     }
 
     pub fn events(&self) -> &[(Range<usize>, MarkdownEvent)] {
-        &self.events
+        self.events.as_slice()
     }
 
     pub fn mark_code_block_copied(&mut self, id: usize, cx: &mut Context<Self>) {
@@ -646,12 +649,13 @@ impl Markdown {
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
-        let (copied, events, highlight_cache, image_cache, doc_dir) =
+        let (copied, events, range, highlight_cache, image_cache, doc_dir) =
             markdown.update(cx, |markdown, _cx| {
                 let range = markdown.item_ranges[ix].clone();
                 (
                     markdown.copied_code_blocks.clone(),
-                    markdown.events[range].to_vec(),
+                    markdown.events.clone(),
+                    range,
                     markdown.highlight_cache.clone(),
                     markdown.image_cache.clone(),
                     markdown.doc_dir.clone(),
@@ -667,7 +671,7 @@ impl Markdown {
             image_cache,
             doc_dir,
         )
-        .build(&events, cx);
+        .build(&events[range], cx);
 
         div().w_full().children(elements).into_any_element()
     }

@@ -13,6 +13,7 @@
 //! *Callouts* (`> [!NOTE]` …): detected on the source line for card chrome.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::editor::markdown_live::block::{Block, DocState, classify_with_next};
 use crate::editor::markdown_live::inline::collect_refdefs;
@@ -179,7 +180,7 @@ fn detect_callout_open(line: &str, content: usize) -> Option<(CalloutKind, Strin
 /// cache it and skip these two O(n) passes on cursor-only moves (P1).
 pub struct Classified {
     pub blocks: Vec<Block>,
-    pub lang_before: Vec<Option<String>>,
+    pub lang_before: Vec<Option<Arc<str>>>,
     /// Lines this pass could have classified differently from the previous
     /// one, as a half-open range.
     ///
@@ -236,7 +237,7 @@ pub fn classify_incremental(
     let can_resume = prev.is_some() && dirty_from > 0 && dirty_from < n;
 
     let mut blocks: Vec<Block> = Vec::with_capacity(n);
-    let mut lang_before: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut lang_before: Vec<Option<Arc<str>>> = Vec::with_capacity(n);
     let mut states: Vec<DocState> = Vec::with_capacity(n / CLASSIFY_CHECKPOINT + 2);
     let mut state = DocState::default();
     let mut start = 0usize;
@@ -300,7 +301,7 @@ pub fn classify_incremental(
             states.push(state.clone());
         }
         let next = lines.get(i + 1).map(|l| l.as_str());
-        let lang_here = state.fence_lang().map(str::to_string);
+        let lang_here = state.fence_lang().map(Arc::<str>::from);
         let block = classify_with_next(&lines[i], next, &mut state);
         blocks.push(block);
         lang_before.push(lang_here);
@@ -446,6 +447,121 @@ pub fn refdefs_for_lines(
     collect_refdefs(lines, &|i| blocks.get(i).is_some_and(is_refdef_skipped))
 }
 
+/// In-place incremental classification for the common "same line count" edit.
+///
+/// The allocating [`classify_incremental`] builds fresh `blocks` /
+/// `lang_before` vectors and copies the unchanged prefix/tail on every
+/// keystroke. When the line count is unchanged the old vectors can be mutated
+/// in place: prefix rows are already correct, re-classified rows are
+/// overwritten, and the converged tail is left untouched. This removes the
+/// O(document) `extend_from_slice` (and its `Arc`/String clones) from the
+/// editor's typing path.
+///
+/// Returns the number of lines actually re-classified.
+pub fn classify_incremental_in_place(
+    classified: &mut Classified,
+    lines: &[Line],
+    dirty: std::ops::Range<usize>,
+) -> usize {
+    let n = lines.len();
+    if n == 0 || classified.blocks.len() != n || classified.lang_before.len() != n {
+        // Caller should fall back to `classify_incremental`; keep this safe.
+        let (fresh, reprocessed) = classify_incremental(lines, Some(classified), dirty);
+        *classified = fresh;
+        return reprocessed;
+    }
+
+    let dirty_from = dirty.start;
+    let tail_floor = dirty.end;
+    let can_resume = dirty_from > 0 && dirty_from < n;
+
+    let mut state = DocState::default();
+    let mut start = 0usize;
+    if can_resume {
+        let mut ck =
+            ((dirty_from - 1) / CLASSIFY_CHECKPOINT).min(classified.states.len().saturating_sub(1));
+        while ck > 0 {
+            let boundary = ck * CLASSIFY_CHECKPOINT;
+            if !matches!(
+                classified.blocks.get(boundary - 1),
+                Some(Block::Heading { content: 0, .. })
+            ) {
+                break;
+            }
+            ck -= 1;
+        }
+        let from = ck * CLASSIFY_CHECKPOINT;
+        state = classified.states[ck].clone();
+        start = from;
+    }
+
+    let mut reprocessed = 0usize;
+    let mut converged_at: Option<usize> = None;
+    let mut i = start;
+    while i < n {
+        if i > start && i.is_multiple_of(CLASSIFY_CHECKPOINT) {
+            let ck = i / CLASSIFY_CHECKPOINT;
+            if ck < classified.states.len() {
+                classified.states[ck] = state.clone();
+            } else {
+                classified.states.push(state.clone());
+            }
+        }
+        let next = lines.get(i + 1).map(|l| l.as_str());
+        let lang_here = state.fence_lang().map(Arc::<str>::from);
+        let block = classify_with_next(&lines[i], next, &mut state);
+        // Compare against the old values *before* overwriting them.
+        let same_block = classified.blocks.get(i) == Some(&block);
+        let same_lang = classified.lang_before.get(i) == Some(&lang_here);
+        classified.blocks[i] = block;
+        classified.lang_before[i] = lang_here;
+        reprocessed += 1;
+
+        if i + 1 < n
+            && i + 1 >= tail_floor
+            && same_block
+            && same_lang
+            && prev_state_at(classified, i + 1).is_some_and(|s| s.same_parse_state(&state))
+        {
+            converged_at = Some(i + 1);
+            break;
+        }
+        i += 1;
+    }
+
+    // Same setext backward restyle as `classify_incremental`; it only mutates
+    // rows, so it is safe in place.
+    let mut changed_lo = start;
+    for i in (0..classified.blocks.len()).rev() {
+        if let Block::SetextUnderline { level, .. } = classified.blocks[i] {
+            let mut j = i;
+            while j > 0
+                && (matches!(classified.blocks[j - 1], Block::Paragraph)
+                    || matches!(classified.blocks[j - 1], Block::Heading { content: 0, .. }))
+            {
+                j -= 1;
+                classified.blocks[j] = Block::Heading { level, content: 0 };
+            }
+            changed_lo = changed_lo.min(j);
+        }
+    }
+    classified.changed = changed_lo..converged_at.unwrap_or(n);
+
+    // Pad the checkpoint table if it is shorter than the document requires.
+    while classified.states.len() <= n.saturating_sub(1) / CLASSIFY_CHECKPOINT {
+        let k = classified.states.len();
+        let from = k * CLASSIFY_CHECKPOINT;
+        let mut st = classified.states[k - 1].clone();
+        for j in from.saturating_sub(CLASSIFY_CHECKPOINT)..from.min(n) {
+            let next = lines.get(j + 1).map(|l| l.as_str());
+            classify_with_next(&lines[j], next, &mut st);
+        }
+        classified.states.push(st);
+    }
+
+    reprocessed
+}
+
 /// Plan a single row, including callout-card tracking and the callout-opener
 /// prefix strip.
 ///
@@ -462,7 +578,7 @@ pub fn refdefs_for_lines(
 fn plan_one(
     lines: &[Line],
     blocks: &[Block],
-    lang_before: &[Option<String>],
+    lang_before: &[Option<Arc<str>>],
     refs: &std::collections::HashMap<String, String>,
     revealed: &BTreeSet<usize>,
     i: usize,

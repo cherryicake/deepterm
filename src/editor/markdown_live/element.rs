@@ -518,7 +518,11 @@ impl Element for LiveLine {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let _ = cx;
-        let mut styled = StyledText::new(self.text.clone()).with_runs(self.runs.clone());
+        // `runs` is consumed only here; the element is built fresh every frame,
+        // so moving it into `StyledText` avoids one full `Vec<TextRun>` clone
+        // per visible row per frame.
+        let mut styled =
+            StyledText::new(self.text.clone()).with_runs(std::mem::take(&mut self.runs));
         let (layout_id, _) = styled.request_layout(_id, _inspector_id, window, cx);
         (layout_id, styled)
     }

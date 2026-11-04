@@ -783,6 +783,7 @@ impl ImageStore {
         _format: Format,
         _width: Option<u32>,
         _height: Option<u32>,
+        _compression: Compression,
     ) -> Result<Vec<u8>, ExecutionError> {
         Err(ExecutionError::UnsupportedMedium)
     }
@@ -1995,6 +1996,21 @@ mod tests {
         path.canonicalize().expect("canonicalize 失败")
     }
 
+    /// 把测试用临时路径编码进 Kitty 命令。
+    ///
+    /// `canonicalize` 在 Windows 上会返回 `\\?\C:\...` 形式的 verbatim 路径，
+    /// 而 `windows_path_is_safe` 会（按安全策略）拒绝 `\\?\` 前缀。测试要走的
+    /// 是普通文件路径分支，所以编码前先把这层前缀去掉；产品侧对真实客户端
+    /// 发来的 verbatim 路径仍保持拒绝。
+    fn payload_path_string(path: &std::path::Path) -> String {
+        let text = path.to_string_lossy();
+        #[cfg(windows)]
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return stripped.to_string();
+        }
+        text.into_owned()
+    }
+
     /// 非直传命令不能成为分片续片：它应中止旧 load，并按新命令执行。
     ///
     /// 对齐 ghostty #14811；旧实现会把文件路径当成像素数据拼进旧图。
@@ -2008,7 +2024,7 @@ mod tests {
         let payload = [1u8, 2, 3, 4];
         let path = write_temp_payload("non-direct-abort", &payload);
         let encoded_path =
-            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+            crate::terminal::kitty::command::encode_base64(payload_path_string(&path).as_bytes());
         let r = run(
             &mut store,
             &format!("a=t,i=2,t=f,f=32,s=1,v=1;{encoded_path}"),
@@ -2053,7 +2069,7 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let path = write_temp_payload("file-range", &[9, 9, 9, 1, 2, 3, 4]);
         let encoded_path =
-            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+            crate::terminal::kitty::command::encode_base64(payload_path_string(&path).as_bytes());
         let r = run(
             &mut store,
             &format!("a=t,i=7,t=f,f=32,s=1,v=1,O=3,S=4;{encoded_path}"),
@@ -2140,7 +2156,7 @@ mod tests {
         let compressed = encoder.finish().unwrap();
         let path = write_temp_payload("zlib-file", &compressed);
         let encoded_path =
-            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+            crate::terminal::kitty::command::encode_base64(payload_path_string(&path).as_bytes());
 
         let mut store = ImageStore::new(1024 * 1024);
         let r = run(
@@ -2166,7 +2182,7 @@ mod tests {
         ));
         std::fs::write(&path, [1u8, 2, 3, 4]).unwrap();
         let encoded_path =
-            crate::terminal::kitty::command::encode_base64(path.to_string_lossy().as_bytes());
+            crate::terminal::kitty::command::encode_base64(payload_path_string(&path).as_bytes());
 
         let mut store = ImageStore::new(1024 * 1024);
         let r = run(
@@ -2385,6 +2401,7 @@ mod tests {
         assert!(!windows_is_drive_absolute(r"\\server\share\image.png"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn posix_sensitive_file_paths_are_rejected() {
         use std::path::Path;
@@ -3088,7 +3105,9 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=T,f=32,s=4,v=4,t=f,i=1,q=2;{b64}",
-            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(
+                payload_path_string(&path).as_bytes()
+            )
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
 
@@ -3138,7 +3157,9 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=t,f=32,s=1,v=1,t=t,i=9;{b64}",
-            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(
+                payload_path_string(&path).as_bytes()
+            )
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
         assert!(r.images_changed, "t=t 应读出数据");
@@ -3159,7 +3180,9 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let seq = format!(
             "a=t,f=32,s=1,v=1,t=t,i=9;{b64}",
-            b64 = crate::terminal::kitty::command::encode_base64(path.to_str().unwrap().as_bytes())
+            b64 = crate::terminal::kitty::command::encode_base64(
+                payload_path_string(&path).as_bytes()
+            )
         );
         let r = run(&mut store, &seq, (0, 0)).unwrap();
         let reply = String::from_utf8_lossy(&r.reply);

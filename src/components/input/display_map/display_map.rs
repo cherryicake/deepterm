@@ -284,8 +284,9 @@ impl DisplayMap {
 
     /// Set font parameters
     pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
-        self.wrap_map.set_font(font, font_size, cx);
-        self.rebuild_fold_projection();
+        if self.wrap_map.set_font(font, font_size, cx) {
+            self.rebuild_fold_projection();
+        }
     }
 
     /// Ensure text is prepared (initializes wrapper if needed)

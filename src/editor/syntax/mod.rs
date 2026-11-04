@@ -252,27 +252,36 @@ impl DiagnosticSet {
         if !self.non_empty {
             return Vec::new();
         }
-        self.items
-            .iter()
-            .filter_map(|d| {
-                let start = d.range.start.max(range.start);
-                let end = d.range.end.min(range.end);
-                if start >= end {
-                    return None;
-                }
-                Some((
-                    start..end,
-                    HighlightStyle {
-                        underline: Some(UnderlineStyle {
-                            thickness: px(1.),
-                            color: Some(d.severity.color(cx)),
-                            wavy: d.severity.is_wavy(),
-                        }),
-                        ..Default::default()
-                    },
-                ))
-            })
-            .collect()
+        // Items are sorted by `range.start` and `max_end_prefix` is the
+        // running maximum of `range.end`, so diagnostics ending before the
+        // visible range can be skipped with one partition_point instead of
+        // scanning the whole (potentially large) set on every frame.
+        let first = self
+            .max_end_prefix
+            .partition_point(|&max_end| max_end < range.start);
+        let mut styles = Vec::new();
+        for d in &self.items[first.min(self.items.len())..] {
+            if d.range.start >= range.end {
+                break;
+            }
+            let start = d.range.start.max(range.start);
+            let end = d.range.end.min(range.end);
+            if start >= end {
+                continue;
+            }
+            styles.push((
+                start..end,
+                HighlightStyle {
+                    underline: Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(d.severity.color(cx)),
+                        wavy: d.severity.is_wavy(),
+                    }),
+                    ..Default::default()
+                },
+            ));
+        }
+        styles
     }
 }
 

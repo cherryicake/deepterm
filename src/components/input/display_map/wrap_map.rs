@@ -97,10 +97,15 @@ impl WrapMap {
         true
     }
 
-    /// Set font parameters
-    pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
-        self.wrapper.set_font(font, font_size, cx);
-        self.rebuild_cache();
+    /// Set font parameters. Returns whether the measurement actually changed;
+    /// callers use this to skip the O(lines) fold-projection rebuild on the
+    /// (common) steady-state frame where the font is unchanged.
+    pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) -> bool {
+        let changed = self.wrapper.set_font(font, font_size, cx);
+        if changed {
+            self.rebuild_cache();
+        }
+        changed
     }
 
     /// Ensure text is prepared (initializes wrapper if needed)

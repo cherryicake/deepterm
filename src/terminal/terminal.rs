@@ -914,9 +914,8 @@ fn detect_scroll_shift(old: &[u64], new: &[u64]) -> isize {
     if rows < 4 || new.len() != rows {
         return 0;
     }
-    let mut best_shift = 0isize;
-    let mut best_matches = 0usize;
-    for shift in -(rows as isize - 1)..=(rows as isize - 1) {
+    let threshold = (rows * 3).div_ceil(4);
+    let matches_at = |shift: isize| {
         let mut matches = 0usize;
         for (index, new_hash) in new.iter().enumerate() {
             let source = index as isize + shift;
@@ -924,16 +923,24 @@ fn detect_scroll_shift(old: &[u64], new: &[u64]) -> isize {
                 matches += 1;
             }
         }
-        if matches > best_matches {
-            best_matches = matches;
-            best_shift = shift;
+        matches
+    };
+    // 常见场景是滚动 1~2 行，按 |shift| 递增搜索并在首次达到 3/4 阈值时
+    // 返回即可。旧的 O(rows²) 全量扫描每次 Full damage（滚动/批量输出）
+    // 都要把 2×rows−1 个候选全部算一遍。
+    if matches_at(0) >= threshold {
+        return 0;
+    }
+    for distance in 1..rows {
+        let shift = distance as isize;
+        if matches_at(shift) >= threshold {
+            return shift;
+        }
+        if matches_at(-shift) >= threshold {
+            return -shift;
         }
     }
-    if best_matches * 4 >= rows * 3 {
-        best_shift
-    } else {
-        0
-    }
+    0
 }
 
 /// 软换行链一次最多拼多少行（见 [`Terminal::link_row_chain`]）。
@@ -1230,6 +1237,10 @@ pub struct Terminal {
     /// Kitty DnD（OSC 72）注册与 drop-target 状态。
     kitty_dnd: crate::terminal::kitty::dnd::DndState,
     last_content: TerminalContent,
+    /// Reusable buffer for the full-viewport row fingerprints. A Full damage
+    /// frame used to allocate a fresh `Vec<u64>` every time; alternating with
+    /// `last_content.row_hashes` keeps two buffers alive and allocation-free.
+    row_hash_scratch: Vec<u64>,
     pub content_generation: u64,
     content_dirty: bool,
     /// 最近一次「有字节真的被解析进网格」的时刻（见 [`AGENT_STREAM_WINDOW`]）。
@@ -1429,6 +1440,7 @@ impl Terminal {
             kitty_clipboard: Default::default(),
             kitty_dnd: Default::default(),
             last_content: TerminalContent::default(),
+            row_hash_scratch: Vec::new(),
             content_generation: 0,
             content_dirty: false,
             last_output_at: None,
@@ -1648,6 +1660,7 @@ impl Terminal {
                 kitty_clipboard: Default::default(),
                 kitty_dnd: Default::default(),
                 last_content: TerminalContent::default(),
+                row_hash_scratch: Vec::new(),
                 content_generation: 0,
                 content_dirty: false,
                 last_output_at: None,
@@ -1828,6 +1841,7 @@ impl Terminal {
             kitty_clipboard: Default::default(),
             kitty_dnd: Default::default(),
             last_content: TerminalContent::default(),
+            row_hash_scratch: Vec::new(),
             content_generation: 0,
             content_dirty: false,
             last_output_at: None,
@@ -2175,6 +2189,7 @@ impl Terminal {
                     ),
                 ),
                 last_content: TerminalContent::default(),
+                row_hash_scratch: Vec::new(),
                 content_generation: 0,
                 content_dirty: false,
                 last_output_at: None,
@@ -3984,7 +3999,11 @@ impl Terminal {
         // 行指纹：全量帧用于识别滚动位移（把整行缓存平移复用），
         // 部分帧也重算一遍，保证下一帧的滚动检测有正确的 old 基准。
         let (row_hashes, scroll_shift) = if rebuild_all {
-            let mut hashes = Vec::with_capacity(row_ranges.len());
+            // 复用 scratch 缓冲区：全量 damage（滚动/批量输出）每帧都会走到
+            // 这里，旧实现每次都 `Vec::with_capacity` 新建一份。
+            let mut hashes = std::mem::take(&mut self.row_hash_scratch);
+            hashes.clear();
+            hashes.reserve(row_ranges.len());
             for (start, end) in row_ranges.iter() {
                 hashes.push(row_content_hash(&cells[*start..*end]));
             }
@@ -3995,13 +4014,29 @@ impl Terminal {
             } else {
                 detect_scroll_shift(&previous_row_hashes, &hashes)
             };
+            // 上一帧的 Vec 归还给 scratch，与 `last_content.row_hashes`
+            // 交替使用，稳态下不再分配。
+            self.row_hash_scratch = previous_row_hashes;
             (hashes, shift)
         } else {
             // 部分更新复用上一帧的 Vec，保证「无变化帧零分配」仍然成立。
+            //
+            // 只有 `dirty_rows` 标记的行内容变过（alacritty 的 Partial
+            // damage 语义保证其余行未移动），所以只需重算这些行的指纹；
+            // 旧实现每次输出都重算整个视口，大窗口 / 高频输出下是纯浪费。
             let mut hashes = previous_row_hashes;
-            hashes.clear();
-            for (start, end) in row_ranges.iter() {
-                hashes.push(row_content_hash(&cells[*start..*end]));
+            if hashes.len() == row_ranges.len() {
+                for (row_idx, (start, end)) in row_ranges.iter().enumerate() {
+                    if self.dirty_rows.get(row_idx).copied().unwrap_or(false) {
+                        hashes[row_idx] = row_content_hash(&cells[*start..*end]);
+                    }
+                }
+            } else {
+                // 防御：长度不一致（不应发生）时退回全量重算。
+                hashes.clear();
+                for (start, end) in row_ranges.iter() {
+                    hashes.push(row_content_hash(&cells[*start..*end]));
+                }
             }
             (hashes, 0)
         };
@@ -4027,10 +4062,14 @@ impl Terminal {
         // term lock a second time per frame.
         self.last_content.selection_range = term.selection.as_ref().and_then(|s| s.to_range(&term));
         // 调色板快照：OSC 4/10/11/12 改色 / 重置与主题切换都在此同步到渲染路径。
+        // 绝大多数帧颜色没变，先在栈上比较再决定是否重算指纹；`from_colors`
+        // 本身只是一次 269 项拷贝，直接比较比每帧重新哈希便宜。
         let palette =
             crate::terminal::mappings::colors::TerminalPalette::from_colors(term.colors());
-        self.last_content.palette_hash = palette.hash_u64();
-        self.last_content.palette = palette;
+        if palette != self.last_content.palette {
+            self.last_content.palette_hash = palette.hash_u64();
+            self.last_content.palette = palette;
+        }
 
         // 链接（URL / OSC8 / 文件路径）不再随每帧输出维护缓存：
         // 消费方只有 hover 命中测试，按需用 `last_content.cells` 现算，
@@ -5482,10 +5521,27 @@ impl Drop for Terminal {
 pub struct LineSnapshot {
     /// 剔除宽字符占位格与行尾 null 后的字符流。
     pub text: String,
-    /// `text` 中每个字符对应的 grid 列号（下标与字符一一对应）。
-    pub cols: Vec<u32>,
-    /// 每个字符占的 cell 宽（1 或 2）。
-    pub widths: Vec<u8>,
+    /// `text` 中每个字符对应的 grid 列号；`None` 表示列号就是从 0 开始的
+    /// 连续序列（绝大多数 terminal 行都是这种形态，省掉一条 `Vec<u32>`）。
+    pub cols: Option<Vec<u32>>,
+    /// 每个字符占的 cell 宽（1 或 2）；`None` 表示全为 1（常见路径）。
+    pub widths: Option<Vec<u8>>,
+}
+
+impl LineSnapshot {
+    #[inline]
+    fn col_at(&self, index: usize) -> usize {
+        self.cols
+            .as_ref()
+            .map_or(index, |cols| cols[index] as usize)
+    }
+
+    #[inline]
+    fn width_at(&self, index: usize) -> usize {
+        self.widths
+            .as_ref()
+            .map_or(1, |widths| widths[index] as usize)
+    }
 }
 
 /// 整个滚动区（scrollback + 屏幕）的搜索快照。
@@ -5517,8 +5573,12 @@ pub fn grid_search_snapshot<T: EventListener>(term: &Term<T>) -> SearchSnapshot 
         let row = &grid[line];
 
         let mut text = String::with_capacity(cols);
-        let mut cols_of = Vec::with_capacity(cols);
-        let mut widths_of = Vec::with_capacity(cols);
+        // Most rows are a contiguous run of single-width chars; keep the
+        // per-char column/width tables lazy so the common case allocates only
+        // the text `String` instead of three allocations per line.
+        let mut cols_of: Option<Vec<u32>> = None;
+        let mut widths_of: Option<Vec<u8>> = None;
+        let mut char_count = 0usize;
         for col in 0..cols {
             let cell = &row[Column(col)];
             let spacer_flags = alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER
@@ -5534,9 +5594,20 @@ pub fn grid_search_snapshot<T: EventListener>(term: &Term<T>) -> SearchSnapshot 
             } else {
                 1
             };
+            if col != char_count {
+                cols_of.get_or_insert_with(|| (0..char_count as u32).collect());
+            }
+            if wide == 2 {
+                widths_of.get_or_insert_with(|| vec![1u8; char_count]);
+            }
             text.push(cell.c);
-            cols_of.push(col as u32);
-            widths_of.push(wide);
+            if let Some(cols_of) = cols_of.as_mut() {
+                cols_of.push(col as u32);
+            }
+            if let Some(widths_of) = widths_of.as_mut() {
+                widths_of.push(wide);
+            }
+            char_count += 1;
         }
         lines.push(LineSnapshot {
             text,
@@ -5581,15 +5652,15 @@ pub fn search_matches_in_snapshot(snapshot: &SearchSnapshot, needle: &str) -> Ve
         let mut start = 0usize;
         while start + window <= folded.len() {
             if folded[start..start + window] == needle_folded[..] {
-                let start_col = line.cols[start] as usize;
+                let start_col = line.col_at(start);
                 // 结束列：优先用下一个字符的列号（稀疏行会自然跨过空档），
                 // 行尾则用命中尾字符的列 + 占宽。
                 let last = start + window - 1;
-                let end_col = line
-                    .cols
-                    .get(last + 1)
-                    .map(|c| *c as usize)
-                    .unwrap_or(line.cols[last] as usize + line.widths[last] as usize);
+                let end_col = if last + 1 < folded.len() {
+                    line.col_at(last + 1)
+                } else {
+                    line.col_at(last) + line.width_at(last)
+                };
                 out.push(SearchMatch {
                     start: AlacPoint::new(grid_line, Column(start_col)),
                     end: AlacPoint::new(grid_line, Column(end_col)),

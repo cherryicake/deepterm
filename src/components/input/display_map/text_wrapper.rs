@@ -123,14 +123,15 @@ impl TextWrapper {
         self.update_all(&self.text.clone(), cx);
     }
 
-    pub(crate) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
+    pub(crate) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) -> bool {
         if self.font.eq(&font) && self.font_size == font_size {
-            return;
+            return false;
         }
 
         self.font = font;
         self.font_size = font_size;
         self.update_all(&self.text.clone(), cx);
+        true
     }
 
     pub(crate) fn prepare_if_need(&mut self, text: &Rope, cx: &mut App) -> bool {

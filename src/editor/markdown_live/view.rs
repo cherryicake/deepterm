@@ -39,7 +39,6 @@ use crate::editor::markdown_live::element::{
 };
 use crate::editor::markdown_live::highlight::HighlightCache;
 use crate::editor::markdown_live::images::{assets_dir, format_extension, unique_file_name};
-use crate::editor::markdown_live::inline::collect_refdefs;
 use crate::editor::markdown_live::interactions::{
     OrderedCounter, SLASH_COMMANDS, backspace_marker, cell_content_cols, classify_alone,
     insert_link, line_selection, list_cols, on_enter, on_tab, pos_of_offset, slash_items,
@@ -113,6 +112,12 @@ pub struct LiveMarkdownView {
     /// [`PlanGeometry`].
     planned_geometry: Rc<PlanGeometry>,
     planned_geometry_version: u64,
+    /// Monotonic revision of `planned_geometry`. Bumped only when the geometry
+    /// is actually rebuilt; a text-only edit keeps the same group list, so the
+    /// O(groups) virtualization prefix/rates can be reused.
+    geometry_revision: u64,
+    /// `geometry_revision` the last `virtual_window` was built from.
+    virt_geometry_revision: u64,
     /// P1: 按 text_version 缓存的文档分类结果（块类型 + 前置语法语言）。
     /// 只有文本变更才重算，纯光标移动时被 `plan_rows` 复用 —— 跳过两个
     /// O(n) 的分类/setext pass。
@@ -123,13 +128,6 @@ pub struct LiveMarkdownView {
     /// 的全文扫描。`Rc` 共享避免每次复用拷贝整表。
     planned_refs: Rc<HashMap<String, String>>,
     planned_refs_version: u64,
-    /// 表格单元格用的文档级参考链接表（`[t][ref]`）。全文档扫描得来的，
-    /// 按「文本版本 + 规划键」缓存，避免每帧重扫一遍整篇文档。
-    /// 用 `Rc` 共享：每帧只需自增引用计数而不是整表克隆（见 P4）。
-    table_refs: Rc<HashMap<String, String>>,
-    /// `table_refs` 对应的缓存键；`None` 表示还没算过。纯文本相关，因此只按
-    /// `text_version` 记账（见 render 中的说明）。
-    table_refs_key: Option<u64>,
     copied_code_blocks: HashSet<usize>,
     /// Mermaid 图渲染缓存 +「预览 | 源码」按钮状态（缓存键 = 块源码 + 主题指纹，
     /// 后台 + 防抖渲染；详见 `mermaid` 模块）。
@@ -322,6 +320,8 @@ impl LiveMarkdownView {
                 wide_anchors: Vec::new(),
             }),
             planned_geometry_version: u64::MAX,
+            geometry_revision: 0,
+            virt_geometry_revision: 0,
             planned_classified: Classified {
                 blocks: Vec::new(),
                 lang_before: Vec::new(),
@@ -331,8 +331,6 @@ impl LiveMarkdownView {
             planned_classified_version: u64::MAX,
             planned_refs: Rc::new(HashMap::new()),
             planned_refs_version: u64::MAX,
-            table_refs: Rc::new(HashMap::new()),
-            table_refs_key: None,
             copied_code_blocks: HashSet::new(),
             mermaid: MermaidState::new(),
             h_scroll: ScrollBarMap::default(),
@@ -1139,20 +1137,55 @@ impl LiveMarkdownView {
             // which disables resumption and forces a full pass.
             let dirty = dirty_range.clone().unwrap_or(0..0);
             let lines = self.buffer.lines();
-            let (classified, _reprocessed) =
-                crate::editor::markdown_live::reveal::classify_incremental(
+            if self.planned_classified.blocks.len() == lines.len()
+                && self.planned_classified.lang_before.len() == lines.len()
+            {
+                // Same line count: mutate the old tables in place instead of
+                // allocating and copying the unchanged prefix/tail per key.
+                crate::editor::markdown_live::reveal::classify_incremental_in_place(
+                    &mut self.planned_classified,
                     lines,
-                    Some(&self.planned_classified),
                     dirty,
                 );
-            self.planned_classified = classified;
+            } else {
+                let (classified, _reprocessed) =
+                    crate::editor::markdown_live::reveal::classify_incremental(
+                        lines,
+                        Some(&self.planned_classified),
+                        dirty,
+                    );
+                self.planned_classified = classified;
+            }
             self.planned_classified_version = self.buffer.text_version();
         }
         if self.planned_refs_version != self.buffer.text_version() {
-            self.planned_refs = Rc::new(refdefs_for_lines(
-                self.buffer.lines(),
-                &self.planned_classified.blocks,
-            ));
+            // Refdefs are document-wide, but only a line that *looks like* a
+            // definition can change the table. Checking the dirty range on
+            // both sides (old text for deleted definitions, new text for
+            // added ones) lets ordinary prose/code edits reuse the previous
+            // map instead of re-scanning every line on each keystroke — the
+            // old path was O(document) per keystroke.
+            let refs_may_change = match &dirty_range {
+                None => true,
+                Some(range) => {
+                    let lines = self.buffer.lines();
+                    let start = range.start;
+                    let end = (range.end + 1).min(lines.len());
+                    (start..end).any(|i| {
+                        lines.get(i).is_some_and(|line| line_may_be_refdef(line))
+                            || self
+                                .plan_input_lines
+                                .get(i)
+                                .is_some_and(|line| line_may_be_refdef(line))
+                    })
+                }
+            };
+            if refs_may_change {
+                self.planned_refs = Rc::new(refdefs_for_lines(
+                    self.buffer.lines(),
+                    &self.planned_classified.blocks,
+                ));
+            }
             self.planned_refs_version = self.buffer.text_version();
         }
 
@@ -1211,6 +1244,7 @@ impl LiveMarkdownView {
             self.plan_refs = (*self.planned_refs).clone();
             if self.planned_geometry_version != self.buffer.text_version() {
                 self.planned_geometry = Rc::new(PlanGeometry::build_owned(&self.planned, lines));
+                self.geometry_revision = self.geometry_revision.wrapping_add(1);
                 self.planned_geometry_version = self.buffer.text_version();
             }
             self.planned_version = self.buffer.text_version();
@@ -1407,6 +1441,7 @@ impl LiveMarkdownView {
             && (blocks_changed || kinds_changed || mermaid_touched)
         {
             self.planned_geometry = Rc::new(PlanGeometry::build_owned(&self.planned, lines));
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
             self.planned_geometry_version = self.buffer.text_version();
         } else if self.planned_geometry_version != self.buffer.text_version() {
             // Inputs unchanged: keep the geometry but re-stamp the version so
@@ -2649,7 +2684,7 @@ impl LiveMarkdownView {
     /// 就编辑哪个格，不会出现「Grid 画 3 列、Tab 走 2 格」这类错位。
     fn table_active_cell(
         &self,
-        rows: &[&PlannedRow],
+        rows: &[Rc<PlannedRow>],
         idxs: &[usize],
         cursor: Pos,
     ) -> Option<(usize, usize, std::ops::Range<usize>)> {
@@ -4067,8 +4102,23 @@ fn callout_accent(kind: CalloutKind, theme: &crate::theme::AppTheme) -> Hsla {
     }
 }
 
+/// Whether a source line *could* be a CommonMark reference definition.
+///
+/// This is a conservative pre-filter for the incremental refdef cache: false
+/// positives only cause an unnecessary full scan, while a false negative would
+/// leave stale link targets. Matches `collect_refdefs`'s shape (≤3 leading
+/// spaces, `[label]:`, not a footnote).
+fn line_may_be_refdef(line: &str) -> bool {
+    let indent = line.bytes().take_while(|&b| b == b' ').count();
+    if indent > 3 {
+        return false;
+    }
+    let rest = &line[indent..];
+    rest.starts_with('[') && !rest.starts_with("[^")
+}
+
 /// Outline entries `(source line, level, title)` in document order.
-fn outline_entries(rows: &[&PlannedRow]) -> Vec<(usize, u8, String)> {
+fn outline_entries(rows: &[Rc<PlannedRow>]) -> Vec<(usize, u8, String)> {
     rows.iter()
         .filter_map(|r| match &r.block {
             Block::Heading { level, .. } => Some((r.line, *level, outline_title(&r.plan.visible))),
@@ -4776,7 +4826,7 @@ impl PlanGeometry {
         while i < rows.len() {
             match &rows[i].block {
                 Block::Fence { open: true, lang } => {
-                    let lang = lang.clone();
+                    let lang = lang.as_deref().map(str::to_string);
                     let open = i;
                     i += 1;
                     let mut code = Vec::new();
@@ -5125,6 +5175,7 @@ impl LiveMarkdownView {
         ginfo: &[(usize, u8, (usize, usize))],
         cursor_line: usize,
         text_version: u64,
+        geometry_revision: u64,
         want_caret: bool,
     ) -> Option<(usize, usize, f32, f32)> {
         let g = ginfo.len();
@@ -5147,15 +5198,22 @@ impl LiveMarkdownView {
         let text_changed = text_version != self.heights_version;
         if text_changed {
             self.heights_version = text_version;
-            // The group list is rebuilt by `plan_rows`; its geometry is cached
-            // by text version, so a text change may alter the group count.
-            self.prefix_dirty = true;
+            // Only a rebuilt `PlanGeometry` can change the group list / row
+            // counts / calibration buckets that feed the prefix sum. A plain
+            // text edit usually keeps it identical; the measured-height
+            // feedback below still marks the prefix dirty if a visible group
+            // actually reflowed. Unconditionally invalidating here made every
+            // keystroke O(groups) (≈6.7k at 20k lines) even for a prose edit.
+            if geometry_revision != self.virt_geometry_revision {
+                self.prefix_dirty = true;
+            }
         }
+        self.virt_geometry_revision = geometry_revision;
         // 上帧几何快照（锚定补偿用）：prefix 逐帧重算会漂，`lo` 越大顶部占位
         // 跳变越大；用同一 anchor 的新旧差修正 scroll offset，视口内容不动。
         // 缓冲复用：`mem::take` 接管上帧的 prefix（容量留用），避免每帧克隆
         // 整份 `Vec<f32>`。
-        let old_prefix = std::mem::take(&mut self.virt_prefix);
+        let mut old_prefix = std::mem::take(&mut self.virt_prefix);
         let old_window = self.last_window;
         let old_same_shape = old_prefix.len() == g + 1;
         // Wrapping follows viewport width: re-measure after resize.
@@ -5176,7 +5234,7 @@ impl LiveMarkdownView {
             && phi < g
             && self.last_window_counts.len() == phi - plo + 1
         {
-            let counts = self.last_window_counts.clone();
+            let counts = std::mem::take(&mut self.last_window_counts);
             let top_off = usize::from(plo > 0);
             let bot_off = usize::from(phi + 1 < g);
             let expected: usize = counts.iter().sum::<usize>() + top_off + bot_off;
@@ -5327,10 +5385,10 @@ impl LiveMarkdownView {
             }
             self.prefix_dirty = false;
         } else {
-            // Unchanged inputs: last frame's sum is still exact. Copy it (the
-            // values, not the allocation — `old_prefix` is still borrowed by
-            // the anchor compensation below).
-            prefix.extend_from_slice(&old_prefix);
+            // Unchanged inputs: last frame's sum is still exact. Take the
+            // buffer instead of copying all groups (the anchor compensation
+            // below only runs when the prefix was rebuilt).
+            prefix = std::mem::take(&mut old_prefix);
         }
         // Viewport window in content pixels (scroll-anchored).
         let vp_h = f32::from(vp.size.height);
@@ -5339,7 +5397,7 @@ impl LiveMarkdownView {
         // 内容末端——两者都会把锚点下方新实测 group 的修正漏成视口位移），
         // 组内按比例跟随；视口下方（含底部）的修正由底部占位吸收，视口内容
         // 保持不动，用户滚轮位移被完整保留。
-        if !text_changed && !want_caret && vp_h > 0.0 && old_same_shape {
+        if need_rates && !text_changed && !want_caret && vp_h > 0.0 && old_same_shape {
             // First group whose *end* is past the viewport top: binary search
             // instead of a linear scan (O(log g) per frame).
             let k = old_prefix.partition_point(|&p| p <= off_y);
@@ -5665,7 +5723,13 @@ impl Render for LiveMarkdownView {
         // for the viewport (+ overscan). Small docs render everything.
         let text_version = self.buffer.text_version();
         let want_caret = self.scroll_to_cursor;
-        let vw = self.virtual_window(ginfo, cursor.line, text_version, want_caret);
+        let vw = self.virtual_window(
+            ginfo,
+            cursor.line,
+            text_version,
+            self.geometry_revision,
+            want_caret,
+        );
         let virtualized = vw.is_some();
         let (v_lo, v_hi, v_top_px, v_bot_px) =
             vw.unwrap_or((0, ginfo.len().saturating_sub(1), 0.0, 0.0));
@@ -5679,8 +5743,12 @@ impl Render for LiveMarkdownView {
         };
         // The caret's row must paint even when it sits just outside the window
         // (it is the scroll target and carries the caret).
-        let caret_row: Option<usize> = if virtualized {
-            rows.iter().position(|r| r.line == cursor.line)
+        // `planned` has exactly one row per source line, in document order
+        // (`plan_range` pushes `PlannedRow { line: i, .. }` for every `i`), so
+        // the cursor's row index *is* its source line. Scanning all rows with
+        // `position()` here made every caret frame O(document).
+        let caret_row: Option<usize> = if virtualized && cursor.line < rows.len() {
+            Some(cursor.line)
         } else {
             None
         };
@@ -5718,56 +5786,54 @@ impl Render for LiveMarkdownView {
         // (multi-line matches split per row, hidden-marker spans dropped).
         let find_marks: HashMap<usize, Vec<(usize, usize, bool)>> = {
             let mut marks: HashMap<usize, Vec<(usize, usize, bool)>> = HashMap::new();
-            let (match_ranges, current) = self
-                .search_panel
-                .as_ref()
-                .and_then(|p| {
-                    p.read(cx)
-                        .matcher()
-                        .map(|m| (m.match_ranges().to_vec(), m.current_ix()))
-                })
-                .unwrap_or_default();
-            if !match_ranges.is_empty() {
-                let row_by_line: HashMap<usize, usize> = rows
-                    .iter()
-                    .enumerate()
-                    .filter(|(pi, _)| row_visible(*pi))
-                    .map(|(pi, r)| (r.line, pi))
-                    .collect();
-                let lines = self.buffer.lines();
-                for (ix, range) in match_ranges.iter().enumerate() {
-                    // O(log lines) offset → Pos instead of a linear scan per
-                    // match (was O(matches × lines) per frame with the find
-                    // panel open — the worst hidden hotspot on large docs).
-                    let start = self.buffer.pos_of_offset(range.start);
-                    let end = self.buffer.pos_of_offset(range.end);
-                    for line in start.line..=end.line {
-                        let Some(src) = lines.get(line) else {
-                            continue;
-                        };
-                        let bs = if line == start.line {
-                            byte_for_col(src, start.col)
-                        } else {
-                            0
-                        };
-                        let be = if line == end.line {
-                            byte_for_col(src, end.col)
-                        } else {
-                            src.len()
-                        };
-                        if bs >= be {
-                            continue;
-                        }
-                        let Some(pi) = row_by_line.get(&line) else {
-                            continue;
-                        };
-                        if virtualized && !is_visible(*pi) {
-                            continue;
-                        }
-                        let segs = &rows[*pi].plan.segs;
-                        let (vs, ve) = (vis_for_src(segs, bs), vis_for_src(segs, be));
-                        if vs < ve {
-                            marks.entry(line).or_default().push((vs, ve, ix == current));
+            let search = self.search_panel.as_ref().map(|p| p.read(cx));
+            if let Some(matcher) = search.as_ref().and_then(|p| p.matcher()) {
+                // Borrow the matcher's ranges instead of cloning the whole
+                // match list on every frame while the find panel is open.
+                let match_ranges = matcher.match_ranges();
+                let current = matcher.current_ix();
+                if !match_ranges.is_empty() {
+                    let row_by_line: HashMap<usize, usize> = rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(pi, _)| row_visible(*pi))
+                        .map(|(pi, r)| (r.line, pi))
+                        .collect();
+                    let lines = self.buffer.lines();
+                    for (ix, range) in match_ranges.iter().enumerate() {
+                        // O(log lines) offset → Pos instead of a linear scan per
+                        // match (was O(matches × lines) per frame with the find
+                        // panel open — the worst hidden hotspot on large docs).
+                        let start = self.buffer.pos_of_offset(range.start);
+                        let end = self.buffer.pos_of_offset(range.end);
+                        for line in start.line..=end.line {
+                            let Some(src) = lines.get(line) else {
+                                continue;
+                            };
+                            let bs = if line == start.line {
+                                byte_for_col(src, start.col)
+                            } else {
+                                0
+                            };
+                            let be = if line == end.line {
+                                byte_for_col(src, end.col)
+                            } else {
+                                src.len()
+                            };
+                            if bs >= be {
+                                continue;
+                            }
+                            let Some(pi) = row_by_line.get(&line) else {
+                                continue;
+                            };
+                            if virtualized && !is_visible(*pi) {
+                                continue;
+                            }
+                            let segs = &rows[*pi].plan.segs;
+                            let (vs, ve) = (vis_for_src(segs, bs), vis_for_src(segs, be));
+                            if vs < ve {
+                                marks.entry(line).or_default().push((vs, ve, ix == current));
+                            }
                         }
                     }
                 }
@@ -5788,8 +5854,8 @@ impl Render for LiveMarkdownView {
             }
             let plan = &row.plan;
             let base = row_base_style(plan, &style);
-            let mut runs = if let Some(block_runs) = code_runs.get(&row.line) {
-                block_runs.clone()
+            let mut runs = if let Some(block_runs) = code_runs.remove(&row.line) {
+                block_runs
             } else {
                 runs_for_row(plan, &base, &colors, &style, &self.hl, &theme)
             };
@@ -5870,18 +5936,21 @@ impl Render for LiveMarkdownView {
         // `render_line` needs lots of context: build rows inline via closure.
         let cursor_shape = self.cursor_shape;
         let mut live_line = |pi: usize,
-                             paints: &HashMap<usize, RowPaint>,
+                             paints: &mut HashMap<usize, RowPaint>,
                              entity: &Entity<Self>,
                              colors: &LiveColors|
          -> LiveLine {
             let drag_fallback = first_row_el;
             first_row_el = false;
-            let paint = paints.get(&pi).expect("visible row must have paint");
+            // Each visible row is built exactly once; move its paint data out
+            // instead of deep-cloning the run vector into the element (and
+            // `LiveLine::request_layout` takes it from there into StyledText).
+            let mut paint = paints.remove(&pi).expect("visible row must have paint");
             let plan = &rows[pi].plan;
             LiveLine::new(
                 ("live-line", rows[pi].line),
                 plan.visible.clone(),
-                paint.runs.clone(),
+                std::mem::take(&mut paint.runs),
                 rows[pi].line,
                 entity.clone(),
                 matches!(rows[pi].plan.kind, RowKind::Task { .. }),
@@ -5892,7 +5961,7 @@ impl Render for LiveMarkdownView {
             )
             .with_drag_fallback(drag_fallback)
             .with_caret_shape(cursor_shape)
-            .with_caret_block(paint.caret_block_width, paint.caret_block_text.clone())
+            .with_caret_block(paint.caret_block_width, paint.caret_block_text.take())
             .with_caret_opacity(caret_opacity)
             .with_caret_metric_height(caret_metric_height)
         };
@@ -5908,36 +5977,11 @@ impl Render for LiveMarkdownView {
         }
 
         // Reference definitions for table cells (`[t][r]` inside the grid
-        // resolves document-wide like the preview). 只在真的有表格渲染时才收集，
-        // 并且跨帧缓存：这次扫描要遍历整篇文档，边打字边每帧重扫纯属浪费。
-        // 跳过规则与 `reveal::plan_document` 一致，源码块里的定义不会生效。
-        //
-        // 缓存键只需要 `text_version`：跳过谓词读的是每行的 `Block`，而它来自
-        // 纯文本的分类结果（`planned_classified`），与光标/选区/源码模式无关。
-        // 早先把整个「规划键」放进 key，导致每次方向键移动都要重扫全文。
-        let table_refs = if geometry.has_table {
-            let key = self.buffer.text_version();
-            if self.table_refs_key != Some(key) {
-                let buf_lines = self.buffer.lines();
-                self.table_refs = Rc::new(collect_refdefs(buf_lines, &|i| {
-                    rows.get(i).is_some_and(|r| {
-                        matches!(
-                            r.block,
-                            Block::CodeLine
-                                | Block::Fence { .. }
-                                | Block::FrontMatter
-                                | Block::Table
-                                | Block::Math { .. }
-                                | Block::MathDelim { .. }
-                        )
-                    })
-                }));
-                self.table_refs_key = Some(key);
-            }
-            self.table_refs.clone()
-        } else {
-            Rc::new(HashMap::new())
-        };
+        // resolves document-wide like the preview). 跳过规则与 `refdefs_for_lines`
+        // 完全一致（表格 / 源码块 / frontmatter / 数学块里的定义不生效），所以
+        // 直接复用 `planned_rows` 已经算好的引用表，不再按 text_version 重扫
+        // 整篇文档（旧实现每次击键都多一次 O(n) 扫描）。
+        let table_refs = self.planned_refs.clone();
         // ---- mermaid pass1：对**全部** mermaid 块（含视口外，虚拟化不参与）
         // ensure 渲染缓存（后台 + 200ms 防抖），随后推进缓存帧。
         // 全量而非只扫视口内的原因：「上一帧同位置成品图」回退按文档序对齐，
@@ -5961,10 +6005,19 @@ impl Render for LiveMarkdownView {
             .get_or_insert_with(|| cx.new(|_| ScrollBarState::default()))
             .clone();
         let mut window_counts: Vec<usize> = Vec::new();
-        for gi in 0..geometry.group_count() {
-            if virtualized && (gi < v_lo || gi > v_hi) {
-                continue;
-            }
+        // Virtualized frames only build the window's groups. Walking
+        // `0..group_count()` and skipping the rest made every frame O(groups)
+        // (≈6.7k iterations at 20k lines) even when the window did not move.
+        let group_count = geometry.group_count();
+        let (group_lo, group_hi) = if virtualized {
+            (
+                v_lo.min(group_count),
+                v_hi.saturating_add(1).min(group_count),
+            )
+        } else {
+            (0, group_count)
+        };
+        for gi in group_lo..group_hi {
             let Some(group) = geometry.group_at(gi) else {
                 continue;
             };
@@ -6011,7 +6064,7 @@ impl Render for LiveMarkdownView {
                                 );
                             if paints.get(&pi).is_some_and(|p| p.caret_vis.is_some()) {
                                 blank
-                                    .child(live_line(pi, &paints, &entity, &colors))
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
                             } else {
                                 blank.into_any_element()
@@ -6022,7 +6075,7 @@ impl Render for LiveMarkdownView {
                                 div()
                                     .flex_shrink_0()
                                     .py(px(2.))
-                                    .child(live_line(pi, &paints, &entity, &colors))
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
                             } else {
                                 // Preview parity: 1px soft rule, my_6.
@@ -6105,12 +6158,12 @@ impl Render for LiveMarkdownView {
                                 .group_hover("heading", |s| s.visible())
                                 .child("#")
                                 .into_any_element();
-                            head.child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .child(live_line(pi, &paints, &entity, &colors)),
-                            )
+                            head.child(div().flex_1().min_w_0().child(live_line(
+                                pi,
+                                &mut paints,
+                                &entity,
+                                &colors,
+                            )))
                             .child(anchor)
                             .into_any_element()
                         }
@@ -6203,20 +6256,19 @@ impl Render for LiveMarkdownView {
                                 item = item.mt_2();
                             }
                             item.child(gutter)
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .w_0()
-                                        .min_w_0()
-                                        .child(live_line(pi, &paints, &entity, &colors)),
-                                )
+                                .child(div().flex_1().w_0().min_w_0().child(live_line(
+                                    pi,
+                                    &mut paints,
+                                    &entity,
+                                    &colors,
+                                )))
                                 .into_any_element()
                         }
                         RowKind::Quote { .. } => {
                             // Single quote lines are grouped above; unreachable.
                             div()
                                 .flex_shrink_0()
-                                .child(live_line(pi, &paints, &entity, &colors))
+                                .child(live_line(pi, &mut paints, &entity, &colors))
                                 .into_any_element()
                         }
                         RowKind::Setext => {
@@ -6228,7 +6280,7 @@ impl Render for LiveMarkdownView {
                             if row.plan.revealed {
                                 div()
                                     .flex_shrink_0()
-                                    .child(live_line(pi, &paints, &entity, &colors))
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
                             } else {
                                 let line = row.line;
@@ -6261,7 +6313,7 @@ impl Render for LiveMarkdownView {
                                 .justify_center()
                                 .my_2()
                                 .line_height(rems(1.75))
-                                .child(live_line(pi, &paints, &entity, &colors))
+                                .child(live_line(pi, &mut paints, &entity, &colors))
                                 .into_any_element()
                         }
                         RowKind::MathDelim { .. } => {
@@ -6271,7 +6323,7 @@ impl Render for LiveMarkdownView {
                             if row.plan.revealed {
                                 div()
                                     .flex_shrink_0()
-                                    .child(live_line(pi, &paints, &entity, &colors))
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
                             } else {
                                 let line = row.line;
@@ -6302,7 +6354,7 @@ impl Render for LiveMarkdownView {
                             // lone fences, frontmatter): plain mono lines.
                             div()
                                 .flex_shrink_0()
-                                .child(live_line(pi, &paints, &entity, &colors))
+                                .child(live_line(pi, &mut paints, &entity, &colors))
                                 .into_any_element()
                         }
                         RowKind::Paragraph => {
@@ -6310,7 +6362,7 @@ impl Render for LiveMarkdownView {
                             // (kept as a defensive plain row).
                             div()
                                 .flex_shrink_0()
-                                .child(live_line(pi, &paints, &entity, &colors))
+                                .child(live_line(pi, &mut paints, &entity, &colors))
                                 .into_any_element()
                         }
                     };
@@ -6359,7 +6411,7 @@ impl Render for LiveMarkdownView {
                             if rows[pi].line == cursor.line {
                                 caret_el_ix = Some(row_els.len());
                             }
-                            src = src.child(live_line(pi, &paints, &entity, &colors));
+                            src = src.child(live_line(pi, &mut paints, &entity, &colors));
                         }
                         let last_idx = *idxs.last().unwrap();
                         self.row_targets
@@ -6519,7 +6571,7 @@ impl Render for LiveMarkdownView {
                         }
                     } else {
                         for pi in code {
-                            inner = inner.child(live_line(*pi, &paints, &entity, &colors));
+                            inner = inner.child(live_line(*pi, &mut paints, &entity, &colors));
                         }
                     }
                     let mut card = outer.child(inner);
@@ -6858,7 +6910,7 @@ impl Render for LiveMarkdownView {
                             // 同步读盘/解码）；其余 URL 走原有卡片分支。
                             d = d.child(self.image_card_cached(&url, &alt, cx));
                         } else {
-                            d = d.child(live_line(*pi, &paints, &entity, &colors));
+                            d = d.child(live_line(*pi, &mut paints, &entity, &colors));
                         }
                     }
                     let a = rows[idxs[0]].line;
@@ -6945,7 +6997,7 @@ impl Render for LiveMarkdownView {
                         );
                     }
                     for pi in idxs {
-                        card = card.child(live_line(*pi, &paints, &entity, &colors));
+                        card = card.child(live_line(*pi, &mut paints, &entity, &colors));
                     }
                     if idxs.iter().any(|pi| rows[*pi].line == cursor.line) {
                         caret_el_ix = Some(row_els.len());
@@ -6981,7 +7033,7 @@ impl Render for LiveMarkdownView {
                             row_els.push(
                                 div()
                                     .flex_shrink_0()
-                                    .child(live_line(*pi, &paints, &entity, &colors))
+                                    .child(live_line(*pi, &mut paints, &entity, &colors))
                                     .into_any_element(),
                             );
                         }
@@ -6991,8 +7043,7 @@ impl Render for LiveMarkdownView {
                     // Preview-parity grid. The cell under the cursor renders
                     // its own source (markers visible) through `plan_cell`, so
                     // it can be edited in place — the rest stay rendered.
-                    let row_refs: Vec<&PlannedRow> = rows.iter().map(|r| r.as_ref()).collect();
-                    let active = self.table_active_cell(&row_refs, idxs, cursor);
+                    let active = self.table_active_cell(rows.as_slice(), idxs, cursor);
                     // Preview-parity grid.
                     let col_count = grid_rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
                     let aligns: Vec<CellAlign> = (0..col_count)
@@ -7822,8 +7873,7 @@ impl Render for LiveMarkdownView {
         // Hidden panel: skip the O(rows) scan entirely (large docs pay it
         // per frame otherwise).
         let (outline, current_section) = if self.show_outline {
-            let row_refs: Vec<&PlannedRow> = rows.iter().map(|r| r.as_ref()).collect();
-            let outline = outline_entries(&row_refs);
+            let outline = outline_entries(rows.as_slice());
             let current = outline
                 .iter()
                 .rfind(|(line, _, _)| *line <= cursor.line)
@@ -10484,7 +10534,7 @@ mod live_showcase_tests {
     fn outline_collects_headings_in_order() {
         let doc = "# A\n\ntext\n\n## B\n\n### C\n\n## D\n";
         let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
-        let rows = plan_document(
+        let rows: Vec<Rc<PlannedRow>> = plan_document(
             &lines,
             Reveal {
                 cursor: Pos::new(0, 0),
@@ -10493,9 +10543,11 @@ mod live_showcase_tests {
                 read_only: false,
                 ..Default::default()
             },
-        );
-        let row_refs: Vec<&PlannedRow> = rows.iter().collect();
-        let outline = outline_entries(&row_refs);
+        )
+        .into_iter()
+        .map(Rc::new)
+        .collect();
+        let outline = outline_entries(&rows);
         assert_eq!(
             outline
                 .iter()

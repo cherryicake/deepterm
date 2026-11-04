@@ -194,8 +194,6 @@ pub fn local_spawn_path_for(home: &Path, system_search_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     /// 用户级目录必须**前置**到既有 PATH 上，且既有路径一个都不能丢。
     ///
     /// 前置：同名二进制同时在 `~/.cargo/bin` 和 Homebrew 里时，用户日常在用的

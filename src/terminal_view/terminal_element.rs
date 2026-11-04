@@ -51,6 +51,13 @@ fn cursor_thickness(cell_width: Pixels) -> Pixels {
         .max(1.0))
 }
 
+/// `DEEPTERM_DISABLE_KITTY` is a process-lifetime diagnostic switch; reading
+/// the environment on every frame is unnecessary (and `var_os` takes a lock).
+fn kitty_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("DEEPTERM_DISABLE_KITTY").is_some())
+}
+
 /// 绘制自绘下划线装饰（双线 / 点线 / 虚线）。
 ///
 /// 底部锚定与 IME 下划线一致（`row_y + line_height - 1px`），
@@ -1451,8 +1458,8 @@ impl Element for TerminalElement {
         TerminalBounds,
         Option<CursorLayout>,
         Option<LocalOverlayLayout>,
-        // 末位为搜索命中高亮（视口行映射后的 span，含当前命中配色）
-        Vec<BackgroundSpan>,
+        // 搜索命中高亮（按视口行分桶，含当前命中配色）
+        Vec<Vec<BackgroundSpan>>,
         // 末位为 Kitty 图像的本帧落位（已换算成像素，pain 直接使用）
         Vec<crate::terminal::kitty::render::PlacedImage>,
     );
@@ -1489,7 +1496,11 @@ impl Element for TerminalElement {
         let theme = cx.theme();
         let ui_theme = theme.ui;
         let terminal_theme = theme.terminal;
-        let active_theme_id = theme.id.clone();
+        // Compare by &str and clone only on the (rare) theme switch; the
+        // steady-state frame must not allocate a String just to compare ids.
+        let theme_changed =
+            self.view.read(cx).cached_theme_id.as_deref() != Some(theme.id.as_str());
+        let new_theme_id = theme_changed.then(|| theme.id.clone());
         let settings = &FontState::global(cx).settings;
         let font_size = px(settings.terminal_font_size);
         let line_height = font_size * settings.terminal_line_height;
@@ -1626,22 +1637,21 @@ impl Element for TerminalElement {
 
                 // Take row render cache out of the view so we can mutate it here
                 // without a borrow conflict, then write it back after processing.
-                match &view.cached_theme_id {
-                    Some(theme_id) if active_theme_id == *theme_id => (
+                if theme_changed {
+                    // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
+                    view.cached_theme_id = new_theme_id;
+                    view.flattened_render_cache = FlattenedRenderCache::default();
+                    (
+                        Vec::new(),
+                        FlattenedRenderCache::default(),
+                        selection_changed,
+                    )
+                } else {
+                    (
                         std::mem::take(&mut view.row_render_cache),
                         view.flattened_render_cache,
                         selection_changed,
-                    ),
-                    _ => {
-                        // 主题更改清空缓存，全量刷新，避免终端字符渲染颜色与主题不一致
-                        view.cached_theme_id = Some(active_theme_id.clone());
-                        view.flattened_render_cache = FlattenedRenderCache::default();
-                        (
-                            Vec::new(),
-                            FlattenedRenderCache::default(),
-                            selection_changed,
-                        )
-                    }
+                    )
                 }
             });
 
@@ -2199,7 +2209,10 @@ impl Element for TerminalElement {
         // ── Search highlight spans ─────────────────────────────────────────────────
         // 把 grid 坐标命中映射到当前视口行（每帧重算，滚动自然跟随），
         // 非当前命中用主题 warning 低透明度，当前命中加倍醒目。
-        let search_spans: Vec<BackgroundSpan> = {
+        // 按视口行分桶。命中集可能是整个 scrollback 的数千条，旧实现
+        // 每帧全量映射一遍、paint 时又对每一行过滤全部 span（O(rows×matches)）。
+        // 匹配按 `start.line` 有序，因此这里先二分出视口区间，再按行归档。
+        let search_spans: Vec<Vec<BackgroundSpan>> = {
             let view = self.view.read(cx);
             let search = &view.search;
             if !search.active || search.matches.is_empty() {
@@ -2207,20 +2220,26 @@ impl Element for TerminalElement {
             } else {
                 let match_color = ui_theme.warning.opacity(0.28);
                 let active_color = ui_theme.warning.opacity(0.55);
-                let mut spans = Vec::with_capacity(search.matches.len());
-                for (idx, m) in search.matches.iter().enumerate() {
-                    // grid Line → 视口顶行索引：line.0 + display_offset
-                    let viewport_row = m.start.line.0 + display_offset as i32;
-                    if viewport_row < 0 {
-                        continue;
-                    }
-                    let viewport_row = viewport_row as usize;
-                    if viewport_row >= viewport_lines {
-                        continue;
-                    }
+                let offset = display_offset as i32;
+                let first = search
+                    .matches
+                    .partition_point(|m| m.start.line.0 + offset < 0);
+                let last = search
+                    .matches
+                    .partition_point(|m| m.start.line.0 + offset < viewport_lines as i32);
+                let mut by_row: Vec<Vec<BackgroundSpan>> =
+                    (0..viewport_lines).map(|_| Vec::new()).collect();
+                for (idx, m) in search
+                    .matches
+                    .iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(last.saturating_sub(first))
+                {
+                    let viewport_row = (m.start.line.0 + offset) as usize;
                     let start_col = m.start.column.0;
                     let end_col = m.end.column.0;
-                    spans.push(BackgroundSpan {
+                    by_row[viewport_row].push(BackgroundSpan {
                         start_col,
                         row: viewport_row,
                         width: end_col.saturating_sub(start_col),
@@ -2231,15 +2250,24 @@ impl Element for TerminalElement {
                         },
                     });
                 }
-                spans
+                by_row
             }
         };
 
         // Kitty 图像的本帧落位。`plan` 只做几何计算（网格 → 像素），
         // 纹理的创建推迟到 paint（那里才有 `&mut Window`/`App` 可用，
         // 且只有真正要画的图像才值得做 RGBA→BGRA 转换）。
-        let placed_images: Vec<crate::terminal::kitty::render::PlacedImage> =
-            if std::env::var_os("DEEPTERM_DISABLE_KITTY").is_some() {
+        let placed_images: Vec<crate::terminal::kitty::render::PlacedImage> = if kitty_disabled() {
+            Vec::new()
+        } else {
+            // 绝大多数终端没有任何 Kitty 图像。旧实现仍然每帧扫描全部
+            // 视口 cell 找 U+10EEEE 占位符，再跑一遍 plan/sort；空存储
+            // 时直接跳过这三步。
+            let has_images = self
+                .terminal
+                .read(cx)
+                .with_kitty_storage(|storage| !storage.is_empty());
+            if !has_images {
                 Vec::new()
             } else {
                 let metrics = crate::terminal::kitty::render::CellMetrics {
@@ -2273,7 +2301,8 @@ impl Element for TerminalElement {
                     });
                     placed
                 })
-            };
+            }
+        };
 
         (
             row_caches,
@@ -2324,9 +2353,13 @@ impl Element for TerminalElement {
         // 纹理缓存从 view 里 `take` 出来、绘制完归还（与行缓存同一套做法）：
         // `paint` 需要在遍历中同时持有缓存可变借用与 view 的读取，两者不能
         // 共存于一次 `view.update`。
-        let mut kitty_cache = self
-            .view
-            .update(cx, |view, _cx| std::mem::take(&mut view.kitty_image_cache));
+        let (mut kitty_cache, last_prune_generation) = self.view.update(cx, |view, _cx| {
+            (
+                std::mem::take(&mut view.kitty_image_cache),
+                view.kitty_prune_generation,
+            )
+        });
+        let kitty_generation = self.terminal.read(cx).kitty_generation();
         let kitty_storage = self.terminal.read(cx).images_handle();
         crate::terminal::kitty::render::paint_images(
             placed_images,
@@ -2340,6 +2373,14 @@ impl Element for TerminalElement {
         // O2：paint 直接按行序遍历行缓存，替代先前的 flattened 拷贝。
         // 同一行内绘制顺序保持 Zed 终端的层级：背景 span → 选区 → 文本
         // runs → 盒字符；跨行按行序输出（各行区域不重叠，先后无视觉差异）。
+        //
+        // Exception: when the Block cursor overlays a box-drawing cell we skip
+        // the foreground-colored paint here and let `CursorLayout::paint`
+        // redraw that single cell inverted. It is loop-invariant.
+        let skip_cursor_box = cursor
+            .as_ref()
+            .map(|c| c.block_box_drawing.is_some())
+            .unwrap_or(false);
         for (row_idx, row_cache) in row_caches.iter().enumerate() {
             // Cell background spans are painted *under* the selection so that a
             // non-default cell background (colored prompt segments, vim splits,
@@ -2363,18 +2404,20 @@ impl Element for TerminalElement {
 
             // 搜索命中高亮：绘制在 cell 背景之上、选区之下（选区拖过命中时
             // 选区视觉优先，符合编辑器惯例）。
-            for span in search_spans.iter().filter(|span| span.row == row_idx) {
-                let span_origin = point(
-                    origin.x + *cell_width * span.start_col as f32,
-                    origin.y + *line_height * row_idx as f32,
-                );
-                window.paint_quad(fill(
-                    Bounds::new(
-                        span_origin,
-                        size(*cell_width * span.width as f32, *line_height),
-                    ),
-                    span.color,
-                ));
+            if let Some(row_spans) = search_spans.get(row_idx) {
+                for span in row_spans {
+                    let span_origin = point(
+                        origin.x + *cell_width * span.start_col as f32,
+                        origin.y + *line_height * row_idx as f32,
+                    );
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            span_origin,
+                            size(*cell_width * span.width as f32, *line_height),
+                        ),
+                        span.color,
+                    ));
+                }
             }
 
             if let Some(selections) = row_cache.selection_spans.as_ref() {
@@ -2410,14 +2453,6 @@ impl Element for TerminalElement {
             // 这些字符在 layout_row 阶段已从文本批次中分离出来，
             // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
             // 效果等同于 Alacritty 的 builtin_box_drawing = true。
-            //
-            // Exception: when the Block cursor overlays a box-drawing cell we
-            // skip the foreground-colored paint here and let
-            // `CursorLayout::paint` redraw that single cell inverted.
-            let skip_cursor_box = cursor
-                .as_ref()
-                .map(|c| c.block_box_drawing.is_some())
-                .unwrap_or(false);
             if let Some(box_cells) = row_cache.box_cells.as_ref() {
                 for cell in box_cells {
                     if skip_cursor_box && cell.col == *cursor_col && cell.row == row_idx {
@@ -2460,7 +2495,7 @@ impl Element for TerminalElement {
         // `RenderImage` 每次构造拿新的全局图集 id，而 GPUI atlas 不会自动回收——
         // 只 prune HashMap 的话，被替换/删除/换帧的图像会在 Metal 图集里永久残留
         // tile（统一内存上直接计进程内存，持续刷新的页面几分钟即达 GB 级）。
-        {
+        if kitty_generation != last_prune_generation {
             let guard = crate::terminal::kitty::storage::lock_unpoisoned(&kitty_storage);
             let freed = kitty_cache.prune(&guard);
             if !freed.is_empty() {
@@ -2478,6 +2513,9 @@ impl Element for TerminalElement {
         }
         self.view.update(cx, |view, _cx| {
             view.kitty_image_cache = std::mem::take(&mut kitty_cache);
+            if kitty_generation != last_prune_generation {
+                view.kitty_prune_generation = kitty_generation;
+            }
         });
 
         // 使用prepaint阶段计算的光标布局进行渲染

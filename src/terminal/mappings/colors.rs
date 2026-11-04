@@ -21,7 +21,7 @@ use crate::theme::TerminalTheme;
 ///
 /// `Copy` 类型：`update_last_content` 持 term 锁期间一次拷贝进
 /// `TerminalContent.palette`，渲染热路径零锁读取。
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalPalette {
     entries: [Option<Rgb>; COLOR_COUNT],
 }

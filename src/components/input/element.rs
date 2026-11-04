@@ -387,6 +387,42 @@ impl TextElement {
             }
             state.display_map.set_font(font, size, cx);
             state.display_map.ensure_text_prepared(&state.text, cx);
+            if state.mode.is_single_line()
+                && !state.masked
+                && state.text.len() != 0
+                && state
+                    .single_line_text
+                    .as_ref()
+                    .is_none_or(|(version, _)| *version != state.text_version)
+            {
+                state.single_line_text = Some((state.text_version, state.text.to_string().into()));
+            }
+            if state.masked
+                && state
+                    .masked_display
+                    .as_ref()
+                    .is_none_or(|(version, _)| *version != state.text_version)
+            {
+                state.masked_display = Some((
+                    state.text_version,
+                    Rope::from(
+                        super::MASK_CHAR
+                            .to_string()
+                            .repeat(state.text.chars().count()),
+                    ),
+                ));
+            }
+            if state.text.len() == 0
+                && state
+                    .placeholder_display
+                    .as_ref()
+                    .is_none_or(|(placeholder, _)| placeholder != &self.placeholder)
+            {
+                state.placeholder_display = Some((
+                    self.placeholder.clone(),
+                    Rope::from(self.placeholder.as_str()),
+                ));
+            }
         });
     }
 
@@ -1964,7 +2000,21 @@ impl TextElement {
         let buffer_lines = state.display_map.lines();
 
         if is_single_line {
-            let text: SharedString = display_text.to_string().into();
+            // Reuse the cached display string when the visible text is exactly
+            // the buffer (not placeholder / mask). Single-line fields repaint
+            // for blink/scroll/cursor moves without any text change.
+            let cached =
+                if !state.masked && state.text.len() != 0 && state.text.len() == display_text.len()
+                {
+                    state
+                        .single_line_text
+                        .as_ref()
+                        .filter(|(version, _)| *version == state.text_version)
+                        .map(|(_, text)| text.clone())
+                } else {
+                    None
+                };
+            let text: SharedString = cached.unwrap_or_else(|| display_text.to_string().into());
             let mut owned_runs = runs.to_vec();
             normalize_runs_for_text(&mut owned_runs, text.as_ref());
             let shaped_line = window
@@ -2104,7 +2154,7 @@ impl TextElement {
                 highlighter,
                 diagnostics,
                 ..
-            } => (highlighter.borrow_mut(), diagnostics.clone()),
+            } => (highlighter.borrow_mut(), diagnostics),
             _ => return None,
         };
 
@@ -2504,13 +2554,24 @@ impl TextElement {
             .editor_foreground
             .unwrap_or(text_style.color);
         text_style.color = fg;
+        let placeholder_rope;
+        let masked_rope;
         let (display_text, text_color) = if is_empty {
-            (&Rope::from(placeholder.as_str()), cx.theme().text_muted)
+            placeholder_rope = state
+                .placeholder_display
+                .as_ref()
+                .filter(|(cached, _)| cached == &self.placeholder)
+                .map(|(_, rope)| rope.clone())
+                .unwrap_or_else(|| Rope::from(placeholder.as_str()));
+            (&placeholder_rope, cx.theme().text_muted)
         } else if state.masked {
-            (
-                &Rope::from(MASK_CHAR.to_string().repeat(text.chars().count())),
-                fg,
-            )
+            masked_rope = state
+                .masked_display
+                .as_ref()
+                .filter(|(version, _)| *version == state.text_version)
+                .map(|(_, rope)| rope.clone())
+                .unwrap_or_else(|| Rope::from(MASK_CHAR.to_string().repeat(text.chars().count())));
+            (&masked_rope, fg)
         } else {
             (&text, fg)
         };

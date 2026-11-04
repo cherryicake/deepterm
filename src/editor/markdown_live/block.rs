@@ -33,7 +33,10 @@ pub enum Block {
     Quote { depth: u8, content: usize },
     /// A ``` or ~~~ fence line. `open` is whether it starts a block;
     /// `lang` is the info string on openers (lowercased).
-    Fence { open: bool, lang: Option<String> },
+    Fence {
+        open: bool,
+        lang: Option<std::sync::Arc<str>>,
+    },
     /// A `$$` delimiter line of a display-math block (Typora math).
     MathDelim { open: bool },
     /// Display math: a single-line `$$...$$` formula, or a line inside a
@@ -66,7 +69,7 @@ pub struct DocState {
     line_no: usize,
     frontmatter: bool,
     /// Open fence: (fence char, marker run length, info string).
-    fence: Option<(u8, usize, Option<String>)>,
+    fence: Option<(u8, usize, Option<std::sync::Arc<str>>)>,
     /// Inside a `$$` display-math block.
     math: bool,
     /// The previous line was a paragraph: a GFM table can never open on a
@@ -441,7 +444,7 @@ fn math_line(line: &str, state: &mut DocState) -> Option<Block> {
 ///
 /// `max_indent` is 3 at document level and `list_content + 3` inside a list
 /// item, mirroring CommonMark's container-relative indent rule.
-fn fence_marker(line: &str, max_indent: usize) -> Option<(u8, usize, Option<String>)> {
+fn fence_marker(line: &str, max_indent: usize) -> Option<(u8, usize, Option<std::sync::Arc<str>>)> {
     let indent = line.len() - line.trim_start().len();
     if indent > max_indent {
         return None;
@@ -463,7 +466,7 @@ fn fence_marker(line: &str, max_indent: usize) -> Option<(u8, usize, Option<Stri
     let lang = info
         .split_whitespace()
         .next()
-        .map(|s| s.to_ascii_lowercase());
+        .map(|s| std::sync::Arc::<str>::from(s.to_ascii_lowercase()));
     Some((ch, len, lang))
 }
 

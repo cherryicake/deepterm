@@ -577,6 +577,17 @@ pub struct InputState {
     pub(crate) text_align: TextAlign,
     pub(crate) placeholder: SharedString,
     pub(crate) placeholder_font_size: Option<Pixels>,
+    /// `(text_version, display)` cache for single-line inputs. `layout_lines`
+    /// otherwise converts the whole `Rope` to `String` + `SharedString` on
+    /// every frame; text fields are commonly single-line and repaint for
+    /// cursor/blink/scroll without changing text.
+    pub(crate) single_line_text: Option<(u64, SharedString)>,
+    /// `(text_version, display)` cache for masked inputs; building the
+    /// `MASK_CHAR.repeat(chars)` rope per frame is O(text) and allocates.
+    pub(crate) masked_display: Option<(u64, Rope)>,
+    /// `(placeholder, rope)` cache for empty inputs; the placeholder is
+    /// immutable for most fields, so the rope need not be rebuilt per frame.
+    pub(crate) placeholder_display: Option<(SharedString, Rope)>,
     pub(crate) font_size: Option<Pixels>,
 
     /// A flag to indicate if we have a pending update to the text.
@@ -823,6 +834,9 @@ impl InputState {
             preferred_column: None,
             placeholder: SharedString::default(),
             placeholder_font_size: None,
+            single_line_text: None,
+            masked_display: None,
+            placeholder_display: None,
             font_size: None,
             text_align: TextAlign::Left,
             size: Size::default(),
