@@ -9,12 +9,23 @@
 //!   行，不做全局 prettify（Typora 同款）。
 
 use crate::editor::markdown_live::block::{
-    Block, is_delimiter_cell, split_table_row, table_cell_spans,
+    Block, DocState, classify_with_next, is_delimiter_cell, split_table_row, table_cell_spans,
 };
 use crate::editor::markdown_live::interactions::cell_content_cols;
 use crate::editor::markdown_live::layout::col_for_byte as char_col;
 use crate::editor::markdown_live::model::{EditorModel, Line, Pos};
-use crate::editor::markdown_live::reveal::classify_document;
+use crate::editor::markdown_live::reveal::{CLASSIFY_CHECKPOINT, Classified, classify_document};
+
+// 测试探针：局部表格检测实际分类了多少行。证明它没有退回全文档扫描。
+#[cfg(test)]
+thread_local! {
+    static TABLE_CLASSIFY_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_table_classify_calls() -> usize {
+    TABLE_CLASSIFY_CALLS.with(|count| count.replace(0))
+}
 
 /// 表格块的范围：`(起始行, 结束行)`，闭区间。`None` = 该行不是表格。
 ///
@@ -34,6 +45,87 @@ pub fn table_block_range(lines: &[Line], line: usize) -> Option<(usize, usize)> 
         .map(|b| matches!(b, Block::Table))
         .collect();
     table_block_range_flagged(lines, &flags, line)
+}
+
+/// 局部版 [`table_block_range`]：从 `planned` 的检查点恢复分类状态，
+/// 只扫描光标附近的表格块，不重跑全文档分类。
+///
+/// `dirty_from` 是本次编辑可能影响的最早行号；检查点选在它之前，因此
+/// 前缀分类仍然可信。没有可用检查点（或旧 blocks 未覆盖回退路径）时
+/// 退回 [`table_block_range`] 的全量分类。
+pub fn table_block_range_local(
+    lines: &[Line],
+    line: usize,
+    planned: Option<&Classified>,
+    dirty_from: usize,
+) -> Option<(usize, usize)> {
+    if line >= lines.len() {
+        return None;
+    }
+    let checkpoint = if dirty_from == 0 {
+        0
+    } else {
+        (dirty_from - 1) / CLASSIFY_CHECKPOINT
+    };
+    let checkpoint_line = checkpoint * CLASSIFY_CHECKPOINT;
+    let (start, mut state) = match planned
+        .and_then(|p| p.states.get(checkpoint).cloned())
+        .filter(|_| checkpoint_line <= line)
+    {
+        Some(state) => (checkpoint_line, state),
+        None => (0, DocState::default()),
+    };
+
+    // 检查点已经落在表格内部：前缀未变，用旧 blocks 回溯到表格起点。
+    let mut block_start = if state.in_table() {
+        let Some(planned) = planned else {
+            return table_block_range(lines, line);
+        };
+        let mut begin = start;
+        while begin > 0 {
+            match planned.blocks.get(begin - 1) {
+                Some(Block::Table) => begin -= 1,
+                Some(_) => break,
+                // 旧分类没有覆盖这一行（文档变长/缓存缺失）：退回全量。
+                None => return table_block_range(lines, line),
+            }
+        }
+        Some(begin)
+    } else {
+        None
+    };
+
+    let mut end = None;
+    let mut i = start;
+    while i < lines.len() {
+        #[cfg(test)]
+        TABLE_CLASSIFY_CALLS.with(|count| count.set(count.get() + 1));
+        let next = lines.get(i + 1).map(|l| l.as_str());
+        let block = classify_with_next(&lines[i], next, &mut state);
+        if matches!(block, Block::Table) {
+            block_start.get_or_insert(i);
+        } else if block_start.is_some() {
+            if i > line {
+                end = Some(i - 1);
+                break;
+            }
+            // 光标之前的非表格行说明这个块与光标无关，继续找下一个块。
+            block_start = None;
+        } else if i > line {
+            return None;
+        }
+        i += 1;
+    }
+
+    let start = block_start?;
+    let end = end.unwrap_or_else(|| lines.len().saturating_sub(1));
+    if start > line || end < line {
+        return None;
+    }
+    if !(start..=end).any(|i| lines.get(i).is_some_and(|l| is_delimiter_row(l))) {
+        return None;
+    }
+    Some((start, end))
 }
 
 /// [`table_block_range`] 的免分类版本：`flags[i]` = 第 i 行是否 `Block::Table`
@@ -1374,6 +1466,109 @@ mod tests {
             table_block_range(&lines, 2),
             table_block_range_flagged(&lines, &flags, 2),
         );
+    }
+
+    fn lines_of(text: &str) -> Vec<Line> {
+        text.lines()
+            .map(|line| std::sync::Arc::new(line.to_string()))
+            .collect()
+    }
+
+    /// 局部版必须与全量分类得到同一个表格块，覆盖检查点边界与脏区间。
+    #[test]
+    fn local_table_block_matches_full_across_checkpoints() {
+        let mut lines: Vec<Line> = (0..200)
+            .map(|i| std::sync::Arc::new(format!("line {i}")))
+            .collect();
+        lines[120] = std::sync::Arc::new("| a | b |".into());
+        lines[121] = std::sync::Arc::new("|---|---|".into());
+        lines[122] = std::sync::Arc::new("| 1 | 2 |".into());
+        lines[123] = std::sync::Arc::new("| 3 | 4 |".into());
+        // 普通段落紧跟在表格后也会被分类为续行；用空行明确结束表格。
+        lines[124] = std::sync::Arc::new(String::new());
+
+        let planned = classify_document(&lines);
+        let full = table_block_range(&lines, 122).expect("table should be detected");
+        assert_eq!(full, (120, 123));
+        for dirty_from in [0, 1, 64, 65, 120, 121, 122, 123, 124, 200] {
+            let local = table_block_range_local(&lines, 122, Some(&planned), dirty_from)
+                .unwrap_or_else(|| panic!("local range missing for dirty_from={dirty_from}"));
+            assert_eq!(local, full, "dirty_from={dirty_from}");
+        }
+    }
+
+    /// 表格跨越检查点时，从旧 blocks 回溯到真实起点（不截断表头）。
+    #[test]
+    fn local_table_block_walks_back_across_checkpoint() {
+        let mut lines: Vec<Line> = (0..200)
+            .map(|i| std::sync::Arc::new(format!("line {i}")))
+            .collect();
+        lines[120] = std::sync::Arc::new("| a | b |".into());
+        lines[121] = std::sync::Arc::new("|---|---|".into());
+        for (offset, line) in lines[122..140].iter_mut().enumerate() {
+            *line = std::sync::Arc::new(format!("| {} | x |", 122 + offset));
+        }
+        lines[140] = std::sync::Arc::new(String::new());
+
+        let planned = classify_document(&lines);
+        let full = table_block_range(&lines, 135).expect("table should be detected");
+        assert_eq!(full, (120, 139));
+        // dirty_from=130 → 检查点在第 128 行，已落在表格内部。
+        for dirty_from in [130, 135] {
+            let local = table_block_range_local(&lines, 135, Some(&planned), dirty_from)
+                .unwrap_or_else(|| panic!("local range missing for dirty_from={dirty_from}"));
+            assert_eq!(local, full, "dirty_from={dirty_from}");
+        }
+    }
+
+    #[test]
+    fn local_table_block_handles_no_outer_pipes_and_continuations() {
+        let lines = lines_of(
+            "intro\n\na | b\n--- | ---\n1 | 2\n\n| c | d |\n|---|---|\nplain row\n# heading\n",
+        );
+        let planned = classify_document(&lines);
+        assert_eq!(
+            table_block_range_local(&lines, 4, Some(&planned), 0),
+            table_block_range(&lines, 4)
+        );
+        // 无 outer pipe 的表格：2..4；普通续行 + 标题结束下一个块。
+        assert_eq!(
+            table_block_range_local(&lines, 4, Some(&planned), 0),
+            Some((2, 4))
+        );
+        assert_eq!(
+            table_block_range_local(&lines, 8, Some(&planned), 0),
+            Some((6, 8))
+        );
+    }
+
+    #[test]
+    fn local_table_block_scans_only_near_cursor() {
+        let mut lines: Vec<Line> = (0..10_000)
+            .map(|i| std::sync::Arc::new(format!("line {i}")))
+            .collect();
+        lines[9000] = std::sync::Arc::new("| a | b |".into());
+        lines[9001] = std::sync::Arc::new("|---|---|".into());
+        for (offset, line) in lines[9002..9005].iter_mut().enumerate() {
+            *line = std::sync::Arc::new(format!("| {} | x |", 9002 + offset));
+        }
+        lines[9005] = std::sync::Arc::new(String::new());
+
+        let planned = classify_document(&lines);
+        take_table_classify_calls();
+        let local = table_block_range_local(&lines, 9002, Some(&planned), 9003)
+            .expect("table should be detected");
+        assert_eq!(local, (9000, 9004));
+        let calls = take_table_classify_calls();
+        assert!(calls < 200, "局部检测应只扫描光标附近，实际分类 {calls} 行");
+    }
+
+    #[test]
+    fn local_table_block_requires_delimiter_row() {
+        let lines = lines_of("| a | b |\n| 1 | 2 |");
+        let planned = classify_document(&lines);
+        assert_eq!(table_block_range(&lines, 0), None);
+        assert_eq!(table_block_range_local(&lines, 0, Some(&planned), 0), None);
     }
 
     /// 回归：文件末尾无换行时，删除末行/删表也要真的删掉（旧实现选中

@@ -15,7 +15,6 @@ use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::ssh::TRANSFER_CANCELLED_MSG;
 use crate::ssh::auth::try_agent_auth;
 use crate::ssh::config::SshConnectionConfig;
@@ -1425,26 +1424,20 @@ pub fn write_file_bytes_atomic(
 
 const LARGE_FILE_THRESHOLD: u64 = 512 * 1024;
 
-fn cached_file_size(config: &SshConnectionConfig, path: &str) -> Option<u64> {
-    let parent = Path::new(path).parent()?;
-    let entries = RemoteFileTreeCache::global().lock().get(config, parent)?;
-    let file_name = Path::new(path).file_name()?.to_string_lossy();
-    entries
-        .into_iter()
-        .find(|e| e.name == file_name)
-        .map(|e| e.size)
-}
-
 pub fn read_file_bytes(
     config: &SshConnectionConfig,
     path: &str,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    if let Some(size) = cached_file_size(config, path).filter(|s| *s > LARGE_FILE_THRESHOLD) {
-        return with_cached_session(config, |session| {
+    // 一次 metadata 决定是否走大文件流水线；不再反向依赖
+    // `file_manager::file_tree_cache`（那会形成 ssh ↔ file_manager 模块环）。
+    with_cached_session(config, |session| {
+        let size = session.metadata(path).map(|meta| meta.size).unwrap_or(0);
+        if size > LARGE_FILE_THRESHOLD {
             session.read_file_bytes_pipelined(path, size)
-        });
-    }
-    with_cached_session(config, |session| session.read_file_bytes(path))
+        } else {
+            session.read_file_bytes(path)
+        }
+    })
 }
 
 /// 有界预览读取（最多 `limit` 字节），供文件树悬停预取等场景使用。

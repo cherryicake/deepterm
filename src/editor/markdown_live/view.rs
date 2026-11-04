@@ -662,7 +662,7 @@ impl LiveMarkdownView {
     /// 预填选区首行、聚焦输入框并定位到光标后首个命中（`show` 内完成）。
     fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search_panel.is_none() {
-            self.search_panel = Some(SearchPanel::new(cx.entity(), window, cx));
+            self.search_panel = Some(SearchPanel::new(cx.entity().downgrade(), window, cx));
         }
         let text = Rope::from(self.buffer.text());
         let prefill = self.search_prefill();
@@ -1633,43 +1633,50 @@ impl LiveMarkdownView {
             return;
         }
         // 前置门控：先问缓存几何「光标行是不是表格行」。绝大多数文档没有表格，
-        // 这一步就把每次击键的全文档克隆（`lines().to_vec()`）+ 全量分类
-        // （`table_block_range` 内部会 `classify_document`）全部省掉。
-        // 几何按 text_version 缓存，编辑后版本已变 → 需要时下面按当前文本重算。
+        // 这一步就把每次击键的全文档克隆 + 全量分类全部省掉。
+        // 几何按 text_version 缓存，编辑后版本已变 → 下面用检查点分类重扫
+        // 光标附近的表格，而不是整个文档。
         if !self.cursor_line_is_table() {
             return;
         }
+
+        let cur = self.buffer.cursor();
+        let dirty_from = self
+            .buffer
+            .dirty_range()
+            .map(|range| range.start)
+            .unwrap_or(0);
+        let lines = self.buffer.lines();
+        let Some(block) =
+            t::table_block_range_local(lines, cur.line, Some(&self.planned_classified), dirty_from)
+        else {
+            return;
+        };
+        let is_table = |l: usize| l >= block.0 && l <= block.1;
+        let Some((_, ci, (cs, _))) = table_cell_at(lines, &is_table, cur.line, cur.col) else {
+            return;
+        };
+        let offset = cur.col.saturating_sub(cs);
+        let Some(edits) = t::prettify_edits(lines, block) else {
+            return;
+        };
+        if edits
+            .iter()
+            .all(|(i, text)| lines.get(*i).map(|l| l.as_str()) == Some(text.as_str()))
+        {
+            return; // 已是目标格式：不动文本、不入撤销栈。
+        }
+        // 新列位置：用改写后的该行文本算同 (行, 格) 的内容起点 + 偏移。
+        let Some(new_col) = edits
+            .iter()
+            .find(|(i, _)| *i == cur.line)
+            .map(|(_, text)| text.as_str())
+            .and_then(|text| cell_content_cols(text, ci))
+            .map(|(cs2, ce2)| (cs2 + offset).min(ce2))
+        else {
+            return;
+        };
         self.edit(cx, |m| {
-            // 用**当前文本**判断（不读可能过期的 planned）。
-            let lines = m.lines().to_vec();
-            let cur = m.cursor();
-            let Some(block) = t::table_block_range(&lines, cur.line) else {
-                return;
-            };
-            let is_table = |l: usize| l >= block.0 && l <= block.1;
-            let Some((_, ci, (cs, _))) = table_cell_at(&lines, &is_table, cur.line, cur.col) else {
-                return;
-            };
-            let offset = cur.col.saturating_sub(cs);
-            let Some(edits) = t::prettify_edits(&lines, block) else {
-                return;
-            };
-            if edits
-                .iter()
-                .all(|(i, text)| lines.get(*i).map(|l| l.as_str()) == Some(text.as_str()))
-            {
-                return; // 已是目标格式：不动文本、不入撤销栈。
-            }
-            // 新列位置：用改写后的该行文本算同 (行, 格) 的内容起点 + 偏移。
-            let Some(new_col) = edits
-                .iter()
-                .find(|(i, _)| *i == cur.line)
-                .map(|(_, text)| text.as_str())
-                .and_then(|text| cell_content_cols(text, ci))
-                .map(|(cs2, ce2)| (cs2 + offset).min(ce2))
-            else {
-                return;
-            };
             m.replace_rows_and_move(&edits, Some(Pos::new(cur.line, new_col)));
         });
     }
@@ -5638,7 +5645,7 @@ fn card_pill(bg: Hsla, fg: Hsla) -> gpui::Div {
 
 impl Render for LiveMarkdownView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        let theme = cx.theme_shared();
         let ui = theme.ui;
         let is_dark = theme.appearance.is_dark();
         let style = MarkdownStyle::themed(window, cx);
@@ -8392,7 +8399,7 @@ mod live_render_tests {
             line: LiveLine,
         }
         let cases: Vec<Case> = cx.update(|window, cx| {
-            let theme = cx.theme().clone();
+            let theme = cx.theme_shared();
             let style = MarkdownStyle::themed(window, cx);
             let colors = LiveColors::resolve(&style, &theme);
             let hl = HighlightCache::new();
@@ -8514,7 +8521,7 @@ mod live_render_tests {
             line: LiveLine,
         }
         let cases: Vec<Case> = cx.update(|window, cx| {
-            let theme = cx.theme().clone();
+            let theme = cx.theme_shared();
             let style = MarkdownStyle::themed(window, cx);
             let colors = LiveColors::resolve(&style, &theme);
             let hl = HighlightCache::new();

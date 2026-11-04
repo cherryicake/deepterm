@@ -102,7 +102,12 @@ pub struct BuiltinCommandManager {
     remote_dir_cache: HashMap<(String, String), RemoteDirCacheEntry>,
     /// 远端目录缓存的访问顺序（LRU），用于限制缓存大小
     remote_dir_cache_lru: Vec<(String, String)>,
-    /// 已经向外部发起、等待结果的远端目录请求集合。
+    /// 当前本地目录补全请求。本地 `read_dir` 也走后台线程，避免大目录
+    /// （`node_modules` / `/usr/lib`）在每次参数击键时卡住 UI。
+    current_local_request: Option<PendingLocalLoad>,
+    /// 本地补全请求代次；回写时用它丢弃过期结果。
+    next_local_request_id: u64,
+    /// 已向外部发起、等待结果的远端目录请求集合。
     /// key 为 `(host id, 绝对目录路径)`；value 携带连接配置快照与派发标记。
     /// BTreeMap：派发顺序确定（避免 HashMap 哈希序的不确定性）。
     pending_remote_keys: std::collections::BTreeMap<(String, String), PendingRemoteLoad>,
@@ -113,6 +118,8 @@ pub struct BuiltinCommandManager {
     failed_remote_keys: HashMap<(String, String), String>,
     /// `/scp` 第二段是否处于"等待远端结果"状态
     pub is_loading_remote: bool,
+    /// 本地目录是否正在后台读取（用于占位/测试）。
+    pub is_loading_local: bool,
     /// 路径补全浮层的滚动句柄：键盘 / Tab 切换选中项时调用
     /// `scroll_to_item` 把选中行带回可视区域，避免被列表区裁掉。
     path_scroll_handle: ScrollHandle,
@@ -150,6 +157,33 @@ pub struct RemoteCompletionRequest {
     pub absolute_dir: String,
 }
 
+/// 本地目录补全的上下文：决定后台结果如何拼回补全列表。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalCompletionContext {
+    /// 普通参数：直接使用 `PathCompletionEngine` 的条目。
+    Plain,
+    /// `/scp` HostOrLocal：主机候选 + 本机文件。
+    ScpHostOrLocal,
+    /// `/scp` 的 `Local:` 路径段：每个候选拼回 `<host_token>:path`。
+    ScpLocalPath { host_token: String },
+}
+
+/// 外部需要加载的本地目录请求。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalCompletionRequest {
+    pub id: u64,
+    pub prefix: String,
+    pub cwd: Option<PathBuf>,
+    pub context: LocalCompletionContext,
+}
+
+/// 一个已注册、等待后台读取的本地目录条目。
+#[derive(Clone, Debug)]
+struct PendingLocalLoad {
+    request: LocalCompletionRequest,
+    started: bool,
+}
+
 /// 一个已注册、等待外部加载的远端目录条目。
 #[derive(Clone, Debug)]
 struct PendingRemoteLoad {
@@ -182,11 +216,14 @@ impl BuiltinCommandManager {
             ssh_saved_configs: Arc::new(Vec::new()),
             terminal_ssh: None,
             terminal_remote_cwd: None,
+            current_local_request: None,
+            next_local_request_id: 0,
             remote_dir_cache: HashMap::new(),
             remote_dir_cache_lru: Vec::new(),
             pending_remote_keys: std::collections::BTreeMap::new(),
             failed_remote_keys: HashMap::new(),
             is_loading_remote: false,
+            is_loading_local: false,
             path_scroll_handle: ScrollHandle::new(),
             history: CommandHistory::default(),
             history_matches: Vec::new(),
@@ -341,6 +378,73 @@ impl BuiltinCommandManager {
                 config,
                 started: false,
             });
+    }
+
+    /// 放弃当前本地补全请求（分支切换/新输入时调用），并推进代次让在途
+    /// 后台结果失效。
+    fn cancel_local_completion(&mut self) {
+        self.next_local_request_id = self.next_local_request_id.wrapping_add(1);
+        self.current_local_request = None;
+        self.is_loading_local = false;
+    }
+
+    /// 注册一次本地目录后台读取。前缀与 cwd 一起快照，避免读取期间
+    /// 用户输入变化导致结果拼到错误目录。
+    fn request_local_completions(&mut self, prefix: &str, context: LocalCompletionContext) {
+        self.next_local_request_id = self.next_local_request_id.wrapping_add(1);
+        self.current_local_request = Some(PendingLocalLoad {
+            request: LocalCompletionRequest {
+                id: self.next_local_request_id,
+                prefix: prefix.to_string(),
+                cwd: self.cwd.clone(),
+                context,
+            },
+            started: false,
+        });
+        self.is_loading_local = true;
+    }
+
+    /// 取出一个尚未派发的本地目录请求。
+    pub fn pending_local_request(&mut self) -> Option<LocalCompletionRequest> {
+        let pending = self.current_local_request.as_mut()?;
+        if pending.started {
+            return None;
+        }
+        pending.started = true;
+        Some(pending.request.clone())
+    }
+
+    /// 该代次是否仍是当前请求（后台任务唤醒后先查一次，避免无谓读盘）。
+    pub fn is_local_request_current(&self, id: u64) -> bool {
+        self.current_local_request
+            .as_ref()
+            .is_some_and(|pending| pending.request.id == id)
+    }
+
+    /// 写入后台读回的本地目录结果；过期代次直接丢弃。
+    pub fn apply_local_completion_result(&mut self, id: u64, local_items: Vec<PathCompletionItem>) {
+        if !self.is_local_request_current(id) {
+            return;
+        }
+        let Some(pending) = self.current_local_request.take() else {
+            return;
+        };
+        let request = pending.request;
+        let items = match request.context {
+            LocalCompletionContext::Plain => local_items,
+            LocalCompletionContext::ScpHostOrLocal => {
+                let mut items =
+                    build_host_only_completions(&request.prefix, &self.ssh_saved_configs);
+                items.extend(map_host_or_local_items(&request.prefix, local_items));
+                items
+            }
+            LocalCompletionContext::ScpLocalPath { host_token } => {
+                map_local_path_items(&request.prefix, &host_token, local_items)
+            }
+        };
+        self.is_loading_local = false;
+        self.path_completions = items;
+        self.path_selected_index = None;
     }
 
     /// 获取当前缓冲区内容
@@ -1055,6 +1159,8 @@ impl BuiltinCommandManager {
 
     /// 刷新路径补全列表。
     fn refresh_path_completions(&mut self) {
+        // 输入变了：在途的本地读取结果作废（远端请求按 key 复用，不受影响）。
+        self.cancel_local_completion();
         let Some(query) = self.query().map(str::to_string) else {
             self.path_completions.clear();
             self.is_loading_remote = false;
@@ -1078,11 +1184,11 @@ impl BuiltinCommandManager {
             return;
         }
 
-        // 本地终端：列出本机文件
+        // 本地终端：后台列出本机文件；先用占位项保持浮层打开。
         self.is_loading_remote = false;
-        self.path_completions =
-            PathCompletionEngine::complete(&effective_prefix, self.cwd.as_deref());
+        self.path_completions = vec![local_loading_item()];
         self.path_selected_index = None;
+        self.request_local_completions(&effective_prefix, LocalCompletionContext::Plain);
     }
 
     /// `/scp` 补全主入口：按光标所在 token 的阶段分发。
@@ -1107,11 +1213,15 @@ impl BuiltinCommandManager {
                     self.path_completions = items;
                     self.path_selected_index = None;
                 } else {
-                    self.path_completions = build_host_or_local_completions(
-                        prefix,
-                        self.cwd.as_deref(),
-                        &self.ssh_saved_configs,
-                    );
+                    // 主机候选无 IO，先显示；本机文件后台读取后追加。
+                    let hosts = build_host_only_completions(prefix, &self.ssh_saved_configs);
+                    self.path_completions = if hosts.is_empty() {
+                        vec![local_loading_item()]
+                    } else {
+                        hosts
+                    };
+                    self.path_selected_index = None;
+                    self.request_local_completions(prefix, LocalCompletionContext::ScpHostOrLocal);
                 }
             }
             ScpCompletionPhase::RemotePath { host_token, prefix } => {
@@ -1130,9 +1240,14 @@ impl BuiltinCommandManager {
                 // 关键字 `Local` —— 始终指向"运行 DeepTerm 的本机"
                 // （端口重映射之后才检查：`user@localhost:2222` 不是本机）
                 if scp_completion::is_local_keyword_str(host_token) {
-                    self.path_completions =
-                        build_local_path_completions(prefix, host_token, self.cwd.as_deref());
+                    self.path_completions = vec![local_loading_item()];
                     self.path_selected_index = None;
+                    self.request_local_completions(
+                        prefix,
+                        LocalCompletionContext::ScpLocalPath {
+                            host_token: host_token.to_string(),
+                        },
+                    );
                     return;
                 }
 
@@ -1331,30 +1446,40 @@ fn remote_dir_failed_item(err: String) -> PathCompletionItem {
     }
 }
 
-/// `HostOrLocal` 阶段：合并"匹配的主机"与"本地路径补全"为一份列表。
-fn build_host_or_local_completions(
+/// 把本机文件候选拼进 `HostOrLocal` 列表（不读盘，供后台结果回写复用）。
+fn map_host_or_local_items(
     prefix: &str,
-    cwd: Option<&std::path::Path>,
-    saved: &[crate::ssh::SshConnectionConfig],
+    local_items: Vec<PathCompletionItem>,
 ) -> Vec<PathCompletionItem> {
-    let mut items: Vec<PathCompletionItem> = build_host_only_completions(prefix, saved);
+    local_items
+        .into_iter()
+        .map(|item| {
+            let replacement = compose_local_replacement(prefix, &item);
+            PathCompletionItem {
+                replacement: Some(replacement),
+                description: Some(if item.is_directory {
+                    "Directory".to_string()
+                } else {
+                    item.path.to_string_lossy().into_owned()
+                }),
+                icon: None,
+                ..item
+            }
+        })
+        .collect()
+}
 
-    // 本地路径补全（空 prefix 时列出当前目录，方便用户直接选择本地文件）
-    for item in PathCompletionEngine::complete(prefix, cwd) {
-        let replacement = compose_local_replacement(prefix, &item);
-        items.push(PathCompletionItem {
-            replacement: Some(replacement),
-            description: Some(if item.is_directory {
-                "Directory".to_string()
-            } else {
-                item.path.to_string_lossy().into_owned()
-            }),
-            icon: None,
-            ..item
-        });
+/// 本地目录读取中的非交互占位项。
+fn local_loading_item() -> PathCompletionItem {
+    PathCompletionItem {
+        name: "读取目录中…".to_string(),
+        path: PathBuf::new(),
+        is_directory: false,
+        kind: CompletionKind::Directory,
+        description: None,
+        icon: None,
+        replacement: None,
     }
-
-    items
 }
 
 /// 仅生成 host 候选（含 `Local` 关键字 + 已保存连接），不附本机/远端文件。
@@ -1412,40 +1537,38 @@ fn compose_local_replacement(prefix: &str, item: &PathCompletionItem) -> String 
     scp_completion::shell_quote(&raw)
 }
 
-/// `Local:` 前缀阶段：列出本机文件，并把每个候选 token 重新拼成 `<host_token>:path`。
-///
-/// `host_token` 是用户当前在缓冲中输入的 host 部分（可能是 `Local`、
-/// `user@localhost` 等），保持原字面量以避免每次按键都改写光标处文本。
-fn build_local_path_completions(
+/// 把本机文件候选拼回 `<host_token>:path`（不读盘，供后台结果回写复用）。
+fn map_local_path_items(
     prefix: &str,
     host_token: &str,
-    cwd: Option<&std::path::Path>,
+    local_items: Vec<PathCompletionItem>,
 ) -> Vec<PathCompletionItem> {
     let host_quoted = quote_host_token(host_token);
-    let mut out: Vec<PathCompletionItem> = Vec::new();
-    for item in PathCompletionEngine::complete(prefix, cwd) {
-        let path_segment = compose_local_replacement(prefix, &item);
-        // path_segment 已经按需要包好引号；与 host 部分独立量化，`:` 永远在外
-        let replacement = format!("{}:{}", host_quoted, path_segment);
-        out.push(PathCompletionItem {
-            name: item.name.clone(),
-            path: item.path.clone(),
-            is_directory: item.is_directory,
-            kind: if item.is_directory {
-                CompletionKind::Directory
-            } else {
-                CompletionKind::File
-            },
-            description: Some(if item.is_directory {
-                "Directory".to_string()
-            } else {
-                item.path.to_string_lossy().into_owned()
-            }),
-            icon: None,
-            replacement: Some(replacement),
-        });
-    }
-    out
+    local_items
+        .into_iter()
+        .map(|item| {
+            let path_segment = compose_local_replacement(prefix, &item);
+            // path_segment 已经按需要包好引号；与 host 部分独立量化，`:` 永远在外
+            let replacement = format!("{}:{}", host_quoted, path_segment);
+            PathCompletionItem {
+                name: item.name.clone(),
+                path: item.path.clone(),
+                is_directory: item.is_directory,
+                kind: if item.is_directory {
+                    CompletionKind::Directory
+                } else {
+                    CompletionKind::File
+                },
+                description: Some(if item.is_directory {
+                    "Directory".to_string()
+                } else {
+                    item.path.to_string_lossy().into_owned()
+                }),
+                icon: None,
+                replacement: Some(replacement),
+            }
+        })
+        .collect()
 }
 
 /// 把远端 path 前缀拆成 "用于查 read_dir 的目录" 和 "过滤用的文件名前缀"。

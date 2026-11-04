@@ -89,6 +89,11 @@ pub struct DocState {
 }
 
 impl DocState {
+    /// 该状态是否正处于表格行之后（下一行即使没有 `|` 也按表格续行处理）。
+    pub fn in_table(&self) -> bool {
+        self.in_table
+    }
+
     /// Whether two states agree on everything that affects *future*
     /// classification. `line_no` is excluded: it only feeds the "is this the
     /// document's first line" frontmatter check, so once both states are past

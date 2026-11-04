@@ -190,21 +190,37 @@ impl KeychainStore {
     }
 
     pub fn load() -> Option<Self> {
+        Self::load_shared().map(|store| (*store).clone())
+    }
+
+    /// 与 [`Self::load`] 同源，但返回缓存里的 `Arc`，供渲染路径复用；
+    /// `Arc::ptr_eq` 可作为“钥匙串是否变化”的版本判断。
+    pub fn load_shared() -> Option<std::sync::Arc<Self>> {
         let path = Self::config_path()?;
         // mtime+size 缓存：命中则免读盘免解析（keychain_view / host_view 的
         // render 路径会频繁 load）。persist() 后同步刷新。
-        if let Some((mtime, len)) = Self::stat_sig(&path)
-            && let Ok(cache) = keychain_cache().lock()
-            && let Some(entry) = cache.as_ref()
-            && entry.path == path
-            && entry.mtime == mtime
-            && entry.len == len
-        {
-            return Some(entry.store.as_ref().clone());
+        if let Some(cached) = Self::cached_shared(&path) {
+            return Some(cached);
         }
         let store = Self::load_uncached(&path);
         Self::store_cache(&path, &store);
-        Some(store)
+        Self::cached_shared(&path)
+    }
+
+    /// 渲染路径用：读取失败时回退为空钥匙串。
+    pub fn load_shared_or_default() -> std::sync::Arc<Self> {
+        Self::load_shared().unwrap_or_default()
+    }
+
+    fn cached_shared(path: &Path) -> Option<std::sync::Arc<Self>> {
+        let (mtime, len) = Self::stat_sig(path)?;
+        let cache = keychain_cache().lock().ok()?;
+        let entry = cache.as_ref()?;
+        if entry.path == path && entry.mtime == mtime && entry.len == len {
+            Some(entry.store.clone())
+        } else {
+            None
+        }
     }
 
     fn stat_sig(path: &Path) -> Option<(std::time::SystemTime, u64)> {

@@ -179,7 +179,14 @@ pub fn folder_subtitle(count: usize) -> String {
 pub fn load_grouped_hosts() -> (Vec<Host>, Vec<SshConnectionConfig>, Vec<HostGroup>) {
     let config = SshGlobalConfig::load();
     let keychain = KeychainStore::load_or_default();
+    load_grouped_hosts_from(&config, &keychain)
+}
 
+/// 用调用方持有的配置/钥匙串快照构建列表，避免渲染路径重复读盘/深拷贝。
+pub fn load_grouped_hosts_from(
+    config: &SshGlobalConfig,
+    keychain: &KeychainStore,
+) -> (Vec<Host>, Vec<SshConnectionConfig>, Vec<HostGroup>) {
     let hosts: Vec<Host> = config
         .saved_connections
         .iter()
@@ -241,5 +248,9 @@ pub fn load_grouped_hosts() -> (Vec<Host>, Vec<SshConnectionConfig>, Vec<HostGro
         })
         .collect();
 
-    (hosts, config.saved_connections, config.host_groups)
+    (
+        hosts,
+        config.saved_connections.clone(),
+        config.host_groups.clone(),
+    )
 }

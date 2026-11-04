@@ -212,6 +212,12 @@ pub struct DiffView {
     /// 快照是否已就绪：首屏加载完成、首次重算未到之前禁止写回，
     /// 否则空元数据会把用户输入当成全量工作区覆盖右栏。
     unified_ready: bool,
+    /// unified 编辑写回右栏的防抖状态：连续输入只在停顿后做一次
+    /// `worktree_from_merged` + `set_text`。
+    unified_writeback_pending: bool,
+    unified_writeback_gen: u64,
+    /// 写回右栏期间抑制 `on_right_changed`，避免再次调度重算。
+    suppress_right_change: bool,
     /// 首次 recompute 是否已完成（初始跳转只做一次）。
     initial_jump_done: bool,
     /// 待执行的初始跳转：recompute 完成时设置，render 时等 line_height
@@ -284,6 +290,9 @@ impl DiffView {
             unified_lines: Vec::new(),
             unified_snapshot: String::new(),
             unified_ready: false,
+            unified_writeback_pending: false,
+            unified_writeback_gen: 0,
+            suppress_right_change: false,
             initial_jump_done: false,
             pending_jump: false,
             _subscriptions: Vec::new(),
@@ -335,6 +344,8 @@ impl DiffView {
         self.load_error = None;
         // 快照失效：重算完成前禁止 unified 写回（见 unified_ready）。
         self.unified_ready = false;
+        self.unified_writeback_pending = false;
+        self.unified_writeback_gen = self.unified_writeback_gen.wrapping_add(1);
         self.close_diff_menu(cx);
         cx.notify();
 
@@ -661,6 +672,39 @@ impl DiffView {
         if self.target != DiffTarget::Worktree || self.loading || !self.unified_ready {
             return;
         }
+        // 只标记脏与调度；全文读取/映射/写回推迟到 60ms 防抖后做一次。
+        self.dirty = true;
+        self.schedule_unified_writeback(cx);
+        cx.notify();
+    }
+
+    fn schedule_unified_writeback(&mut self, cx: &mut Context<Self>) {
+        self.unified_writeback_pending = true;
+        self.unified_writeback_gen = self.unified_writeback_gen.wrapping_add(1);
+        let generation = self.unified_writeback_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(60))
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                if view.unified_writeback_gen == generation {
+                    view.flush_unified_writeback(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 把 unified 编辑落回工作区右栏。保存/关闭确认/重算前必须先调用，
+    /// 保证读到的右栏文本是最新的。
+    fn flush_unified_writeback(&mut self, cx: &mut Context<Self>) {
+        if !self.unified_writeback_pending {
+            return;
+        }
+        self.unified_writeback_pending = false;
+        if self.target != DiffTarget::Worktree || self.loading || !self.unified_ready {
+            return;
+        }
         let current = self.unified.read(cx).value().to_string();
         if current == self.unified_snapshot {
             return;
@@ -672,13 +716,21 @@ impl DiffView {
             &self.base_text,
         );
         // 快照保持到重算时更新（元数据必须与快照文本严格对应）；
-        // 累积 diff 下一次按键仍能基于旧快照精确对齐。
+        // 累积 diff 下一次编辑仍能基于旧快照精确对齐。
+        self.suppress_right_change = true;
         self.right.update(cx, |state, cx| {
             state.set_text(worktree, cx);
         });
+        self.suppress_right_change = false;
+        self.dirty = true;
+        self.schedule_recompute(cx);
     }
 
     fn on_right_changed(&mut self, cx: &mut Context<Self>) {
+        // unified 写回触发的 Change 已由 flush 统一处理，避免重复调度。
+        if self.suppress_right_change {
+            return;
+        }
         // 已暂存视图右栏为只读展示（HEAD↔暂存区）：内容变化只重算 hunk，
         // 不计入工作区 dirty（否则切过去瞬间就显示“● 保存”）。
         if self.target != DiffTarget::Worktree {
@@ -687,8 +739,13 @@ impl DiffView {
             cx.notify();
             return;
         }
-        let current = self.right.read(cx).value().to_string();
-        self.dirty = current != self.saved_text;
+        // 长度不同必然脏，先跳过全文拷贝；同长度（替换/撤销回原样）才精确比较。
+        let state = self.right.read(cx);
+        self.dirty = if state.text().len() != self.saved_text.len() {
+            true
+        } else {
+            state.value().as_ref() != self.saved_text
+        };
         self.schedule_recompute(cx);
         cx.notify();
     }
@@ -717,6 +774,8 @@ impl DiffView {
     /// never blocks the UI thread. Successive calls supersede each other via
     /// `recompute_gen`.
     fn recompute(&mut self, cx: &mut Context<Self>) {
+        // 重算读右栏：先把尚未落地的 unified 编辑写回。
+        self.flush_unified_writeback(cx);
         self.recompute_gen += 1;
         let generation = self.recompute_gen;
 
@@ -1438,6 +1497,8 @@ impl DiffView {
     /// 风格。此前直接 `repo.write_file` 写的是解码后的 UTF-8 字符串，等于
     /// 悄悄删掉 BOM、把 GBK / UTF-16 文件整体改写成 UTF-8。
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        // 快速 Cmd+S 可能早于防抖定时器：先把 unified 编辑落到右栏。
+        self.flush_unified_writeback(cx);
         // 已暂存视图只读：保存无意义，直接忽略（按钮本身已禁用，此处为防御）。
         if self.target != DiffTarget::Worktree {
             return;

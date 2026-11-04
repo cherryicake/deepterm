@@ -5,46 +5,9 @@
 //! 含无法表示的字符时报告错误，由调用方决定阻止保存（避免静默替换 `?`
 //! 破坏文件内容）。
 
-use encoding_rs::{Encoding, UTF_16BE, UTF_16LE};
-use serde::{Deserialize, Serialize};
+use encoding_rs::{UTF_16BE, UTF_16LE};
 
-/// 文件文本编码。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
-pub enum FileEncoding {
-    #[default]
-    Utf8,
-    /// 带 BOM 的 UTF-8（保存时写回 BOM）。
-    Utf8Bom,
-    Utf16Le,
-    Utf16Be,
-    Gbk,
-    /// GB18030（GBK 超集，覆盖四字节区）。
-    Gb18030,
-}
-
-impl FileEncoding {
-    /// 状态栏 / UI 显示名。
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Utf8 => "UTF-8",
-            Self::Utf8Bom => "UTF-8 BOM",
-            Self::Utf16Le => "UTF-16 LE",
-            Self::Utf16Be => "UTF-16 BE",
-            Self::Gbk => "GBK",
-            Self::Gb18030 => "GB18030",
-        }
-    }
-
-    fn encoder(&self) -> &'static Encoding {
-        match self {
-            Self::Utf8 | Self::Utf8Bom => encoding_rs::UTF_8,
-            Self::Utf16Le => UTF_16LE,
-            Self::Utf16Be => UTF_16BE,
-            Self::Gbk => encoding_rs::GBK,
-            Self::Gb18030 => encoding_rs::GB18030,
-        }
-    }
-}
+pub use crate::utils::encoding::FileEncoding;
 
 /// 解码结果：编辑器文本 + 源编码。
 pub struct DecodedText {

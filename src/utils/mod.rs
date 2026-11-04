@@ -5,6 +5,7 @@
 //! 这里反过来不依赖任何业务模块。
 
 pub mod console;
+pub mod encoding;
 pub mod fs_atomic;
 pub mod path;
 pub mod safe_open;

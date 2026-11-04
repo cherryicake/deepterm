@@ -79,9 +79,10 @@ impl WrapMap {
         range: &Range<usize>,
         new_text: &Rope,
         cx: &mut App,
-    ) {
+    ) -> usize {
         let dirty_from = self.wrapper.update(changed_text, range, new_text, cx);
         self.rebuild_cache_from(dirty_from);
+        dirty_from
     }
 
     /// Update layout parameters (wrap width or font).
@@ -119,7 +120,8 @@ impl WrapMap {
 
     /// Initialize with text
     pub fn set_text(&mut self, text: &Rope, cx: &mut App) {
-        self.wrapper.set_default_text(text);
+        // 必须先让 `update_all` 看到旧文本：它用旧长度作为全量替换 range，
+        // 预先写入新文本会让你以为旧尾部已经覆盖，实际留下陈旧行。
         self.wrapper.update_all(text, cx);
         self.rebuild_cache();
     }

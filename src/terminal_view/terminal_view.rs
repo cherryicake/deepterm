@@ -4140,7 +4140,10 @@ impl TerminalView {
 
         f(&mut self.builtin_command_manager);
 
-        // 远端目录按需加载：如果管理器标记为"loading"，取出请求并后台读取
+        // 本地/远端目录按需加载：后台读取，避免同步 read_dir 卡住 UI。
+        while let Some(request) = self.builtin_command_manager.pending_local_request() {
+            self.spawn_local_dir_load(request, cx);
+        }
         while let Some(request) = self.builtin_command_manager.pending_remote_request() {
             self.spawn_remote_dir_load(request, cx);
         }
@@ -4158,6 +4161,45 @@ impl TerminalView {
         }
 
         cx.notify();
+    }
+
+    /// 后台读取本地目录并把结果回写到 `BuiltinCommandManager`。
+    ///
+    /// 40ms 防抖把连续击键合并成一次读盘；醒来先校验代次，过期请求直接丢弃。
+    fn spawn_local_dir_load(
+        &self,
+        request: crate::builtin_commands::LocalCompletionRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let id = request.id;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            let still_current = this
+                .update(cx, |this, _| {
+                    this.builtin_command_manager.is_local_request_current(id)
+                })
+                .unwrap_or(false);
+            if !still_current {
+                return;
+            }
+            let prefix = request.prefix.clone();
+            let cwd = request.cwd.clone();
+            let items = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::builtin_commands::PathCompletionEngine::complete(&prefix, cwd.as_deref())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.builtin_command_manager
+                    .apply_local_completion_result(id, items);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 后台读取远端目录并把结果回写到 `BuiltinCommandManager`。
@@ -5244,8 +5286,10 @@ impl TerminalView {
         let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
             if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
-                input_bytes = Some(bytes.to_vec());
+                // `write` 只需要切片；发送完把已拥有的 Vec 直接交给广播路径，
+                // 避免每个按键多一次 `to_vec()` 拷贝。
                 terminal.write(&bytes);
+                input_bytes = Some(bytes);
                 true
             } else {
                 false

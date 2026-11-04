@@ -5,10 +5,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::editor::encoding::FileEncoding;
 use crate::file_manager::types::FileEntry;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind};
 use crate::ssh::SshConnectionConfig;
+use crate::utils::encoding::FileEncoding;
 use serde::{Deserialize, Serialize};
 
 /// Disk persistence types (Instant is reset to now on load).

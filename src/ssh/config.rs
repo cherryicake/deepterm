@@ -544,25 +544,37 @@ impl SshGlobalConfig {
     /// 读盘+JSON 解析）。HostView/KeychainView 的 render 路径会频繁调用 load()，
     /// 避免每帧读盘；save() 后同步刷新缓存，其它窗口/进程的写入靠 mtime 失效。
     pub fn load() -> Self {
+        (*Self::load_shared()).clone()
+    }
+
+    /// 与 [`Self::load`] 同源，但返回缓存里的 `Arc`，避免 UI 渲染路径每次
+    /// 深拷贝整份配置。`Arc::ptr_eq` 可直接用作“配置是否变化”的版本判断。
+    pub fn load_shared() -> std::sync::Arc<Self> {
         let config_path = match Self::config_path() {
             Some(path) => path,
-            None => return Self::new(),
+            None => return std::sync::Arc::new(Self::new()),
         };
-        if let Some(cached) = Self::cached(&config_path) {
+        if let Some(cached) = Self::cached_shared(&config_path) {
             return cached;
         }
         let config = Self::load_uncached(&config_path);
         Self::store_cache(&config_path, &config);
-        config
+        Self::cached_shared(&config_path).unwrap_or_else(|| std::sync::Arc::new(config))
     }
 
-    /// 查询缓存：路径 + mtime + size 完全一致时返回克隆。
+    /// 查询缓存：路径 + mtime + size 完全一致时返回克隆（`load_or_create`
+    /// 会修改配置，不能拿共享句柄）。
     fn cached(path: &std::path::Path) -> Option<Self> {
+        Self::cached_shared(path).map(|config| (*config).clone())
+    }
+
+    /// 查询缓存：路径 + mtime + size 完全一致时返回共享句柄。
+    fn cached_shared(path: &std::path::Path) -> Option<std::sync::Arc<Self>> {
         let (mtime, len) = Self::stat_sig(path)?;
         let cache = ssh_config_cache().lock().ok()?;
         let entry = cache.as_ref()?;
         if entry.path == path && entry.mtime == mtime && entry.len == len {
-            Some((*entry.config).clone())
+            Some(entry.config.clone())
         } else {
             None
         }

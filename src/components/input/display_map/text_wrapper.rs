@@ -51,12 +51,26 @@ impl LineItem {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LongestRow {
     /// The 0-based row index.
     pub row: usize,
     /// The bytes length of the longest line.
     pub len: usize,
+}
+
+/// 重新扫描所有行，找到最长行（仅在旧最长行被编辑替换时使用）。
+fn recompute_longest(lines: &[LineItem]) -> LongestRow {
+    let mut longest = LongestRow::default();
+    for (ix, line) in lines.iter().enumerate() {
+        if line.len() > longest.len {
+            longest = LongestRow {
+                row: ix,
+                len: line.len(),
+            };
+        }
+    }
+    longest
 }
 
 /// Used to prepare the text with soft wrap to be get lines to displayed in the Editor.
@@ -92,11 +106,6 @@ impl TextWrapper {
         }
     }
 
-    #[inline]
-    pub(crate) fn set_default_text(&mut self, text: &Rope) {
-        self.text = text.clone();
-    }
-
     /// Get reference to the rope text.
     #[inline]
     pub(crate) fn text(&self) -> &Rope {
@@ -123,6 +132,7 @@ impl TextWrapper {
         self.update_all(&self.text.clone(), cx);
     }
 
+    /// 字体或字号真的变化时重排，返回是否发生了重排。
     pub(crate) fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) -> bool {
         if self.font.eq(&font) && self.font_size == font_size {
             return false;
@@ -203,43 +213,37 @@ impl TextWrapper {
             .offset_to_point(range.start + new_text.len())
             .row;
 
-        let new_text_has_newline = new_text.to_string().contains('\n');
+        // 只替换受这次编辑影响的行。`new_start_row` 是插入点所在的新行，
+        // `new_end_row` 覆盖插入/删除后仍属于同一段的行（含尾部空行）。
+        // 之前多行编辑会重排到文档末尾，在长文件里一次回车就是 O(尾部)。
+        let rows_range = start_row..=end_row;
+        let new_range = changed_text.line_start_offset(new_start_row)
+            ..changed_text.line_end_offset(new_end_row);
 
-        let (rows_range, new_range) = if new_text_has_newline || start_row != end_row {
-            // Multi-line edit: rewrap from start row to end to ensure line count stays in sync.
-            let rows_range = start_row..=self.lines.len().saturating_sub(1);
-            let new_range = changed_text.line_start_offset(new_start_row)..changed_text.len();
-            (rows_range, new_range)
+        let old_longest = self.longest_row;
+        let longest_row_in_replaced = old_longest.row >= start_row && old_longest.row <= end_row;
+        let removed_rows = if self.lines.is_empty() {
+            0
         } else {
-            let rows_range = start_row..=end_row;
-            let new_range = changed_text.line_start_offset(new_start_row)
-                ..changed_text.line_end_offset(new_end_row);
-            (rows_range, new_range)
+            end_row - start_row + 1
         };
-
-        if rows_range.contains(&self.longest_row.row) {
-            self.longest_row = LongestRow::default();
-        }
-
-        let mut longest_row_ix = self.longest_row.row;
-        let mut longest_row_len = self.longest_row.len;
+        let removed_soft: usize = if self.lines.is_empty() {
+            0
+        } else {
+            self.lines[rows_range.clone()]
+                .iter()
+                .map(|line| line.lines_len())
+                .sum()
+        };
 
         let mut new_lines = vec![];
         let wrap_width = self.wrap_width;
 
         // line not contains `\n`.
-        for (ix, line) in Rope::from(changed_text.slice(new_range))
-            .iter_lines()
-            .enumerate()
-        {
+        for line in Rope::from(changed_text.slice(new_range)).iter_lines() {
             let line_str = line.to_string();
             let mut wrapped_lines = vec![];
             let mut prev_boundary_ix = 0;
-
-            if line_str.len() > longest_row_len {
-                longest_row_ix = new_start_row + ix;
-                longest_row_len = line_str.len();
-            }
 
             // If wrap_width is Pixels::MAX, skip wrapping to disable word wrap
             if let Some(wrap_width) = wrap_width {
@@ -266,18 +270,43 @@ impl TextWrapper {
             });
         }
 
+        let added_soft: usize = new_lines.iter().map(|line| line.lines_len()).sum();
+        let inserted_rows = new_lines.len();
+        let new_longest_in_replaced = new_lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, line)| line.len())
+            .map(|(ix, line)| (start_row + ix, line.len()));
+
         if self.lines.is_empty() {
             self.lines = new_lines;
+            self.soft_lines = added_soft;
         } else {
             self.lines.splice(rows_range, new_lines);
+            self.soft_lines = self.soft_lines.saturating_sub(removed_soft) + added_soft;
         }
 
         self.text = changed_text.clone();
-        self.soft_lines = self.lines.iter().map(|l| l.lines_len()).sum();
-        self.longest_row = LongestRow {
-            row: longest_row_ix,
-            len: longest_row_len,
-        };
+
+        if longest_row_in_replaced {
+            // 旧最长行被替换：新的全局最长可能在被替换区间之外（之前没重排
+            // 的部分），保守重扫一次。只在“恰好编辑到最长行”时发生。
+            self.longest_row = recompute_longest(&self.lines);
+        } else {
+            let mut row = old_longest.row;
+            if row > end_row {
+                let shift = inserted_rows as isize - removed_rows as isize;
+                row = (row as isize + shift).max(0) as usize;
+            }
+            let mut len = old_longest.len;
+            if let Some((new_row, new_len)) = new_longest_in_replaced
+                && new_len > len
+            {
+                row = new_row;
+                len = new_len;
+            }
+            self.longest_row = LongestRow { row, len };
+        }
         start_row
     }
 
@@ -285,7 +314,10 @@ impl TextWrapper {
     ///
     /// If the `text` is the same as the current text, do nothing.
     pub(crate) fn update_all(&mut self, text: &Rope, cx: &mut App) {
-        self.update(text, &(0..text.len()), text, cx);
+        // `range` 是**旧文本**里被替换的区间；用新文本长度会让缩短后的
+        // 全量重排只覆盖前几行，旧尾部残留。
+        let old_len = self.text.len();
+        self.update(text, &(0..old_len), text, cx);
     }
 
     /// Return display point (with soft wrap) from the given byte offset in the text.
@@ -918,5 +950,117 @@ mod tests {
             wrapper.display_point_to_offset(WrapDisplayPoint::new(0, 0, 15)),
             15
         );
+    }
+
+    /// 单行编辑只重排受影响行，不再把文档尾部全部送给 `wrap_line`。
+    #[test]
+    fn single_line_edit_does_not_rewrap_tail() {
+        let font = gpui::font("Arial");
+        let mut wrapper = TextWrapper::new(font, px(14.), Some(px(200.)));
+        let text: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+        let rope = Rope::from(text);
+        let mut fake_wrap_line = |_: &str, _: Pixels| Vec::new();
+        wrapper._update(&rope, &(0..rope.len()), &rope, &mut fake_wrap_line);
+
+        let mut calls = 0usize;
+        let mut counting_wrap = |_: &str, _: Pixels| {
+            calls += 1;
+            Vec::new()
+        };
+        let mut edited = rope.clone();
+        edited.insert(0, "x");
+        wrapper._update(&edited, &(0..0), &Rope::from("x"), &mut counting_wrap);
+
+        assert!(
+            calls <= 2,
+            "单行编辑不应重排文档尾部，实际调用 wrap_line {calls} 次"
+        );
+    }
+
+    #[gpui::test]
+    fn update_all_shortening_drops_stale_tail(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut wrapper = TextWrapper::new(gpui::font("Arial"), px(14.), None);
+            let long = Rope::from("a\nb\nc\nd");
+            wrapper.update_all(&long, cx);
+            assert_eq!(wrapper.lines.len(), 4);
+
+            let short = Rope::from("x");
+            wrapper.update_all(&short, cx);
+            assert_eq!(wrapper.lines.len(), 1);
+            assert_eq!(wrapper.lines[0].line.to_string(), "x");
+            assert_eq!(wrapper.soft_lines, 1);
+            assert_eq!(wrapper.text.to_string(), "x");
+        });
+    }
+
+    /// 增量 splice 与全量重排必须得到相同的行表、软换行数和最长行。
+    #[test]
+    fn incremental_update_matches_full_rebuild() {
+        fn apply_edit(
+            incr: &mut TextWrapper,
+            full: &mut TextWrapper,
+            text: &mut Rope,
+            range: Range<usize>,
+            new: &str,
+        ) {
+            let new_rope = Rope::from(new);
+            let full_range = 0..full.text.len();
+            text.replace(range.clone(), new);
+            let mut fake_wrap_line = |_: &str, _: gpui::Pixels| Vec::new();
+            incr._update(text, &range, &new_rope, &mut fake_wrap_line);
+            full._update(text, &full_range, text, &mut fake_wrap_line);
+
+            assert_eq!(
+                incr.lines.len(),
+                full.lines.len(),
+                "line count diverged after edit {range:?} -> {new:?}"
+            );
+            assert_eq!(
+                incr.soft_lines, full.soft_lines,
+                "soft line count diverged after edit {range:?} -> {new:?}"
+            );
+            assert_eq!(
+                incr.longest_row.row, full.longest_row.row,
+                "longest row index diverged after edit {range:?} -> {new:?}"
+            );
+            assert_eq!(
+                incr.longest_row.len, full.longest_row.len,
+                "longest row length diverged after edit {range:?} -> {new:?}"
+            );
+            for (left, right) in incr.lines.iter().zip(full.lines.iter()) {
+                assert_eq!(
+                    left.line.to_string(),
+                    right.line.to_string(),
+                    "line text diverged after edit {range:?} -> {new:?}"
+                );
+                assert_eq!(
+                    left.wrapped_lines, right.wrapped_lines,
+                    "wrapped ranges diverged after edit {range:?} -> {new:?}"
+                );
+            }
+        }
+
+        let font = gpui::font("Arial");
+        let mut incr = TextWrapper::new(font.clone(), px(14.), None);
+        let mut full = TextWrapper::new(font, px(14.), None);
+        let mut text = Rope::from("alpha\nbeta\ngamma\ndelta\nepsilon");
+
+        let mut fake_wrap_line = |_: &str, _: gpui::Pixels| Vec::new();
+        incr._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+        full._update(&text, &(0..text.len()), &text, &mut fake_wrap_line);
+
+        // 行内插入、顶部插入、尾部追加、唯一最长行被替换、跨行替换、整段删除。
+        apply_edit(&mut incr, &mut full, &mut text, 6..6, "x");
+        let len = text.len();
+        apply_edit(&mut incr, &mut full, &mut text, 0..0, "prefix\n");
+        apply_edit(&mut incr, &mut full, &mut text, len..len, "\nend");
+        let row = text.line_start_offset(2)..text.line_end_offset(2);
+        apply_edit(&mut incr, &mut full, &mut text, row, "X");
+        apply_edit(&mut incr, &mut full, &mut text, 3..8, "yz\nw");
+        let first_line = 0..text.line_start_offset(1);
+        apply_edit(&mut incr, &mut full, &mut text, first_line, "ré\n");
+        let all = 0..text.len();
+        apply_edit(&mut incr, &mut full, &mut text, all, "");
     }
 }

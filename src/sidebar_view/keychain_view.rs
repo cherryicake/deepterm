@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -31,6 +32,8 @@ pub struct KeychainSidebarView {
     search_input: Entity<InputState>,
     _search_subscription: Subscription,
     search_query: SharedString,
+    /// 钥匙串快照；`Arc` 身份变化时替换，避免每帧 `load_or_default` 深拷贝。
+    store: Option<Arc<KeychainStore>>,
 }
 
 impl KeychainSidebarView {
@@ -68,6 +71,7 @@ impl KeychainSidebarView {
                 search_input,
                 _search_subscription: subscription,
                 search_query: SharedString::new_static(""),
+                store: None,
             }
         })
     }
@@ -161,7 +165,15 @@ crate::impl_focusable!(KeychainSidebarView);
 impl Render for KeychainSidebarView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let items = KeychainStore::load_or_default().items;
+        let shared_store = KeychainStore::load_shared_or_default();
+        if self
+            .store
+            .as_ref()
+            .is_none_or(|store| !Arc::ptr_eq(store, &shared_store))
+        {
+            self.store = Some(shared_store);
+        }
+        let items = &self.store.as_ref().expect("store set above").items;
 
         let on_select = self.on_select.clone();
 

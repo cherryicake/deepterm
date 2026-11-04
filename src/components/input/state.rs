@@ -22,7 +22,7 @@ use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
     EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, Subscription, UTF16Selection, WeakEntity, Window, actions, point, px,
+    SharedString, Subscription, TextRun, UTF16Selection, WeakEntity, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use lsp_types::Url;
@@ -401,6 +401,13 @@ pub(crate) struct LastLayout {
     pub(crate) visible_range_offset: Range<usize>,
     /// The last layout lines (Only have visible lines, no empty entries for hidden lines).
     pub(crate) lines: Rc<Vec<LineLayout>>,
+    /// 生成 `lines` 时的文本版本、字号与 run 列表；三者与可见行都未变时
+    /// 可直接复用整形结果，跳过每帧 `shape_line`。
+    pub(crate) text_version: u64,
+    pub(crate) font_size: Pixels,
+    pub(crate) runs: Rc<Vec<TextRun>>,
+    /// 生成 `lines` 时是否带空白指示器（•/→），避免关闭开关后复用带标记的行。
+    pub(crate) has_whitespace_indicators: bool,
     /// The line_height of text layout, this will change will InputElement painted.
     pub(crate) line_height: Pixels,
     /// The line number area width of text layout, if not line number, this will be 0px.
@@ -495,7 +502,7 @@ pub struct InputState {
     pub(crate) selection_reversed: bool,
     /// The marked range is the temporary insert text on IME typing.
     pub(crate) ime_marked_range: Option<Selection>,
-    pub(crate) last_layout: Option<LastLayout>,
+    pub(crate) last_layout: Option<Rc<LastLayout>>,
     pub(crate) last_cursor: Option<usize>,
     /// The input container bounds
     pub(crate) input_bounds: Bounds<Pixels>,

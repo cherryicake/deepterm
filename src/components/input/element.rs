@@ -511,20 +511,45 @@ impl TextElement {
         let mut cursor_start = None;
         let mut cursor_end = None;
 
-        let mut prev_lines_offset = 0;
-        let mut offset_y = px(0.);
-        // git 展开区：绝对坐标累计（从第 0 行起），锚点行上的块高先行。
+        // git 展开区：绝对坐标累计，锚点行上的块高先行。
         let insert_total = state
             .display_map
             .git_insertions()
             .iter()
             .map(|ins| ins.lines.len())
             .sum::<usize>();
-        let mut prev_insert_rows = 0usize;
         let buffer_lines = state.display_map.lines();
         let visible_buffer_lines = &last_layout.visible_buffer_lines;
+
+        // 光标与选区端点都在可见区内时，从可见区起点开始累计即可；
+        // 否则仍需从第 0 行扫描，用于滚动跟随与折叠内光标映射。
+        let visible_offsets = &last_layout.visible_range_offset;
+        let can_start_at_visible = cursor >= visible_offsets.start
+            && cursor <= visible_offsets.end
+            && selected_range.start >= visible_offsets.start
+            && selected_range.end <= visible_offsets.end;
+        let start_ix = if can_start_at_visible {
+            visible_buffer_lines
+                .first()
+                .copied()
+                .unwrap_or(last_layout.visible_range.start)
+        } else {
+            0
+        };
+
+        let mut prev_lines_offset = state.text.line_start_offset(start_ix);
+        let mut offset_y = if start_ix == 0 {
+            px(0.)
+        } else {
+            last_layout.visible_top
+        };
+        let mut prev_insert_rows = if insert_total > 0 {
+            state.display_map.git_insertion_rows_before(start_ix)
+        } else {
+            0
+        };
         let mut vi = 0; // index into visible_buffer_lines / lines
-        for (ix, wrap_line) in buffer_lines.iter().enumerate() {
+        for (ix, wrap_line) in buffer_lines.iter().enumerate().skip(start_ix) {
             let row = ix;
             // git 展开区：锚在本行上的块高先计入（line_origin 依赖它）。
             if insert_total > 0 {
@@ -1499,12 +1524,12 @@ impl TextElement {
         state: &InputState,
         line_height: Pixels,
         input_height: Pixels,
+        geometry_dirty_from: usize,
     ) -> (Range<usize>, Vec<usize>, Pixels) {
         // Add extra rows to avoid showing empty space when scroll to bottom.
         let extra_rows = 1;
-        let mut visible_top = px(0.);
         if state.mode.is_single_line() {
-            return (0..1, vec![0], visible_top);
+            return (0..1, vec![0], px(0.));
         }
 
         let total_lines = state.display_map.wrap_row_count();
@@ -1513,14 +1538,45 @@ impl TextElement {
         } else {
             state.scroll_handle.offset().y
         };
+        let lines = state.display_map.lines();
 
-        let mut visible_range = 0..total_lines;
-        let mut line_bottom = px(0.);
+        // 复用上一帧的可见区锚点：只要锚点之前的行高没变，且锚点仍在当前
+        // 视口顶部或其上方，就可以从锚点继续向下扫描，跳过文档上半部分。
+        // 条件不满足时退回第 0 行（滚动向上、字体/宽度/折叠变化等）。
+        let hint = state.last_layout.as_ref().and_then(|last| {
+            if last.line_height != line_height {
+                return None;
+            }
+            let start = *last.visible_buffer_lines.first()?;
+            if start >= total_lines || geometry_dirty_from < start {
+                return None;
+            }
+            // 锚点必须在视口顶部上方；否则用户已经向上滚过它，首可见行在
+            // 锚点之前，从锚点开始会漏行。
+            if last.visible_top > -scroll_top {
+                return None;
+            }
+            Some((start, last.visible_top))
+        });
+
+        let (start_ix, initial_bottom, initial_visible_top) = match hint {
+            Some((start, top)) => (start, top, top),
+            None => (0, px(0.), px(0.)),
+        };
+        let mut visible_top = initial_visible_top;
+        let mut visible_range = start_ix..total_lines;
+        let mut line_bottom = initial_bottom;
         // git 展开区：块显示在锚点行上方（间隙归属锚点行），累计时先加块高
         // 再加行高；`rows_through(ix)` 计锚点 ≤ ix 的块行。
         let has_insertions = !state.display_map.git_insertions().is_empty();
-        let mut prev_insertion_rows = 0usize;
-        for (ix, _line) in state.display_map.lines().iter().enumerate() {
+        let mut prev_insertion_rows = if has_insertions {
+            state.display_map.git_insertion_rows_before(start_ix)
+        } else {
+            0
+        };
+        for (ix, _line) in lines.iter().enumerate().skip(start_ix) {
+            #[cfg(test)]
+            VISIBLE_RANGE_SCAN_LINES.with(|count| count.set(count.get() + 1));
             let visible_wrap_rows = state.display_map.visible_wrap_row_count_for_buffer_line(ix);
 
             if visible_wrap_rows == 0 {
@@ -1996,6 +2052,8 @@ impl TextElement {
         whitespace_indicators: Option<WhitespaceIndicators>,
         window: &mut Window,
     ) -> Vec<LineLayout> {
+        #[cfg(test)]
+        LAYOUT_LINES_CALLS.with(|count| count.set(count.get() + 1));
         let is_single_line = state.mode.is_single_line();
         let buffer_lines = state.display_map.lines();
 
@@ -2355,8 +2413,9 @@ struct GitInsertRowPaint {
 }
 
 pub(crate) struct PrepaintState {
-    /// The lines of entire lines.
-    last_layout: LastLayout,
+    /// The lines of entire lines. `Rc` 让 paint 末尾写回 `state.last_layout`
+    /// 只是一次引用计数递增，不再复制 `visible_buffer_lines` 等 Vec。
+    last_layout: Rc<LastLayout>,
     /// The lines only contains the visible lines in the viewport, based on `visible_range`.
     ///
     /// The child is the soft lines.
@@ -2511,11 +2570,20 @@ impl TextElement {
     ) -> PrepaintState {
         let style = window.text_style();
 
+        // 每帧取一次“几何最早变化行”，供可见区锚点复用判断。读取后重置，
+        // 下一次 prepaint 拿到的是这一帧之后发生的变化。
+        let geometry_dirty_from = self
+            .state
+            .update(cx, |state, _| state.display_map.take_geometry_dirty_from());
         let state = self.state.read(cx);
         let line_height = window.line_height();
 
-        let (visible_range, visible_buffer_lines, visible_top) =
-            self.calculate_visible_range(state, line_height, bounds.size.height);
+        let (visible_range, visible_buffer_lines, visible_top) = self.calculate_visible_range(
+            state,
+            line_height,
+            bounds.size.height,
+            geometry_dirty_from,
+        );
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text
@@ -2639,6 +2707,10 @@ impl TextElement {
             git_insert_shift,
             git_insert_baseline,
             lines: Rc::new(vec![]),
+            text_version: state.text_version,
+            font_size: text_size,
+            runs: Rc::new(Vec::new()),
+            has_whitespace_indicators: false,
             cursor_bounds: None,
             text_align: state.text_align,
             content_width: bounds.size.width,
@@ -2714,17 +2786,40 @@ impl TextElement {
         // Create shaped lines for whitespace indicators before layout
         let whitespace_indicators =
             Self::layout_whitespace_indicators(state, text_size, &text_style, window, cx);
+        last_layout.has_whitespace_indicators = whitespace_indicators.is_some();
+        let runs = Rc::new(runs);
 
-        let lines = Self::layout_lines(
-            state,
-            display_text,
-            &last_layout,
-            text_size,
-            &runs,
-            fg,
-            whitespace_indicators,
-            window,
-        );
+        // 光标移动/闪烁帧的文本、可见行、run 与字号都没变：直接复用上一帧
+        // 的整形结果，跳过每帧 `shape_line`。whitespace 指示器带 ShapedLine，
+        // 开启时保守重建。
+        let can_reuse_lines = whitespace_indicators.is_none()
+            && state.last_layout.as_ref().is_some_and(|last| {
+                !last.has_whitespace_indicators
+                    && last.text_version == state.text_version
+                    && last.font_size == text_size
+                    && last.text_align == state.text_align
+                    && last.visible_buffer_lines == last_layout.visible_buffer_lines
+                    && last.runs.as_ref() == runs.as_ref()
+            });
+        let lines = if can_reuse_lines {
+            state
+                .last_layout
+                .as_ref()
+                .expect("checked above")
+                .lines
+                .clone()
+        } else {
+            Rc::new(Self::layout_lines(
+                state,
+                display_text,
+                &last_layout,
+                text_size,
+                runs.as_slice(),
+                fg,
+                whitespace_indicators,
+                window,
+            ))
+        };
 
         let mut longest_line_width = wrap_width.unwrap_or(px(0.));
         // 1. Single line
@@ -2750,7 +2845,8 @@ impl TextElement {
                 )
                 .width;
         }
-        last_layout.lines = Rc::new(lines);
+        last_layout.lines = lines;
+        last_layout.runs = runs;
 
         // 可见行几何（相对 y）：paint 阶段与色条 hitbox 创建共用。
         // git 展开区：锚点行上的块高经 `git_insert_delta` 查表补入，
@@ -3178,7 +3274,7 @@ impl TextElement {
 
         PrepaintState {
             bounds,
-            last_layout,
+            last_layout: Rc::new(last_layout),
             scroll_size,
             line_numbers,
             cursor_bounds,
@@ -4898,6 +4994,30 @@ pub(crate) fn take_cursor_requests() -> Vec<CursorRequest> {
     CURSOR_REQUESTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
 }
 
+// 最近一次 `calculate_visible_range` 扫描了多少个 buffer 行。
+// 只用于证明可见区锚点复用真的跳过了文档上半部分；与 `CURSOR_REQUESTS`
+// 一样放 thread-local，避免并行用例互相污染。
+#[cfg(test)]
+thread_local! {
+    static VISIBLE_RANGE_SCAN_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_visible_range_scan_lines() -> usize {
+    VISIBLE_RANGE_SCAN_LINES.with(|count| count.replace(0))
+}
+
+// 测试探针：`layout_lines` 被调用的次数；用于验证整形结果跨帧复用。
+#[cfg(test)]
+thread_local! {
+    static LAYOUT_LINES_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_layout_lines_calls() -> usize {
+    LAYOUT_LINES_CALLS.with(|count| count.replace(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5935,6 +6055,166 @@ mod tests {
                 arrow.bounds
             );
         }
+    }
+
+    /// 文本/可见行/run/字号都没变的帧应复用上一帧的整形结果。
+    #[gpui::test]
+    fn unchanged_frame_reuses_shaped_lines(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        struct Host {
+            state: Entity<InputState>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                crate::components::input::EditorInput::new(&self.state)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let state = cx.new(|cx| {
+                let mut s = InputState::new(window, cx)
+                    .multi_line(true)
+                    .code_editor("rust".to_string());
+                s.set_text("fn main() {\n    println!(\"hi\");\n}\n", cx);
+                s
+            });
+            Host { state }
+        });
+
+        let viewport = size(px(600.0), px(200.0));
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            host.clone().into_any_element()
+        });
+        assert!(take_layout_lines_calls() > 0, "首帧必须真正整形可见行");
+        assert!(
+            host.read_with(cx, |host, cx| host.state.read(cx).last_layout.is_some()),
+            "首帧 paint 应写回 last_layout"
+        );
+
+        // 没有文本/光标/主题变化：第二帧应命中缓存，不再整形。
+        cx.executor().advance_clock(Duration::from_millis(16));
+        cx.draw(point(px(0.0), px(0.0)), viewport, |_, _| {
+            host.clone().into_any_element()
+        });
+        assert_eq!(
+            take_layout_lines_calls(),
+            0,
+            "未变化的帧不应重新调用 layout_lines"
+        );
+    }
+
+    /// 回归：从上一帧可见区锚点继续扫描，不再每帧从第 0 行开始。
+    #[gpui::test]
+    fn visible_range_reuses_last_anchor(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+
+        struct Host;
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        let (_host, cx) = cx.add_window_view(|_window, _cx| Host);
+        cx.update(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).code_editor("text"));
+            let text: String = (0..10_000).map(|i| format!("line {i}\n")).collect();
+            input.update(cx, |state, cx| state.set_value(&text, window, cx));
+            let element = TextElement::new(input.clone());
+            let line_height = px(20.);
+            let viewport_height = px(400.);
+            let scroll_top = -(9950.0 * 20.0);
+
+            // 首帧：没有上一帧锚点，从第 0 行扫描到视口。
+            input.update(cx, |state, _| {
+                state
+                    .scroll_handle
+                    .set_offset(point(px(0.), px(scroll_top)));
+            });
+            take_visible_range_scan_lines();
+            input.update(cx, |state, _| {
+                let _ = element.calculate_visible_range(state, line_height, viewport_height, 0);
+            });
+            let full_scans = take_visible_range_scan_lines();
+            assert!(
+                full_scans > 9_000,
+                "首帧应从第 0 行扫描到视口，实际 {full_scans}"
+            );
+
+            // 构造上一帧锚点：可见区从 9950 行开始，锚点仍在当前视口上方。
+            input.update(cx, |state, _| {
+                state.last_layout = Some(Rc::new(LastLayout {
+                    visible_range: 9950..10_000,
+                    visible_buffer_lines: (9950..10_000).collect(),
+                    visible_line_byte_offsets: vec![0; 50],
+                    visible_top: px(9950.0 * 20.0),
+                    visible_range_offset: 0..text.len(),
+                    lines: Rc::new(Vec::new()),
+                    line_height,
+                    line_number_width: px(0.),
+                    line_number_len: 0,
+                    git_insert_shift: Rc::new(Vec::new()),
+                    git_insert_baseline: 0,
+                    text_version: state.text_version,
+                    font_size: px(14.),
+                    runs: Rc::new(Vec::new()),
+                    has_whitespace_indicators: false,
+                    cursor_bounds: None,
+                    text_align: TextAlign::Left,
+                    content_width: px(0.),
+                }));
+            });
+            take_visible_range_scan_lines();
+            input.update(cx, |state, _| {
+                let _ = element.calculate_visible_range(
+                    state,
+                    line_height,
+                    viewport_height,
+                    usize::MAX,
+                );
+            });
+            let reused_scans = take_visible_range_scan_lines();
+            assert!(
+                reused_scans < 100,
+                "复用锚点后应只扫描视口附近，实际 {reused_scans}（全量 {full_scans}）"
+            );
+
+            // 编辑落在锚点行本身：锚点之前的行高没变，仍可复用。
+            take_visible_range_scan_lines();
+            input.update(cx, |state, _| {
+                let _ = element.calculate_visible_range(state, line_height, viewport_height, 9950);
+            });
+            let edited_at_anchor = take_visible_range_scan_lines();
+            assert!(
+                edited_at_anchor < 100,
+                "锚点行自身的编辑不应让锚点失效，实际 {edited_at_anchor}"
+            );
+
+            // 编辑落在锚点之前的行：锚点绝对 y 可能变化，必须退回全量。
+            take_visible_range_scan_lines();
+            input.update(cx, |state, _| {
+                let _ = element.calculate_visible_range(state, line_height, viewport_height, 9949);
+            });
+            let edited_before_anchor = take_visible_range_scan_lines();
+            assert!(
+                edited_before_anchor > 9_000,
+                "锚点之前的编辑必须触发全量扫描，实际 {edited_before_anchor}"
+            );
+        });
     }
 }
 

@@ -253,8 +253,6 @@ Supports local terminals and SSH remote connections.
 embed-resource = "2"
 
 [features]
-default = ["tree-sitter-languages"]
-tree-sitter-languages = []
 # 启用 src/utils/alloc_probe（计数分配器 + footprint 探针）。
 # bench target 需要独立启用：dev-dependencies 的 cfg(test) 不作用于其代码。
 alloc-probe = []

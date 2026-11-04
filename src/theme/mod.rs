@@ -506,17 +506,26 @@ struct TerminalThemeFile {
 pub struct ThemeState {
     themes: Vec<AppTheme>,
     active_theme_id: SharedString,
+    /// 当前主题的共享句柄。渲染路径用它替代 `cx.theme().clone()`，
+    /// 避免每帧深拷贝 `id`/`name`/`description` 三个 String。
+    active_theme: Arc<AppTheme>,
 }
 
 impl Global for ThemeState {}
 
 pub trait ActiveTheme {
     fn theme(&self) -> &AppTheme;
+    /// 共享句柄；需要把主题带过 `&mut cx` 边界时用它，克隆是 O(1)。
+    fn theme_shared(&self) -> Arc<AppTheme>;
 }
 
 impl ActiveTheme for App {
     fn theme(&self) -> &AppTheme {
         ThemeState::global(self).active_theme()
+    }
+
+    fn theme_shared(&self) -> Arc<AppTheme> {
+        ThemeState::global(self).active_theme_shared()
     }
 }
 
@@ -532,10 +541,22 @@ pub fn init(cx: &mut App) {
         .filter(|theme_id| !theme_id.is_empty())
         .filter(|theme_id| themes.iter().any(|theme| theme.id == *theme_id));
     let active_theme_id = preferred_theme_id.unwrap_or_else(|| default_theme_id.to_string());
+    let active_theme = Arc::new(
+        themes
+            .iter()
+            .find(|theme| theme.id == active_theme_id)
+            .unwrap_or_else(|| {
+                themes
+                    .first()
+                    .expect("builtin themes should never be empty")
+            })
+            .clone(),
+    );
 
     cx.set_global(ThemeState {
         themes,
         active_theme_id: active_theme_id.into(),
+        active_theme,
     });
 }
 
@@ -549,14 +570,11 @@ impl ThemeState {
     }
 
     pub fn active_theme(&self) -> &AppTheme {
-        self.themes
-            .iter()
-            .find(|theme| theme.id == self.active_theme_id.as_ref())
-            .unwrap_or_else(|| {
-                self.themes
-                    .first()
-                    .expect("builtin themes should never be empty")
-            })
+        self.active_theme.as_ref()
+    }
+
+    pub fn active_theme_shared(&self) -> Arc<AppTheme> {
+        self.active_theme.clone()
     }
 
     pub fn active_theme_id(&self) -> &str {
@@ -564,19 +582,21 @@ impl ThemeState {
     }
 
     pub fn set_active(theme_id: &str, cx: &mut App) -> bool {
-        let Some(next_theme_id) = Self::themes(cx)
+        let Some(next_theme) = Self::themes(cx)
             .iter()
             .find(|theme| theme.id == theme_id)
-            .map(|theme| theme.id.to_string())
+            .cloned()
         else {
             return false;
         };
+        let next_theme_id = next_theme.id.clone();
 
         let mut changed = false;
         {
             let state = cx.global_mut::<ThemeState>();
             if state.active_theme_id.as_ref() != next_theme_id {
                 state.active_theme_id = next_theme_id.clone().into();
+                state.active_theme = Arc::new(next_theme);
                 changed = true;
             }
         }
@@ -604,18 +624,23 @@ impl ThemeState {
         else {
             return;
         };
-        let Some(next) = Self::themes(cx)
+        let Some(next_theme) = Self::themes(cx)
             .iter()
             .find(|theme| theme.id == preferred)
-            .map(|theme| theme.id.clone())
+            .cloned()
         else {
             return;
         };
+        let next = next_theme.id.clone();
         // 先比较再取可变引用：`global_mut` 会无条件通知观察者。
         if cx.global::<ThemeState>().active_theme_id.as_ref() == next {
             return;
         }
-        cx.global_mut::<ThemeState>().active_theme_id = next.into();
+        {
+            let state = cx.global_mut::<ThemeState>();
+            state.active_theme_id = next.into();
+            state.active_theme = Arc::new(next_theme);
+        }
         cx.refresh_windows();
     }
 }

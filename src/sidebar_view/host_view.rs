@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::prelude::*;
 use gpui::{
@@ -17,12 +18,13 @@ use crate::sidebar_view::folder_dialog::{FolderDialogMode, FolderNameDialog};
 use crate::sidebar_view::host_form::NewHostForm;
 use crate::sidebar_view::hosts_view::{
     ConnectHost, ConnectHostViaProxy, CopyHostAddress, DeleteHost, EditHost, Host, folder_subtitle,
-    load_grouped_hosts, sort_hosts,
+    load_grouped_hosts, load_grouped_hosts_from, sort_hosts,
 };
 use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
 use crate::ssh::config::{
     HostGroup, SortMode, SshConnectionConfig, SshGlobalConfig, sort_host_groups,
 };
+use crate::ssh::keychain::KeychainStore;
 use crate::theme::ActiveTheme;
 
 /// SSH 主机回调（连接 / 编辑主机时触发），参数为该主机的连接配置。
@@ -101,6 +103,21 @@ pub struct HostView {
     header_menu: Option<Entity<PopupMenu>>,
     header_menu_position: Option<Point<Pixels>>,
     header_menu_subscription: Option<Subscription>,
+    /// 渲染缓存：配置/钥匙串的 `Arc` 身份变化或排序设置变化时才重建。
+    grouped_cache: Option<GroupedHostsCache>,
+}
+
+/// 主机列表的派生数据缓存。持有配置/钥匙串的 `Arc`，用于 `ptr_eq` 判断
+/// 底层文件是否变化；避免每帧 `load_grouped_hosts` + 深拷贝。
+struct GroupedHostsCache {
+    config: Arc<SshGlobalConfig>,
+    keychain: Arc<KeychainStore>,
+    hosts: Rc<Vec<Host>>,
+    configs: Rc<Vec<SshConnectionConfig>>,
+    groups: Rc<Vec<HostGroup>>,
+    host_counts: HashMap<String, usize>,
+    folder_sort: SortMode,
+    host_sort: SortMode,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -155,6 +172,7 @@ impl HostView {
                 header_menu: None,
                 header_menu_position: None,
                 header_menu_subscription: None,
+                grouped_cache: None,
             }
         })
     }
@@ -1058,24 +1076,60 @@ impl HostView {
     }
 }
 
+impl HostView {
+    /// 从共享配置/钥匙串快照重建列表与排序缓存。
+    fn build_grouped_cache(
+        config: Arc<SshGlobalConfig>,
+        keychain: Arc<KeychainStore>,
+    ) -> GroupedHostsCache {
+        let (hosts, configs, mut groups) = load_grouped_hosts_from(&config, &keychain);
+        let mut host_counts: HashMap<String, usize> = HashMap::new();
+        for host in &hosts {
+            if let Some(group_id) = host.group_id.as_ref() {
+                *host_counts.entry(group_id.to_string()).or_insert(0) += 1;
+            }
+        }
+        sort_host_groups(&mut groups, config.folder_sort, Some(&host_counts));
+        GroupedHostsCache {
+            folder_sort: config.folder_sort,
+            host_sort: config.host_sort,
+            config,
+            keychain,
+            hosts: Rc::new(hosts),
+            configs: Rc::new(configs),
+            groups: Rc::new(groups),
+            host_counts,
+        }
+    }
+}
+
 crate::impl_focusable!(HostView);
 
 impl Render for HostView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
-        let (hosts, configs, mut groups) = load_grouped_hosts();
-        let cfg_sort = SshGlobalConfig::load();
-        let folder_sort = cfg_sort.folder_sort;
-        let host_sort = cfg_sort.host_sort;
-
-        // 计算每个文件夹的主机数
-        let mut host_counts: HashMap<String, usize> = HashMap::new();
-        for h in &hosts {
-            if let Some(gid) = h.group_id.as_ref() {
-                *host_counts.entry(gid.to_string()).or_insert(0) += 1;
-            }
+        // 配置/钥匙串按 `Arc` 身份缓存：文件未变时同一帧复用列表，
+        // 避免每帧 `load_grouped_hosts` + 深拷贝配置。
+        let config = SshGlobalConfig::load_shared();
+        let keychain = KeychainStore::load_shared_or_default();
+        let needs_rebuild = self.grouped_cache.as_ref().is_none_or(|cache| {
+            !Arc::ptr_eq(&cache.config, &config)
+                || !Arc::ptr_eq(&cache.keychain, &keychain)
+                || cache.folder_sort != config.folder_sort
+                || cache.host_sort != config.host_sort
+        });
+        if needs_rebuild {
+            self.grouped_cache = Some(Self::build_grouped_cache(config, keychain));
         }
-        sort_host_groups(&mut groups, folder_sort, Some(&host_counts));
+        let cache = self
+            .grouped_cache
+            .as_ref()
+            .expect("grouped cache built above");
+        let hosts = cache.hosts.clone();
+        let configs = cache.configs.clone();
+        let groups = cache.groups.clone();
+        let host_counts = &cache.host_counts;
+        let host_sort = cache.host_sort;
 
         let on_select = self.on_select.clone();
         let on_connect = self.on_connect.clone();
@@ -1149,9 +1203,10 @@ impl Render for HostView {
 
             // 未分组主机
             let mut ungrouped: Vec<Host> = hosts
-                .into_iter()
+                .iter()
                 .filter(|h| h.group_id.is_none())
                 .filter(|h| Self::host_matches_query(h, query_str))
+                .cloned()
                 .collect();
             sort_hosts(&mut ungrouped, host_sort);
 
@@ -1232,9 +1287,10 @@ impl Render for HostView {
                 }
             };
             let mut folder_hosts: Vec<Host> = hosts
-                .into_iter()
+                .iter()
                 .filter(|h| h.group_id.as_deref() == Some(fid.as_ref()))
                 .filter(|h| Self::host_matches_query(h, query_str))
+                .cloned()
                 .collect();
             sort_hosts(&mut folder_hosts, host_sort);
 
@@ -1292,13 +1348,10 @@ impl Render for HostView {
             div().into_any_element()
         };
 
-        let configs_rc = Rc::new(configs.clone());
+        let configs_rc = configs;
         let on_connect_action = self.on_connect.clone();
         let on_connect_via_proxy = self.on_connect.clone();
-        let hosts_for_delete = {
-            let (h, _, _) = load_grouped_hosts();
-            h
-        };
+        let hosts_for_delete = hosts.clone();
 
         div()
             .w_full()

@@ -47,6 +47,12 @@ pub struct DisplayMap {
     fold_map: FoldMap,
     /// git hunk 展开区（按 `before_buffer_row` 升序）。
     git_insertions: Vec<GitInsertion>,
+    /// 自上次 `take_geometry_dirty_from` 以来，几何可能变化的**最早** buffer 行。
+    ///
+    /// 供编辑区 `calculate_visible_range` 判断上一帧的可见区锚点是否还能复用：
+    /// 只要 `dirty_from >= 上一帧 visible_range.start`，该行之前的行高就没变，
+    /// 可以从锚点继续扫描而不用从第 0 行重来。`usize::MAX` 表示无变化。
+    geometry_dirty_from: usize,
 }
 
 impl DisplayMap {
@@ -55,6 +61,33 @@ impl DisplayMap {
             wrap_map: WrapMap::new(font, font_size, wrap_width),
             fold_map: FoldMap::new(),
             git_insertions: Vec::new(),
+            // 首帧没有历史锚点，从 0 开始（等价于全量扫描）。
+            geometry_dirty_from: 0,
+        }
+    }
+
+    /// 取走并重置“几何最早变化行”。
+    ///
+    /// 返回值是自上次调用以来可能变化的最早 buffer 行；`usize::MAX` 表示
+    /// 期间没有几何变化。首帧返回 0。
+    pub fn take_geometry_dirty_from(&mut self) -> usize {
+        let dirty_from = self.geometry_dirty_from;
+        self.geometry_dirty_from = usize::MAX;
+        dirty_from
+    }
+
+    /// 标记 `row` 及其之后的行几何可能变化（取最小值）。
+    fn mark_geometry_dirty_from(&mut self, row: usize) {
+        self.geometry_dirty_from = self.geometry_dirty_from.min(row);
+    }
+
+    /// 文本编辑后折行几何的保守脏行：有折叠或 git 展开区时直接判全量，
+    /// 否则用 `WrapMap` 返回的增量起点。
+    fn text_geometry_dirty_from(&self, wrap_dirty_from: usize) -> usize {
+        if self.fold_map.folds().is_empty() && self.git_insertions.is_empty() {
+            wrap_dirty_from
+        } else {
+            0
         }
     }
 
@@ -81,7 +114,14 @@ impl DisplayMap {
     /// 替换展开区（调用方保证按 `before_buffer_row` 升序；当前实现里
     /// hunk 按旧侧行序产出，天然有序）。
     pub fn set_git_insertions(&mut self, insertions: Vec<GitInsertion>) {
+        // 没有展开区时保持几何锚点有效；`sync_git_expansions` 在每次编辑后
+        // 都会调用这里，无脑标脏会让普通 git 仓库里的每个文件都退回全量扫描。
+        if self.git_insertions.is_empty() && insertions.is_empty() {
+            return;
+        }
         self.git_insertions = insertions;
+        // 展开区会改变其锚点之后所有行的 y，保守全量。
+        self.mark_geometry_dirty_from(0);
     }
 
     #[inline]
@@ -151,6 +191,7 @@ impl DisplayMap {
         let changed = self.fold_map.fold(folds);
         if changed {
             self.rebuild_fold_projection();
+            self.mark_geometry_dirty_from(0);
         }
         changed
     }
@@ -170,6 +211,7 @@ impl DisplayMap {
         let changed = self.fold_map.unfold_intersecting(ranges, inclusive);
         if changed {
             self.rebuild_fold_projection();
+            self.mark_geometry_dirty_from(0);
         }
         changed
     }
@@ -227,6 +269,7 @@ impl DisplayMap {
     pub fn clear_folds(&mut self) {
         self.fold_map.clear_folds();
         self.rebuild_fold_projection();
+        self.mark_geometry_dirty_from(0);
     }
 
     // ==================== Creases (zed semantics) ====================
@@ -251,8 +294,13 @@ impl DisplayMap {
     /// Must be called with the edit range in the OLD text and the
     /// replacement length (see [`FoldMap::adjust_folds_for_edit`]).
     pub fn adjust_folds_for_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        if self.fold_map.folds().is_empty() {
+            return;
+        }
         self.fold_map
             .adjust_folds_for_edit(range.clone(), new_text.len());
+        // 折叠行号可能移位：保守全量，代价只落在有折叠的文档上。
+        self.mark_geometry_dirty_from(0);
     }
 
     /// Update text (incremental or full)
@@ -263,12 +311,14 @@ impl DisplayMap {
         new_text: &Rope,
         cx: &mut App,
     ) {
-        self.wrap_map
+        let wrap_dirty_from = self
+            .wrap_map
             .on_text_changed(changed_text, range, new_text, cx);
         // Folds are byte-offset based; recompute their row/column points
         // against the new text.
         self.fold_map.refresh_points(self.wrap_map.text());
         self.rebuild_fold_projection();
+        self.mark_geometry_dirty_from(self.text_geometry_dirty_from(wrap_dirty_from));
     }
 
     /// Update layout parameters (wrap width or font).
@@ -279,14 +329,18 @@ impl DisplayMap {
             return false;
         }
         self.rebuild_fold_projection();
+        self.mark_geometry_dirty_from(0);
         true
     }
 
-    /// Set font parameters
-    pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) {
-        if self.wrap_map.set_font(font, font_size, cx) {
-            self.rebuild_fold_projection();
+    /// Set font parameters；字体/字号未变时是 no-op（每帧都会调用）。
+    pub fn set_font(&mut self, font: Font, font_size: Pixels, cx: &mut App) -> bool {
+        if !self.wrap_map.set_font(font, font_size, cx) {
+            return false;
         }
+        self.rebuild_fold_projection();
+        self.mark_geometry_dirty_from(0);
+        true
     }
 
     /// Ensure text is prepared (initializes wrapper if needed)
@@ -294,6 +348,7 @@ impl DisplayMap {
         let did_initialize = self.wrap_map.ensure_text_prepared(text, cx);
         if did_initialize {
             self.rebuild_fold_projection();
+            self.mark_geometry_dirty_from(0);
         }
     }
 
@@ -301,6 +356,7 @@ impl DisplayMap {
     pub fn set_text(&mut self, text: &Rope, cx: &mut App) {
         self.wrap_map.set_text(text, cx);
         self.rebuild_fold_projection();
+        self.mark_geometry_dirty_from(0);
     }
 
     // ==================== Internal Helpers ====================
@@ -405,5 +461,56 @@ impl DisplayMap {
     #[inline]
     pub fn buffer_line_count(&self) -> usize {
         self.wrap_map.buffer_line_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_dirty_from_only_tracks_relevant_changes() {
+        let mut map = DisplayMap::new(gpui::font(".SystemUIFont"), gpui::px(14.), None);
+        // 首帧没有历史锚点；之后无变化时返回 MAX。
+        assert_eq!(map.take_geometry_dirty_from(), 0);
+        assert_eq!(map.take_geometry_dirty_from(), usize::MAX);
+
+        // 没有折叠时，编辑前的 fold 调整不构成几何变化。
+        map.adjust_folds_for_edit(&(0..0), "x");
+        assert_eq!(map.take_geometry_dirty_from(), usize::MAX);
+
+        // 空展开区不改变行高。
+        map.set_git_insertions(Vec::new());
+        assert_eq!(map.take_geometry_dirty_from(), usize::MAX);
+
+        // 有展开区则保守全量。
+        map.set_git_insertions(vec![GitInsertion {
+            before_buffer_row: 3,
+            hunk_ix: 0,
+            lines: std::rc::Rc::new(Vec::new()),
+        }]);
+        assert_eq!(map.take_geometry_dirty_from(), 0);
+    }
+
+    #[gpui::test]
+    fn text_edit_marks_geometry_from_edited_row(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut map = DisplayMap::new(gpui::font(".SystemUIFont"), gpui::px(14.), None);
+            let text: String = (0..100).map(|i| format!("line {i}\n")).collect();
+            let rope = Rope::from(text);
+            map.set_text(&rope, cx);
+            // 初始化时是全量标记，先取走。
+            assert_eq!(map.take_geometry_dirty_from(), 0);
+
+            let offset = rope.line_start_offset(50);
+            let mut edited = rope.clone();
+            edited.insert(offset, "x");
+            map.on_text_changed(&edited, &(offset..offset), &Rope::from("x"), cx);
+            assert_eq!(
+                map.take_geometry_dirty_from(),
+                50,
+                "普通无折叠文档应从被编辑行开始增量失效"
+            );
+        });
     }
 }

@@ -2,13 +2,6 @@ use gpui::SharedString;
 
 use crate::editor::syntax::LanguageConfig;
 
-#[cfg(not(feature = "tree-sitter-languages"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]
-pub enum Language {
-    Json,
-}
-
-#[cfg(feature = "tree-sitter-languages")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, enum_iterator::Sequence)]
 pub enum Language {
     Json,
@@ -48,10 +41,6 @@ impl Language {
     }
 
     pub fn name(&self) -> &'static str {
-        #[cfg(not(feature = "tree-sitter-languages"))]
-        return "json";
-
-        #[cfg(feature = "tree-sitter-languages")]
         match self {
             Self::Plain => "text",
             Self::Bash => "bash",
@@ -112,10 +101,6 @@ impl Language {
     /// 刻意不叫 `from_str`：它不会失败、也不实现 [`std::str::FromStr`]，
     /// 与标准 trait 同名容易误读。
     pub fn from_id(s: &str) -> Self {
-        #[cfg(not(feature = "tree-sitter-languages"))]
-        return Self::Json;
-
-        #[cfg(feature = "tree-sitter-languages")]
         match s {
             "bash" | "sh" => Self::Bash,
             "c" => Self::C,
@@ -144,10 +129,6 @@ impl Language {
     }
 
     pub(super) fn injection_languages(&self) -> Vec<SharedString> {
-        #[cfg(not(feature = "tree-sitter-languages"))]
-        return vec![];
-
-        #[cfg(feature = "tree-sitter-languages")]
         match self {
             Self::Markdown => vec!["markdown-inline", "html", "toml"],
             Self::MarkdownInline => vec![],
@@ -167,17 +148,6 @@ impl Language {
     ///
     /// (language, query, injection, locals)
     pub(super) fn config(&self) -> LanguageConfig {
-        #[cfg(not(feature = "tree-sitter-languages"))]
-        let (language, query, injection, locals) = match self {
-            Self::Json => (
-                tree_sitter_json::LANGUAGE,
-                include_str!("languages/json/highlights.scm"),
-                "",
-                "",
-            ),
-        };
-
-        #[cfg(feature = "tree-sitter-languages")]
         let (language, query, injection, locals) = match self {
             Self::Plain => (tree_sitter_json::LANGUAGE, "", "", ""),
             Self::Json => (
@@ -343,7 +313,6 @@ impl Language {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[cfg(feature = "tree-sitter-languages")]
     fn test_language_name() {
         use super::*;
 

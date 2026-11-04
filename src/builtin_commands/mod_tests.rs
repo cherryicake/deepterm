@@ -749,3 +749,128 @@ fn plain_local_keyword_completion_still_works() {
     // 本机补全由 cwd 决定，可能有或没有条目，但绝不应出现远端 loading
     assert!(!manager.is_loading_remote);
 }
+
+fn temp_completion_dir(tag: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("deepterm-completion-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn local_completion_is_async_and_discards_stale_results() {
+    let dir = temp_completion_dir("plain");
+    std::fs::write(dir.join("alpha.txt"), "x").unwrap();
+    std::fs::write(dir.join("beta.txt"), "x").unwrap();
+
+    let mut manager = BuiltinCommandManager::new();
+    manager.set_local_cwd(Some(dir.clone()));
+    manager.update("/open ");
+    let first = manager.pending_local_request().expect("local request");
+    assert_eq!(first.context, LocalCompletionContext::Plain);
+    assert_eq!(first.cwd.as_deref(), Some(dir.as_path()));
+    assert!(manager.is_loading_local);
+    assert!(
+        manager.path_completions.iter().any(|i| i.is_placeholder()),
+        "读取期间应显示占位项"
+    );
+
+    manager.update("/open a");
+    let second = manager.pending_local_request().expect("second request");
+    assert_ne!(first.id, second.id);
+
+    // 旧代次的结果必须丢弃。
+    manager.apply_local_completion_result(
+        first.id,
+        vec![PathCompletionItem {
+            name: "stale.txt".to_string(),
+            path: dir.join("stale.txt"),
+            is_directory: false,
+            kind: CompletionKind::File,
+            description: None,
+            icon: None,
+            replacement: None,
+        }],
+    );
+    assert!(
+        !manager
+            .path_completions
+            .iter()
+            .any(|i| i.name == "stale.txt"),
+        "过期结果不得覆盖当前补全"
+    );
+
+    let items = PathCompletionEngine::complete(&second.prefix, second.cwd.as_deref());
+    manager.apply_local_completion_result(second.id, items);
+    assert!(
+        manager
+            .path_completions
+            .iter()
+            .any(|i| i.name == "alpha.txt"),
+        "当前代次的结果应写入列表"
+    );
+    assert!(!manager.is_loading_local);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scp_local_path_completion_is_async_with_host_prefix() {
+    let dir = temp_completion_dir("scp-local");
+    std::fs::write(dir.join("remote.txt"), "x").unwrap();
+
+    let mut manager = BuiltinCommandManager::new();
+    manager.set_ssh_configs(vec![]);
+    manager.set_local_cwd(Some(dir.clone()));
+    manager.update(&format!("/scp Local:{}/", dir.display()));
+    let request = manager.pending_local_request().expect("local request");
+    assert_eq!(
+        request.context,
+        LocalCompletionContext::ScpLocalPath {
+            host_token: "Local".to_string()
+        }
+    );
+    assert!(
+        manager.path_completions.iter().any(|i| i.is_placeholder()),
+        "读取期间应显示占位项"
+    );
+
+    let items = PathCompletionEngine::complete(&request.prefix, request.cwd.as_deref());
+    manager.apply_local_completion_result(request.id, items);
+    let hit = manager
+        .path_completions
+        .iter()
+        .find(|i| i.name == "remote.txt")
+        .expect("local file should be listed");
+    assert!(
+        hit.replacement
+            .as_deref()
+            .is_some_and(|r| r.starts_with("Local:")),
+        "补全 token 应保留 host 前缀"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn scp_host_or_local_appends_local_files_to_host_candidates() {
+    let dir = temp_completion_dir("scp-host-local");
+    std::fs::write(dir.join("local-file.txt"), "x").unwrap();
+
+    let mut manager = BuiltinCommandManager::new();
+    manager.set_ssh_configs(vec![]);
+    manager.set_local_cwd(Some(dir.clone()));
+    manager.update("/scp ");
+    let request = manager.pending_local_request().expect("local request");
+    assert_eq!(request.context, LocalCompletionContext::ScpHostOrLocal);
+
+    let items = PathCompletionEngine::complete(&request.prefix, request.cwd.as_deref());
+    manager.apply_local_completion_result(request.id, items);
+    assert!(
+        manager
+            .path_completions
+            .iter()
+            .any(|i| i.name == "local-file.txt"),
+        "主机候选之后应追加本机文件"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

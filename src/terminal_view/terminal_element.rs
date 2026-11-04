@@ -288,28 +288,36 @@ fn retarget_row_cache(cache: &mut RowRenderCache, row: usize) {
 
 /// 按滚动位移平移行缓存：`new[i] = old[i + shift]`，越界行留空待重建。
 fn rotate_row_caches(
-    caches: Vec<RowRenderCache>,
+    mut caches: Vec<RowRenderCache>,
     shift: isize,
     rows: usize,
 ) -> Vec<RowRenderCache> {
     if shift == 0 || rows == 0 {
         return caches;
     }
-    let mut slots: Vec<Option<RowRenderCache>> = caches.into_iter().map(Some).collect();
-    let mut rotated = Vec::with_capacity(rows);
-    for index in 0..rows {
-        let source = index as isize + shift;
-        let cache = if source >= 0 {
-            slots
-                .get_mut(source as usize)
-                .and_then(Option::take)
-                .unwrap_or_default()
-        } else {
-            RowRenderCache::default()
-        };
-        rotated.push(cache);
+    if caches.len() != rows {
+        caches.resize_with(rows, RowRenderCache::default);
     }
-    rotated
+    let magnitude = shift.unsigned_abs();
+    if magnitude >= rows {
+        for cache in &mut caches {
+            *cache = RowRenderCache::default();
+        }
+        return caches;
+    }
+    // 原地旋转，越界端重置为默认；不再分配 slots/rotated 两个 Vec。
+    if shift > 0 {
+        caches.rotate_left(magnitude);
+        for cache in &mut caches[rows - magnitude..] {
+            *cache = RowRenderCache::default();
+        }
+    } else {
+        caches.rotate_right(magnitude);
+        for cache in &mut caches[..magnitude] {
+            *cache = RowRenderCache::default();
+        }
+    }
+    caches
 }
 
 /// 盒子绘制字符 / 块元素单元格。
@@ -2678,6 +2686,12 @@ mod tests {
         assert_eq!(caches[0].fingerprint, Some(2));
         assert_eq!(caches[1].fingerprint, Some(3));
         assert_eq!(caches[2].fingerprint, None);
+
+        // 下滚一行：新 0 行是新内容，新 1/2 行来自旧 0/1 行。
+        caches = rotate_row_caches(caches, -1, 3);
+        assert_eq!(caches[0].fingerprint, None);
+        assert_eq!(caches[1].fingerprint, Some(2));
+        assert_eq!(caches[2].fingerprint, Some(3));
 
         // 平移后必须把 span 的绝对行号重标到新下标。
         let mut cache = RowRenderCache {

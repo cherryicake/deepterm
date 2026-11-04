@@ -3,14 +3,14 @@
 //! Ported from gpui-component's `input/search.rs`, adapted to deepterm's
 //! component set (no `Label` / `IconName` / flex helpers).
 
-use std::{ops::Range, rc::Rc};
+use std::{ops::Range, rc::Rc, time::Duration};
 
 use aho_corasick::AhoCorasick;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, FocusHandle, Focusable, Hsla,
     InteractiveElement, IntoElement, MouseButton, ParentElement, Render, Styled, Subscription,
-    Window, actions, div, px, relative,
+    WeakEntity, Window, actions, div, px, relative,
 };
 use ropey::Rope;
 
@@ -126,6 +126,15 @@ impl SearchMatcher {
             current_match_ix: 0,
             replacing: false,
         }
+    }
+
+    /// 关闭面板时释放全文副本与命中集；query 与输入框内容保留，
+    /// 下次打开由宿主重新 `update` 文本。
+    pub(crate) fn release_text(&mut self) {
+        self.text = Rope::new();
+        self.matched_ranges = Rc::new(Vec::new());
+        self.current_match_ix = 0;
+        self.replacing = false;
     }
 
     /// Update source text and re-match.
@@ -385,7 +394,9 @@ pub(crate) trait SearchTarget: 'static + Sized {
 }
 
 pub(crate) struct SearchPanel<T: SearchTarget = InputState> {
-    editor: Entity<T>,
+    /// 宿主持弱引用：面板与被搜索的编辑器互相强引用会形成环，关闭标签后
+    /// 整份文档（`Rope`、display map、布局缓存、undo 历史）都无法释放。
+    editor: WeakEntity<T>,
     search_input: Entity<InputState>,
     replace_input: Entity<InputState>,
     case_insensitive: bool,
@@ -398,6 +409,9 @@ pub(crate) struct SearchPanel<T: SearchTarget = InputState> {
     preserve_case: bool,
     replace_mode: bool,
     matcher: SearchMatcher,
+    /// 宿主连续编辑时合并同步：只保留最新文本，60ms 后重扫一次。
+    pending_sync: Option<Rope>,
+    sync_generation: u64,
 
     open: bool,
     _subscriptions: Vec<Subscription>,
@@ -418,8 +432,8 @@ impl InputState {
         }
 
         let text = self.text.clone();
-        search_panel.update(cx, |this, _| {
-            this.matcher.update(&text);
+        search_panel.update(cx, |this, cx| {
+            this.sync_text_debounced(text, cx);
         });
     }
 
@@ -435,15 +449,15 @@ impl InputState {
 
         let search_panel = match self.search_panel.as_ref() {
             Some(panel) => panel.clone(),
-            None => SearchPanel::new(cx.entity(), window, cx),
+            None => SearchPanel::new(cx.entity().downgrade(), window, cx),
         };
 
         let text = self.text.clone();
         let editor = cx.entity();
         let selected_text = Rope::from(self.selected_text());
         search_panel.update(cx, |this, cx| {
-            this.editor = editor;
-            this.matcher.update(&text);
+            this.editor = editor.downgrade();
+            this.sync_text(&text);
             this.show(&selected_text, window, cx);
         });
         self.search_panel = Some(search_panel);
@@ -543,7 +557,7 @@ impl<T: SearchTarget> SearchPanel<T> {
 
     // 没有「替换并跳到上一个」的入口，`prev_scroll_direction` 因此没有调用点。
 
-    pub fn new(editor: Entity<T>, window: &mut Window, cx: &mut App) -> Entity<Self> {
+    pub fn new(editor: WeakEntity<T>, window: &mut Window, cx: &mut App) -> Entity<Self> {
         let search_input = cx.new(|cx| InputState::new(window, cx));
         let replace_input = cx.new(|cx| InputState::new(window, cx).placeholder("替换"));
 
@@ -566,6 +580,8 @@ impl<T: SearchTarget> SearchPanel<T> {
                 // 替换行默认收起，通过左侧 ⌄ 折叠开关展开。
                 replace_mode: false,
                 matcher: SearchMatcher::new(),
+                pending_sync: None,
+                sync_generation: 0,
                 open: true,
                 _subscriptions,
             }
@@ -598,6 +614,9 @@ impl<T: SearchTarget> SearchPanel<T> {
         // 此处不能同步 read/update 编辑器（重入借用会 panic），必须延迟执行。
         let editor = self.editor.clone();
         cx.defer_in(window, move |this, window, cx| {
+            let Some(editor) = editor.upgrade() else {
+                return;
+            };
             let start = editor.read(cx).anchor_offset();
             if let Some(start) = start {
                 this.matcher.update_cursor_by_offset(start);
@@ -628,7 +647,10 @@ impl<T: SearchTarget> SearchPanel<T> {
 
     fn update_search_query(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.read(cx).value().to_string();
-        let visible_range_offset = self.editor.read(cx).anchor_offset();
+        let visible_range_offset = self
+            .editor
+            .upgrade()
+            .and_then(|editor| editor.read(cx).anchor_offset());
 
         self.matcher.update_query_ext(
             &query,
@@ -663,7 +685,9 @@ impl<T: SearchTarget> SearchPanel<T> {
         else {
             return;
         };
-        let editor = self.editor.clone();
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
         editor.update(cx, |state, cx| {
             state.reveal_match(range, window, cx);
         });
@@ -671,7 +695,10 @@ impl<T: SearchTarget> SearchPanel<T> {
 
     /// 按 dir（+1 下一个 / -1 上一个）跳转：以编辑器光标为锚点对齐当前索引后 ±1（循环）。
     pub(crate) fn jump(&mut self, dir: i32, window: &mut Window, cx: &mut Context<Self>) {
-        let caret = self.editor.read(cx).search_caret();
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
+        let caret = editor.read(cx).search_caret();
         if let Some(target) = jump_target(&self.matcher.matched_ranges, caret, dir) {
             self.matcher.current_match_ix = target;
             self.reveal_current_match(window, cx);
@@ -680,8 +707,35 @@ impl<T: SearchTarget> SearchPanel<T> {
     }
 
     /// 文档变化时同步全文（宿主每次编辑后调用，`InputState::update_search` parity）。
+    ///
+    /// 立即同步会取消挂起的防抖任务，保证打开面板/程序化替换后立即可用。
     pub(crate) fn sync_text(&mut self, text: &Rope) {
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.pending_sync = None;
         self.matcher.update(text);
+    }
+
+    /// 宿主击键触发的同步：60ms 防抖，连续输入只在停顿后重扫一次。
+    pub(crate) fn sync_text_debounced(&mut self, text: Rope, cx: &mut Context<Self>) {
+        self.pending_sync = Some(text);
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        let generation = self.sync_generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(60))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.sync_generation != generation || !panel.open {
+                    return;
+                }
+                let Some(text) = panel.pending_sync.take() else {
+                    return;
+                };
+                panel.matcher.update(&text);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -697,13 +751,22 @@ impl<T: SearchTarget> SearchPanel<T> {
     }
 
     fn replaceable(&self, cx: &App) -> bool {
-        self.editor.read(cx).search_replaceable()
+        self.editor
+            .upgrade()
+            .is_some_and(|editor| editor.read(cx).search_replaceable())
     }
 
     pub(crate) fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open = false;
-        let handle = self.editor.read(cx).target_focus_handle(cx);
-        handle.focus(window, cx);
+        // 关闭时取消挂起的防抖同步，并释放匹配用的全文副本；输入框里的
+        // query 保留，下次 `show` 会由宿主重新同步文本并重算命中。
+        self.sync_generation = self.sync_generation.wrapping_add(1);
+        self.pending_sync = None;
+        self.matcher.release_text();
+        if let Some(editor) = self.editor.upgrade() {
+            let handle = editor.read(cx).target_focus_handle(cx);
+            handle.focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -730,7 +793,10 @@ impl<T: SearchTarget> SearchPanel<T> {
     }
 
     fn on_action_tab(&mut self, _: &IndentInline, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.editor.read(cx).target_focus_handle(cx);
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
+        let handle = editor.read(cx).target_focus_handle(cx);
         handle.focus(window, cx);
     }
 
@@ -770,10 +836,13 @@ impl<T: SearchTarget> SearchPanel<T> {
             .get(self.matcher.current_match_ix)
             .cloned()
         {
-            let content = self.editor.read(cx).search_text();
+            let Some(editor) = self.editor.upgrade() else {
+                return;
+            };
+            let content = editor.read(cx).search_text();
             let matched = content.slice(range.clone()).to_string();
             let replacement = apply_case_preservation(&new_text, &matched, preserve_case);
-            let text_state = self.editor.clone();
+            let text_state = editor.clone();
             let next_match_ix = self.matcher.next_ix().unwrap_or(previous_match_ix);
             let next_range = self.matcher.peek().unwrap_or(range.clone());
             self.matcher.current_match_ix = next_match_ix;
@@ -805,7 +874,10 @@ impl<T: SearchTarget> SearchPanel<T> {
             return;
         }
         // 逐匹配算好替换串（含保留大小写），宿主只做一次批量替换。
-        let content = self.editor.read(cx).search_text();
+        let Some(editor) = self.editor.upgrade() else {
+            return;
+        };
+        let content = editor.read(cx).search_text();
         let pairs: Vec<(Range<usize>, String)> = ranges
             .iter()
             .map(|range| {
@@ -817,7 +889,6 @@ impl<T: SearchTarget> SearchPanel<T> {
             })
             .collect();
 
-        let editor = self.editor.clone();
         cx.spawn_in(window, async move |_, cx| {
             cx.update(|window, cx| {
                 editor.update(cx, |state, cx| {
@@ -1258,6 +1329,23 @@ mod tests {
     }
 
     #[test]
+    fn release_text_drops_matches_and_keeps_query() {
+        let mut matcher = SearchMatcher::new();
+        matcher.update(&Rope::from("foo foo"));
+        matcher.update_query("foo", true, false);
+        assert_eq!(matcher.len(), 2);
+
+        matcher.release_text();
+        assert_eq!(matcher.len(), 0);
+        assert_eq!(matcher.text.len(), 0);
+        assert!(!matcher.replacing);
+
+        // query 保留：重新同步文本后无需重新输入即可恢复命中。
+        matcher.update(&Rope::from("foo"));
+        assert_eq!(matcher.len(), 1);
+    }
+
+    #[test]
     fn test_update_matches_clamps_current_match_index_while_replacing() {
         let mut matcher = SearchMatcher::new();
         matcher.update(&Rope::from("foo foo foo"));
@@ -1271,6 +1359,45 @@ mod tests {
         assert_eq!(matcher.current_match_ix, 1);
         assert_eq!(matcher.label(), "第2项，共2项");
         assert!(!matcher.replacing);
+    }
+
+    /// 回归：面板曾经强引用宿主，`InputState -> SearchPanel -> InputState`
+    /// 形成环，关闭标签后整份文档不会释放。
+    #[gpui::test]
+    fn search_panel_does_not_keep_host_alive(cx: &mut gpui::TestAppContext) {
+        struct Host;
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        let cell = std::cell::RefCell::new(None);
+        let (host, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| InputState::new(window, cx).code_editor("rust"));
+            *cell.borrow_mut() = Some(input);
+            Host
+        });
+        let input = cell.into_inner().unwrap();
+        input
+            .downgrade()
+            .update_in(cx, |state, window, cx| {
+                state.searchable = true;
+                state.on_action_search(&crate::components::input::Search, window, cx);
+            })
+            .unwrap();
+        assert!(input.read_with(cx, |state, _| state.search_panel.is_some()));
+
+        let weak = input.downgrade();
+        drop(input);
+        drop(host);
+        cx.run_until_parked();
+
+        assert!(weak.upgrade().is_none(), "SearchPanel 不得持有宿主的强引用");
     }
 }
 

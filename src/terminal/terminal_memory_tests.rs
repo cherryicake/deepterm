@@ -828,3 +828,27 @@ fn incremental_snapshot_rebuilds_far_fewer_cells(cx: &mut TestAppContext) {
          增量路径疑似退化为全量"
     );
 }
+
+/// 部分帧只重算脏行的内容指纹，其余行沿用上一帧，避免每帧 O(视口) 哈希。
+#[gpui::test]
+fn partial_frame_hashes_only_dirty_rows(cx: &mut TestAppContext) {
+    let terminal = cx.update(|cx| {
+        let t = Terminal::new_headless(cx, 1_000);
+        t.update(cx, |t, cx| feed(t, 60, 0, cx));
+        t
+    });
+    // 预热到稳定行切片，并让上一帧指纹填满视口。
+    cx.update(|cx| {
+        terminal.update(cx, |t, cx| t.sync_for_test(cx));
+    });
+    let before = cx.update(|cx| terminal.read(cx).snapshot_rows_hashed_for_test());
+    cx.update(|cx| {
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"X\x1b[1D", cx);
+            t.sync_for_test(cx);
+        });
+    });
+    let after = cx.update(|cx| terminal.read(cx).snapshot_rows_hashed_for_test());
+    let hashed = after - before;
+    assert!(hashed <= 2, "单行写入应只重算 1~2 行指纹，实际 {hashed} 行");
+}

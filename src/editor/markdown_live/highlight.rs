@@ -199,7 +199,7 @@ mod tests {
     #[gpui::test]
     fn runs_for_block_covers_lines_exactly(cx: &mut gpui::TestAppContext) {
         cx.update(crate::theme::init);
-        let theme = cx.update(|cx| cx.theme().clone());
+        let theme = cx.update(|cx| cx.theme_shared());
         let lines = vec!["/* header", "still comment */ let x = 1;"];
         let hl = HighlightCache::new();
         let per_line = hl.runs_for_block("rust", &lines, &base(), &theme);
@@ -223,7 +223,7 @@ mod tests {
     #[gpui::test]
     fn runs_for_block_handles_empty_lines(cx: &mut gpui::TestAppContext) {
         cx.update(crate::theme::init);
-        let theme = cx.update(|cx| cx.theme().clone());
+        let theme = cx.update(|cx| cx.theme_shared());
         let lines = vec!["a", "", "b"];
         let hl = HighlightCache::new();
         let per_line = hl.runs_for_block("rust", &lines, &base(), &theme);
@@ -239,7 +239,7 @@ mod tests {
     #[gpui::test]
     fn cache_stays_bounded_and_evictions_recompute(cx: &mut gpui::TestAppContext) {
         cx.update(crate::theme::init);
-        let theme = cx.update(|cx| cx.theme().clone());
+        let theme = cx.update(|cx| cx.theme_shared());
         let hl = HighlightCache::new();
         let n = MAX_ENTRIES + 40;
         // Distinct contents, one per "keystroke" the way block editing does it.
@@ -268,7 +268,7 @@ mod tests {
     #[gpui::test]
     fn reinsert_after_eviction_keeps_bounded(cx: &mut gpui::TestAppContext) {
         cx.update(crate::theme::init);
-        let theme = cx.update(|cx| cx.theme().clone());
+        let theme = cx.update(|cx| cx.theme_shared());
         let hl = HighlightCache::new();
         for i in 0..MAX_ENTRIES + 1 {
             let content = format!("k{i}");

@@ -1260,6 +1260,9 @@ pub struct Terminal {
     /// 测试专用：累计重建了多少个 `IndexedCell`（增量快照收益的直接度量）。
     #[cfg(test)]
     snapshot_cells_built: u64,
+    /// 测试专用：部分帧累计重算了多少行指纹（应只覆盖脏行）。
+    #[cfg(test)]
+    snapshot_rows_hashed: u64,
     /// 每次 update_last_content 后，标记哪些 viewport 行（0 = 顶行）发生了变化
     dirty_rows: Vec<bool>,
     /// 每次 update_last_content 后，记录 viewport 行的脏区列范围 `(left, right)`。
@@ -1451,6 +1454,8 @@ impl Terminal {
             snapshot_fallback_count: 0,
             #[cfg(test)]
             snapshot_cells_built: 0,
+            #[cfg(test)]
+            snapshot_rows_hashed: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
             _event_loop_task: None,
@@ -1671,6 +1676,8 @@ impl Terminal {
                 snapshot_fallback_count: 0,
                 #[cfg(test)]
                 snapshot_cells_built: 0,
+                #[cfg(test)]
+                snapshot_rows_hashed: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 _event_loop_task: Some(event_loop_task),
@@ -1852,6 +1859,8 @@ impl Terminal {
             snapshot_fallback_count: 0,
             #[cfg(test)]
             snapshot_cells_built: 0,
+            #[cfg(test)]
+            snapshot_rows_hashed: 0,
             dirty_rows: Vec::new(),
             dirty_row_bounds: Vec::new(),
             _event_loop_task: None,
@@ -2200,6 +2209,8 @@ impl Terminal {
                 snapshot_fallback_count: 0,
                 #[cfg(test)]
                 snapshot_cells_built: 0,
+            #[cfg(test)]
+            snapshot_rows_hashed: 0,
                 dirty_rows: Vec::new(),
                 dirty_row_bounds: Vec::new(),
                 _event_loop_task: Some(event_loop_task),
@@ -3935,9 +3946,11 @@ impl Terminal {
         let offset_changed = self.last_content.display_offset != display_offset;
         let geometry_changed = size_changed || offset_changed;
         let rebuild_all = full_damage || geometry_changed;
+        // 部分帧若走了兜底全量重建，行切片也可能整体变了；行指纹需全量重算。
+        let mut snapshot_rebuilt_all = rebuild_all;
 
         // 全量重建前留下上一帧的行指纹，用于识别“滚动位移”；部分更新
-        // 没有整体位移，直接按新行重算。
+        // 只更新脏行，未变行沿用上一帧指纹。
         let previous_row_hashes = std::mem::take(&mut self.last_content.row_hashes);
 
         let cells = &mut self.last_content.cells;
@@ -3990,14 +4003,15 @@ impl Terminal {
                 self.snapshot_fallback_count += 1;
             }
             Self::rebuild_viewport_snapshot(cells, row_ranges, content.display_iter, num_rows);
+            snapshot_rebuilt_all = true;
             #[cfg(test)]
             {
                 self.snapshot_cells_built += cells.len() as u64;
             }
         }
 
-        // 行指纹：全量帧用于识别滚动位移（把整行缓存平移复用），
-        // 部分帧也重算一遍，保证下一帧的滚动检测有正确的 old 基准。
+        // 行指纹：全量帧用于识别滚动位移（把整行缓存平移复用）；部分帧只
+        // 更新真正重建过的脏行，未变行沿用上一帧指纹（内容没变，指纹不变）。
         let (row_hashes, scroll_shift) = if rebuild_all {
             // 复用 scratch 缓冲区：全量 damage（滚动/批量输出）每帧都会走到
             // 这里，旧实现每次都 `Vec::with_capacity` 新建一份。
@@ -4025,17 +4039,23 @@ impl Terminal {
             // damage 语义保证其余行未移动），所以只需重算这些行的指纹；
             // 旧实现每次输出都重算整个视口，大窗口 / 高频输出下是纯浪费。
             let mut hashes = previous_row_hashes;
-            if hashes.len() == row_ranges.len() {
-                for (row_idx, (start, end)) in row_ranges.iter().enumerate() {
-                    if self.dirty_rows.get(row_idx).copied().unwrap_or(false) {
-                        hashes[row_idx] = row_content_hash(&cells[*start..*end]);
-                    }
-                }
-            } else {
-                // 防御：长度不一致（不应发生）时退回全量重算。
+            let recompute_all = snapshot_rebuilt_all || hashes.len() != row_ranges.len();
+            if recompute_all {
                 hashes.clear();
-                for (start, end) in row_ranges.iter() {
-                    hashes.push(row_content_hash(&cells[*start..*end]));
+                hashes.reserve(row_ranges.len());
+            }
+            for (row_idx, (start, end)) in row_ranges.iter().enumerate() {
+                if recompute_all || self.dirty_rows.get(row_idx).copied().unwrap_or(false) {
+                    let hash = row_content_hash(&cells[*start..*end]);
+                    if recompute_all {
+                        hashes.push(hash);
+                    } else {
+                        hashes[row_idx] = hash;
+                    }
+                    #[cfg(test)]
+                    {
+                        self.snapshot_rows_hashed += 1;
+                    }
                 }
             }
             (hashes, 0)
@@ -4142,6 +4162,12 @@ impl Terminal {
     #[cfg(test)]
     pub fn snapshot_cells_built_for_test(&self) -> u64 {
         self.snapshot_cells_built
+    }
+
+    /// 测试专用：累计重算了多少行指纹。
+    #[cfg(test)]
+    pub fn snapshot_rows_hashed_for_test(&self) -> u64 {
+        self.snapshot_rows_hashed
     }
 
     /// 测试专用：立刻应用挂起的 resize（绕过 25ms 合并定时器）。
