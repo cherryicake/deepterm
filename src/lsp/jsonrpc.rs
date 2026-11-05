@@ -131,11 +131,6 @@ struct IncomingMessage {
     method: Option<String>,
     #[serde(default)]
     params: Option<Value>,
-    /// 服务器可能用字符串 id（少见但不违规）；统一拒绝并记日志，
-    /// 因为本实现只发数值 id。
-    #[serde(default)]
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
 }
 
 /// 解析一帧：`Content-Length` 头 + 空行 + 载荷。

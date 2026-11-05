@@ -6,13 +6,11 @@ pub mod callbacks;
 pub mod cursor_animation;
 pub mod input;
 pub mod macos_select;
-pub mod macos_sidebar;
 pub mod menu;
 pub mod modal;
 pub mod notification;
 pub mod spinner;
 pub mod stepper;
-pub mod title_bar;
 pub mod tooltip;
 
 /// 为持有 `focus_handle: FocusHandle` 字段的实体实现 Focusable。

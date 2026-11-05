@@ -29,11 +29,7 @@ use gpui::{
 
 use crate::assets::Icon;
 use crate::components::macos_select::{MacosSelect, SelectPopupPosition};
-use crate::components::macos_sidebar::{
-    DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarEvent, SidebarTabGroupState, SidebarTabItem,
-};
 use crate::components::notification::{NotificationKind, NotificationManager};
-use crate::components::title_bar::TitleBar;
 use crate::editor::{Editor, FileTreeEditorState, FileTreeKey};
 use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
@@ -47,6 +43,10 @@ use crate::workspace::persistence::PersistenceManager;
 use crate::workspace::session_state::{
     AppSessionState, WorkspaceGroupSessionState, WorkspaceSessionState,
 };
+use crate::workspace::sidebar::{
+    DEFAULT_TAB_GROUP_ID, MacosSidebar, SidebarEvent, SidebarTabGroupState, SidebarTabItem,
+};
+use crate::workspace::title_bar::TitleBar;
 use crate::workspace::transfer_bell::TransferBellPanel;
 use crate::workspace::window_manager::WindowManager;
 use crate::workspace::workspace::{Workspace, WorkspaceEvent};
@@ -701,7 +701,7 @@ impl AppWindow {
                     let workspace = this.workspace.clone();
                     window.defer(cx, move |window, cx| {
                         if sidebar.read(cx).current_view()
-                            != &crate::components::macos_sidebar::SidebarView::FileTree
+                            != &crate::workspace::sidebar::SidebarView::FileTree
                         {
                             return;
                         }
@@ -726,7 +726,7 @@ impl AppWindow {
                     ssh_config,
                     terminal_cwd,
                 } => {
-                    crate::sidebar_view::open_path::handle_open_path(
+                    crate::workspace::sidebar::handle_open_path(
                         this.editor.clone(),
                         this.sidebar.clone(),
                         path.clone(),
@@ -1013,10 +1013,10 @@ impl AppWindow {
         // 根据侧边栏当前视图决定下拉的选中态：二级页时高亮对应一级菜单
         let current_view = self.sidebar.read(cx).current_view().clone();
         let selected_label: SharedString = match current_view {
-            crate::components::macos_sidebar::SidebarView::Host => "Host".into(),
-            crate::components::macos_sidebar::SidebarView::Keychain => "Keychain".into(),
-            crate::components::macos_sidebar::SidebarView::Theme => "主题".into(),
-            crate::components::macos_sidebar::SidebarView::Font => "字体".into(),
+            crate::workspace::sidebar::SidebarView::Host => "Host".into(),
+            crate::workspace::sidebar::SidebarView::Keychain => "Keychain".into(),
+            crate::workspace::sidebar::SidebarView::Theme => "主题".into(),
+            crate::workspace::sidebar::SidebarView::Font => "字体".into(),
             _ => tab_selected_label,
         };
         let mut item_labels: Vec<SharedString> =
@@ -1169,8 +1169,8 @@ impl AppWindow {
                         let view = this.sidebar.read(cx).current_view();
                         !matches!(
                             view,
-                            crate::components::macos_sidebar::SidebarView::Menu
-                                | crate::components::macos_sidebar::SidebarView::FileTree
+                            crate::workspace::sidebar::SidebarView::Menu
+                                | crate::workspace::sidebar::SidebarView::FileTree
                         )
                     };
                     if is_secondary_view {
@@ -1240,8 +1240,7 @@ impl AppWindow {
         let sidebar = self.sidebar.clone();
         let workspace = self.workspace.clone();
         window.defer(cx, move |window, cx| {
-            if *sidebar.read(cx).current_view()
-                != crate::components::macos_sidebar::SidebarView::FileTree
+            if *sidebar.read(cx).current_view() != crate::workspace::sidebar::SidebarView::FileTree
             {
                 return;
             }
@@ -1634,8 +1633,8 @@ impl Render for AppWindow {
             });
         }
 
-        let is_menu_view = *self.sidebar.read(cx).current_view()
-            == crate::components::macos_sidebar::SidebarView::Menu;
+        let is_menu_view =
+            *self.sidebar.read(cx).current_view() == crate::workspace::sidebar::SidebarView::Menu;
         let top_control: gpui::AnyElement = if is_menu_view {
             self.render_new_tab_group_button(window, cx)
                 .into_any_element()
@@ -1840,10 +1839,7 @@ mod init_tests {
                 "SettingsStore"
             );
             assert!(cx.has_global::<crate::theme::ThemeState>(), "ThemeState");
-            assert!(
-                cx.has_global::<crate::sidebar_view::font_settings::FontState>(),
-                "FontState"
-            );
+            assert!(cx.has_global::<crate::settings::FontState>(), "FontState");
             assert!(cx.has_global::<crate::lsp::LspManager>(), "LspManager");
         });
     }

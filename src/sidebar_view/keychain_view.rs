@@ -14,7 +14,7 @@ use crate::components::input::{EditorInput, InputEvent, InputState};
 use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::components::modal::{Modal, ModalState};
 use crate::sidebar_view::keychain_editor::KeychainEditor;
-use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
+use crate::sidebar_view::style::{round_icon_button, row_selection_state};
 use crate::ssh::keychain::{KeychainItem, KeychainItemKind, KeychainStore};
 use crate::theme::ActiveTheme;
 
@@ -212,30 +212,17 @@ impl Render for KeychainSidebarView {
             .px(px(4.0))
             .mb(px(8.0))
             .child(
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(button_bg(theme))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(theme)))
-                    .child(
-                        gpui::svg()
-                            .size(px(8.0))
-                            .path(Icon::ChevronLeft.path())
-                            .text_color(theme.text),
-                    )
-                    .on_mouse_down(MouseButton::Left, {
+                round_icon_button(theme, Icon::ChevronLeft, 8.0).on_mouse_down(
+                    MouseButton::Left,
+                    {
                         let on_select = on_select.clone();
                         move |_, window, cx| {
                             if let Some(ref f) = on_select {
                                 f("__back", window, cx);
                             }
                         }
-                    }),
+                    },
+                ),
             )
             .child(
                 div()
@@ -245,27 +232,11 @@ impl Render for KeychainSidebarView {
                     .child("Keychain"),
             )
             .child(
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(button_bg(theme))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(theme)))
-                    .child(
-                        gpui::svg()
-                            .size(px(12.0))
-                            .path(Icon::Plus.path())
-                            .text_color(theme.text),
-                    )
-                    .on_mouse_down(MouseButton::Left, {
-                        cx.listener(|this, _, window, cx| {
-                            this.open_new_key_modal(window, cx);
-                        })
-                    }),
+                round_icon_button(theme, Icon::Plus, 12.0).on_mouse_down(MouseButton::Left, {
+                    cx.listener(|this, _, window, cx| {
+                        this.open_new_key_modal(window, cx);
+                    })
+                }),
             );
 
         // 搜索框
@@ -477,13 +448,7 @@ fn render_keychain_item_row(
         .gap(px(10.0))
         .rounded(px(8.0))
         .cursor_pointer()
-        .when(is_selected, |this| {
-            this.bg(theme.accent).text_color(theme.accent_foreground)
-        })
-        .when(!is_selected, |this| {
-            this.hover(|style| style.bg(hover_bg(theme)))
-                .text_color(theme.text)
-        })
+        .map(row_selection_state(theme, is_selected))
         .child(
             div()
                 .w(px(32.0))

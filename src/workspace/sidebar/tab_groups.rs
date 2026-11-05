@@ -544,13 +544,7 @@ impl MacosSidebar {
             .rounded(px(8.0))
             .cursor_pointer()
             .on_hover(on_hover)
-            .when(is_selected, |this| {
-                this.bg(theme.accent).text_color(theme.accent_foreground)
-            })
-            .when(!is_selected, |this| {
-                this.hover(|style| style.bg(hover_bg(theme)))
-                    .text_color(theme.text)
-            })
+            .map(row_selection_state(theme, is_selected))
             .child(
                 div()
                     .size(px(SIDEBAR_ROW_ICON_BOX))

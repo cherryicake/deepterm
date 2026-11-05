@@ -5,13 +5,16 @@
 //! - [`tab_groups`]：标签页组的状态管理（创建/重命名/删除/折叠）与渲染
 //! - [`file_tree`]：文件树与 Git 面板的接线（订阅、会话绑定）与渲染
 //! - [`content`]：菜单列表与各二级页面（主题/字体/主机/密钥串）渲染、顶部 chrome 按钮
+//! - [`open_path`]：终端点击路径到编辑器与文件树的协调逻辑
 //! - [`resize`]：宽度拖拽的全局鼠标事件元素
 
 mod content;
 mod file_tree;
+mod open_path;
 mod resize;
 mod tab_groups;
 
+pub(crate) use open_path::handle_open_path;
 use resize::SidebarResizeElement;
 
 use std::collections::HashMap;
@@ -40,8 +43,8 @@ use crate::sidebar_view::font_view::FontSettingsView;
 use crate::sidebar_view::host_view::HostView;
 use crate::sidebar_view::keychain_view::KeychainSidebarView;
 use crate::sidebar_view::style::{
-    border_color, button_bg, button_bg_hover, glass_bg, glass_bottom_shade, glass_top_highlight,
-    hover_bg,
+    border_color, glass_bg, glass_bottom_shade, glass_top_highlight, hover_bg, round_icon_button,
+    row_selection_state,
 };
 use crate::sidebar_view::theme_view;
 use crate::ssh::SshConnectionConfig;

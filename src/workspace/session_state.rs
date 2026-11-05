@@ -17,7 +17,7 @@ impl Default for AppSessionState {
     fn default() -> Self {
         Self {
             version: SESSION_STATE_VERSION,
-            active_group_id: crate::components::macos_sidebar::DEFAULT_TAB_GROUP_ID.to_string(),
+            active_group_id: crate::workspace::sidebar::DEFAULT_TAB_GROUP_ID.to_string(),
             groups: Vec::new(),
         }
     }

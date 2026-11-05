@@ -7,8 +7,8 @@ use gpui::{
     WindowDecorations, WindowOptions,
 };
 
+use super::title_bar::TitleBar;
 use crate::AppWindow;
-use crate::components::title_bar::TitleBar;
 
 /// Manages all open DeepTerm windows.
 ///

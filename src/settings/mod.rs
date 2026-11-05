@@ -10,17 +10,19 @@
 //! 文件里，避免把「可手改」与「程序自管」混在一处。
 
 pub mod content;
+pub mod font_state;
 pub mod store;
 pub mod watcher;
 
 pub use content::*;
+pub use font_state::FontState;
 pub use store::{Settings, SettingsStore};
 
 use gpui::App;
 
 /// 初始化设置系统：读取默认文档与用户文件、完成首轮求值、启动热重载。
 ///
-/// 必须在 `theme::init` 与 `FontState::init` 之前调用——这两者改为从
+/// 必须在 `theme::init` 与 [`FontState::init`] 之前调用——这两者改为从
 /// [`SettingsStore`] 取值，而不是各自读文件。
 pub fn init(cx: &mut App) {
     SettingsStore::init(cx);
@@ -35,7 +37,7 @@ pub fn init(cx: &mut App) {
 fn observe(cx: &mut App) {
     cx.observe_global::<SettingsStore>(|cx| {
         crate::theme::ThemeState::sync_from_settings(cx);
-        crate::sidebar_view::font_settings::FontState::sync_from_settings(cx);
+        FontState::sync_from_settings(cx);
         // vim 开关决定是否加载 vim 键位表，所以设置一变就要重建 keymap。
         crate::keymap::reload(cx);
         // 关闭 vim 时清掉各编辑器残留的模式状态：否则 Normal 模式会继续
@@ -56,15 +58,11 @@ mod tests {
         cx.update(|cx| {
             SettingsStore::init_for_test(cx);
             crate::theme::init(cx);
-            crate::sidebar_view::font_settings::FontState::init(cx);
+            FontState::init(cx);
             observe(cx);
         });
 
-        let before_font = cx.update(|cx| {
-            crate::sidebar_view::font_settings::FontState::global(cx)
-                .settings
-                .editor_font_size
-        });
+        let before_font = cx.update(|cx| FontState::global(cx).settings.editor_font_size);
         let before_theme = cx.update(|cx| {
             crate::theme::ThemeState::global(cx)
                 .active_theme_id()
@@ -95,11 +93,7 @@ mod tests {
             });
         });
 
-        let after_font = cx.update(|cx| {
-            crate::sidebar_view::font_settings::FontState::global(cx)
-                .settings
-                .editor_font_size
-        });
+        let after_font = cx.update(|cx| FontState::global(cx).settings.editor_font_size);
         let after_theme = cx.update(|cx| {
             crate::theme::ThemeState::global(cx)
                 .active_theme_id()
@@ -120,12 +114,12 @@ mod tests {
         cx.update(|cx| {
             assert!(cx.try_global::<SettingsStore>().is_none());
             crate::theme::init(cx);
-            crate::sidebar_view::font_settings::FontState::init(cx);
+            FontState::init(cx);
         });
 
         cx.update(|cx| {
             assert!(crate::theme::ThemeState::themes(cx).len() > 1);
-            let font = crate::sidebar_view::font_settings::FontState::global(cx);
+            let font = FontState::global(cx);
             assert!(font.settings.editor_font_size > 0.0);
         });
     }

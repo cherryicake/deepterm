@@ -4,7 +4,7 @@ use gpui::prelude::*;
 use gpui::{App, MouseButton, ScrollHandle, Window, div, px};
 
 use crate::assets::Icon;
-use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
+use crate::sidebar_view::style::{round_icon_button, row_selection_state};
 use crate::theme::ThemeState;
 
 /// 渲染主题侧边栏视图
@@ -33,26 +33,10 @@ where
         .px(px(4.0))
         .mb(px(8.0))
         .child(
-            div()
-                .w(px(28.0))
-                .h(px(28.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(999.0))
-                .bg(button_bg(theme))
-                .cursor_pointer()
-                .hover(|style| style.bg(button_bg_hover(theme)))
-                .child(
-                    gpui::svg()
-                        .size(px(8.0))
-                        .path(Icon::ChevronLeft.path())
-                        .text_color(theme.text),
-                )
-                .on_mouse_down(MouseButton::Left, {
-                    let on_select = on_select.clone();
-                    move |_, window, cx| on_select("__back", window, cx)
-                }),
+            round_icon_button(theme, Icon::ChevronLeft, 8.0).on_mouse_down(MouseButton::Left, {
+                let on_select = on_select.clone();
+                move |_, window, cx| on_select("__back", window, cx)
+            }),
         )
         .child(
             div()
@@ -148,13 +132,7 @@ where
             .p(px(10.0))
             .rounded(px(8.0))
             .cursor_pointer()
-            .when(is_active, |this| {
-                this.bg(theme.accent).text_color(theme.accent_foreground)
-            })
-            .when(!is_active, |this| {
-                this.hover(|style| style.bg(hover_bg(theme)))
-                    .text_color(theme.text)
-            })
+            .map(row_selection_state(theme, is_active))
             .flex()
             .flex_row()
             .items_start()

@@ -307,21 +307,21 @@ pub struct ServerKey {
 
 跨文件跳转是唯一的结构性缺口。
 
-`editor.rs:1905` 的 `OpenFile` 分支调 `open_file_at_line_col_no_notify(path, ...)`，
+`editor.rs` 的 `OpenFile` 分支调 `open_file_at_line_col(path, ...)`，
 它内部走 `open_local_file_at`（`editor.rs:3155`）—— **按本地路径打开**。
 远程 LSP 跳转到 `/remote/project/src/lib.rs` 时，这个路径会被当成
 本地路径，结果是在本地文件系统里找一个不存在的文件。
 
 修复很小：`open_lsp_location` 需要知道当前会话是不是远程的，
-是则改调 `open_remote_file_at_line_col_no_notify`
+是则改调 `open_remote_file_at_line_col`
 （`editor.rs:3159`，**已存在，签名正好匹配**）。
 
 ```rust
 LspJumpAction::OpenFile { path, line, col } => {
     match self.active_lsp_session().and_then(|s| s.ssh_config()) {
-        Some(config) => self.open_remote_file_at_line_col_no_notify(
+        Some(config) => self.open_remote_file_at_line_col(
             path.to_string_lossy().to_string(), config, Some(line), Some(col), window, cx),
-        None => self.open_file_at_line_col_no_notify(path, Some(line), Some(col), window, cx),
+        None => self.open_file_at_line_col(path, Some(line), Some(col), window, cx),
     }
 }
 ```
@@ -373,7 +373,7 @@ LspJumpAction::OpenFile { path, line, col } => {
 在传输层改造完成后自动可用，不需要任何额外代码。** 这是主体价值。
 
 第二档只需要在 `open_lsp_location` 加一个路径归属判断，工作量很小
-（`open_remote_file_at_line_col_no_notify` 已经写好了）。
+（`open_remote_file_at_line_col` 已经写好了）。
 跨文件重命名是第二档里唯一有实际工作量的项。
 
 所以方案 A 落地后，远程代码文件的体验与本地基本齐平，
@@ -394,7 +394,7 @@ LspJumpAction::OpenFile { path, line, col } => {
 | 2 | 远端传输：`RemoteLspProcess` 经 russh channel `exec` 起服务器，`ChannelStream` + `tokio-util compat` 桥接两套 trait 家族；两级 PATH 探测 | `src/ssh/lsp_channel.rs` |
 | 3 | 默认关闭：`LspContent::default().enabled = false` + `default_settings.json` 同步；状态栏新增 `LspStatus::NotStarted`，chip 可点开菜单启动 | `src/lsp/registry.rs`、`src/lsp/status.rs`、`src/editor/editor.rs` |
 | 4 | `ServerKey` 增加 `ssh_config` 维度（含手写 `Hash`，字段口径与既有 `PartialEq` 一致）；编辑器放开远程门控 | `src/lsp/project.rs`、`src/ssh/config.rs` |
-| 5 | 跨文件跳转按会话归属分流（远端走 `open_remote_file_at_line_col_no_notify`）；远端 `project_root` 经 SFTP 逐级探测；`didChangeWatchedFiles` 放开为匹配当前 backend | `src/editor/editor.rs`、`src/lsp/project.rs` |
+| 5 | 跨文件跳转按会话归属分流（远端走 `open_remote_file_at_line_col`）；远端 `project_root` 经 SFTP 逐级探测；`didChangeWatchedFiles` 放开为匹配当前 backend | `src/editor/editor.rs`、`src/lsp/project.rs` |
 
 ## 与方案的偏差
 

@@ -766,10 +766,6 @@ pub fn parse_agent_event(payload: &[u8]) -> Option<AgentEvent> {
 
     #[derive(Deserialize)]
     struct Wire {
-        /// 协议版本。当前只有 1，先只做存在性校验，不做分支。
-        #[serde(default)]
-        #[allow(dead_code)]
-        v: u32,
         #[serde(default)]
         agent: Option<String>,
         event: String,

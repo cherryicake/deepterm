@@ -2405,7 +2405,7 @@ impl Workspace {
     pub fn handle_sidebar_tab_double_click(
         &mut self,
         tab_id: &str,
-        sidebar: Entity<crate::components::macos_sidebar::MacosSidebar>,
+        sidebar: Entity<crate::workspace::sidebar::MacosSidebar>,
         window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {

@@ -421,7 +421,6 @@ enum OpenMode {
 #[derive(Clone, Copy)]
 struct OpenOptions {
     mode: OpenMode,
-    notify_app: bool,
     silent: bool,
 }
 
@@ -435,9 +434,6 @@ struct OpenFileRequest {
     ssh_config: Option<SshConnectionConfig>,
     encoding: FileEncoding,
     read_only: bool,
-    /// 历史参数；当前打开路径通过 `cx.notify()` 驱动，不再单独使用。
-    #[allow(dead_code)]
-    notify_app: bool,
     is_loading: bool,
     edit_mode: bool,
     live_mode: bool,
@@ -749,7 +745,7 @@ pub struct Editor {
     /// 一次」，且多占一个进程）。这些文件属于**报告这个位置的服务器的工作区**，
     /// 所以把它的根传过去，二者复用同一个进程。
     ///
-    /// 用表而不是函数参数：跨文件打开要经过 `open_*_at_line_col_no_notify`
+    /// 用表而不是函数参数：跨文件打开要经过 `open_*_at_line_col`
     /// （终端 Cmd+Click 也用它，那边没有会话概念），而远端文件还是异步加载的
     /// ——真正接 LSP 的时刻在 `finish_file_load` 里，中间没有传参的通道。
     lsp_jump_roots: HashMap<(String, Option<(String, u16, String)>), PathBuf>,
@@ -1221,7 +1217,6 @@ impl Editor {
                         cx,
                         OpenOptions {
                             mode: OpenMode::Preview,
-                            notify_app: false,
                             silent: true,
                         },
                     );
@@ -1232,7 +1227,6 @@ impl Editor {
                         cx,
                         OpenOptions {
                             mode: OpenMode::Preview,
-                            notify_app: false,
                             silent: true,
                         },
                     );
@@ -1270,7 +1264,6 @@ impl Editor {
                         cx,
                         OpenOptions {
                             mode: OpenMode::Preview,
-                            notify_app: false,
                             silent: true,
                         },
                     );
@@ -1281,7 +1274,6 @@ impl Editor {
                         cx,
                         OpenOptions {
                             mode: OpenMode::Preview,
-                            notify_app: false,
                             silent: true,
                         },
                     );
@@ -3430,7 +3422,7 @@ impl Editor {
                     self.prune_lsp_jump_roots(&key);
                 }
                 match remote.as_ref() {
-                    Some(ssh_config) => self.open_remote_file_at_line_col_no_notify(
+                    Some(ssh_config) => self.open_remote_file_at_line_col(
                         path_str.clone(),
                         ssh_config.clone(),
                         // 行列留空：目标文本可能还在异步加载，LSP Position
@@ -3441,9 +3433,7 @@ impl Editor {
                         window,
                         cx,
                     ),
-                    None => {
-                        self.open_file_at_line_col_no_notify(path.clone(), None, None, window, cx)
-                    }
+                    None => self.open_file_at_line_col(path.clone(), None, None, window, cx),
                 }
                 // 打开动作可能是同步复用已有标签，也可能是新标签（还在
                 // loading）。两种情况都交给 `jump_to_lsp_position`：它会在
@@ -3622,24 +3612,9 @@ impl Editor {
 
     /// 补全菜单：下一项。
     fn completion_next(&mut self, _: &CompletionNext, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.completion.is_visible() {
-            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
-            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
-            // `IndentInline` / 方向键才会继续执行。
-            cx.propagate();
-            return;
-        }
-        let Some(editor) = self.focused_completion_editor(window, cx) else {
-            cx.propagate();
+        let Some(editor) = self.prepare_completion_navigation(window, cx) else {
             return;
         };
-        // 菜单状态可见时这个键归补全管：即使随后 `validate` 发现菜单过期并
-        // 收起，也不能把 Down 再透给 `editor::MoveDown`。
-        cx.stop_propagation();
-        self.completion.validate(&editor, cx);
-        if !self.completion.is_visible() {
-            return;
-        }
         self.completion.move_selection(1);
         self.completion.sync_selection(&editor, cx);
         cx.notify();
@@ -3647,22 +3622,9 @@ impl Editor {
 
     /// 补全菜单：上一项。
     fn completion_prev(&mut self, _: &CompletionPrev, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.completion.is_visible() {
-            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
-            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
-            // `IndentInline` / 方向键才会继续执行。
-            cx.propagate();
-            return;
-        }
-        let Some(editor) = self.focused_completion_editor(window, cx) else {
-            cx.propagate();
+        let Some(editor) = self.prepare_completion_navigation(window, cx) else {
             return;
         };
-        cx.stop_propagation();
-        self.completion.validate(&editor, cx);
-        if !self.completion.is_visible() {
-            return;
-        }
         self.completion.move_selection(-1);
         self.completion.sync_selection(&editor, cx);
         cx.notify();
@@ -3675,22 +3637,9 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.completion.is_visible() {
-            // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
-            // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
-            // `IndentInline` / 方向键才会继续执行。
-            cx.propagate();
-            return;
-        }
-        let Some(editor) = self.focused_completion_editor(window, cx) else {
-            cx.propagate();
+        let Some(editor) = self.prepare_completion_navigation(window, cx) else {
             return;
         };
-        cx.stop_propagation();
-        self.completion.validate(&editor, cx);
-        if !self.completion.is_visible() {
-            return;
-        }
         self.completion.select_first();
         self.completion.sync_selection(&editor, cx);
         cx.notify();
@@ -3698,25 +3647,40 @@ impl Editor {
 
     /// 补全菜单：最后一项。
     fn completion_last(&mut self, _: &CompletionLast, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.prepare_completion_navigation(window, cx) else {
+            return;
+        };
+        self.completion.select_last();
+        self.completion.sync_selection(&editor, cx);
+        cx.notify();
+    }
+
+    /// 补全导航动作的可见性、焦点与过期校验。
+    ///
+    /// 菜单不可见或焦点不在编辑区时显式放行按键；一旦菜单当时可见，就先消费
+    /// 按键，即使 `validate` 随后发现菜单过期，也不能把方向键透给编辑器。
+    fn prepare_completion_navigation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<InputState>> {
         if !self.completion.is_visible() {
             // GPUI 的动作在冒泡阶段**默认阻断**传播；补全拦截器无条件绑定在
             // `Input` 上，菜单不可见时必须显式放行，后面的 `editor::Enter` /
             // `IndentInline` / 方向键才会继续执行。
             cx.propagate();
-            return;
+            return None;
         }
         let Some(editor) = self.focused_completion_editor(window, cx) else {
             cx.propagate();
-            return;
+            return None;
         };
         cx.stop_propagation();
         self.completion.validate(&editor, cx);
         if !self.completion.is_visible() {
-            return;
+            return None;
         }
-        self.completion.select_last();
-        self.completion.sync_selection(&editor, cx);
-        cx.notify();
+        Some(editor)
     }
 
     /// 补全菜单：确认插入。
@@ -5311,20 +5275,11 @@ impl Editor {
     }
 
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_local_file(path, window, cx, true);
-    }
-
-    pub fn open_file_no_notify(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_local_file(path, window, cx, false);
+        self.open_local_file(path, window, cx);
     }
 
     /// Terminal `Cmd+Click`: open local file and jump to `line:col`.
-    pub fn open_file_at_line_col_no_notify(
+    pub fn open_file_at_line_col(
         &mut self,
         path: PathBuf,
         line: Option<u32>,
@@ -5332,11 +5287,11 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_local_file_at(path, window, cx, false, line, col);
+        self.open_local_file_at(path, window, cx, line, col);
     }
 
     /// Terminal `Cmd+Click`: open remote file and jump to `line:col`.
-    pub fn open_remote_file_at_line_col_no_notify(
+    pub fn open_remote_file_at_line_col(
         &mut self,
         path: String,
         ssh_config: SshConnectionConfig,
@@ -5345,7 +5300,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_remote_file_at(path, ssh_config, window, cx, false, line, col);
+        self.open_remote_file_at(path, ssh_config, window, cx, line, col);
     }
 
     /// Apply a `line:col` jump to an already-open tab. No-op when `line` is
@@ -5676,7 +5631,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Edit,
-                notify_app: true,
                 silent: false,
             },
         );
@@ -5695,26 +5649,18 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Live,
-                notify_app: true,
                 silent: false,
             },
         );
     }
 
-    fn open_local_file(
-        &mut self,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        notify_app: bool,
-    ) {
+    fn open_local_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.open_local_file_inner(
             path,
             window,
             cx,
             OpenOptions {
                 mode: OpenMode::Preview,
-                notify_app,
                 silent: false,
             },
         );
@@ -5725,7 +5671,6 @@ impl Editor {
         path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
-        notify_app: bool,
         line: Option<u32>,
         col: Option<u32>,
     ) {
@@ -5758,7 +5703,6 @@ impl Editor {
                 cx,
                 OpenOptions {
                     mode: OpenMode::Preview,
-                    notify_app,
                     silent: false,
                 },
             );
@@ -5773,7 +5717,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Preview,
-                notify_app,
                 silent: false,
             },
         );
@@ -5790,7 +5733,6 @@ impl Editor {
     ) {
         let edit_mode = options.mode == OpenMode::Edit;
         let live_mode = Self::default_live_mode(&path, edit_mode, options.mode == OpenMode::Live);
-        let notify_app = options.notify_app;
         let silent = options.silent;
         let path_str = path.to_string_lossy().to_string();
         let tab_id = if live_mode {
@@ -5813,7 +5755,7 @@ impl Editor {
         }
 
         if is_image {
-            self.open_image_file(tab_id, path_str, path, None, window, cx, notify_app);
+            self.open_image_file(tab_id, path_str, path, None, window, cx);
             return;
         }
 
@@ -5829,7 +5771,6 @@ impl Editor {
                 ssh_config: None,
                 encoding: FileEncoding::Utf8,
                 read_only: false,
-                notify_app,
                 is_loading: true,
                 edit_mode,
                 live_mode,
@@ -6069,7 +6010,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Preview,
-                notify_app: true,
                 silent: false,
             },
         );
@@ -6081,7 +6021,6 @@ impl Editor {
         ssh_config: SshConnectionConfig,
         window: &mut Window,
         cx: &mut Context<Self>,
-        notify_app: bool,
         line: Option<u32>,
         col: Option<u32>,
     ) {
@@ -6118,7 +6057,6 @@ impl Editor {
                 cx,
                 OpenOptions {
                     mode: OpenMode::Preview,
-                    notify_app,
                     silent: false,
                 },
             );
@@ -6134,7 +6072,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Preview,
-                notify_app,
                 silent: false,
             },
         );
@@ -6169,7 +6106,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Edit,
-                notify_app: true,
                 silent: false,
             },
         );
@@ -6190,7 +6126,6 @@ impl Editor {
             cx,
             OpenOptions {
                 mode: OpenMode::Live,
-                notify_app: true,
                 silent: false,
             },
         );
@@ -6212,7 +6147,6 @@ impl Editor {
             edit_mode,
             options.mode == OpenMode::Live,
         );
-        let notify_app = options.notify_app;
         let silent = options.silent;
         let suffix = if live_mode {
             Self::MARKDOWN_LIVE_SUFFIX
@@ -6240,7 +6174,6 @@ impl Editor {
                 Some(ssh_config),
                 window,
                 cx,
-                notify_app,
             );
             return;
         }
@@ -6265,7 +6198,6 @@ impl Editor {
                     ssh_config: Some(ssh_config.clone()),
                     encoding,
                     read_only: false,
-                    notify_app,
                     is_loading: false, // 有缓存内容
                     edit_mode,
                     live_mode,
@@ -6364,7 +6296,6 @@ impl Editor {
                 ssh_config: Some(ssh_config),
                 encoding: FileEncoding::Utf8,
                 read_only: false,
-                notify_app,
                 is_loading: true,
                 edit_mode,
                 live_mode,
@@ -6396,7 +6327,6 @@ impl Editor {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_image_file(
         &mut self,
         tab_id: String,
@@ -6405,7 +6335,6 @@ impl Editor {
         ssh_config: Option<SshConnectionConfig>,
         window: &mut Window,
         cx: &mut Context<Self>,
-        notify_app: bool,
     ) {
         let load_gen = self.begin_load(&tab_id);
 
@@ -6418,7 +6347,6 @@ impl Editor {
                 ssh_config: ssh_config.clone(),
                 encoding: FileEncoding::Utf8,
                 read_only: false,
-                notify_app,
                 is_loading: true,
                 edit_mode: false, // 图片没有编辑模式
                 live_mode: false,
@@ -6557,7 +6485,6 @@ impl Editor {
         .detach();
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn open_file_with_content(
         &mut self,
         request: OpenFileRequest,
@@ -6572,7 +6499,6 @@ impl Editor {
             ssh_config,
             encoding,
             read_only,
-            notify_app: _,
             is_loading,
             edit_mode,
             live_mode,
@@ -9375,7 +9301,6 @@ mod tests {
                             ssh_config: None,
                             encoding: FileEncoding::Utf8,
                             read_only: false,
-                            notify_app: false,
                             is_loading: false,
                             edit_mode: false,
                             live_mode: true,
@@ -9503,7 +9428,6 @@ mod tests {
                             ssh_config: None,
                             encoding: FileEncoding::Utf8,
                             read_only: false,
-                            notify_app: false,
                             is_loading: false,
                             edit_mode: false,
                             live_mode: false,
@@ -10276,7 +10200,6 @@ mod tests {
                                 ssh_config: None,
                                 encoding: FileEncoding::Utf8,
                                 read_only: false,
-                                notify_app: false,
                                 is_loading: false,
                                 edit_mode: false,
                                 live_mode: live,

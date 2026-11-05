@@ -264,9 +264,13 @@ enum TabContent {
 | `editor/editor.rs` | 9,045 | open、file_io、tabs、lsp、render、tests |
 | `terminal/terminal.rs` | 5,634 | snapshot、agent、input、osc、remote |
 | `terminal_view/terminal_view.rs` | 5,969 | render、scrollbar、search、toast、hooks、builtin_commands |
-| `components/input/state.rs` | 5,886 | search_ui、lsp_ui、decorations、layout、scroll、tests |
+| `components/input/state.rs` | 5,060 | search_ui、decorations、layout、scroll、tests |
 | `components/input/element.rs` | 4,839 | prepaint、paint、overlay、gutter、tests |
 | `workspace/workspace.rs` | 3,010 | transfer_hub、resize、session |
+
+**已落地（2026-11-05）**：`InputState` 的 LSP/hover/completion 状态域
+（约 858 行）原样迁到 `components/input/state/lsp.rs`。`state.rs` 从
+5,918 行降到 5,060 行，拆分前后内容逐行比对一致，无逻辑改动。
 
 | 函数 | 行数 |
 |---|---:|
@@ -298,7 +302,8 @@ enum TabContent {
 
 - `open_file_with_content` 的 13 个位置参数收成 `OpenFileRequest`。
 - `open_local_file_inner` / `open_remote_file_inner` 的 4 个布尔参数收成
-  `OpenOptions { mode: OpenMode, notify_app, silent }`。
+  `OpenOptions { mode: OpenMode, silent }`；早期透传但从未读取的
+  `notify_app` 已于 2026-11-05 删除。
 - 剩余 `too_many_arguments` 从 22 处降到 20 处；`shape_overlay_layout`
   （16 参数）、`render_path_overlay`（11）、`create_remote_terminal`（10）、
   `LiveLine::new`（10）仍待处理。
@@ -341,12 +346,14 @@ feature 也不减少构建时间。
 cfg 分支/fallback。`cargo check --no-default-features` 现在通过。
 若未来确需轻量构建，再把 grammar 依赖设 `optional = true` 并补齐 cfg。
 
-### R5：模块环与层级倒置（部分完成）
+### R5：模块环与层级倒置（本轮范围已完成）
 
 - `ssh/sftp_fs.rs:18` 依赖 `file_manager::file_tree_cache::RemoteFileTreeCache`。
 - `file_manager/file_tree_cache.rs:8` 依赖 `editor::encoding::FileEncoding`。
-- `components/macos_sidebar/mod.rs:35-48` 直接依赖 `sidebar_view`、
-  `file_manager`、`terminal_view` 等业务模块。
+- 原 `components/macos_sidebar` 是 workspace 级应用外壳，却直接依赖
+  `sidebar_view`、`file_manager`、`terminal_view` 等业务模块。
+- `components/title_bar.rs` 直接持有 `Workspace`/`TabBar`，同样属于
+  workspace 外壳。
 
 **已落地**：
 
@@ -355,10 +362,16 @@ cfg 分支/fallback。`cargo check --no-default-features` 现在通过。
 - `sftp_fs::read_file_bytes` 改为先 `metadata` 判大文件，删除对
   `file_manager::file_tree_cache::RemoteFileTreeCache` 的依赖；
   `ssh ↔ file_manager` 的直接环解除。
+- `macos_sidebar` 整体迁到 `workspace/sidebar`，与它实际所处的应用层级一致；
+  `components` 不再承载 workspace 外壳。依赖 `Editor` 与侧栏的
+  `sidebar_view::open_path` 同步迁为 `workspace::sidebar::open_path`，
+  `sidebar_view` 不再反向依赖应用外壳。
+- `TitleBar` 迁到 `workspace/title_bar.rs`，`components` 不再反向依赖
+  `Workspace`/`TabBar`。
 
-**剩余**：`components/macos_sidebar` 仍直接依赖 `sidebar_view`/`file_manager`/
-`terminal_view`；建议改成插槽实体、`TitleBar` 移入 `workspace`。这项改动面
-较大，留作后续独立重构。
+上述依赖倒置已解除。`components/input` 与 editor/LSP 之间仍有更细粒度的
+耦合，编辑器/LSP/终端之间也仍有模块依赖；若继续清理，应按单项依赖拆成
+独立改动。
 
 ### R6：验证基础设施
 
@@ -432,7 +445,8 @@ DEEPTERM_VALIDATE_ROW_CACHE=1 cargo run --release
   搜索面板防抖；本地路径补全异步化；侧边栏配置快照缓存。
 - 结构：`EditorFile` → `TabContent` enum；`OpenFileRequest`/`OpenOptions`；
   移除失效的 `tree-sitter-languages` feature；`FileEncoding` 下沉、
-  `ssh ↔ file_manager` 环解除。
+  `ssh ↔ file_manager` 环解除；`FontState` 下沉到设置层；
+  `macos_sidebar` 归位到 `workspace/sidebar`；`TitleBar` 归位到 workspace。
 
 **仍待做（已单列，避免与行为改动混在一起）**
 
@@ -440,10 +454,9 @@ DEEPTERM_VALIDATE_ROW_CACHE=1 cargo run --release
    `terminal_view.rs`、`input/element.rs` 的超长 render/prepaint/paint。
    这类改动需要按领域逐个提交，且每一步跑完整输入/渲染测试。
 2. R3 God object 子结构：`InputState`、`TerminalView`、`Terminal`、`Editor`。
-3. R5 剩余：`components/macos_sidebar` 对业务模块的反向依赖。
-4. R6：clippy 基线清理、Windows/Linux CI matrix、
+3. R6：clippy 基线清理、Windows/Linux CI matrix、
    `cargo build --timings` 与是否拆 crate 的决策。
-5. 基准：现有 terminal/markdown bench 尚未在本轮复跑；新增 editor bench
+4. 基准：现有 terminal/markdown bench 尚未在本轮复跑；新增 editor bench
    后再给结构重构提供回归数据。
 
 ## 七、进展记录
@@ -501,7 +514,7 @@ DEEPTERM_VALIDATE_ROW_CACHE=1 cargo run --release
 
 - `open_file_with_content` → `OpenFileRequest`（13 参数收成 1 个具名结构）。
 - `open_local_file_inner` / `open_remote_file_inner` 的
-  `notify_app/edit_mode/live_mode/silent` 收成 `OpenMode` + `OpenOptions`。
+  `edit_mode/live_mode/silent` 收成 `OpenMode` + `OpenOptions`。
 - 验证：`cargo test --lib editor::editor::tests`（49 passed）。
 
 ### 2026-11-04：EditorFile 内容模式 enum（R1 完成）
@@ -639,3 +652,120 @@ DEEPTERM_VALIDATE_ROW_CACHE=1 cargo run --release
   `cargo test --lib plain_editor_dirty_check_covers_length_changes`（1 passed）、
   `cargo test --lib dirty`（4 passed）、
   `cargo test --lib content_matches_baseline`（1 passed）。
+
+### 2026-11-05：打开链路与字体设置去重（已完成）
+
+- 删除 `notify_app` 的整条透传链：`OpenOptions`、`OpenFileRequest`、本地/
+  远程图片与文本打开函数都不再接收这个最终被丢弃的布尔值；`_no_notify`
+  后缀失去语义，恢复为 `open_file_at_line_col` /
+  `open_remote_file_at_line_col`，并删除未使用的 `open_file_no_notify`。
+- `FontSettings` 与 `FontContent` 合并为后者；`FontState` 直接读写
+  `SettingsContent.font`，删除 `from_settings`/`into_content` 两段人工转写，
+  同时解除 `settings::content` 对 `sidebar_view::font_settings` 的反向依赖。
+- 删除 `IncomingMessage.jsonrpc`、agent wire `v` 两个只反序列化不读取的字段，
+  以及 `ssh::shell_quote_single` 纯转发包装。
+- 验证：`cargo fmt --all --check`、`cargo check --release --workspace --all-targets`、
+  settings/JSON-RPC/CLI-agent/SSH/LSP-jump 定向测试全绿。完整 lib 测试在
+  release 模式下为 2264 passed / 52 failed / 3 ignored；失败集中在渲染、
+  网络代理、共享内存与 PTY 环境用例（例如 `editor_width_follows_window`
+  单独复跑时 `debug_bounds` 返回 `None`）。
+
+### 2026-11-05：字体状态下沉与侧栏层级归位（已完成）
+
+- `FontState` 从 `sidebar_view::font_settings` 下沉到
+  `settings::font_state`，设置层不再反向依赖 UI 层；原路径保留兼容
+  re-export，现有调用点无需一次性迁移。
+- 原 `components/macos_sidebar` 迁到 `workspace/sidebar`。侧栏是
+  workspace 级应用外壳，不属于可复用组件；`components` 不再承载应用外壳。
+- `TitleBar` 从 `components` 迁到 `workspace/title_bar.rs`，`components`
+  不再反向依赖 `Workspace`/`TabBar`。
+- 依赖 `Editor` 与侧栏的 `sidebar_view::open_path` 同步迁入
+  `workspace/sidebar/open_path.rs`，并收窄为 crate 内可见，解除
+  `sidebar_view → components::macos_sidebar` 的反向依赖。
+- 删除 `editor::git_repository` 内仅转发到 `utils::shell::shell_quote_single`
+  的 `shell_quote` 包装及重复测试，直接复用统一实现。
+- 验证：`cargo fmt --all --check`、`git diff --check`、
+  `cargo check --release --workspace --all-targets`、
+  `cargo clippy --release --workspace --all-targets`；定向测试
+  `settings::tests`（2 passed）、`init_tests`（2 passed）、
+  `workspace::tests`（2 passed）、`test_rust_highlight_use_path`（1 passed）、
+  `editor::git_repository::tests`（21 passed）。
+
+### 2026-11-05：InputState 的 LSP 状态域拆分（已完成）
+
+- 将 `components/input/state.rs` 中连续的 LSP/hover/completion 状态访问、
+  补全应用、诊断版本门控与 LSP 折叠逻辑迁到
+  `components/input/state/lsp.rs`，以子模块内第二个 `impl InputState`
+  扩展状态类型。
+- 主文件从 5,918 行降到 5,060 行；新文件 862 行。迁移块与拆分前逐行
+  `diff` 一致，属于纯移动，无逻辑改动。
+- 验证：`cargo fmt --all --check`、`git diff --check`、
+  `cargo check --release --workspace --all-targets`、
+  `cargo clippy --release --workspace --all-targets`（183 条既有 warning，
+  数量未变）；`cargo test --release --lib components::input` 为
+  214 passed / 3 failed，失败均为 `hover_card_*` 用例读取
+  `debug_bounds`，属于 release 构建不记录布局调试信息的既有环境限制；
+  其余输入、补全、诊断与折叠测试全部通过。
+
+### 2026-11-05：侧栏圆形图标按钮去重（已完成）
+
+- 审计出 7 处完全同构的 28px 圆形图标按钮：主机页返回/更多、密钥串页
+  返回/新增、主题页返回、字体页返回、文件树页返回。各调用点原先把尺寸、
+  圆角、底色、hover、指针与 SVG 样式重复展开 14 行。
+- 在 `sidebar_view::style` 新增 `round_icon_button(theme, icon, icon_size)`，
+  只封装纯视觉样式并返回 `Div`；`id`、`on_click` 与 `on_mouse_down`
+  仍由调用方绑定，避免为不同闭包类型引入泛型回调层。
+- 7 个调用点全部改为单行构造，交互语义与图标尺寸保持不变；同时删除
+  迁移后不再使用的 `button_bg` / `button_bg_hover` 导入。
+- 验证：改动文件 `rustfmt --check`、`git diff --check`、
+  `cargo check --release --workspace --all-targets`、
+  `cargo clippy --release --workspace --all-targets`（183 条既有 warning，
+  数量未变）、`cargo test --release --lib sidebar_view::host_view`
+  （3 passed）。
+- 环境说明：`src/components/stepper/stepper.rs` 与 `assets/icon.png` 曾被
+  误删，前者会使 `cargo fmt --all` / 全仓编译直接失败。后续已从 `HEAD`
+  恢复这两个仍被模块与打包配置引用的文件（见下一条进展记录）。
+
+### 2026-11-05：终端事件分发与列表状态收敛（已完成）
+
+- `TerminalView` 原有三份近乎相同的终端事件订阅：本地、首次 SSH 连接、
+  重连后。公共事件处理完全一致，仅 `Wakeup` / `SelectionsChanged` 与 SSH
+  专属事件依赖连接阶段。新增 `TerminalEventSource` 枚举和统一
+  `handle_terminal_event`，把差异显式保留为三条阶段分支：
+  - 本地：额外 `poll_wsl_cwd`，忽略 SSH 断连/端口转发；
+  - 首次 SSH：额外检测远端 OS，处理 SSH 断连/端口转发；
+  - 重连后：不再重复检测远端 OS，处理 SSH 断连/端口转发。
+- `terminal_view.rs` 相对基线净减 63 行，三套事件匹配不再各自漂移。
+- 侧栏 6 处列表行复用 `row_selection_state(theme, is_selected)`：选中态
+  accent 实底、未选中态 hover 叠加与常规文字色保持原样；行高、内边距、
+  图标和内容布局仍由各列表自行控制。
+- 编辑器补全的下/上/首/末四个导航动作原先各复制 14 行可见性、焦点、
+  按键消费与过期校验；收敛为 `prepare_completion_navigation`，四个动作只
+  保留各自的选择移动逻辑。
+- 删除 `md_image::is_supported_extension` 纯转发包装，调用方统一直接使用
+  `image_viewer::is_image_file`，避免图片扩展名口径出现第二个入口。
+- 验证：`cargo fmt --all --check`、`git diff --check`、
+  `cargo check --release --workspace --all-targets`、
+  `cargo clippy --release --workspace --all-targets`（183 条既有 warning，
+  数量未变）；定向测试 `terminal_view::terminal_view::tests`
+  （17 passed）、`sidebar_view::host_view`（3 passed）、编辑器补全/Enter/Tab
+  （7 passed）、`editor::md_image::tests`（13 passed / 3 failed）。
+  `md_image` 的 3 个失败为既有环境限制：1 个网络访问 `PermissionDenied`，
+  2 个 release 渲染用例读不到布局/加载结果；其余图片路径解析、URL 与缓存
+  用例全部通过。
+
+### 2026-11-05：恢复误删文件并修复全仓编译（已完成）
+
+- 编译阻断根因不是本轮结构改造，而是两个被误删的受版本控制文件：
+  - `src/components/stepper/stepper.rs` 仍被 `stepper/mod.rs` 声明，
+    且 `Stepper` / `StepperStatus` 被 `ssh_view/connect.rs` 实际使用；
+  - `assets/icon.png` 仍被 `[package.metadata.bundle].icon` 与图片相关测试
+    引用。
+- 两者已从 `HEAD` 原样恢复，没有通过删除模块、改导入或绕过打包配置来
+  掩盖缺失文件。
+- 验证：`cargo fmt --all --check`、`git diff --check`、
+  `cargo check --release --workspace --all-targets`、
+  `cargo clippy --release --workspace --all-targets`、
+  `cargo build --release --workspace` 全部通过。Clippy 仍为既有 183 条
+  warning；release 构建仅剩 Cargo 对 `mach2` 用途归属的既有 manifest
+  warning，不影响编译产物。

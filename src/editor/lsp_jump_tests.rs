@@ -14,7 +14,7 @@
 //! `cx.watch_path`，启动真实的 OS 文件监视线程；在 gpui 的
 //! `TestScheduler` 下这些线程会被判为「非确定性活动」并 abort 整个测试
 //! 进程（`test_scheduler.rs` 的 non-determinism 检查）。决策函数把分支
-//! 逻辑完整覆盖，而文件打开本身复用已有的 `open_file_at_line_col_no_notify`
+//! 逻辑完整覆盖，而文件打开本身复用已有的 `open_file_at_line_col`
 //! （它有自己的测试）。
 
 use gpui::AppContext as _;

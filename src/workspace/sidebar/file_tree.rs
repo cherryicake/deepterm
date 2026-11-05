@@ -425,29 +425,13 @@ impl MacosSidebar {
             .px(px(4.0))
             .mb(px(8.0))
             .child(
-                div()
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(button_bg(theme))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(theme)))
-                    .child(
-                        gpui::svg()
-                            .size(px(8.0))
-                            .path(Icon::ChevronLeft.path())
-                            .text_color(theme.text),
-                    )
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        cx.listener(|this, _, _window, cx| {
-                            this.handle_item_select("__back", cx);
-                            this.notify_app_window(cx);
-                        }),
-                    ),
+                round_icon_button(theme, Icon::ChevronLeft, 8.0).on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _window, cx| {
+                        this.handle_item_select("__back", cx);
+                        this.notify_app_window(cx);
+                    }),
+                ),
             )
             .child(self.render_file_tree_panel_tabs(cx));
 

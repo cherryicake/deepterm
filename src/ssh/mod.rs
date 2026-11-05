@@ -62,10 +62,6 @@ fn append_remote_file(script: &mut String, path: &str, marker: &str, content: &s
     script.push('\n');
 }
 
-fn shell_quote_single(value: &str) -> String {
-    crate::utils::shell::shell_quote_single(value)
-}
-
 pub fn remote_shell_tracking_command(initial_cwd: Option<&str>) -> String {
     let mut script = String::new();
     script.push_str(
@@ -127,7 +123,7 @@ printf '\033]1338;%s\007' "$__deepterm_os_id"
         // 在终端里看到 `cd ...`。这等价于给远程 shell 设置启动目录；若目录
         // 不存在或无权限，忽略失败并回到远程默认目录。
         script.push_str("__deepterm_initial_cwd=");
-        script.push_str(&shell_quote_single(cwd.trim()));
+        script.push_str(&crate::utils::shell::shell_quote_single(cwd.trim()));
         script.push_str(
             r#"
 cd "$__deepterm_initial_cwd" 2>/dev/null || true

@@ -458,6 +458,18 @@ struct ForegroundAgentCache {
     refresh_in_flight: bool,
 }
 
+/// 终端事件订阅所处的连接阶段。
+///
+/// 三处订阅大部分事件处理完全一致，只有 `Wakeup` / `SelectionsChanged`
+/// 依赖本地终端、首次 SSH 连接或重连后的差异；用枚举把这些差异显式列在
+/// 统一分发函数里，避免三份事件匹配分支各自漂移。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalEventSource {
+    Local,
+    SshConnecting,
+    SshReconnected,
+}
+
 pub struct TerminalView {
     terminal: Entity<Terminal>,
     terminal_subscription: Option<Subscription>,
@@ -1172,57 +1184,8 @@ impl TerminalView {
         // 本地终端只需要处理基本事件，不需要处理 SSH 相关事件
         let subscription = cx.subscribe(
             &terminal_clone,
-            |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
-                TerminalEvent::TitleChanged => {
-                    this.update_title(cx);
-                }
-                TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                    this.check_remote_os(terminal.clone(), cx);
-                    this.check_tab_label_changed(cx);
-                    this.poll_wsl_cwd(cx);
-                    cx.notify();
-                    // 输出边沿要把「正在滚字」同步给 tab（扫光动画用），
-                    // 并保证输出停下时有一个计时器把状态翻回去。
-                    if this.sync_agent_streaming(cx) {
-                        this.ensure_agent_timer(cx);
-                    }
-                }
-                TerminalEvent::WorkingDirectoryChanged(cwd) => {
-                    this.on_working_directory_changed(cwd, cx);
-                }
-                TerminalEvent::Bell => {
-                    this.on_bell(cx);
-                }
-                TerminalEvent::NotificationReceived { title, body } => {
-                    this.on_notification(title.clone(), body.clone(), cx);
-                }
-                TerminalEvent::CloseTerminal => {
-                    cx.emit(Event::CloseTerminal);
-                }
-                TerminalEvent::ProcessExited(status) => {
-                    cx.emit(Event::ProcessExited(*status));
-                }
-                // 本地终端不会触发 SshAbnormalDisconnect，也不需要处理端口转发
-                TerminalEvent::SshAbnormalDisconnect => {}
-                TerminalEvent::PortForwardChanged => {}
-                TerminalEvent::BlinkChanged(blinking) => {
-                    this.on_blink_changed(*blinking, cx);
-                }
-                // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
-                // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
-                TerminalEvent::AgentChanged => {
-                    cx.emit(Event::AgentChanged);
-                    cx.notify();
-                    this.maybe_prompt_hook_install(cx);
-                    // 状态可能变成 Working/打断待决：把计时器拉起来。
-                    this.agent_streaming_reported = this.agent_output_streaming(cx);
-                    this.ensure_agent_timer(cx);
-                }
-                // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent，
-                // 不等 TTL。远程路径在这里早退（见 refresh_foreground_agent）。
-                TerminalEvent::ForegroundGroupChanged => {
-                    this.refresh_foreground_agent_now(cx);
-                }
+            |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| {
+                this.handle_terminal_event(&terminal, event, TerminalEventSource::Local, cx);
             },
         );
 
@@ -1443,64 +1406,13 @@ impl TerminalView {
 
             let terminal_subscription = cx.subscribe(
                 &terminal_clone,
-                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| match event {
-                    TerminalEvent::TitleChanged => {
-                        this.update_title(cx);
-                    }
-                    TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                        if let Some(connect_view) = this.ssh_connect_view.clone() {
-                            this.handle_ssh_connect_status(
-                                &connect_view,
-                                SshCheckOutcome::check(&terminal, cx),
-                                cx,
-                            );
-                        }
-                        this.check_remote_os(terminal.clone(), cx);
-                        this.check_tab_label_changed(cx);
-                        cx.notify();
-                        if this.sync_agent_streaming(cx) {
-                            this.ensure_agent_timer(cx);
-                        }
-                    }
-                    TerminalEvent::WorkingDirectoryChanged(cwd) => {
-                        this.on_working_directory_changed(cwd, cx);
-                    }
-                    TerminalEvent::Bell => {
-                        this.on_bell(cx);
-                    }
-                    TerminalEvent::NotificationReceived { title, body } => {
-                        this.on_notification(title.clone(), body.clone(), cx);
-                    }
-                    TerminalEvent::CloseTerminal => {
-                        cx.emit(Event::CloseTerminal);
-                    }
-                    TerminalEvent::ProcessExited(status) => {
-                        cx.emit(Event::ProcessExited(*status));
-                    }
-                    TerminalEvent::SshAbnormalDisconnect => {
-                        this.handle_ssh_abnormal_disconnect(cx);
-                    }
-                    TerminalEvent::BlinkChanged(blinking) => {
-                        this.on_blink_changed(*blinking, cx);
-                    }
-                    // 端口转发结果到达：弹一条 toast 告知端口与结果。
-                    TerminalEvent::PortForwardChanged => {
-                        this.notify_port_forward(cx);
-                    }
-                    // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
-                    // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
-                    TerminalEvent::AgentChanged => {
-                        cx.emit(Event::AgentChanged);
-                        cx.notify();
-                        this.maybe_prompt_hook_install(cx);
-                        // 状态可能变成 Working/打断待决：把计时器拉起来。
-                        this.agent_streaming_reported = this.agent_output_streaming(cx);
-                        this.ensure_agent_timer(cx);
-                    }
-                    // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
-                    TerminalEvent::ForegroundGroupChanged => {
-                        this.refresh_foreground_agent_now(cx);
-                    }
+                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| {
+                    this.handle_terminal_event(
+                        &terminal,
+                        event,
+                        TerminalEventSource::SshConnecting,
+                        cx,
+                    );
                 },
             );
 
@@ -1635,6 +1547,87 @@ impl TerminalView {
         cx.emit(Event::TitleChanged);
     }
 
+    fn handle_terminal_event(
+        &mut self,
+        terminal: &Entity<Terminal>,
+        event: &TerminalEvent,
+        source: TerminalEventSource,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TerminalEvent::TitleChanged => {
+                self.update_title(cx);
+            }
+            TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
+                if source != TerminalEventSource::Local
+                    && let Some(connect_view) = self.ssh_connect_view.clone()
+                {
+                    self.handle_ssh_connect_status(
+                        &connect_view,
+                        SshCheckOutcome::check(terminal, cx),
+                        cx,
+                    );
+                }
+                if source != TerminalEventSource::SshReconnected {
+                    self.check_remote_os(terminal.clone(), cx);
+                }
+                if source == TerminalEventSource::Local {
+                    self.poll_wsl_cwd(cx);
+                }
+                self.check_tab_label_changed(cx);
+                cx.notify();
+                // 输出边沿要把「正在滚字」同步给 tab（扫光动画用），
+                // 并保证输出停下时有一个计时器把状态翻回去。
+                if self.sync_agent_streaming(cx) {
+                    self.ensure_agent_timer(cx);
+                }
+            }
+            TerminalEvent::WorkingDirectoryChanged(cwd) => {
+                self.on_working_directory_changed(cwd, cx);
+            }
+            TerminalEvent::Bell => {
+                self.on_bell(cx);
+            }
+            TerminalEvent::NotificationReceived { title, body } => {
+                self.on_notification(title.clone(), body.clone(), cx);
+            }
+            TerminalEvent::CloseTerminal => {
+                cx.emit(Event::CloseTerminal);
+            }
+            TerminalEvent::ProcessExited(status) => {
+                cx.emit(Event::ProcessExited(*status));
+            }
+            TerminalEvent::SshAbnormalDisconnect => {
+                if source != TerminalEventSource::Local {
+                    self.handle_ssh_abnormal_disconnect(cx);
+                }
+            }
+            TerminalEvent::BlinkChanged(blinking) => {
+                self.on_blink_changed(*blinking, cx);
+            }
+            TerminalEvent::PortForwardChanged => {
+                if source != TerminalEventSource::Local {
+                    self.notify_port_forward(cx);
+                }
+            }
+            // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
+            // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
+            TerminalEvent::AgentChanged => {
+                cx.emit(Event::AgentChanged);
+                cx.notify();
+                self.maybe_prompt_hook_install(cx);
+                // 状态可能变成 Working/打断待决：把计时器拉起来。
+                self.agent_streaming_reported = self.agent_output_streaming(cx);
+                self.ensure_agent_timer(cx);
+            }
+            // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent，
+            // 不等 TTL。远程路径在这里早退（见 refresh_foreground_agent）。
+            TerminalEvent::ForegroundGroupChanged => {
+                self.refresh_foreground_agent_now(cx);
+            }
+        }
+    }
+
     /// 订阅终端事件（用于重新连接时）
     fn subscribe_terminal_events(
         &mut self,
@@ -1643,64 +1636,8 @@ impl TerminalView {
     ) -> Subscription {
         cx.subscribe(
             terminal,
-            |this: &mut TerminalView, term, event: &TerminalEvent, cx| match event {
-                TerminalEvent::TitleChanged => {
-                    this.update_title(cx);
-                }
-                TerminalEvent::Wakeup | TerminalEvent::SelectionsChanged => {
-                    if let Some(connect_view) = this.ssh_connect_view.clone() {
-                        this.handle_ssh_connect_status(
-                            &connect_view,
-                            SshCheckOutcome::check(&term, cx),
-                            cx,
-                        );
-                    }
-                    this.check_tab_label_changed(cx);
-                    cx.notify();
-                    if this.sync_agent_streaming(cx) {
-                        this.ensure_agent_timer(cx);
-                    }
-                }
-                TerminalEvent::WorkingDirectoryChanged(cwd) => {
-                    this.on_working_directory_changed(cwd, cx);
-                }
-                TerminalEvent::Bell => {
-                    this.on_bell(cx);
-                }
-                TerminalEvent::NotificationReceived { title, body } => {
-                    this.on_notification(title.clone(), body.clone(), cx);
-                }
-                TerminalEvent::CloseTerminal => {
-                    // 正常退出（用户执行 exit 命令），关闭 panel
-                    cx.emit(Event::CloseTerminal);
-                }
-                TerminalEvent::ProcessExited(status) => {
-                    cx.emit(Event::ProcessExited(*status));
-                }
-                TerminalEvent::SshAbnormalDisconnect => {
-                    this.handle_ssh_abnormal_disconnect(cx);
-                }
-                TerminalEvent::BlinkChanged(blinking) => {
-                    this.on_blink_changed(*blinking, cx);
-                }
-                // 端口转发结果到达（重连路径与首次连接共用同一订阅体）。
-                TerminalEvent::PortForwardChanged => {
-                    this.notify_port_forward(cx);
-                }
-                // agent 身份或状态变了：先转发给上层（panel → workspace → tab 图标/状态点），
-                // 再重绘本视图。转发不带载荷，订阅方用 `agent_tab_state()` 现场取快照。
-                TerminalEvent::AgentChanged => {
-                    cx.emit(Event::AgentChanged);
-                    cx.notify();
-                    this.maybe_prompt_hook_install(cx);
-                    // 状态可能变成 Working/打断待决：把计时器拉起来。
-                    this.agent_streaming_reported = this.agent_output_streaming(cx);
-                    this.ensure_agent_timer(cx);
-                }
-                // shell 刚画完提示符 / 刚收回前台：立刻重查本地前台 agent。
-                TerminalEvent::ForegroundGroupChanged => {
-                    this.refresh_foreground_agent_now(cx);
-                }
+            |this: &mut TerminalView, term, event: &TerminalEvent, cx| {
+                this.handle_terminal_event(&term, event, TerminalEventSource::SshReconnected, cx);
             },
         )
     }

@@ -12,10 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use super::store::Settings;
 pub use crate::lsp::registry::LspContent;
-use crate::sidebar_view::font_settings::{
-    default_editor_font_family, default_editor_font_size, default_terminal_font_family,
-    default_terminal_font_size, default_terminal_font_weight, default_terminal_line_height,
-};
 
 /// 一份完整的设置文档（默认值与用户覆盖共用此类型）。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -73,8 +69,13 @@ pub struct FontContent {
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_font_weight")]
     pub terminal_font_weight: f32,
+    /// 代码编辑器正文的字体族（独立于终端字体与 UI 字体）。
+    ///
+    /// 缩进参考线、列对齐都以等宽字体为前提，所以默认取平台等宽字体，
+    /// 而不是 UI 的比例字体（SF Pro 等）。
     #[serde(default = "default_editor_font_family")]
     pub editor_font_family: String,
+    /// 代码编辑器正文的字号。
     #[serde(default = "default_editor_font_size")]
     pub editor_font_size: f32,
 }
@@ -90,6 +91,59 @@ impl Default for FontContent {
             editor_font_size: default_editor_font_size(),
         }
     }
+}
+
+pub fn default_terminal_font_family() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        "Menlo".into()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas".into()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        get_system_monospace_font().into()
+    }
+}
+
+pub fn default_terminal_font_size() -> f32 {
+    18.0
+}
+
+pub fn default_terminal_line_height() -> f32 {
+    1.3
+}
+
+pub fn default_terminal_font_weight() -> f32 {
+    400.0
+}
+
+/// 编辑器默认字体 = 平台默认等宽字体（与终端默认一致）。
+pub fn default_editor_font_family() -> String {
+    default_terminal_font_family()
+}
+
+pub fn default_editor_font_size() -> f32 {
+    16.0
+}
+
+/// 获取 Linux 系统默认等宽字体名称（带缓存）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn get_system_monospace_font() -> &'static str {
+    use fontconfig::Fontconfig;
+    use std::sync::OnceLock;
+
+    static SYSTEM_MONO_FONT: OnceLock<String> = OnceLock::new();
+    SYSTEM_MONO_FONT.get_or_init(|| {
+        if let Some(fc) = Fontconfig::new()
+            && let Some(font) = fc.find("monospace", None)
+        {
+            return font.name;
+        }
+        "DejaVu Sans Mono".to_string()
+    })
 }
 
 // ============================== editor ==============================

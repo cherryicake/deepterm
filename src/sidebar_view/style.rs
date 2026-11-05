@@ -14,12 +14,16 @@
 //! 4. 底部体积渐变 `glass_bottom_shade` —— 自下而上的微暗，营造厚度。
 //!
 //! 3/4 只做窄幅柔化：亮度主坡度已由 1 的整高渐变承担，边缘层负责锐化
-//! 玻璃「受光面」的观感。二者由 `macos_sidebar` 容器以 absolute 装饰层
+//! 玻璃「受光面」的观感。二者由 `workspace::sidebar` 容器以 absolute 装饰层
 //! 渲染；装饰层不注册任何鼠标监听，GPUI 中不会形成交互 hitbox，
 //! 不会挡住下层交互。
 
-use gpui::{Background, Hsla, linear_color_stop, linear_gradient, transparent_black};
+use gpui::prelude::*;
+use gpui::{
+    Background, Div, Hsla, Stateful, div, linear_color_stop, linear_gradient, px, transparent_black,
+};
 
+use crate::assets::Icon;
 use crate::theme::UiTheme;
 
 /// 暗色主题材质不透明度：macOS 26 侧边栏通透感很强，取较低值让窗口级
@@ -126,6 +130,47 @@ pub fn button_bg(theme: UiTheme) -> Hsla {
 /// 图标按钮 hover 底色。
 pub fn button_bg_hover(theme: UiTheme) -> Hsla {
     theme.text.opacity(0.15)
+}
+
+/// 侧边栏顶部 28px 圆形图标按钮。
+///
+/// 只复用视觉样式；调用方继续绑定 `id`、点击/鼠标事件，避免把不同的
+/// 交互语义塞进同一个泛型回调参数。
+pub(crate) fn round_icon_button(theme: UiTheme, icon: Icon, icon_size: f32) -> Div {
+    div()
+        .w(px(28.0))
+        .h(px(28.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(999.0))
+        .bg(button_bg(theme))
+        .cursor_pointer()
+        .hover(move |style| style.bg(button_bg_hover(theme)))
+        .child(
+            gpui::svg()
+                .size(px(icon_size))
+                .path(icon.path())
+                .text_color(theme.text),
+        )
+}
+
+/// 列表行的选中 / 悬停视觉状态。
+///
+/// 选中行使用 accent 实底；未选中行只保留 hover 叠加与常规文字色。
+/// 行尺寸、内边距和内容布局仍由各调用点负责。
+pub(crate) fn row_selection_state(
+    theme: UiTheme,
+    is_selected: bool,
+) -> impl FnOnce(Stateful<Div>) -> Stateful<Div> {
+    move |row| {
+        if is_selected {
+            row.bg(theme.accent).text_color(theme.accent_foreground)
+        } else {
+            row.hover(move |style| style.bg(hover_bg(theme)))
+                .text_color(theme.text)
+        }
+    }
 }
 
 /// 在 HSL 明度上做 ±delta 偏移，色相与饱和度保持不变。

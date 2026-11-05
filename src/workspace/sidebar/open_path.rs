@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use gpui::{App, AppContext, Entity, Window};
 
-use crate::components::macos_sidebar::MacosSidebar;
+use super::MacosSidebar;
 use crate::editor::Editor;
 use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSystem};
 use crate::sidebar_view::file_tree::SidebarFileTree;
@@ -17,7 +17,7 @@ use crate::ssh::SshConnectionConfig;
 /// - 目录 → 树内 reveal 展开；
 /// - 点击路径落在当前 root 之外（如绝对路径）→ 树保持不动（仍为终端 cwd），
 ///   文件照常在编辑器打开。
-pub fn handle_open_path(
+pub(crate) fn handle_open_path(
     editor: Entity<Editor>,
     sidebar: Entity<MacosSidebar>,
     path: String,
@@ -85,14 +85,7 @@ pub fn handle_open_path(
                 } else {
                     let ssh_for_open = ssh_config.clone();
                     editor.update(cx, |e, cx| {
-                        e.open_remote_file_at_line_col_no_notify(
-                            path,
-                            ssh_for_open,
-                            line,
-                            col,
-                            window,
-                            cx,
-                        );
+                        e.open_remote_file_at_line_col(path, ssh_for_open, line, col, window, cx);
                     });
                     if let Some(tree) = tree {
                         tree.update(cx, |t, cx| {
@@ -136,7 +129,7 @@ pub fn handle_open_path(
             });
         } else {
             editor.update(cx, |e, cx| {
-                e.open_file_at_line_col_no_notify(local_path.clone(), line, col, window, cx);
+                e.open_file_at_line_col(local_path.clone(), line, col, window, cx);
             });
             if let Some(tree) = ensure_tree_for_cwd(&sidebar, backend, desired_root, None, cx) {
                 tree.update(cx, |t, cx| {

@@ -9,6 +9,7 @@ use parking_lot::Mutex;
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs;
 use crate::ssh::sftp_fs::RemoteFileKind;
+use crate::utils::shell::shell_quote_single as shell_quote;
 
 use super::encoding;
 use super::git_status::{DiffStat, FileStatus, GitStatus, StatusEntry, parse_numstat};
@@ -1606,10 +1607,6 @@ fn execute_remote_git_bytes(
     Ok(raw.stdout)
 }
 
-fn shell_quote(s: &str) -> String {
-    crate::utils::shell::shell_quote_single(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1681,14 +1678,6 @@ mod tests {
 
     fn cleanup(path: &PathBuf) {
         let _ = std::fs::remove_dir_all(path);
-    }
-
-    #[test]
-    fn test_shell_quote() {
-        assert_eq!(shell_quote("hello"), "'hello'");
-        assert_eq!(shell_quote("hello world"), "'hello world'");
-        assert_eq!(shell_quote("it's"), "'it'\\''s'");
-        assert_eq!(shell_quote(""), "''");
     }
 
     #[test]

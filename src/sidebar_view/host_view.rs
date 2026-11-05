@@ -20,7 +20,7 @@ use crate::sidebar_view::hosts_view::{
     ConnectHost, ConnectHostViaProxy, CopyHostAddress, DeleteHost, EditHost, Host, folder_subtitle,
     load_grouped_hosts, load_grouped_hosts_from, sort_hosts,
 };
-use crate::sidebar_view::style::{button_bg, button_bg_hover, hover_bg};
+use crate::sidebar_view::style::{hover_bg, round_icon_button, row_selection_state};
 use crate::ssh::config::{
     HostGroup, SortMode, SshConnectionConfig, SshGlobalConfig, sort_host_groups,
 };
@@ -572,23 +572,8 @@ impl HostView {
             .px(px(4.0))
             .mb(px(8.0))
             .child(
-                div()
+                round_icon_button(theme, Icon::ChevronLeft, 8.0)
                     .id("host-back-btn")
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(button_bg(theme))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(theme)))
-                    .child(
-                        gpui::svg()
-                            .size(px(8.0))
-                            .path(Icon::ChevronLeft.path())
-                            .text_color(theme.text),
-                    )
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.current_folder.is_some() {
                             this.exit_folder(cx);
@@ -605,23 +590,8 @@ impl HostView {
                     .child(title),
             )
             .child(
-                div()
+                round_icon_button(theme, Icon::Ellipsis, 14.0)
                     .id("host-header-more")
-                    .w(px(28.0))
-                    .h(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(999.0))
-                    .bg(button_bg(theme))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(button_bg_hover(theme)))
-                    .child(
-                        gpui::svg()
-                            .size(px(14.0))
-                            .path(Icon::Ellipsis.path())
-                            .text_color(theme.text),
-                    )
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_header_menu(window, cx);
                     })),
@@ -844,13 +814,7 @@ impl HostView {
             .gap(px(10.0))
             .rounded(px(8.0))
             .cursor_pointer()
-            .when(is_selected, |this| {
-                this.bg(theme.accent).text_color(theme.accent_foreground)
-            })
-            .when(!is_selected, |this| {
-                this.hover(|style| style.bg(hover_bg(theme)))
-                    .text_color(theme.text)
-            })
+            .map(row_selection_state(theme, is_selected))
             .child(
                 div()
                     .w(px(32.0))

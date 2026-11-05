@@ -926,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_rust_highlight_use_path() {
-        let code = "use crate::components::title_bar::TitleBar;\n";
+        let code = "use crate::workspace::title_bar::TitleBar;\n";
         let mut h = SimpleHighlighter::new("rust");
         let rope = Rope::from_str(code);
         h.update(None, &rope, None);

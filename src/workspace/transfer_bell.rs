@@ -1,6 +1,6 @@
 //! 传输任务铃铛面板。
 //!
-//! 从 [`TitleBar`](crate::components::title_bar::TitleBar) 剥离出的业务组件：
+//! 从 [`TitleBar`](crate::workspace::title_bar::TitleBar) 剥离出的业务组件：
 //! TitleBar 只保留通用布局（TabBar、拖拽区、trailing 插槽），
 //! 传输任务的触发按钮、popover、workspace 订阅与进度刷新定时器
 //! 全部由本组件持有，通过 TitleBar 的 trailing 插槽挂载。
@@ -13,11 +13,11 @@ use gpui::{
     MouseButton, ParentElement, Pixels, Render, WeakEntity, Window, div, px,
 };
 
-use crate::components::title_bar::TITLE_BAR_HEIGHT;
 use crate::file_manager::{
     TransferHoverAction, TransferTaskHandler, TransferTaskStatus, render_transfer_panel,
 };
 use crate::theme::ActiveTheme;
+use crate::workspace::title_bar::TITLE_BAR_HEIGHT;
 use crate::workspace::workspace::Workspace;
 
 /// 通知面板进入动画时长（毫秒）

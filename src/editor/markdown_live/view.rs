@@ -27,6 +27,7 @@ use crate::components::input::{
     search::{SearchPanel, SearchTarget},
 };
 use crate::components::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use crate::editor::image_viewer::is_image_file;
 use crate::editor::markdown::{Copy, MarkdownStyle, SelectAll};
 use crate::editor::markdown_element::MarkdownElementBuilder;
 use crate::editor::markdown_live::block::{
@@ -60,7 +61,7 @@ use crate::editor::markdown_live::reveal::{
 use crate::editor::markdown_live::scrollbar::{
     BAR_THICKNESS, ScrollBarMap, ScrollBarState, h_bar_strip, scroll_bar, table_natural_width,
 };
-use crate::editor::md_image::{MAX_IMAGE_BYTES, is_supported_extension};
+use crate::editor::md_image::MAX_IMAGE_BYTES;
 use crate::theme::ActiveTheme;
 use ropey::Rope;
 
@@ -577,7 +578,7 @@ impl LiveMarkdownView {
 
     /// 单个图片文件导入 assets（拖拽 / Finder 拷贝），返回引用名。
     fn import_image_file(&self, src: &Path) -> Option<String> {
-        if !is_supported_extension(src) {
+        if !is_image_file(src) {
             return None;
         }
         let ext = src.extension()?.to_str()?.to_ascii_lowercase();
@@ -625,7 +626,7 @@ impl LiveMarkdownView {
                 }
                 ClipboardEntry::ExternalPaths(paths) => {
                     for path in paths.paths() {
-                        if !is_supported_extension(path) {
+                        if !is_image_file(path) {
                             continue;
                         }
                         saw_image = true;

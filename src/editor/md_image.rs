@@ -302,7 +302,7 @@ fn resolve(url: &str, doc_dir: Option<&Path>) -> Option<ImageSource> {
         base.join(path)
     };
     let normalized = normalize_path(&joined);
-    if !is_supported_extension(&normalized) {
+    if !crate::editor::image_viewer::is_image_file(&normalized) {
         return None;
     }
     Some(ImageSource::Local(normalized))
@@ -313,12 +313,6 @@ fn strip_angle(url: &str) -> &str {
     url.strip_prefix('<')
         .and_then(|rest| rest.strip_suffix('>'))
         .unwrap_or(url)
-}
-
-/// 是否为可解码的图片扩展名（口径见
-/// `image_viewer::IMAGE_EXTENSIONS`）。
-pub(crate) fn is_supported_extension(path: &Path) -> bool {
-    crate::editor::image_viewer::is_image_file(path)
 }
 
 /// `file://` 的剩余部分 → 本地路径字符串。
@@ -431,7 +425,7 @@ fn load(source: &ImageSource) -> Option<(Arc<Image>, (u32, u32))> {
 
 /// 本地图片：大小/扩展名门禁 → 读盘 → 解码（含解码炸弹防护）。
 fn load_local(path: &Path) -> Option<(Arc<Image>, (u32, u32))> {
-    if !is_supported_extension(path) {
+    if !crate::editor::image_viewer::is_image_file(path) {
         return None;
     }
     let meta = std::fs::metadata(path).ok()?;
