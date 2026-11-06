@@ -739,13 +739,10 @@ impl DiffView {
             cx.notify();
             return;
         }
-        // 长度不同必然脏，先跳过全文拷贝；同长度（替换/撤销回原样）才精确比较。
+        // 逐字节比较基线（`text_equals` 零分配）；同长度替换（撤销回原样、
+        // 改写字符）是每次击键都会走的分支，不能再造一份全文副本。
         let state = self.right.read(cx);
-        self.dirty = if state.text().len() != self.saved_text.len() {
-            true
-        } else {
-            state.value().as_ref() != self.saved_text
-        };
+        self.dirty = !state.text_equals(&self.saved_text);
         self.schedule_recompute(cx);
         cx.notify();
     }
@@ -1545,8 +1542,7 @@ impl DiffView {
                         // `written` 是行尾归一化后的实际落盘内容，用它做新的
                         // 脏检查基线，否则下次保存会误判为未修改。
                         view.saved_text = written;
-                        view.dirty =
-                            view.right.read(cx).value().as_ref() != view.saved_text.as_str();
+                        view.dirty = !view.right.read(cx).text_equals(&view.saved_text);
                     }
                     Err(e) => {
                         log::error!("diff save failed for {}: {e}", view.path);

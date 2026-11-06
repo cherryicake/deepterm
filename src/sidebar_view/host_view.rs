@@ -792,8 +792,8 @@ impl HostView {
     fn render_host_row(
         &self,
         host: &Host,
-        configs: &[SshConnectionConfig],
-        groups: &[HostGroup],
+        configs: &Rc<Vec<SshConnectionConfig>>,
+        groups: &Rc<Vec<HostGroup>>,
         cx: &mut Context<Self>,
         theme: crate::theme::UiTheme,
         on_select: &OptionalStrCallback,
@@ -802,7 +802,6 @@ impl HostView {
         let icon_color = host.icon_color.to_hsla(cx);
         let host_id = host.id.to_string();
         let is_selected = self.selected_ids.iter().any(|s| s.as_ref() == host_id);
-        let host_config = configs.iter().find(|c| c.id() == host_id).cloned();
         let host_id_clone = host_id.clone();
         div()
             .id(SharedString::from(format!("host-item-{host_id}")))
@@ -882,7 +881,9 @@ impl HostView {
             .on_click(cx.listener({
                 let on_select = on_select.clone();
                 let on_connect = on_connect.clone();
-                let host_config = host_config.clone();
+                // 只搬 `Rc`（引用计数 +1）：双击才需要的那份配置在事件里按 id
+                // 现查现克隆，不让每一行每次重绘都深拷贝一遍连接配置。
+                let configs = configs.clone();
                 let id = host_id.clone();
                 move |this, event: &gpui::ClickEvent, window, cx| {
                     if event.modifiers().secondary() {
@@ -903,8 +904,8 @@ impl HostView {
                         if let Some(ref f) = on_select {
                             f(&id, window, cx);
                         }
-                    } else if let Some(ref config) = host_config
-                        && let Some(ref f) = on_connect
+                    } else if let Some(ref f) = on_connect
+                        && let Some(config) = configs.iter().find(|c| c.id() == id)
                     {
                         f(config, window, cx);
                     }
@@ -929,7 +930,9 @@ impl HostView {
             .context_menu(format!("host-item-menu-{}", host_id), {
                 let entity = cx.entity().clone();
                 let host_id_for_menu = host_id.clone();
-                let groups_clone = groups.to_vec();
+                // 菜单回调持有的是共享句柄（`Rc` +1），不是整份分组表的深拷贝：
+                // 原先每个可见行、每一帧都要把全部分组连名字一起克隆一遍。
+                let groups_clone = groups.clone();
                 let host_group_id = host.group_id.clone();
                 move |menu: PopupMenu, _window, _cx| {
                     let count = entity.read(_cx).selected_ids.len();
@@ -986,7 +989,7 @@ impl HostView {
                             );
                             has_move_items = true;
                         }
-                        for g in &groups_for_move {
+                        for g in groups_for_move.iter() {
                             if is_single && Some(g.id.as_str()) == host_group_id.as_deref() {
                                 continue;
                             }

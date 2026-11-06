@@ -7089,17 +7089,15 @@ impl Editor {
     /// 判断文件当前是否有未保存的修改（编辑器文本 vs 磁盘基线）。
     fn file_is_dirty(&self, file: &EditorFile, cx: &mut App) -> bool {
         let state = file.editor_state.read(cx);
-        // 普通编辑器：长度不同必然脏，直接返回，省掉 `value()` 的全文拷贝。
-        // live 标签的影子文本是归一化（剥 `\r`）的，基线保留原始行尾，
-        // 长度口径不同，交给下面的同口径比较。
-        if file.live().is_none() && state.text.len() != file.original_content.len() {
-            return true;
+        // 普通编辑器：直接与基线逐字节比较，不构造 `value()` 的全文副本。
+        // 同长度替换（改写字符、替换选中内容、撤销回原样）是每键都会走到的
+        // 路径，10 MB 文件就是每键一次 10 MB 分配 + 拷贝。
+        if file.live().is_none() {
+            return !state.text_equals(&file.original_content);
         }
-        !content_matches_baseline(
-            state.value().as_ref(),
-            &file.original_content,
-            file.live().is_some(),
-        )
+        // live 标签的影子文本是归一化（剥 `\r`）的，基线保留原始行尾，
+        // 字节口径不同，仍交给同口径的比较。
+        !content_matches_baseline(state.value().as_ref(), &file.original_content, true)
     }
 
     /// 同步标签栏的未保存标记。
@@ -7349,7 +7347,7 @@ impl Editor {
                 continue;
             };
             let text = live.read(cx).text();
-            if file.editor_state.read(cx).value().as_ref() == text {
+            if file.editor_state.read(cx).text_equals(&text) {
                 continue;
             }
             file.editor_state.update(cx, |st, cx| {

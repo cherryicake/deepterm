@@ -4264,7 +4264,7 @@ impl TerminalView {
         let has_text = self
             .search_input
             .as_ref()
-            .is_some_and(|input| !input.read(cx).value().is_empty());
+            .is_some_and(|input| input.read(cx).text().len() > 0);
         if has_text {
             self.start_search_from_scratch(cx);
         }

@@ -21,7 +21,9 @@ where
     G: Fn(&str, &mut App) + 'static,
 {
     let active_theme_id = ThemeState::global(cx).active_theme_id().to_string();
-    let themes = ThemeState::themes(cx).to_vec();
+    // 只读遍历，不克隆整张主题表：每个 `AppTheme` 都带一串 `String`
+    // （id/name/description + 完整配色），`.to_vec()` 是每帧一次深拷贝。
+    let themes = ThemeState::themes(cx);
 
     // 顶部导航栏
     let header = div()

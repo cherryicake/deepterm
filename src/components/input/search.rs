@@ -915,7 +915,8 @@ impl<T: SearchTarget> Render for SearchPanel<T> {
         let has_matches = self.matcher.len() > 0;
         let allow_replace = self.replaceable(cx);
         let replace_visible = self.replace_mode && allow_replace;
-        let query_empty = self.search_input.read(cx).value().is_empty();
+        // 每帧都走：只问「空不空」，不构造整份 query 的 `SharedString`。
+        let query_empty = self.search_input.read(cx).text().len() == 0;
 
         // ---- 主题色（Copy，提前拷出避免后续 &mut cx 借用冲突）。
         // 卡片/输入框底色从编辑器背景推导：卡片比编辑器略深、输入框比卡片

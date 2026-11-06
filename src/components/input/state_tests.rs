@@ -1457,3 +1457,75 @@ fn a_content_less_progress_report_changes_nothing(cx: &mut gpui::TestAppContext)
         );
     });
 }
+
+/// 脏检查不得复制整份文档：`text_equals` 的分配与文档大小无关，`value()` 不是。
+///
+/// 编辑器每次击键（`text_version` 变化）都要回答「与磁盘基线是否一致」。
+/// 旧实现走 `value()`，内部 `Rope::to_string()` —— 10 MB 文件就是每键一次
+/// 10 MB 分配 + 拷贝（实测分配流量 44 MB，因为 String 增长反复 realloc）。
+/// 这里用测试分配器把两条路径的口径钉死，并用多字节字符 / 空串覆盖语义。
+#[gpui::test]
+fn text_equals_does_not_copy_the_document(cx: &mut gpui::TestAppContext) {
+    use crate::utils::alloc_probe::AllocObserver;
+
+    struct Host(#[allow(dead_code)] gpui::Entity<InputState>);
+    impl gpui::Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl gpui::IntoElement {
+            gpui::div()
+        }
+    }
+    let cell = std::cell::RefCell::new(None);
+    let (_host, cx) = cx.add_window_view(|window, cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        *cell.borrow_mut() = Some(input.clone());
+        Host(input)
+    });
+    let input = cell.into_inner().unwrap();
+
+    input.update(cx, |state, cx| {
+        // 混合多字节字符：ropey 按 chunk 切分，比较必须按**字节**而不是按字符，
+        // 否则 chunk 落在多字节字符之间时会误判。
+        let mut doc = String::new();
+        for i in 0..1024 {
+            doc.push_str(&format!("第 {i} 行 line-{i} αβγ ✓\n"));
+        }
+        state.set_text(doc.clone(), cx);
+        assert!(state.text_equals(&doc));
+        assert_eq!(state.value().as_ref(), doc, "两条路径口径必须一致");
+
+        // 语义：长度不同 / 同长度不同内容 / 空串。
+        assert!(!state.text_equals(&doc[..doc.len() - 1]));
+        // 首字符是「第」（3 字节）：按字符边界改一个字符，长度不变。
+        let mut tampered = doc.clone();
+        tampered.replace_range(0..'第'.len_utf8(), "X");
+        assert!(!state.text_equals(&tampered));
+        assert!(!state.text_equals(""));
+
+        // 分配口径：比较只允许 ropey 的 chunk 迭代器付一个小 Vec（实测 128 B），
+        // 且必须**不随文档大小增长**；`value()` 则至少分配一份全文。
+        //
+        // 先空跑一次：`AllocObserver::scope` 首次进入会做本线程统计槽的
+        // TLS 惰性初始化，那一次分配属于观测器本身，不该记到被测代码头上。
+        let _ = AllocObserver::scope(|| state.text_equals(&doc));
+        let (equal, stats) = AllocObserver::scope(|| state.text_equals(&doc));
+        assert!(equal);
+        assert!(
+            stats.bytes <= 1024,
+            "text_equals 的分配必须与文档大小无关（文档 {} 字节，实际 {} 次 / {} 字节）",
+            doc.len(),
+            stats.allocations,
+            stats.bytes
+        );
+
+        // 对照：value() 的分配随文档线性增长，证明上面的口径确实在度量。
+        let (value, stats) = AllocObserver::scope(|| state.value());
+        assert_eq!(value.as_ref(), doc);
+        assert!(
+            stats.bytes >= doc.len() as u64,
+            "value() 应至少分配一份全文（实际 {} 次 / {} 字节，文档 {} 字节）",
+            stats.allocations,
+            stats.bytes,
+            doc.len()
+        );
+    });
+}
