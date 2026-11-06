@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS
+            artifact: deepterm-macos
+          - os: ubuntu-22.04
+            name: Linux
+            artifact: deepterm-linux
+          - os: windows-latest
+            name: Windows
+            artifact: deepterm-windows
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME 与 Cargo.toml 中的版本 $version 不一致"
+            exit 1
+          fi
+          for file in scripts/build-dmg.sh scripts/build-deb.sh windows/deepterm.iss; do
+            if ! grep -q "$version" "$file"; then
+              echo "::error file=$file::打包脚本中的版本没有同步到 $version"
+              exit 1
+            fi
+          done
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev \
+            libfontconfig-dev libfreetype-dev libncurses-dev ncurses-bin \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xkb-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libvulkan1 libdbus-1-dev \
+            libssl-dev libzstd-dev libasound2-dev
+
+      - name: Prepare macOS packaging tools
+        if: runner.os == 'macOS'
+        run: |
+          command -v cargo-bundle >/dev/null || cargo install cargo-bundle --locked
+
+          # Xcode 27 起 Metal Toolchain 需要单独下载；装上后再编译 GPUI 的 shader。
+          if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+            echo "Metal Toolchain 未安装，尝试下载..."
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Prepare Windows packaging tools
+        if: runner.os == 'Windows'
+        run: choco install innosetup --no-progress -y
+
+      - name: Build macOS DMG
+        if: runner.os == 'macOS'
+        run: |
+          chmod +x scripts/build-dmg.sh
+          ./scripts/build-dmg.sh
+          mkdir -p dist
+          cp DeepTerm-*-macOS.dmg dist/
+
+      - name: Build Linux .deb
+        if: runner.os == 'Linux'
+        run: |
+          chmod +x scripts/build-deb.sh
+          ./scripts/build-deb.sh
+          mkdir -p dist
+          cp target/deb-out/*.deb dist/
+
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --bin deepterm
+
+          $iscc = Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" |
+            Select-Object -First 1
+          if (-not $iscc) { throw "找不到 Inno Setup 的 ISCC.exe" }
+          & $iscc.FullName windows\deepterm.iss
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\bundle\DeepTerm-*-setup.exe dist\
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download installers
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
