@@ -6612,8 +6612,10 @@ impl Editor {
                     let has_session = this.open_files[idx].lsp.is_some();
                     let is_active =
                         this.active_file_id.as_deref() == Some(sync_tab_id.as_str());
+                    // 每次击键都会走到（没有会话 / 不是当前标签是常态）：
+                    // release 默认 Info 级，用 info 会把每次击键都写进日志文件。
                     if !(has_session && is_active) {
-                        log::info!(
+                        log::debug!(
                             "lsp: 跳过自动补全 has_session={has_session} is_active_tab={is_active} (active={:?} this={sync_tab_id})",
                             this.active_file_id
                         );
@@ -6641,16 +6643,13 @@ impl Editor {
                         // 中文/emoji 后面时会落在字符中间并 panic。
                         let prev_char = char_before(editor.read(cx).text(), editor.read(cx).cursor());
 
-                        // 服务器声明的触发字符集合。
-                        let declared_triggers: Vec<String> = client
-                            .as_ref()
-                            .map(|c| c.completion_trigger_characters())
-                            .unwrap_or_default();
-
-                        let trigger_character = prev_char.and_then(|c| {
-                            let s = c.to_string();
-                            declared_triggers.iter().any(|t| t == &s).then_some(s)
-                        });
+                        // 服务器声明的触发字符：直接问客户端判定，不再每键
+                        // 克隆一份 `Vec<String>` 触发字符表。
+                        let trigger_character = prev_char
+                            .filter(|c| {
+                                client.as_ref().is_some_and(|cl| cl.is_completion_trigger(*c))
+                            })
+                            .map(|c| c.to_string());
 
                         let in_identifier = prev_char
                             .map(|c| {
@@ -6665,7 +6664,8 @@ impl Editor {
                             let uri = this
                                 .active_lsp_session()
                                 .map(|s| s.uri().clone());
-                            log::info!(
+                            // 同上：处在标识符里打字时每键一次，降为 debug。
+                            log::debug!(
                                 "lsp: 补全触发判定命中 in_identifier={in_identifier} trigger={trigger_character:?} 有session={}",
                                 uri.is_some()
                             );

@@ -259,17 +259,22 @@ impl LspClient {
         &self.capabilities
     }
 
-    /// 服务器声明的补全触发字符（`completionProvider.triggerCharacters`）。
+    /// 该字符是否是服务器声明的补全触发字符
+    /// （`completionProvider.triggerCharacters`）。
     ///
     /// 对照 Zed 的 `lsp_store.rs`：它从
     /// `server.capabilities().completion_provider.trigger_characters` 取，
-    /// 存进 `completion_triggers_per_language_server` 用于触发补全。
+    /// 用于触发补全。典型值：Rust 的 `:` / `.`、CSS 的 `:` / `@`、
+    /// HTML 的 `<`；不读这个字段就会漏掉这些**服务器明确要求的**触发点。
     ///
-    /// 典型值：Rust 的 `:` / `.`、CSS 的 `:` / `@`、HTML 的 `<`。
-    /// 之前完全不读这个字段，只按「标识符字符」触发，于是 `:`、`@`、`<`
-    /// 这些**服务器明确要求的**触发点永远不会请求补全。
-    pub fn completion_trigger_characters(&self) -> Vec<String> {
-        trigger_characters_of(&self.capabilities)
+    /// 逐字符判定、零分配：补全触发在**每次击键**的判定里都要问一次，
+    /// 原先返回 `Vec<String>` 的写法会让每键都克隆一遍触发字符表。
+    pub fn is_completion_trigger(&self, ch: char) -> bool {
+        let mut buf = [0u8; 4];
+        let needle = ch.encode_utf8(&mut buf);
+        capability_trigger_characters(&self.capabilities)
+            .iter()
+            .any(|t| t == needle)
     }
 
     /// 服务器是否支持 `completionItem/resolve`。
@@ -1147,18 +1152,18 @@ fn supports_code_action_resolve(caps: &lsp_types::ServerCapabilities) -> bool {
     }
 }
 
-/// 从 `InitializeResult` 取服务器的补全触发字符。
+/// 从 `InitializeResult` 取服务器的补全触发字符（借用能力快照，不克隆）。
 ///
 /// 抽成自由函数便于单测：这是唯一读取该能力字段的地方，测试可以直接喂
 /// 真实的 `InitializeResult`（由 JSON 反序列化而来）验证取值路径。
-fn trigger_characters_of(result: &InitializeResult) -> Vec<String> {
+fn capability_trigger_characters(result: &InitializeResult) -> &[String] {
     result
         .capabilities
         .completion_provider
         .as_ref()
         .and_then(|provider| provider.trigger_characters.as_ref())
-        .map(|chars| chars.to_vec())
-        .unwrap_or_default()
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
 }
 
 fn client_capabilities() -> ClientCapabilities {
@@ -1495,11 +1500,8 @@ mod tests {
         }))
         .expect("InitializeResult parses");
 
-        let chars = trigger_characters_of(&result);
-        assert_eq!(
-            chars,
-            vec![":".to_string(), ".".to_string(), "@".to_string()]
-        );
+        let chars = capability_trigger_characters(&result);
+        assert_eq!(chars, [":".to_string(), ".".to_string(), "@".to_string()]);
     }
 
     /// 服务器没声明触发字符时返回空（不能因此 panic 或瞎触发）。
@@ -1509,7 +1511,7 @@ mod tests {
             "capabilities": {}
         }))
         .expect("InitializeResult parses");
-        assert!(trigger_characters_of(&result).is_empty());
+        assert!(capability_trigger_characters(&result).is_empty());
     }
 
     /// 同一文件的两种 URI 写法必须判为相等。

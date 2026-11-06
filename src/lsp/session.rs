@@ -350,7 +350,12 @@ impl LspSession {
             return;
         }
         let uri = self.uri.clone();
-        let text_str = text.to_string();
+        // 只捕获 O(1) 的 `Rope` 快照（ropey 克隆共享底层节点，不复制正文），
+        // 全文 `String` 推迟到真正发送那一刻再造。旧实现在这里就
+        // `text.to_string()`：而下面的防抖会取消绝大多数任务，等于每次击键
+        // 白付一次全文拷贝（10 MB 文件 ≈ 10 MB 分配 + 拷贝），且被取消前
+        // 字符串一直挂在 future 上。
+        let snapshot = text.clone();
 
         // **版本号在真正发送时原子递增，而不是每次击键**。
         //
@@ -375,6 +380,7 @@ impl LspSession {
             // 发送那一刻才分配版本：取消掉的任务不会推进版本。
             let version = version_slot.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             // 全量同步：不构造增量 TextEdit，避免与服务器文本漂移。
+            let text_str = snapshot.to_string();
             if let Err(e) = client.did_change(&uri, version, &text_str, &[]).await {
                 log::debug!("lsp didChange failed for {uri}: {e}");
             }

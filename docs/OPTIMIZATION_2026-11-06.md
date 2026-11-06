@@ -184,3 +184,48 @@ cargo test --lib                                  # 2316 passed / 3 ignored / 0 
 | `src/sidebar_view/theme_view.rs` | 去掉每帧主题表克隆 |
 | `src/terminal_view/terminal_view.rs` | 搜索框判空不再构造 `SharedString` |
 | `src/terminal_view/terminal_element.rs` | `PrepaintState` / 覆盖层参数改结构体 |
+
+---
+
+## 五、第二轮（同日）：击键路径上的漏网之鱼
+
+第一轮之后又按「每次击键 / 每帧都会执行」的口径扫了一遍编辑器与 LSP 路径，
+找到三处仍在热路径上做整份工作的地方。
+
+| 位置 | 问题 | 处置 |
+|---|---|---|
+| `lsp/session.rs:353` | `didChange` 在**调度时**就把整份 `Rope` 转成 `String`，而 60 ms 防抖会取消绝大多数任务 | 改为捕获 `Rope` 快照（ropey 克隆 O(1)、共享节点），发送那一刻才 `to_string()` |
+| `editor.rs:6616`、`:6668` | 每键 `log::info!`；release 默认 `Info` 级 → 每次击键都格式化并写日志文件 | 降为 `log::debug!` |
+| `editor.rs:6647` + `lsp/client.rs` | 每键把服务器触发字符表克隆成 `Vec<String>` 只为查一个 `char` | 新增 `LspClient::is_completion_trigger(ch)`，逐字符零分配判定 |
+
+第一条在 10 MB 文件上等于**每键一次 10 MB 分配 + 拷贝**（实测 `to_string()`
+的分配流量是文档大小的 4.4 倍），且被取消前字符串一直挂在 future 上。
+
+### 测出来的下一个目标：编辑器单帧 3 MB 分配（未做）
+
+用 `AllocObserver` 量了编辑器元素的一帧（真实 `EditorInput`，600×900 视口，
+300 行 rust 文本，稳态无滚动无编辑）：
+
+| 场景 | 分配次数 | 分配字节 |
+|---|---:|---:|
+| rust 高亮 + 行号 | 1483 | **3.1 MB** |
+| 关掉语法高亮 | 1009 | 0.3 MB |
+| 关掉彩虹括号 | 1419 | 2.5 MB |
+| 纯文本（无高亮无行号） | 834 | 0.1 MB |
+
+- 语法高亮一项占 **474 次 / 2.8 MB**，彩虹括号占 64 次 / 0.6 MB；
+- 与**文档大小无关**（1200 行文档与 300 行读数相同），只随可见行数增长
+  （视口 300px→1200px：1208→1986 次）；
+- 也就是说光标闪烁帧、光标移动帧都会把这一份重新算一遍——`can_reuse_lines`
+  只复用了「整形结果」，没有复用「高亮样式本身」。
+
+**下一步建议**：把 `highlight_lines` 的产物（含诊断/彩虹括号合并后）缓存到
+`LastLayout`，键用 `(text_version, 可见字节区间, tree root id, 主题 id,
+诊断版本, rainbow_cache 的 Rc 指针)`——`rainbow_bracket_spans` 的
+`(text_version, tree_fingerprint)` 缓存已经是这个模式，可以照抄。
+预期收益：稳态帧 1483 → 约 850 次分配、3.1 MB → 约 0.3 MB。
+
+> 测量口径提醒：元素必须放在**定高容器**里量。直接 `cx.draw` 一个
+> `EditorInput` 会让 GPUI 按 MaxContent 排版整份文档，读数是 O(文档行数)
+> 的（150/300/600/1200 行 → 3376/5501/9755/18251 次），那是测量装置的问题，
+> 不是生产路径的行为。
