@@ -19,10 +19,10 @@
 //!   expand, "…" menu to expand all); collapsed rows refill from HEAD on
 //!   write-back so editing never loses hidden code.
 //!
-//! The default layout preference is `Auto`: unified (single column) is shown
-//! by default, and the view automatically switches to split once the panel
-//! width reaches `SPLIT_MIN_WIDTH`. The toolbar button cycles
-//! Auto → Unified → Split → Auto to pin a specific layout.
+//! The default layout is the **unified single-column** view. The "…" menu
+//! lets the user pin `Auto` (switch to split once the panel width reaches
+//! `SPLIT_MIN_WIDTH`) or `Split`; `Auto` is no longer the default because a
+//! wide window used to flip every diff into two columns on open.
 //!
 //! Hunk actions (stage/revert, VSCode's gutter affordances) live in the
 //! toolbar "…" menu and apply to the hunk at the viewport; hunk navigation
@@ -63,17 +63,43 @@ type LineColors = Vec<(u32, Hsla, DiffLineKind)>;
 /// 词级背景着色：`(字节范围, 背景色)`。
 type WordColors = Vec<(Range<usize>, Hsla)>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DiffMode {
     Unified,
     Split,
 }
 
-/// Layout preference. `Auto` (default) shows the unified single-column
-/// layout and switches to split only when the available width is sufficient.
-#[derive(Clone, Copy, PartialEq, Eq)]
+impl DiffMode {
+    /// 按布局偏好与可用宽度解析实际布局。
+    ///
+    /// 抽成纯函数是为了能直接单测「默认就是单栏」这个约定——视图本身要
+    /// 窗口与真实仓库才能构造。
+    fn resolve(preference: LayoutPreference, available_width: f32) -> Self {
+        match preference {
+            LayoutPreference::Unified => DiffMode::Unified,
+            LayoutPreference::Split => DiffMode::Split,
+            LayoutPreference::Auto => {
+                if available_width >= SPLIT_MIN_WIDTH {
+                    DiffMode::Split
+                } else {
+                    DiffMode::Unified
+                }
+            }
+        }
+    }
+}
+
+/// Layout preference for the diff view.
+///
+/// The default is [`LayoutPreference::Unified`] (single column). `Auto` is
+/// opt-in: it keeps the width-based behaviour (split once
+/// `SPLIT_MIN_WIDTH` is available) for users who prefer the two-pane view
+/// on large windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum LayoutPreference {
     Auto,
+    /// 默认布局：单栏（合并视图）。
+    #[default]
     Unified,
     Split,
 }
@@ -258,7 +284,7 @@ impl DiffView {
             hunks_source: TextFingerprint::default(),
             additions: 0,
             deletions: 0,
-            preference: LayoutPreference::Auto,
+            preference: LayoutPreference::default(),
             available_width: 0.0,
             old_highlighter: SimpleHighlighter::new(&language),
             new_highlighter: SimpleHighlighter::new(&language),
@@ -1311,19 +1337,9 @@ impl DiffView {
     // ---- layout -------------------------------------------------------------
 
     /// The layout actually shown: explicit preference wins; `Auto` picks by
-    /// available width (unified by default, split when wide enough).
+    /// available width (unified when narrow, split when wide enough).
     fn effective_mode(&self) -> DiffMode {
-        match self.preference {
-            LayoutPreference::Unified => DiffMode::Unified,
-            LayoutPreference::Split => DiffMode::Split,
-            LayoutPreference::Auto => {
-                if self.available_width >= SPLIT_MIN_WIDTH {
-                    DiffMode::Split
-                } else {
-                    DiffMode::Unified
-                }
-            }
-        }
+        DiffMode::resolve(self.preference, self.available_width)
     }
 
     /// Called by the editor panel each render with the current content width.
@@ -2423,6 +2439,41 @@ fn map_line_new_to_old(new_line: u32, hunks: &[DiffHunk]) -> u32 {
 mod tests {
     use super::*;
     use crate::editor::diff_model::build_unified;
+
+    /// 默认必须是**单栏**：无论窗口多宽，打开 diff 都不能自动变成两栏。
+    ///
+    /// 回归：此前默认是 `Auto`，宽窗口（≥ `SPLIT_MIN_WIDTH`）一打开就是
+    /// 并排视图；用户明确要求默认单栏，`Auto` 只作为「…」菜单里的可选项。
+    #[test]
+    fn default_layout_is_single_column_at_any_width() {
+        assert_eq!(LayoutPreference::default(), LayoutPreference::Unified);
+        for width in [0.0, 480.0, SPLIT_MIN_WIDTH - 1.0, SPLIT_MIN_WIDTH, 2560.0] {
+            assert_eq!(
+                DiffMode::resolve(LayoutPreference::default(), width),
+                DiffMode::Unified,
+                "默认布局在 {width}px 宽时必须是单栏"
+            );
+        }
+
+        // `Auto` 仍保留按宽度切换的老行为，供用户在菜单里显式选择。
+        assert_eq!(
+            DiffMode::resolve(LayoutPreference::Auto, SPLIT_MIN_WIDTH - 1.0),
+            DiffMode::Unified
+        );
+        assert_eq!(
+            DiffMode::resolve(LayoutPreference::Auto, SPLIT_MIN_WIDTH),
+            DiffMode::Split
+        );
+        // 显式钉住两种布局时与宽度无关。
+        assert_eq!(
+            DiffMode::resolve(LayoutPreference::Split, 320.0),
+            DiffMode::Split
+        );
+        assert_eq!(
+            DiffMode::resolve(LayoutPreference::Unified, 3840.0),
+            DiffMode::Unified
+        );
+    }
     use crate::editor::syntax::{HighlightTheme, HighlightThemeStyle, SyntaxColors, ThemeStyle};
     use crate::theme::ThemeAppearance;
 
