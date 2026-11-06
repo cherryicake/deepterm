@@ -8374,7 +8374,7 @@ mod live_render_tests {
     use gpui::{point, size};
 
     const SAMPLE: &str = "# Title\n\n```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\npara text\n\n| a | b |\n|---|---|\n| 1 | 2 |\n";
-    const SHOWCASE: &str = include_str!("../../../markdown-showcase.md");
+    const SHOWCASE: &str = include_str!("../../../docs/markdown-showcase.md");
 
     struct Host(gpui::Entity<LiveMarkdownView>);
     impl gpui::Render for Host {
@@ -8763,7 +8763,7 @@ mod live_frame_tests {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
         });
-        const DOC: &str = include_str!("../../../markdown-showcase.md");
+        const DOC: &str = include_str!("../../../docs/markdown-showcase.md");
         let (host, cx) =
             cx.add_window_view(|_, cx| Host(cx.new(|cx| LiveMarkdownView::with_text(DOC, cx))));
         let view = host.read_with(cx, |h, _| h.0.clone());
@@ -10182,14 +10182,14 @@ mod live_frame_tests {
         });
         for (name, doc, want_code, want_table) in [
             (
-                "CODE_REVIEW",
-                include_str!("../../../docs/CODE_REVIEW.md"),
-                false,
+                "DESIGN",
+                include_str!("../../../docs/DESIGN_LSP_REMOTE.md"),
+                true,
                 true,
             ),
             (
-                "TAB_SPEC",
-                include_str!("../../../docs/safari-26-tab-spec.md"),
+                "GHOSTTY_REVIEW",
+                include_str!("../../../docs/GHOSTTY_1.4_DEEPTERM_REVIEW_2026-11-02.md"),
                 true,
                 true,
             ),
@@ -10485,7 +10485,7 @@ mod live_showcase_tests {
     use super::*;
     use crate::editor::markdown_live::reveal::plan_document;
 
-    const SHOWCASE: &str = include_str!("../../../markdown-showcase.md");
+    const SHOWCASE: &str = include_str!("../../../docs/markdown-showcase.md");
 
     /// The exact user repro: plan the showcase doc and report every code /
     /// table row whose visible text is empty or suspiciously short.

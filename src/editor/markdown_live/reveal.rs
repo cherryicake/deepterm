@@ -1004,7 +1004,7 @@ mod showcase_tests {
 
     // The repo's manual QA document must plan without panics and keep every
     // row's segments/runs covering their strings exactly.
-    const SHOWCASE: &str = include_str!("../../../markdown-showcase.md");
+    const SHOWCASE: &str = include_str!("../../../docs/markdown-showcase.md");
 
     fn check_row(line: &str, plan: &RowPlan) {
         let mut src_at = 0;
