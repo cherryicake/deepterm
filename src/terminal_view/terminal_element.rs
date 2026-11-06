@@ -1352,25 +1352,27 @@ impl TerminalElement {
     /// 将 builtin / IME 文本经过 wrap + 切段后逐段 shape，得到 GPUI 渲染所需的多行布局。
     ///
     /// 返回 `None` 表示无内容可渲染（builtin 与 IME 都为空）。
-    #[allow(clippy::too_many_arguments)]
     fn shape_overlay_layout(
         &self,
-        builtin_text: &str,
-        ime_text: &str,
-        builtin_cursor: usize,
-        cursor_display_col: usize,
-        cursor_line_in_viewport: i32,
-        terminal_bounds: TerminalBounds,
-        cell_width: Pixels,
-        line_height: Pixels,
-        font_size: Pixels,
-        text_style: &TextStyle,
-        builtin_color: Hsla,
-        ime_color: Hsla,
-        cursor_shape: CursorShape,
-        cursor_color: Hsla,
+        params: OverlayShapeParams<'_>,
         window: &mut Window,
     ) -> Option<LocalOverlayLayout> {
+        let OverlayShapeParams {
+            builtin_text,
+            ime_text,
+            builtin_cursor,
+            cursor_display_col,
+            cursor_line_in_viewport,
+            terminal_bounds,
+            cell_width,
+            line_height,
+            font_size,
+            text_style,
+            builtin_color,
+            ime_color,
+            cursor_shape,
+            cursor_color,
+        } = params;
         if builtin_text.is_empty() && ime_text.is_empty() {
             return None;
         }
@@ -1445,32 +1447,69 @@ impl IntoElement for TerminalElement {
     }
 }
 
-impl Element for TerminalElement {
-    type RequestLayoutState = ();
-    /// O2：paint 直接持有行缓存（take/restore），不再经过 4×Arc 的
-    /// flattened 拷贝。字段：行缓存、cell 度量、光标位置、光标布局、
-    /// 本地输入覆盖层。
+/// `TerminalElement` 一帧 prepaint 的产物，交给 paint 直接消费。
+///
+/// 旧实现是一个 11 元位置元组：构造点（prepaint 末尾）与解构点（paint
+/// 开头）相隔数百行，字段顺序改一次就要两处同步核对，新增字段还必须数
+/// 下标。换成命名字段后由编译器对齐，字段的语义也写在类型上。
+///
+/// 增加了两个**具名**的结构字段（`row_caches` / `search_spans`），却没有
+/// 增加任何每帧开销：仍是一次 move 或引用。
+pub struct TerminalPrepaintState {
+    /// 视口行缓存：prepaint 从 view `take` 出来，paint 用完归还。
     ///
     /// 不变量：prepaint 从 view `take` 出行缓存到 paint 归还期间，view
     /// 上的 `row_render_cache` 为空。gpui 帧周期保证 prepaint×1 →
     /// paint×1 配对执行，paint 体内无提前 return，归还必然到达；若同一
     /// 帧意外出现第二次 prepaint（当前框架不会），会触发该次全量重排
     /// ——行为正确、仅性能回退。
-    type PrepaintState = (
-        Vec<RowRenderCache>,
-        Pixels,
-        Pixels,
-        usize,
-        usize,
-        bool,
-        TerminalBounds,
-        Option<CursorLayout>,
-        Option<LocalOverlayLayout>,
-        // 搜索命中高亮（按视口行分桶，含当前命中配色）
-        Vec<Vec<BackgroundSpan>>,
-        // 末位为 Kitty 图像的本帧落位（已换算成像素，pain 直接使用）
-        Vec<crate::terminal::kitty::render::PlacedImage>,
-    );
+    row_caches: Vec<RowRenderCache>,
+    cell_width: Pixels,
+    line_height: Pixels,
+    /// 光标所在 grid 列（block 光标反白字符用）。
+    cursor_col: usize,
+    terminal_bounds: TerminalBounds,
+    /// 真实光标布局（弹簧动画后的四边形）；None = 本帧不画光标。
+    cursor: Option<CursorLayout>,
+    /// builtin / IME 覆盖层布局。
+    input_overlay: Option<LocalOverlayLayout>,
+    /// 搜索命中高亮，按视口行分桶（含当前命中配色）。
+    search_spans: Vec<Vec<BackgroundSpan>>,
+    /// 本帧 Kitty 图像落位（已换算成像素，paint 直接使用）。
+    placed_images: Vec<crate::terminal::kitty::render::PlacedImage>,
+}
+
+/// `shape_overlay_layout` 的入参。
+///
+/// 原先 15 个位置参数里同时混着「文本 + 光标偏移」「网格几何」「配色」
+/// 三组语义，调用点只能靠数位置对齐；换成分组命名字段后，新增一项不必再
+/// 动调用点以外的地方，也不会出现「行高传成列宽」这类静默错位。
+#[derive(Clone, Copy)]
+struct OverlayShapeParams<'a> {
+    /// builtin command 文本与光标字节偏移（`builtin_cursor`）。
+    builtin_text: &'a str,
+    builtin_cursor: usize,
+    /// IME 组字中的文本。
+    ime_text: &'a str,
+    /// 光标在 grid 上的显示列 / 视口行。
+    cursor_display_col: usize,
+    cursor_line_in_viewport: i32,
+    /// 终端网格与单元格度量。
+    terminal_bounds: TerminalBounds,
+    cell_width: Pixels,
+    line_height: Pixels,
+    font_size: Pixels,
+    text_style: &'a TextStyle,
+    /// builtin / IME 前景色与覆盖层光标色。
+    builtin_color: Hsla,
+    ime_color: Hsla,
+    cursor_shape: CursorShape,
+    cursor_color: Hsla,
+}
+
+impl Element for TerminalElement {
+    type RequestLayoutState = ();
+    type PrepaintState = TerminalPrepaintState;
 
     fn id(&self) -> Option<ElementId> {
         Some(ElementId::Name("terminal-element".into()))
@@ -1950,7 +1989,6 @@ impl Element for TerminalElement {
         // Cursor is only visible if it's within the current viewport
         let cursor_in_viewport =
             cursor_line_in_viewport >= 0 && (cursor_line_in_viewport as usize) < viewport_lines;
-        let cursor_row = cursor_line_in_viewport.max(0) as usize;
 
         let cursor_display_col = cursor_point.column.0;
 
@@ -2012,20 +2050,22 @@ impl Element for TerminalElement {
                 )
             };
             self.shape_overlay_layout(
-                builtin_text,
-                ime_text,
-                builtin_cursor,
-                cursor_display_col,
-                cursor_line_in_viewport,
-                terminal_bounds,
-                cell_width,
-                line_height,
-                font_size,
-                &text_style,
-                ui_theme.text,
-                terminal_theme.foreground,
-                overlay_cursor_shape,
-                cursor_color,
+                OverlayShapeParams {
+                    builtin_text,
+                    builtin_cursor,
+                    ime_text,
+                    cursor_display_col,
+                    cursor_line_in_viewport,
+                    terminal_bounds,
+                    cell_width,
+                    line_height,
+                    font_size,
+                    text_style: &text_style,
+                    builtin_color: ui_theme.text,
+                    ime_color: terminal_theme.foreground,
+                    cursor_shape: overlay_cursor_shape,
+                    cursor_color,
+                },
                 window,
             )
         } else {
@@ -2312,19 +2352,17 @@ impl Element for TerminalElement {
             }
         };
 
-        (
+        TerminalPrepaintState {
             row_caches,
             cell_width,
             line_height,
-            cursor_point.column.0,
-            cursor_row,
-            cursor_in_viewport,
+            cursor_col: cursor_point.column.0,
             terminal_bounds,
             cursor,
             input_overlay,
             search_spans,
             placed_images,
-        )
+        }
     }
 
     fn paint(
@@ -2338,19 +2376,18 @@ impl Element for TerminalElement {
         cx: &mut gpui::App,
     ) {
         let terminal_theme = cx.theme().terminal;
-        let (
+        let TerminalPrepaintState {
             row_caches,
             cell_width,
             line_height,
             cursor_col,
-            _cursor_row,
-            _cursor_in_viewport,
             terminal_bounds,
             cursor,
             input_overlay,
             search_spans,
             placed_images,
-        ) = prepaint_state;
+            ..
+        } = prepaint_state;
 
         let origin = terminal_bounds.bounds.origin;
         window.paint_quad(fill(bounds, terminal_theme.background));
@@ -2934,7 +2971,7 @@ mod tests {
 
         // 首帧：光标直接就位，无动画。
         let first = draw_once(cx);
-        let cursor = first.7.as_ref().expect("首帧应绘制光标");
+        let cursor = first.cursor.as_ref().expect("首帧应绘制光标");
         let origin = cursor.quad.corners[0];
         assert!(!view.read_with(cx, |v, _| v.cursor_animator.is_animating()));
 
@@ -2943,7 +2980,7 @@ mod tests {
             terminal.handle_remote_data(b"\x1b[C", cx);
         });
         let moved = draw_once(cx);
-        let moved_cursor = moved.7.as_ref().expect("移动后应绘制光标");
+        let moved_cursor = moved.cursor.as_ref().expect("移动后应绘制光标");
         assert!(
             view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
             "一格水平移动应产生动画"
@@ -2972,7 +3009,12 @@ mod tests {
                 break;
             }
             let state = draw_once(cx);
-            settled = state.7.as_ref().expect("收敛帧应绘制光标").quad.corners;
+            settled = state
+                .cursor
+                .as_ref()
+                .expect("收敛帧应绘制光标")
+                .quad
+                .corners;
         }
         assert!(
             !view.read_with(cx, |v, _| v.cursor_animator.is_animating()),
@@ -3049,14 +3091,14 @@ mod tests {
 
         // 首帧就位。
         let first = draw_after(cx, Duration::from_millis(16));
-        let origin = first.7.as_ref().expect("首帧应绘制光标").quad.corners[0];
+        let origin = first.cursor.as_ref().expect("首帧应绘制光标").quad.corners[0];
 
         // 用户停顿 3 秒后敲第一个字符。
         terminal.update(cx, |terminal, cx| {
             terminal.handle_remote_data(b"a", cx);
         });
         let typed = draw_after(cx, Duration::from_secs(3));
-        let cursor = typed.7.as_ref().expect("打字后应绘制光标");
+        let cursor = typed.cursor.as_ref().expect("打字后应绘制光标");
         let x = cursor.quad.corners[0].0;
 
         assert!(
@@ -3218,7 +3260,12 @@ mod tests {
 
         // Block 就位。
         let block_state = draw(cx, Duration::from_millis(16));
-        let block = block_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let block = block_state
+            .cursor
+            .as_ref()
+            .expect("应绘制光标")
+            .quad
+            .corners;
         let block_w = block[1].0 - block[0].0;
         assert!(block_w > 0.0);
         // 静止的 beam 宽度：`cursor_thickness`（cell 宽的 15%，至少 1px）。
@@ -3229,7 +3276,12 @@ mod tests {
             terminal.handle_remote_data(b"\x1b[5 q", cx);
         });
         let morph = draw(cx, Duration::from_millis(16));
-        let morph_quad = morph.7.as_ref().expect("morph 中应绘制光标").quad.corners;
+        let morph_quad = morph
+            .cursor
+            .as_ref()
+            .expect("morph 中应绘制光标")
+            .quad
+            .corners;
         let morph_w = morph_quad[1].0 - morph_quad[0].0;
         assert!(
             morph_w < block_w,
@@ -3249,7 +3301,7 @@ mod tests {
         }
         let settled_state = draw(cx, Duration::from_millis(16));
         let settled = settled_state
-            .7
+            .cursor
             .as_ref()
             .expect("收敛后应绘制光标")
             .quad
@@ -3322,7 +3374,12 @@ mod tests {
 
         // 宽字符 Block：宽度应为 2 个 cell。
         let block_state = draw(cx, Duration::from_millis(16));
-        let block = block_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let block = block_state
+            .cursor
+            .as_ref()
+            .expect("应绘制光标")
+            .quad
+            .corners;
         let block_w = block[1].0 - block[0].0;
 
         // 先切到 beam 拿到「单格粗细」基准，再切回 block 比较——两者用
@@ -3339,7 +3396,7 @@ mod tests {
             draw(cx, Duration::from_millis(16));
         }
         let beam_state = draw(cx, Duration::from_millis(16));
-        let beam = beam_state.7.as_ref().expect("应绘制光标").quad.corners;
+        let beam = beam_state.cursor.as_ref().expect("应绘制光标").quad.corners;
         let beam_w = beam[1].0 - beam[0].0;
 
         // 宽字符 Block 应是单格粗细基准的 2 倍左右（宽度翻倍）；
