@@ -19,8 +19,8 @@ use gpui::{
 use ropey::Rope;
 
 use super::model::{
-    DiffHunk, FileDiff, FileStatus, LineKind, Side, build_hunk_patch, compute_hunks, language_of,
-    line_starts,
+    DiffHunk, FileDiff, FileStatus, Hunk, LineKind, Side, build_hunk_patch, compute_hunks,
+    language_of, line_starts,
 };
 use super::state::{DiffMode, DiffState, Expand, LineRef, Row};
 use super::theme::{BAR, CODE_PAD, DiffTheme, GAP_H, HEADER_H, NOTE_H};
@@ -194,6 +194,8 @@ pub struct DiffView {
     diff_menu_subscription: Option<Subscription>,
     /// The hunk the viewport is in, for the toolbar's counter.
     current_hunk: usize,
+    /// The first load's jump to the first change has been made.
+    jumped: bool,
     recompute_gen: u32,
     _subscriptions: Vec<Subscription>,
 }
@@ -244,6 +246,7 @@ impl DiffView {
             diff_menu_position: None,
             diff_menu_subscription: None,
             current_hunk: 0,
+            jumped: false,
             recompute_gen: 0,
             _subscriptions: Vec::new(),
         };
@@ -533,11 +536,9 @@ impl DiffView {
                     };
                     let additions = file.additions();
                     let deletions = file.deletions();
-                    let hunks = if binary {
-                        Vec::new()
-                    } else {
-                        compute_hunks(&task_old, &task_new)
-                    };
+                    // The same blocks the view draws: staging and reverting act on exactly what
+                    // the reader sees, and one diff pass serves both.
+                    let hunks: Vec<DiffHunk> = file.hunks.iter().map(hunk_ranges).collect();
                     let old_hl = if binary {
                         Highlights::default()
                     } else {
@@ -569,6 +570,13 @@ impl DiffView {
                 }
                 view.current_hunk = 0;
                 view.loading = false;
+                // Open on the first change, as a review starts there, not on the file head.
+                if !view.jumped {
+                    view.jumped = true;
+                    if let Some(row) = view.diff.first_hunk_row() {
+                        view.scroll_to_row(row, 1, cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -2088,6 +2096,14 @@ impl DiffView {
                 self.render_line_row(ix, r, cx)
             }
         }
+    }
+}
+
+/// The row ranges of a hunk, for the staging patch builder and the revert path.
+fn hunk_ranges(h: &Hunk) -> DiffHunk {
+    DiffHunk {
+        old_rows: h.first(Side::Old).saturating_sub(1)..h.end(Side::Old).saturating_sub(1),
+        new_rows: h.first(Side::New).saturating_sub(1)..h.end(Side::New).saturating_sub(1),
     }
 }
 
