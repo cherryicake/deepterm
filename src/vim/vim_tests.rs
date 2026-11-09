@@ -1151,7 +1151,7 @@ fn plain_input_host(cx: &mut TestAppContext) -> (Entity<InputState>, &mut Visual
 /// 没 vim，用户改一次字号后 vim 突然出现——diff 视图当初正是这样漏掉了
 /// `sync_vim_state`。
 ///
-/// 断言的是 [`InputState::new_code_editor`] 而不是 `DiffView::new_editor`：
+/// 断言的是 [`InputState::new_code_editor`] 而不是 `DiffView::new_loading`：
 /// 后者要构造整个 `DiffView` 实体，而两个生产调用点（编辑器 tab、diff 视图）
 /// 现在共用同一个构造器，守住它等于同时守住两处。
 #[gpui::test]

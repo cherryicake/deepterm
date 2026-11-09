@@ -276,7 +276,7 @@ enum TabContent {
     Live(Entity<crate::editor::markdown_live::LiveMarkdownView>),
     Image(Entity<crate::editor::image_viewer::ImageViewer>),
     Diff {
-        view: Entity<crate::editor::diff_view::DiffView>,
+        view: Entity<crate::editor::diff::DiffView>,
         /// diff 所属仓库；会话恢复时可能暂时缺失，由 DiffView 自行重载。
         repo: Option<crate::editor::git_repository::GitRepository>,
     },
@@ -304,7 +304,7 @@ impl TabContent {
         }
     }
 
-    fn diff(&self) -> Option<&Entity<crate::editor::diff_view::DiffView>> {
+    fn diff(&self) -> Option<&Entity<crate::editor::diff::DiffView>> {
         match self {
             Self::Diff { view, .. } => Some(view),
             _ => None,
@@ -366,7 +366,7 @@ impl EditorFile {
         self.content.image()
     }
 
-    fn diff(&self) -> Option<&Entity<crate::editor::diff_view::DiffView>> {
+    fn diff(&self) -> Option<&Entity<crate::editor::diff::DiffView>> {
         self.content.diff()
     }
 
@@ -560,7 +560,7 @@ pub struct FileTreeEditorState {
     pub open_files_info: Vec<EditorOpenFileInfo>,
     pub cached_editor_states: HashMap<SharedString, Entity<InputState>>,
     /// diff tab 的视图缓存：切组时整实体保留，未保存的右侧编辑、滚动、折叠状态不丢。
-    pub cached_diff_views: HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
+    pub cached_diff_views: HashMap<SharedString, Entity<crate::editor::diff::DiffView>>,
     /// 各标签的 LSP 会话：切组时随 `InputState` 一起换手。
     ///
     /// 不能留在 `EditorFile` 里。`save_to_file_tree_state` 会 `clear()` 整个
@@ -593,7 +593,7 @@ impl FileTreeEditorState {
 /// ——`lsp: None` 那个历史 bug 正是这么来的。
 struct RestoreBuffers<'a> {
     states: &'a HashMap<SharedString, Entity<InputState>>,
-    diffs: &'a HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>>,
+    diffs: &'a HashMap<SharedString, Entity<crate::editor::diff::DiffView>>,
     lsp_sessions: &'a mut LspSessionMap,
 }
 
@@ -1070,7 +1070,7 @@ impl Editor {
     /// 取出 diff tab 的 DiffView 实体，用于标签页组切换时整实体保留。
     fn take_cached_diff_views(
         &mut self,
-    ) -> HashMap<SharedString, Entity<crate::editor::diff_view::DiffView>> {
+    ) -> HashMap<SharedString, Entity<crate::editor::diff::DiffView>> {
         let mut cached = HashMap::new();
         for file in &mut self.open_files {
             if let Some(diff) = file.diff().cloned() {
@@ -5498,7 +5498,7 @@ impl Editor {
         let editor_weak = cx.entity().downgrade();
         let diff_repo = repo.clone();
         let diff_view = cx.new(|cx| {
-            crate::editor::diff_view::DiffView::new_loading(
+            crate::editor::diff::DiffView::new_loading(
                 path.clone(),
                 repo,
                 staged,
@@ -5516,7 +5516,7 @@ impl Editor {
         path: String,
         label: String,
         editor_state: Entity<InputState>,
-        diff_view: Entity<crate::editor::diff_view::DiffView>,
+        diff_view: Entity<crate::editor::diff::DiffView>,
         diff_repo: crate::editor::git_repository::GitRepository,
         cx: &mut Context<Self>,
     ) {
@@ -5569,7 +5569,7 @@ impl Editor {
         tab_id: String,
         path: String,
         label: String,
-        diff_view: Entity<crate::editor::diff_view::DiffView>,
+        diff_view: Entity<crate::editor::diff::DiffView>,
         diff_repo: Option<crate::editor::git_repository::GitRepository>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7232,7 +7232,7 @@ impl Editor {
 
     /// 刷新所有已打开的 diff 页（提交后 HEAD 整体前移）。
     pub fn refresh_all_diff_views(&mut self, cx: &mut Context<Self>) {
-        let views: Vec<Entity<crate::editor::diff_view::DiffView>> = self
+        let views: Vec<Entity<crate::editor::diff::DiffView>> = self
             .open_files
             .iter()
             .filter_map(|f| f.diff().cloned())
@@ -9602,7 +9602,7 @@ mod tests {
                     std::collections::HashMap::new();
                 let empty_diff: std::collections::HashMap<
                     SharedString,
-                    Entity<crate::editor::diff_view::DiffView>,
+                    Entity<crate::editor::diff::DiffView>,
                 > = std::collections::HashMap::new();
                 let mut empty_lsp = LspSessionMap::new();
                 editor.restore_from_info(

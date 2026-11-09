@@ -5,7 +5,7 @@
 //! 支撑行首色条点击就地展开（红色删除行 + 绿色新增行底色）。
 
 use crate::components::input::{GitDeletedLine, GitDiffSummary, GitHunkInfo, GitLineMark};
-use crate::editor::diff_model::line_diff;
+use crate::editor::diff::line_diff;
 
 /// 新行号（0 起）上限保护：超大文件放弃标记。
 const MAX_NEW_LINES: usize = 200_000;

@@ -21,9 +21,9 @@ pub(crate) use edit_primitives::{
 
 use gpui::{
     Action, App, AppContext, Bounds, ClipboardItem, Context, Entity, EntityInputHandler,
-    EventEmitter, FocusHandle, HighlightStyle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine,
-    SharedString, Subscription, TextRun, UTF16Selection, WeakEntity, Window, actions, point, px,
+    EventEmitter, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollHandle, ScrollWheelEvent, ShapedLine, SharedString,
+    Subscription, TextRun, UTF16Selection, WeakEntity, Window, actions, point, px,
 };
 use gpui::{Half, TextAlign};
 use lsp_types::Url;
@@ -193,15 +193,6 @@ impl GitHunkInfo {
 pub struct GitDiffSummary {
     pub marks: Vec<(u32, GitLineMark)>,
     pub hunks: Vec<GitHunkInfo>,
-}
-
-/// Diff 行种类（unified / split 视图的行底色装饰）。
-/// 决定 gutter 与行号的配套装饰：新增行用实色条＋着色行号，
-/// 删除行用虚线条＋着色行号（参考 diff UI）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DiffLineKind {
-    Added,
-    Deleted,
 }
 
 /// 同词高亮缓存。
@@ -608,22 +599,6 @@ pub struct InputState {
     /// The first element is the x-coordinate (Pixels), preferred to use this.
     /// The second element is the column (usize), fallback to use this.
     pub(crate) preferred_column: Option<(Pixels, usize)>,
-    /// Diff decorations: per-buffer-line background colors (e.g. added /
-    /// deleted lines in a diff view), painted full-width behind the text.
-    /// The kind drives gutter/number decorations (solid bar + tinted number
-    /// for added rows, dotted bar + tinted number for deleted rows).
-    pub(crate) diff_line_colors: std::collections::HashMap<u32, (gpui::Hsla, DiffLineKind)>,
-    /// Diff decorations: word-level background colors over byte ranges.
-    pub(crate) diff_range_colors: Vec<(Range<usize>, gpui::Hsla)>,
-    /// Diff decorations: per-buffer-line line-number label override.
-    /// `Some(vec)` indexed by buffer row; `None` entry = blank label (e.g.
-    /// deleted lines on the new side of a unified diff).
-    pub(crate) diff_line_labels: Option<Vec<Option<u32>>>,
-    /// Precomputed syntax highlight runs for the whole buffer (used by the
-    /// unified diff view, which cannot parse its merged text with one tree).
-    /// Sorted, contiguous and gap-free over `[0, text.len())`; when set, the
-    /// internal tree-sitter highlighter is bypassed.
-    pub(crate) external_highlight_runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
     /// Monotonic text version, incremented on every edit. Background
     /// parses carry the version they were started for; mismatches are
     /// discarded (prevents stale-tree flicker while typing).
@@ -881,10 +856,6 @@ impl InputState {
             vim: None,
             cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             cursor_blink: true,
-            diff_line_colors: std::collections::HashMap::new(),
-            diff_range_colors: Vec::new(),
-            diff_line_labels: None,
-            external_highlight_runs: None,
             text_version: 0,
             scroll_beyond_last_line: None,
             cursor_surrounding_lines: None,
@@ -901,54 +872,6 @@ impl InputState {
         });
 
         state
-    }
-
-    /// Override the line-number labels (indexed by buffer row; `None` entry
-    /// renders a blank gutter cell). Pass `None` to restore default numbering.
-    pub fn set_diff_line_labels(
-        &mut self,
-        labels: Option<Vec<Option<u32>>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.diff_line_labels = labels;
-        cx.notify();
-    }
-
-    /// Set diff decorations: per-line background colors (buffer line index →
-    /// color) and word-level background colors (byte range → color).
-    /// Used by the git diff view to render added/deleted lines and inline
-    /// word highlights on top of the regular editor rendering.
-    pub(crate) fn set_diff_decorations(
-        &mut self,
-        line_colors: Vec<(u32, gpui::Hsla, DiffLineKind)>,
-        range_colors: Vec<(Range<usize>, gpui::Hsla)>,
-        cx: &mut Context<Self>,
-    ) {
-        self.diff_line_colors = line_colors
-            .into_iter()
-            .map(|(row, color, kind)| (row, (color, kind)))
-            .collect();
-        self.diff_range_colors = range_colors;
-        cx.notify();
-    }
-
-    /// Replace the syntax highlight runs with externally computed ones (e.g.
-    /// per-source-tree highlights for the unified diff view). `Some(runs)`
-    /// must be sorted, contiguous and gap-free over the whole buffer, and
-    /// takes over rendering from the internal tree-sitter highlighter (which
-    /// is reset to avoid wasted parses of the merged text); `None` restores
-    /// normal highlighting.
-    pub fn set_external_highlight_runs(
-        &mut self,
-        runs: Option<Vec<(Range<usize>, HighlightStyle)>>,
-        cx: &mut Context<Self>,
-    ) {
-        self.external_highlight_runs = runs;
-        if self.external_highlight_runs.is_some() {
-            self.reset_highlighter(cx);
-            self._pending_update = false;
-        }
-        cx.notify();
     }
 
     /// Set Input to use multi line mode.
@@ -1729,10 +1652,6 @@ impl InputState {
     /// 无语法树 / 非代码模式返回空。
     pub(crate) fn sticky_lines(&self, first_visible_row: usize) -> Vec<usize> {
         if !self.sticky_scroll || self.mode.is_single_line() || self.masked {
-            return Vec::new();
-        }
-        // diff 视图（外部高亮）与图片等场景不做 sticky
-        if self.external_highlight_runs.is_some() {
             return Vec::new();
         }
         if first_visible_row == 0 {

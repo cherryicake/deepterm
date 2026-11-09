@@ -1891,11 +1891,10 @@ mod tests {
             .unwrap()
             .expect("should find repo");
         let (old, new) = repo.diff_file_contents("a.txt").unwrap();
-        let hunks = crate::editor::diff_model::compute_hunks(&old, &new);
+        let hunks = crate::editor::diff::compute_hunks(&old, &new);
         assert_eq!(hunks.len(), 2);
 
-        let patch =
-            crate::editor::diff_model::build_hunk_patch("a.txt", &old, &new, &hunks[0], false);
+        let patch = crate::editor::diff::build_hunk_patch("a.txt", &old, &new, &hunks[0], false);
         repo.stage_hunk_patch(&patch).unwrap();
 
         // 暂存区只有第一块，工作区两块都在。
@@ -1936,9 +1935,9 @@ mod tests {
         assert!(base.is_new, "未跟踪文件 is_new 应为 true");
 
         // 空 HEAD ↔ 全文：单个“整文件新增”hunk。
-        let hunks = crate::editor::diff_model::compute_hunks(&base.head, &base.worktree);
+        let hunks = crate::editor::diff::compute_hunks(&base.head, &base.worktree);
         assert_eq!(hunks.len(), 1);
-        let patch = crate::editor::diff_model::build_hunk_patch(
+        let patch = crate::editor::diff::build_hunk_patch(
             "new.txt",
             &base.head,
             &base.worktree,
@@ -2132,9 +2131,9 @@ mod tests {
         assert_eq!(base.worktree_base(), "ONE\ntwo\nthree\nfour\nfive\n");
 
         // 以基线计算的补丁应用到 index（暂存区）必须成功，且只并入 FIVE。
-        let hunks = crate::editor::diff_model::compute_hunks(base.worktree_base(), &base.worktree);
+        let hunks = crate::editor::diff::compute_hunks(base.worktree_base(), &base.worktree);
         assert_eq!(hunks.len(), 1);
-        let patch = crate::editor::diff_model::build_hunk_patch(
+        let patch = crate::editor::diff::build_hunk_patch(
             "a.txt",
             base.worktree_base(),
             &base.worktree,

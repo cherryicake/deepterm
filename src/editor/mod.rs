@@ -1,6 +1,6 @@
 pub mod completion;
-pub mod diff_model;
-pub mod diff_view;
+pub mod diff;
+
 pub mod editor;
 pub mod encoding;
 pub mod ex_command;
