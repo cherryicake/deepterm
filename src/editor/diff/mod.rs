@@ -15,7 +15,7 @@ mod view;
 
 pub use model::{
     CONTEXT, DiffHunk, FileDiff, FileStatus, Hunk, Line, LineKind, Side, build_hunk_patch,
-    compute_hunks, language_of, line_count, line_diff, line_of, line_range, line_starts,
+    compute_hunks, line_count, line_diff, line_of, line_range, line_starts,
 };
 pub use state::{DiffMode, DiffState, EXPAND_STEP, Expand, LineRange, LineRef, Row};
 pub use theme::{DiffTheme, Tints};

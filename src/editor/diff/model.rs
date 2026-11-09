@@ -313,12 +313,6 @@ impl FileDiff {
         self.deletions
     }
 
-    /// The highlighter language for the path's extension (or name, for a `Makefile`), as
-    /// written: `"rs"`, `"tsx"`.
-    pub fn language(&self) -> Option<&str> {
-        language_of(self.path())
-    }
-
     /// Whether the unchanged lines between hunks can be shown.
     pub fn expandable(&self) -> bool {
         self.old_text.is_some() || self.new_text.is_some()
@@ -420,15 +414,6 @@ impl FileDiff {
                 }
             }
         }
-    }
-}
-
-/// The highlighter language a path's extension names (or its name, for a `Makefile`).
-pub fn language_of(path: &str) -> Option<&str> {
-    let name = path.rsplit('/').next()?;
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => Some(ext),
-        _ => Some(name).filter(|n| matches!(*n, "Makefile" | "Dockerfile")),
     }
 }
 
@@ -930,19 +915,6 @@ mod tests {
         assert_eq!(d.status, FileStatus::Deleted);
         assert_eq!(d.hunks[0].header(), "@@ -1 +0,0 @@");
         assert_eq!(d.sole_side(), Some(Side::Old));
-    }
-
-    #[test]
-    fn languages_come_from_the_extension() {
-        let f = |p: &str| {
-            FileDiff::from_texts(p, "", "x")
-                .language()
-                .map(str::to_owned)
-        };
-        assert_eq!(f("src/lib.rs").as_deref(), Some("rs"));
-        assert_eq!(f("web/App.tsx").as_deref(), Some("tsx"));
-        assert_eq!(f(".gitignore"), None);
-        assert_eq!(f("Makefile").as_deref(), Some("Makefile"));
     }
 
     #[test]

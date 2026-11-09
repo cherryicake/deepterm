@@ -20,7 +20,7 @@ use ropey::Rope;
 
 use super::model::{
     DiffHunk, FileDiff, FileStatus, Hunk, LineKind, Side, build_hunk_patch, compute_hunks,
-    language_of, line_starts,
+    line_starts,
 };
 use super::state::{DiffMode, DiffState, Expand, LineRef, Row};
 use super::theme::{BAR, CODE_PAD, DiffTheme, GAP_H, HEADER_H, NOTE_H};
@@ -98,6 +98,13 @@ impl TextFingerprint {
             hash: hasher.finish(),
         }
     }
+}
+
+/// The language id the highlighter needs for `path`: `rust`, not the extension `rs`.
+/// `SimpleHighlighter::new("rs")` matches no language, loads no query, and draws every line
+/// plain.
+fn language_for(path: &str) -> String {
+    crate::editor::editor::guess_language_from_extension(std::path::Path::new(path))
 }
 
 /// Highlight runs of one side of the file, split per line so drawing a row is a lookup.
@@ -192,8 +199,6 @@ pub struct DiffView {
     diff_menu: Option<Entity<PopupMenu>>,
     diff_menu_position: Option<gpui::Point<Pixels>>,
     diff_menu_subscription: Option<Subscription>,
-    /// The hunk the viewport is in, for the toolbar's counter.
-    current_hunk: usize,
     /// The first load's jump to the first change has been made.
     jumped: bool,
     recompute_gen: u32,
@@ -245,42 +250,12 @@ impl DiffView {
             diff_menu: None,
             diff_menu_position: None,
             diff_menu_subscription: None,
-            current_hunk: 0,
             jumped: false,
             recompute_gen: 0,
             _subscriptions: Vec::new(),
         };
-        this.watch_scroll(cx);
         this.fetch_contents(cx);
         this
-    }
-
-    /// The list's scroll position chooses the toolbar's current hunk.
-    fn watch_scroll(&mut self, cx: &mut Context<Self>) {
-        let weak = cx.weak_entity();
-        let mut last = usize::MAX;
-        self.list_state
-            .set_scroll_handler(move |_event, _window, cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    let top = this.list_state.logical_scroll_top();
-                    let ix = top.item_ix;
-                    if ix == last {
-                        return;
-                    }
-                    last = ix;
-                    let mut hunk = None;
-                    for (i, &row) in this.diff_hunk_rows().iter().enumerate() {
-                        if row as usize <= ix {
-                            hunk = Some(i);
-                        }
-                    }
-                    let hunk = hunk.unwrap_or(0);
-                    if hunk != this.current_hunk {
-                        this.current_hunk = hunk;
-                        cx.notify();
-                    }
-                });
-            });
     }
 
     fn diff_hunk_rows(&self) -> Vec<u32> {
@@ -516,7 +491,7 @@ impl DiffView {
         let new_text = self.new_text.clone();
         let path = self.path.clone();
         let binary = self.is_binary;
-        let language = language_of(&path).map(str::to_owned);
+        let language = language_for(&path);
         let theme = cx.theme().highlight_theme.clone();
         let mode = self.preference.resolve(self.available_width);
         let top_key = self.top_row_key();
@@ -542,12 +517,12 @@ impl DiffView {
                     let old_hl = if binary {
                         Highlights::default()
                     } else {
-                        Highlights::of(&task_old, task_language.as_deref(), &theme)
+                        Highlights::of(&task_old, Some(&task_language), &theme)
                     };
                     let new_hl = if binary {
                         Highlights::default()
                     } else {
-                        Highlights::of(&task_new, task_language.as_deref(), &theme)
+                        Highlights::of(&task_new, Some(&task_language), &theme)
                     };
                     (file, hunks, old_hl, new_hl, additions, deletions)
                 })
@@ -568,7 +543,6 @@ impl DiffView {
                 if let Some(key) = top_key {
                     view.restore_top(&key);
                 }
-                view.current_hunk = 0;
                 view.loading = false;
                 // Open on the first change, as a review starts there, not on the file head.
                 if !view.jumped {
@@ -646,16 +620,18 @@ impl DiffView {
         }
         match key {
             "j" => {
-                let from = self.list_state.logical_scroll_top().item_ix as u32;
-                if let Some(row) = self.diff.next_hunk_row(from, true) {
-                    self.scroll_to_row(row, 1, cx);
+                if let Some(cur) = self.active_hunk_index()
+                    && cur + 1 < self.diff.hunk_count()
+                {
+                    self.jump_to_hunk(cur + 1, cx);
                 }
                 true
             }
             "k" => {
-                let from = self.list_state.logical_scroll_top().item_ix as u32;
-                if let Some(row) = self.diff.next_hunk_row(from, false) {
-                    self.scroll_to_row(row, 1, cx);
+                if let Some(cur) = self.active_hunk_index()
+                    && cur > 0
+                {
+                    self.jump_to_hunk(cur - 1, cx);
                 }
                 true
             }
@@ -677,7 +653,12 @@ impl DiffView {
             return None;
         }
         let top = self.list_state.logical_scroll_top().item_ix as u32;
-        let ix = rows.iter().rposition(|&r| r <= top).unwrap_or(0);
+        // The hunk at or below the viewport's top: jumping to a hunk leaves one row of context
+        // above it, so its own row is `top + 1`.
+        let ix = rows
+            .iter()
+            .rposition(|&r| r <= top.saturating_add(1))
+            .unwrap_or(0);
         Some(ix)
     }
 
@@ -687,7 +668,6 @@ impl DiffView {
             return;
         };
         self.scroll_to_row(row, 0, cx);
-        self.current_hunk = ix;
     }
 
     fn expand_gap(&mut self, file: usize, gap: usize, how: Expand, cx: &mut Context<Self>) {
@@ -1141,6 +1121,8 @@ impl DiffView {
         let is_worktree = self.target == DiffTarget::Worktree;
 
         let hunk_total = self.diff.hunk_count();
+        // Read the list here, in the view pass: never from inside a list callback, which runs
+        // while `ListState` holds its own borrow.
         let hunk_current = self.active_hunk_index().map(|i| i + 1).unwrap_or(0);
         let nav_enabled = hunk_total > 0;
 
@@ -2023,11 +2005,7 @@ impl DiffView {
         file: usize,
     ) -> AnyElement {
         let (side, n) = cell.source();
-        let text = if cell.text.is_empty() {
-            ""
-        } else {
-            cell.text.as_str()
-        };
+        let text = cell.text.as_str();
         let syntax = self.highlights_for(file, side, n, text);
         let word_bg = theme.tints(kind).map(|t| t.word);
         let runs = build_runs(
@@ -2043,12 +2021,8 @@ impl DiffView {
             &self.diff,
         );
         let (shown, runs) = expand_tabs(text, runs);
-        let shown: SharedString = if shown.is_empty() {
-            " ".into()
-        } else {
-            shown.into()
-        };
         let _ = st;
+        let text_el = code_text(shown, runs);
         let mut code = div()
             .w_full()
             .min_w_0()
@@ -2056,7 +2030,7 @@ impl DiffView {
             .text_size(theme.font_size)
             .line_height(theme.line_height)
             .text_color(theme.text)
-            .child(StyledText::new(shown).with_runs(runs));
+            .child(text_el);
         if cell.no_newline {
             code = code.child(
                 div()
@@ -2096,6 +2070,36 @@ impl DiffView {
                 self.render_line_row(ix, r, cx)
             }
         }
+    }
+}
+
+/// A line's text as a [`StyledText`], safe for the empty and partially styled cases.
+///
+/// `StyledText::with_runs` requires the runs' lengths to add up to the text exactly. A blank
+/// line has no runs, and a line whose spans were cut away (a tab-only line, a change that
+/// covers nothing) can come back short; both are drawn as plain text instead of panicking.
+/// An empty line draws a space so the row keeps its line height.
+fn code_text(shown: String, runs: Vec<TextRun>) -> StyledText {
+    // Runs are byte lengths cut from the drawn text: they must add up to it exactly, and each
+    // cut must fall on a character boundary (with_runs slices the text at every run end).
+    let mut at = 0usize;
+    let mut exact = true;
+    for run in &runs {
+        at += run.len;
+        if at > shown.len() || !shown.is_char_boundary(at) {
+            exact = false;
+            break;
+        }
+    }
+    let covered = exact && at == shown.len();
+    // An empty line gets a placeholder space, which no run can describe: the runs' lengths
+    // would have to add up to the space's single byte.
+    let drawable = !shown.is_empty();
+    let text: SharedString = if drawable { shown.into() } else { " ".into() };
+    if !drawable || runs.is_empty() || !covered {
+        StyledText::new(text)
+    } else {
+        StyledText::new(text).with_runs(runs)
     }
 }
 
@@ -2251,6 +2255,176 @@ fn expand_tabs(text: &str, mut runs: Vec<TextRun>) -> (String, Vec<TextRun>) {
     (shown, out)
 }
 
+/// Render smoke tests: they need a window but no debug selectors, so they also run in release
+/// builds, where a row whose runs do not cover its text would panic.
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::editor::git_repository::GitRepository;
+    use gpui::{px, size};
+
+    struct Host {
+        diff: Entity<DiffView>,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(self.diff.clone())
+        }
+    }
+
+    fn repo_with(head: &str, worktree: &str) -> (std::path::PathBuf, GitRepository) {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm-diff-render-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = |args: &[&str]| {
+            let _ = Command::new("git").args(args).current_dir(&dir).output();
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        run(&["config", "core.autocrlf", "false"]);
+        std::fs::write(dir.join("a.rs"), head).unwrap();
+        run(&["add", "a.rs"]);
+        run(&["commit", "-m", "init", "--quiet"]);
+        std::fs::write(dir.join("a.rs"), worktree).unwrap();
+        let repo = GitRepository::find(&dir, true, None)
+            .unwrap()
+            .expect("repo");
+        (dir, repo)
+    }
+
+    /// Scrolling must not re-enter the list while it holds its borrow: the scroll handler runs
+    /// with `ListState` mutably borrowed, so it reads the event, never `logical_scroll_top`.
+    #[gpui::test]
+    fn scrolling_updates_the_toolbar_hunk(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let old: String = (1..=400).map(|i| format!("line {i}\n")).collect();
+        let new = old
+            .replace("line 40\n", "line forty\n")
+            .replace("line 200\n", "line two hundred\n")
+            .replace("line 350\n", "line three fifty\n");
+        let (dir, repo) = repo_with(&old, &new);
+        let (host, cx) = cx.add_window_view(|window, cx| Host {
+            diff: cx.new(|cx| {
+                DiffView::new_loading(
+                    "a.rs".into(),
+                    repo,
+                    false,
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            }),
+        });
+        cx.simulate_resize(size(px(900.), px(600.)));
+        let diff = host.read_with(cx, |h, _| h.diff.clone());
+        for _ in 0..40 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if diff.read_with(cx, |v, _| !v.loading) {
+                break;
+            }
+        }
+        assert_eq!(diff.read_with(cx, |v, _| v.diff.hunk_count()), 3);
+        // Folded to 29 rows the list is shorter than the viewport and cannot scroll, so a
+        // jump would be clamped; expanding makes every row real.
+        diff.update(cx, |v, cx| v.expand_all(cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        // The list only takes wheel events whose hitbox is under the pointer, so aim at the
+        // middle of the viewport before scrolling.
+        cx.simulate_mouse_move(gpui::point(px(400.), px(300.)), None, Default::default());
+        let before = diff.read_with(cx, |v, _| v.list_state.logical_scroll_top().item_ix);
+        // Scrolling runs the list's scroll handler while it holds its own borrow: reading the
+        // list back from inside it would panic with a double borrow.
+        for _ in 0..20 {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(px(400.), px(300.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-300.))),
+                modifiers: Default::default(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let after = diff.read_with(cx, |v, _| v.list_state.logical_scroll_top().item_ix);
+        assert!(after > before, "the list scrolled: {before} -> {after}");
+        // `j` steps to the next hunk through the same list without a double borrow. The
+        // scroll above left the viewport somewhere in the middle, so measure from there.
+        let handle = diff.read_with(cx, |v, cx| v.focus_handle(cx));
+        cx.update(|window, cx| window.focus(&handle, cx));
+        let start = diff.read_with(cx, |v, _| v.active_hunk_index());
+        let total = diff.read_with(cx, |v, _| v.diff.hunk_count());
+        if let Some(ix) = start {
+            for _ in 0..=(ix + 1) {
+                cx.simulate_keystrokes("j");
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            let now = diff.read_with(cx, |v, _| v.active_hunk_index());
+            assert!(
+                now.unwrap_or(0) > ix,
+                "j advanced past hunk {ix}: now {now:?} of {total}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Real files have blank lines, tabs, CJK and end without a line break; every row draws in
+    /// both layouts with every range open, which is where `StyledText` rejects bad runs.
+    #[gpui::test]
+    fn every_row_draws_with_blank_tabbed_and_unterminated_lines(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::settings::SettingsStore::init_for_test(cx);
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let old = "fn main() {\n\n\tlet a = 1;\n\t// 中文注释\n\n}\n";
+        let new = "fn main() {\n\n\tlet a = 2;\n\t// 中文注释，改了\n\n}";
+        let (dir, repo) = repo_with(old, new);
+        let (host, cx) = cx.add_window_view(|window, cx| Host {
+            diff: cx.new(|cx| {
+                DiffView::new_loading(
+                    "a.rs".into(),
+                    repo,
+                    false,
+                    WeakEntity::new_invalid(),
+                    window,
+                    cx,
+                )
+            }),
+        });
+        cx.simulate_resize(size(px(900.), px(4000.)));
+        let diff = host.read_with(cx, |h, _| h.diff.clone());
+        for _ in 0..40 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            if diff.read_with(cx, |v, _| !v.loading) {
+                break;
+            }
+        }
+        assert!(!diff.read_with(cx, |v, _| v.loading), "loaded");
+        for mode in [LayoutPreference::Unified, LayoutPreference::Split] {
+            diff.update(cx, |v, cx| {
+                v.set_preference(mode, cx);
+                v.expand_all(cx);
+            });
+            for _ in 0..5 {
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            assert_eq!(
+                diff.read_with(cx, |v, _| v.effective_mode()),
+                mode.resolve(900.0)
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 impl Focusable for DiffView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2402,6 +2576,35 @@ mod tests {
         }
     }
 
+    /// The highlighter keys off a language id; the file's extension is not one. Passing the
+    /// extension (`rs`) silently loads no query and every line drew plain.
+    #[test]
+    fn rust_files_get_syntax_highlights() {
+        assert_eq!(language_for("src/lib.rs"), "rust");
+        assert_eq!(language_for("web/App.tsx"), "tsx");
+        // Unknown languages still name themselves, and the highlighter has no query for them.
+        assert_eq!(language_for("notes.unknownext"), "text");
+
+        let mut t = theme();
+        t.syntax.style.syntax.keyword = Some(crate::editor::syntax::ThemeStyle::color(gpui::red()));
+
+        let code = "let x = 1;\n";
+        let hl = Highlights::of(code, Some(&language_for("src/lib.rs")), &t.syntax);
+        let runs = hl.line(1);
+        assert!(
+            runs.iter()
+                .any(|(range, style)| *range == (0..3) && style.color == Some(gpui::red())),
+            "`let` draws as a keyword: {runs:?}"
+        );
+        // The extension alone finds no language, so no run covers the keyword.
+        let plain = Highlights::of(code, Some("rs"), &t.syntax);
+        assert!(
+            !plain.line(1).iter().any(|(range, _)| *range == (0..3)),
+            "the extension is not a language id: {:?}",
+            plain.line(1)
+        );
+    }
+
     #[test]
     #[allow(clippy::single_range_in_vec_init)]
     fn runs_cover_the_text_and_carry_word_backgrounds() {
@@ -2429,6 +2632,100 @@ mod tests {
         assert!(runs.iter().any(|r| r.background_color == Some(green)));
     }
 
+    /// The exact assertion the release build tripped: a placeholder space with no runs.
+    #[test]
+    fn gpui_rejects_runs_that_do_not_cover_the_text() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _ = StyledText::new(" ").with_runs(Vec::new());
+        });
+        assert!(
+            panicked.is_err(),
+            "StyledText must reject a space with no runs"
+        );
+        // And the guard returns something drawable for exactly that case.
+        let _ = code_text(String::new(), Vec::new());
+        // A zero-length run with an empty line: `at == shown.len()` holds, so a check that only
+        // compares lengths would hand the placeholder space to `with_runs` and panic.
+        let zero = TextRun {
+            len: 0,
+            font: gpui::Font::default(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let _ = code_text(String::new(), vec![zero]);
+    }
+
+    /// A run ending inside a multi-byte character would slice mid-character in `with_runs`.
+    #[test]
+    fn runs_that_cut_a_character_fall_back_to_plain_text() {
+        let run = |len: usize| TextRun {
+            len,
+            font: gpui::Font::default(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        // "中" is three bytes: a two-byte run cuts it.
+        let _ = code_text("中文".to_string(), vec![run(2), run(4)]);
+        // Whole characters keep their runs.
+        let _ = code_text("中文".to_string(), vec![run(3), run(3)]);
+    }
+
+    #[test]
+    fn blank_and_shortly_styled_lines_draw_as_plain_text() {
+        let line = |len: usize| TextRun {
+            len,
+            font: gpui::Font::default(),
+            color: gpui::black(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        // Blank line: a space with no runs (the release-build crash).
+        let _ = code_text(String::new(), Vec::new());
+        // Runs that fall short of the text (a tab-only line whose span was cut).
+        let _ = code_text(" ".to_string(), vec![line(0)]);
+        // Runs longer than the text cannot happen, but must not panic either.
+        let _ = code_text("ab".to_string(), vec![line(3)]);
+        // A covered line keeps its runs.
+        let _ = code_text("ab".to_string(), vec![line(2)]);
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn runs_always_add_up_to_the_drawn_text() {
+        let t = theme();
+        // Lines an ordinary source file has: empty, whitespace only, tabs, CJK, a word change
+        // at the very end and one at the start.
+        for text in ["", " ", "\t", "\t\tx", "let a = 1;\t// 中文", "x\t"] {
+            let syntax = vec![(
+                0..text.len().min(3),
+                HighlightStyle {
+                    color: Some(gpui::rgb(0xff0000).into()),
+                    ..Default::default()
+                },
+            )];
+            let changes = [0..text.len().min(2)];
+            let runs = build_runs(
+                text,
+                &syntax,
+                &changes,
+                Some(gpui::rgb(0x00ff00).into()),
+                &t,
+                &DiffState::default(),
+            );
+            let (shown, runs) = expand_tabs(text, runs);
+            assert_eq!(
+                runs.iter().map(|r| r.len).sum::<usize>(),
+                shown.len(),
+                "runs must cover {text:?} exactly: {runs:?} over {shown:?}"
+            );
+        }
+    }
+
     #[test]
     fn tabs_expand_to_four_columns_and_runs_follow() {
         let t = theme();
@@ -2443,7 +2740,9 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+/// Layout tests read element bounds through `debug_selectors`, which only debug builds
+/// record; release builds run the model/state tests instead.
+#[cfg(all(test, debug_assertions))]
 mod layout_tests {
     use super::*;
     use crate::editor::git_repository::GitRepository;
@@ -2647,9 +2946,9 @@ mod layout_tests {
     }
 }
 
-/// Golden-image helpers: render the view headlessly and compare a few pixels against the
-/// colours the theme's tints should paint.
-#[cfg(test)]
+/// Colour tests read painted quads by row bounds, which need `debug_selectors`: keep them in
+/// debug builds, like [`layout_tests`].
+#[cfg(all(test, debug_assertions))]
 mod visual_tests {
     use super::*;
     use crate::editor::git_repository::GitRepository;
