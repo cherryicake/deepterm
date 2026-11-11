@@ -132,6 +132,11 @@ const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
 // ── herdr Terminals LAYOUT 的托盘尺寸 ──────────────────────────────────────
 /// 托盘高度（标签自身高度 = 托盘高度 - 上下各 3px 内边距 = 30）。
 const TRAY_HEIGHT_PX: f32 = 36.0;
+/// 标签在托盘里的实际高度 = `TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2`。
+///
+/// 单独列出来是因为拖拽预览要按同一个高度画：预览没有托盘可依靠，
+/// 必须自己把这个高度写死，否则两处会各算各的。
+const TRAY_TAB_HEIGHT_PX: f32 = TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0;
 /// 托盘内边距。
 const TRAY_PADDING_PX: f32 = 3.0;
 /// 托盘圆角。
@@ -139,7 +144,7 @@ const TRAY_RADIUS_PX: f32 = 16.0;
 /// 标签间距。
 const TRAY_GAP_PX: f32 = 3.0;
 /// 标签宽度：等宽 + `flex_shrink(1)`，标签条不会随内容抖动。
-const TAB_WIDTH_PX: f32 = 260.0;
+pub const TAB_WIDTH_PX: f32 = 260.0;
 /// 标签最小宽度：可被压缩，但不能压到看不见（再多标签也保证图标 + 名字）。
 const TAB_MIN_WIDTH_PX: f32 = 96.0;
 /// 标签圆角（比托盘小一档，形成「槽里嵌胶囊」的层次）。
@@ -183,6 +188,55 @@ pub struct TrayTabVisual {
     pub width: Pixels,
     /// 动画元素 id 前缀：同一个标签的扫光 / 转圈在托盘与预览里不能共用 id。
     pub animation_key: SharedString,
+}
+
+impl TrayTabVisual {
+    /// 从终端视图构造：面板标题栏拖拽时用，与顶部标签栏同一份视觉来源。
+    ///
+    /// 顶部标签栏的 `TabBar::tray_tab_visual` 是从 `TabItem` 取的，而面板没有
+    /// `TabItem`——它手里只有 `TerminalView`。两者都从 `terminal_view` 的同一组
+    /// 方法（`tab_title_parts` / `foreground_program` / `agent_tab_state`）取值，
+    /// 所以同一条终端无论从顶部还是从面板标题栏拖起来，画面都一致。
+    pub fn from_terminal_view(
+        view: &crate::terminal_view::terminal_view::TerminalView,
+        is_active: bool,
+        width: Pixels,
+        animation_key: impl Into<SharedString>,
+        cx: &App,
+    ) -> Self {
+        let (title, cwd) = view.tab_title_parts(cx);
+        let program = view.foreground_program(cx);
+        let (agent, status) = view.agent_tab_state(cx);
+        // 与 `TabItem::tile_program` 同构：程序表给什么就用什么，没有就退回
+        // agent 自己的图标（面板在这里没有 OS 图标可用）。
+        let tile = TileProgram {
+            icon: program
+                .icon
+                .clone()
+                .or_else(|| agent.map(|agent| agent.icon_path().to_string())),
+            name: program.name.clone(),
+            tile: program
+                .tile
+                .or_else(|| agent.map(|agent| agent.accent_rgb())),
+            color: program
+                .color
+                .or_else(|| agent.map(|agent| agent.icon_rgb())),
+            tint: program.is_tinted() || agent.is_some(),
+        };
+        Self {
+            program: tile,
+            title: title.into(),
+            cwd: cwd.into(),
+            is_modified: false,
+            needs_attention: false,
+            dot: agent.map(|_| status),
+            streaming: view.agent_output_streaming(cx),
+            agent_accent_rgb: agent.map(|agent| agent.accent_rgb()),
+            is_active,
+            width,
+            animation_key: animation_key.into(),
+        }
+    }
 }
 
 /// 拖拽预览视图。
@@ -263,12 +317,20 @@ impl Render for DragPreview {
             let tray = TabBar::tray_colors(theme);
             return div()
                 .pl(self.drag_offset.x - self.preview_width / 2.0)
-                .pt(self.drag_offset.y - px(TAB_HEIGHT_PX) / 2.0)
+                .pt(self.drag_offset.y - px(TRAY_TAB_HEIGHT_PX) / 2.0)
                 .child(
                     div()
                         .w(self.preview_width)
-                        .h(px(TAB_HEIGHT_PX))
-                        .opacity(0.92)
+                        .h(px(TRAY_TAB_HEIGHT_PX))
+                        // **必须补上托盘底色**：未选中的标签自身是透明底，
+                        // 在托盘里靠托盘的颜色托着；脱离托盘以后不加这层，
+                        // 就只剩图标和文字浮在桌面上，正是"文字在飘"的来源。
+                        // 选中标签会再叠自己的抬起底色，所以两种状态都与原样一致。
+                        .rounded(px(TAB_RADIUS_TRAY_PX))
+                        .bg(tray.tray)
+                        // 阴影给"被拿起来"的那一层浮起感；透明度只轻微下调，
+                        // 过低的 opacity 会把同色系的方块和文字一起洗淡。
+                        .opacity(0.98)
                         .shadow_md()
                         .child(render_tray_tab_body(&visual, tray, theme, None, false)),
                 );
@@ -3450,6 +3512,85 @@ mod tests {
         assert!(
             preview.tray.is_some(),
             "终端标签的预览必须走托盘视觉，不能退回旧的文字胶囊"
+        );
+    }
+
+    /// 两条拖拽入口必须画出**同一个**标签：顶部标签栏拖的是 `TabItem`，
+    /// 面板标题栏拖的是 `TerminalView`，但落到预览上必须是同一套视觉。
+    ///
+    /// 这条钉住的是「视觉来源」而不是像素：两边的方块、标题、目录、状态点
+    /// 都必须来自 `TerminalView` 的同一组方法。历史 bug 正是面板那条走了
+    /// 另一条渲染分支（单行文字胶囊），同一个终端从两处拖起来长得不一样。
+    #[gpui::test]
+    fn panel_and_tab_drag_share_one_visual(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::Terminal;
+        use crate::terminal_view::terminal_view::TerminalView;
+
+        cx.update(crate::theme::init);
+        cx.update(crate::sidebar_view::font_settings::FontState::init);
+
+        let view = cx.new(|cx| {
+            let terminal = Terminal::new_headless(cx, 200);
+            TerminalView::build_headless(cx, terminal)
+        });
+        cx.run_until_parked();
+
+        // 面板那条：从 TerminalView 直接构造视觉。
+        let from_panel = view.read_with(cx, |view, cx| {
+            TrayTabVisual::from_terminal_view(view, true, px(TAB_WIDTH_PX), "panel-probe", cx)
+        });
+
+        // 顶部那条的等价输入：把同一个视图的标题/程序塞进一个 TabItem，
+        // 走 TabBar 的视觉提取。
+        let (title, cwd) = view.read_with(cx, |view, cx| view.tab_title_parts(cx));
+        let program = view.read_with(cx, |view, cx| view.foreground_program(cx));
+        let mut tab = TabItem::new("probe", title.clone());
+        tab.cwd_label = cwd.clone().into();
+        tab.program = Some(program.clone());
+        let bar = cx.update(|cx| TabBar::new_with_tabs("probe-bar", cx, vec![tab]));
+        let from_tab = bar.read_with(cx, |bar, _| {
+            bar.tray_tab_visual(&bar.tabs[0], px(TAB_WIDTH_PX))
+        });
+
+        // 同一条终端：名字 / 目录 / 程序方块必须逐项相等。
+        assert_eq!(from_panel.title, from_tab.title, "两处拖拽的标题必须一致");
+        assert_eq!(from_panel.cwd, from_tab.cwd, "两处拖拽的目录必须一致");
+        assert_eq!(
+            from_panel.program.icon, from_tab.program.icon,
+            "两处拖拽的程序图标必须一致"
+        );
+        assert_eq!(
+            from_panel.program.tile, from_tab.program.tile,
+            "两处拖拽的方块底色必须一致"
+        );
+        assert_eq!(from_panel.dot, from_tab.dot, "两处拖拽的状态点必须一致");
+        assert_eq!(
+            from_panel.streaming, from_tab.streaming,
+            "两处拖拽的扫光状态必须一致"
+        );
+
+        // 高度：预览必须按**标签在托盘里的实际高度**画（托盘高减去上下
+        // 内边距），不是托盘外框高度——直接用 36 会让预览比原标签高 6px。
+        assert_eq!(TRAY_TAB_HEIGHT_PX, TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0);
+    }
+
+    /// 预览不能只有一个"浮动"的方块和文字：未选中标签本身是透明底，在托盘里
+    /// 靠托盘托着，脱离托盘后必须自己补一层底色，否则看起来就是文字在飘。
+    ///
+    /// 这里钉住的是「补底色这件事必须发生」这个不变量——托盘底色与选中标签
+    /// 底色必须不同，否则补上去也看不出来。
+    #[gpui::test]
+    fn preview_has_a_surface_not_just_text(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let theme = cx.update(|cx| cx.theme().ui);
+        let tray = TabBar::tray_colors(theme);
+        assert_ne!(
+            tray.tray, tray.selected,
+            "托盘底与选中标签底必须不同：预览靠补托盘底来避免「文字浮空」"
+        );
+        assert_ne!(
+            tray.tray, tray.hover,
+            "hover 高光不能与托盘底同色，否则悬停提示看不见"
         );
     }
 

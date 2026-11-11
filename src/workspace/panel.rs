@@ -778,6 +778,25 @@ impl Panel {
             .unwrap_or_else(|| "Panel".into())
     }
 
+    /// 面板标题栏拖拽时跟随光标的视觉：与顶部标签栏同一套（herdr 托盘）。
+    ///
+    /// 只有终端面板有程序方块可言；纯文面板返回 `None`，调用方退回文字胶囊。
+    ///
+    /// 宽度固定取 `TAB_WIDTH_PX`：面板没有"在标签栏里被压缩"这回事，
+    /// 它拖出去以后要落在标签栏或分屏区域，用标准标签宽度最好认。
+    fn drag_tray_visual(&self, cx: &App) -> Option<crate::workspace::tab_bar::TrayTabVisual> {
+        let view = self.content.terminal_view()?.read(cx);
+        Some(
+            crate::workspace::tab_bar::TrayTabVisual::from_terminal_view(
+                view,
+                self.is_selected,
+                crate::workspace::tab_bar::TAB_WIDTH_PX.into(),
+                format!("panel-{}", self.panel_id),
+                cx,
+            ),
+        )
+    }
+
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -800,6 +819,10 @@ impl Panel {
             .unwrap_or_default();
         let drag_title = self.drag_tab_label(cx).to_string();
         let broadcast_enabled = self.broadcast_enabled;
+        // 面板拖起来时跟随光标的预览：与顶部标签栏同一个渲染器、同一份
+        // 视觉来源（`TrayTabVisual::from_terminal_view`）。两个入口拖同一条
+        // 终端，画面必须一致，否则用户会以为拖的是两样东西。
+        let drag_visual = self.drag_tray_visual(cx);
 
         div()
             .h(px(28.0))
@@ -827,9 +850,23 @@ impl Panel {
                         move |_drag_data, position, window, cx| {
                             // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步
                             cx.stop_propagation();
-                            let preview =
-                                DragPreview::new(drag_title.clone().into(), position, window, cx);
-                            cx.new(move |_cx| preview)
+                            match drag_visual.clone() {
+                                // 终端面板：与顶部标签栏同一套托盘视觉。
+                                Some(visual) => {
+                                    let width = visual.width;
+                                    cx.new(move |_cx| DragPreview::tab(visual, width, position))
+                                }
+                                // 没有终端（纯文本面板）：退回旧的一行文字胶囊。
+                                None => {
+                                    let preview = DragPreview::new(
+                                        drag_title.clone().into(),
+                                        position,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.new(move |_cx| preview)
+                                }
+                            }
                         },
                     )
                     .when_some(self.remote_os, |this, os| {
