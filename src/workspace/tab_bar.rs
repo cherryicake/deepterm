@@ -153,11 +153,48 @@ const TILE_SIZE_PX: f32 = 26.0;
 /// 方块内图形的边长。
 const TILE_GLYPH_PX: f32 = 15.0;
 
-/// 拖拽预览视图
+/// 托盘标签的**视觉快照**：把「一个标签长什么样」从交互里剥出来。
+///
+/// 存在的理由：拖拽时跟随光标的预览必须和原标签**逐项一致**（宽度、高度、
+/// 圆角、程序方块、两段文字、状态点）。两处各写一遍必然漂移——改了托盘样式
+/// 忘了改预览，拖动中就露出一个旧样式的幽灵标签。所以两边都从这份快照出发，
+/// 走同一个 [`render_tray_tab_body`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrayTabVisual {
+    /// 左侧程序方块的内容。
+    pub program: TileProgram,
+    /// 名字段。
+    pub title: SharedString,
+    /// 目录段（空串表示不画）。
+    pub cwd: SharedString,
+    /// 有未保存改动（灰点）。
+    pub is_modified: bool,
+    /// 需要看一眼（红点）。
+    pub needs_attention: bool,
+    /// 方块右上角的 agent 回合状态点；`None` 不画。
+    pub dot: Option<AgentStatus>,
+    /// 是否正在输出（文字扫光 + 转圈）。
+    pub streaming: bool,
+    /// 扫光用的品牌色（`Icon::AgentIcon::accent_rgb`）。
+    pub agent_accent_rgb: Option<u32>,
+    /// 选中态：选中用「抬起底色 + 描边」，未选中用托盘底。
+    pub is_active: bool,
+    /// 标签宽度（拖拽预览按同一个值画）。
+    pub width: Pixels,
+    /// 动画元素 id 前缀：同一个标签的扫光 / 转圈在托盘与预览里不能共用 id。
+    pub animation_key: SharedString,
+}
+
+/// 拖拽预览视图。
 pub struct DragPreview {
     pub tab_label: SharedString,
     pub drag_offset: Point<Pixels>,
     pub preview_width: Pixels,
+    /// 终端标签的拖拽预览：带完整视觉，画出来与原标签一致。
+    ///
+    /// `None` 是 panel 标题栏的拖拽（分屏面板），那里没有程序方块，
+    /// 沿用旧的一行文字胶囊。
+    tray: Option<TrayTabVisual>,
 }
 
 impl DragPreview {
@@ -171,6 +208,24 @@ impl DragPreview {
             preview_width: Self::measure_width(window, &tab_label, cx),
             tab_label,
             drag_offset,
+            tray: None,
+        }
+    }
+
+    /// 终端标签的拖拽预览：视觉与托盘里那一枚完全一致。
+    ///
+    /// 只多两样东西——略微的透明度与一层阴影，用来区分「被拖着的那个」
+    /// 和「还留在托盘里的那个」。
+    ///
+    /// 宽度取标签在托盘里**实际**占的宽度（可能已被压缩），不是名义上的
+    /// 260：否则窄窗口里拖动，落点判定按 260 算、预览按 260 画，而原标签
+    /// 只有 120，视觉上对不上。
+    pub fn tab(visual: TrayTabVisual, width: Pixels, drag_offset: Point<Pixels>) -> Self {
+        Self {
+            preview_width: width,
+            tab_label: visual.title.clone(),
+            drag_offset,
+            tray: Some(visual),
         }
     }
 
@@ -198,9 +253,29 @@ impl DragPreview {
 
 impl Render for DragPreview {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().ui;
+
+        // 终端标签：与托盘里那一枚走同一个 body 渲染器，只有外层定位不同。
+        if let Some(mut visual) = self.tray.clone() {
+            // body 自己按 `visual.width` 定宽；外层再兜一层同样的宽度，
+            // 保证「预览宽度 = 标签宽度」这件事只有一处真值。
+            visual.width = self.preview_width;
+            let tray = TabBar::tray_colors(theme);
+            return div()
+                .pl(self.drag_offset.x - self.preview_width / 2.0)
+                .pt(self.drag_offset.y - px(TAB_HEIGHT_PX) / 2.0)
+                .child(
+                    div()
+                        .w(self.preview_width)
+                        .h(px(TAB_HEIGHT_PX))
+                        .opacity(0.92)
+                        .shadow_md()
+                        .child(render_tray_tab_body(&visual, tray, theme, None, false)),
+                );
+        }
+
         let preview_width = self.preview_width;
         let preview_height = px(30.0);
-        let theme = cx.theme().ui;
 
         div()
             // 将预览中心对齐到鼠标位置
@@ -228,6 +303,174 @@ impl Render for DragPreview {
             )
     }
 }
+/// 画一个托盘标签的**全部视觉**：底色 / 描边 / 圆角 / 程序方块 / 两段文字 /
+/// 状态点 / 转圈 / 关闭槽占位。
+///
+/// 托盘里的真标签与拖拽时跟随光标的预览都调用它——这是两者视觉一致的唯一
+/// 保证。`interactive` 只影响 hover 高亮（预览不需要，它跟着光标走）。
+///
+/// 返回 `Div`（不是 `AnyElement`）：托盘那边还要往上挂 id / 交互回调，
+/// 包成 `AnyElement` 就接不回去了。
+fn render_tray_tab_body(
+    visual: &TrayTabVisual,
+    tray: TrayColors,
+    theme: UiTheme,
+    close: Option<AnyElement>,
+    interactive: bool,
+) -> Div {
+    let is_active = visual.is_active;
+    let title_color = if is_active { tray.text } else { tray.muted };
+    let cwd_color = tray.dim;
+    // 扫光文字要在它上面可见：取标签自己的底色（选中 = 抬起的那块，
+    // 未选中 = 托盘底）。
+    let surface = if is_active { tray.selected } else { tray.tray };
+
+    let label = div()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_w_0()
+        .gap(px(6.0))
+        .items_center()
+        // 两个语义圆点：灰点 = 未保存改动，红点 = 「需要你看一眼」
+        // （后台铃 / agent 跑完一回合）。
+        .when(visual.is_modified, |this| {
+            this.child(
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(if is_active {
+                        tray.muted
+                    } else {
+                        tray.muted.opacity(0.7)
+                    }),
+            )
+        })
+        .when(visual.needs_attention, |this| {
+            this.child(
+                div()
+                    .size(px(7.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme.error),
+            )
+        })
+        // herdr 把名字设为 `flex_none`、目录设 `truncate`：先保证「这是什么」
+        // 完整，再让「在哪儿」在剩余宽度里省略。名字本身也留一个最大宽度，
+        // 否则一个超长进程名会把目录段整段挤没。
+        //
+        // 文字宽度用「幽灵 sizer」撑住（见 `render_tab_label` 的文档）：
+        // 扫光每帧改变高亮分段，gpui 会按分段重新 shaping，行宽在整像素间
+        // 振荡；让普通文本（宽度恒定）占位、扫光以覆盖层叠上去，标签
+        // 才不会逐帧微抖。
+        .child(
+            div()
+                .relative()
+                .flex_none()
+                .max_w(px(TAB_TITLE_MAX_PX))
+                .min_w_0()
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(TAB_TEXT_PX))
+                        .text_color(title_color)
+                        .when(visual.streaming, |this| this.opacity(0.0))
+                        .child(visual.title.clone()),
+                )
+                .when(visual.streaming, |this| {
+                    this.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .child(render_working_label(
+                                &visual.animation_key,
+                                &visual.title,
+                                title_color,
+                                TabBar::agent_sweep_color(
+                                    visual.agent_accent_rgb.unwrap_or(0),
+                                    title_color,
+                                    surface,
+                                    theme.accent,
+                                ),
+                            )),
+                    )
+                }),
+        )
+        .when(!visual.cwd.is_empty(), |this| {
+            this.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(TAB_TEXT_PX))
+                    .text_color(cwd_color)
+                    .child(visual.cwd.clone()),
+            )
+        })
+        // herdr 的「正在干活」指示：转圈。它由「真的在输出」驱动，而不是
+        // 回合状态——一个静默的 agent 不该永远转。
+        .when(visual.streaming, |this| {
+            this.child(
+                svg()
+                    .flex_none()
+                    .size(px(12.0))
+                    .text_color(theme.warning)
+                    .path(Icon::Loader.path())
+                    .with_animation(
+                        format!("tab-working-{}", visual.animation_key),
+                        Animation::new(Duration::from_millis(900))
+                            .repeat()
+                            .with_easing(ease_in_out),
+                        |this, delta| {
+                            this.with_transformation(Transformation::rotate(percentage(delta)))
+                        },
+                    ),
+            )
+        });
+
+    let mut body = div()
+        .h_full()
+        .w(visual.width)
+        .flex_shrink_1()
+        .min_w(px(TAB_MIN_WIDTH_PX))
+        .pl(px(5.0))
+        .pr(px(12.0))
+        .gap(px(9.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .rounded(px(TAB_RADIUS_TRAY_PX))
+        .border_1()
+        .when(is_active, |this| {
+            this.bg(tray.selected).border_color(tray.selected_edge)
+        })
+        .when(!is_active, |this| {
+            let this = this.border_color(gpui::transparent_black());
+            if interactive {
+                this.hover(move |style| style.bg(tray.hover))
+            } else {
+                this
+            }
+        })
+        .child(TabBar::render_program_tile(
+            &visual.program,
+            visual.dot,
+            tray,
+            theme,
+        ))
+        .child(label);
+
+    body = match close {
+        Some(close) => body.child(close),
+        // 预览里没有关闭按钮，但**留同样的宽度**：两边文字能截断到同样长度，
+        // 拖动时标签不会突然变长。
+        None => body.child(div().flex_none().w(px(16.0)).h(px(16.0))),
+    };
+    body
+}
+
 /// Cosine envelope: strongest at the center, zero with a flat slope at both edges.
 fn shimmer_intensity(distance: f32, radius: f32) -> f32 {
     let position = (distance.abs() / radius).min(1.0);
@@ -2209,7 +2452,6 @@ impl TabBar {
         let tab_id = tab.id.clone();
         let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
         let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
-        let program = tab.tile_program();
 
         let start_offset =
             self.tab_offset_for_preview(self.previous_reorder_preview.as_ref(), index);
@@ -2218,151 +2460,36 @@ impl TabBar {
             self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
         let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
 
-        let title_color = if is_active { tray.text } else { tray.muted };
-        let cwd_color = tray.dim;
-        // 扫光文字要在它上面可见：取标签自己的底色（选中 = 抬起的那块，
-        // 未选中 = 托盘底）。
-        let surface = if is_active { tray.selected } else { tray.tray };
+        // 标签在托盘里可能被压缩（窗口窄、标签多）：拖拽预览必须按**实际**
+        // 布局宽度画，否则一抓起来就比原标签宽一截。`bounds_for_item` 的
+        // 宽度就是上一帧真实布局的宽度。
+        let actual_width = self
+            .current_tab_bounds()
+            .get(index)
+            .map(|bounds| bounds.size.width)
+            .filter(|width| *width > px(0.0))
+            .unwrap_or(px(TAB_WIDTH_PX));
 
-        // 程序方块常驻，**不**被关闭按钮顶替：方块是「这是什么程序」的身份，
-        // 悬停时把它换成 X 会让「点左边选标签」变成「点左边关标签」——
-        // 手一抖就关掉正在看的东西。关闭按钮固定占右侧 16px，hover 才显形，
-        // 占位恒定所以标签宽度不会跟着抖动。
-        //
-        // agent 回合状态点压在程序方块上（herdr 同款）。只在真有程序方块
-        // 时画：恢复会话等场景下 program/icon 都可能为空，空方块上点一个
-        // 点既没信息量，也会让一次状态变化改到与它无关的几何。
-        let dot = (tab.program.is_some() || matches!(tab.icon, Some(Icon::AgentIcon { .. })))
-            .then_some(tab.agent_status)
-            .flatten();
-        let icon_slot = Self::render_program_tile(&program, dot, tray, theme);
+        // 视觉只算一次，托盘与拖拽预览共用同一份快照。
+        let visual = self.tray_tab_visual(tab, actual_width);
+        let mut drag_visual = visual.clone();
+        // 预览里的动画键加后缀：同一个标签在托盘与预览里同时存在，扫光 / 转圈
+        // 的动画 id 必须唯一，否则两处争同一份动画状态。
+        drag_visual.animation_key = SharedString::from(format!("drag-{}", tab_id));
 
-        let label =
-            div()
-                .flex()
-                .flex_row()
-                .flex_1()
-                .min_w_0()
-                .gap(px(6.0))
-                .items_center()
-                // 两个语义圆点：灰点 = 未保存改动，红点 = 「需要你看一眼」
-                // （后台铃 / agent 跑完一回合）。与旧版一致，herdr 的托盘不画它们，
-                // 但 deepterm 的编辑器与铃铛依赖这两个点做未读提示。
-                .when(tab.is_modified, |this| {
-                    this.child(
-                        div()
-                            .size(px(6.0))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(if is_active {
-                                tray.muted
-                            } else {
-                                tray.muted.opacity(0.7)
-                            }),
-                    )
-                })
-                .when(should_show_attention_dot(tab), |this| {
-                    this.child(
-                        div()
-                            .size(px(7.0))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(theme.error),
-                    )
-                })
-                // herdr 把名字设为 `flex_none`、目录设 `truncate`：先保证「这是什么」
-                // 完整，再让「在哪儿」在剩余宽度里省略。名字本身也留一个最大宽度，
-                // 否则一个超长进程名会把目录段整段挤没。
-                //
-                // 文字宽度用「幽灵 sizer」撑住（见 `render_tab_label` 的文档）：
-                // 扫光每帧改变高亮分段，gpui 会按分段重新 shaping，行宽在整像素间
-                // 振荡；让普通文本（宽度恒定）占位、扫光以覆盖层叠上去，标签
-                // 才不会逐帧微抖。
-                .child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .max_w(px(TAB_TITLE_MAX_PX))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(TAB_TEXT_PX))
-                                .text_color(title_color)
-                                .when(tab.is_agent_streaming(), |this| this.opacity(0.0))
-                                .child(tab.label.clone()),
-                        )
-                        .when(tab.is_agent_streaming(), |this| {
-                            this.child(div().absolute().top_0().left_0().child(
-                                render_working_label(
-                                    &tab.id,
-                                    &tab.label,
-                                    title_color,
-                                    Self::agent_sweep_color(
-                                        tab.agent_accent_rgb().unwrap_or(0),
-                                        title_color,
-                                        surface,
-                                        theme.accent,
-                                    ),
-                                ),
-                            ))
-                        }),
-                )
-                .when(!tab.cwd_label.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(TAB_TEXT_PX))
-                            .text_color(cwd_color)
-                            .child(tab.cwd_label.clone()),
-                    )
-                })
-                // herdr 的「正在干活」指示：转圈。它由 `agent_streaming`（真的在
-                // 输出）驱动，而不是回合状态——一个静默的 agent 不该永远转。
-                .when(tab.is_agent_streaming(), |this| {
-                    this.child(
-                        svg()
-                            .flex_none()
-                            .size(px(12.0))
-                            .text_color(theme.warning)
-                            .path(Icon::Loader.path())
-                            .with_animation(
-                                format!("tab-working-{}", tab.id),
-                                Animation::new(Duration::from_millis(900))
-                                    .repeat()
-                                    .with_easing(ease_in_out),
-                                |this, delta| {
-                                    this.with_transformation(Transformation::rotate(percentage(
-                                        delta,
-                                    )))
-                                },
-                            ),
-                    )
-                });
+        // 关闭槽是唯一带交互的部分：交给共用 body；预览里传 None，
+        // 但 body 会留同样宽的空位，保证两边文字截断长度一致。
+        let close = Self::render_tray_close_slot(
+            tab_id.clone(),
+            is_active,
+            is_hovered,
+            tray,
+            self.on_tab_close.clone(),
+            cx,
+        );
 
-        let tab_inner = div()
+        let tab_inner = render_tray_tab_body(&visual, tray, theme, Some(close), true)
             .id(tab_id.clone())
-            .h_full()
-            .w(px(TAB_WIDTH_PX))
-            .flex_shrink_1()
-            .min_w(px(TAB_MIN_WIDTH_PX))
-            .pl(px(5.0))
-            .pr(px(12.0))
-            .gap(px(9.0))
-            .flex()
-            .flex_row()
-            .items_center()
-            .rounded(px(TAB_RADIUS_TRAY_PX))
-            .border_1()
-            .when(is_active, |this| {
-                this.bg(tray.selected).border_color(tray.selected_edge)
-            })
-            .when(!is_active, |this| {
-                this.border_color(gpui::transparent_black())
-                    .hover(move |style| style.bg(tray.hover))
-            })
             .cursor_pointer()
             .on_hover(cx.listener({
                 let tab_id = tab_id.clone();
@@ -2379,25 +2506,13 @@ impl TabBar {
                     tab_id: tab_id.clone(),
                     from_index: index,
                 },
-                {
-                    let label = tab.label.clone();
-                    move |_drag_data, position, window, cx| {
-                        cx.stop_propagation();
-                        let preview = DragPreview::new(label.clone(), position, window, cx);
-                        cx.new(move |_cx| preview)
-                    }
+                move |_drag_data, position, _window, cx| {
+                    cx.stop_propagation();
+                    let visual = drag_visual.clone();
+                    let width = actual_width;
+                    cx.new(move |_cx| DragPreview::tab(visual, width, position))
                 },
             )
-            .child(icon_slot)
-            .child(label)
-            .child(Self::render_tray_close_slot(
-                tab_id.clone(),
-                is_active,
-                is_hovered,
-                tray,
-                self.on_tab_close.clone(),
-                cx,
-            ))
             .on_click(cx.listener({
                 let on_tab_click = self.on_tab_click.clone();
                 let tab_id = tab_id.clone();
@@ -2443,7 +2558,7 @@ impl TabBar {
         let needs_animation = start_offset != end_offset || start_opacity != end_opacity;
         if needs_animation {
             let animation_id = format!("tab-reorder-{}-{}", tab_id, self.reorder_animation_epoch);
-            div()
+            return div()
                 .child(tab_inner)
                 .flex_shrink_0()
                 .with_animation(
@@ -2456,9 +2571,34 @@ impl TabBar {
                         this.left(px(offset)).opacity(opacity)
                     },
                 )
-                .into_any_element()
-        } else {
-            tab_inner.into_any_element()
+                .into_any_element();
+        }
+        tab_inner.into_any_element()
+    }
+
+    /// 把一个标签的「长什么样」抽成快照：托盘渲染与拖拽预览共用。
+    ///
+    /// `width` 由调用方给：标签在托盘里允许被压缩，预览要按同一个宽度画，
+    /// 否则一松手就「变宽了」。
+    fn tray_tab_visual(&self, tab: &TabItem, width: Pixels) -> TrayTabVisual {
+        // agent 回合状态点压在程序方块上（herdr 同款）。只在真有程序方块
+        // 时画：恢复会话等场景下 program/icon 都可能为空，空方块上点一个点
+        // 既没信息量，也会让一次状态变化改到与它无关的几何。
+        let dot = (tab.program.is_some() || matches!(tab.icon, Some(Icon::AgentIcon { .. })))
+            .then_some(tab.agent_status)
+            .flatten();
+        TrayTabVisual {
+            program: tab.tile_program(),
+            title: tab.label.clone(),
+            cwd: tab.cwd_label.clone(),
+            is_modified: tab.is_modified,
+            needs_attention: should_show_attention_dot(tab),
+            dot,
+            streaming: tab.is_agent_streaming(),
+            agent_accent_rgb: tab.agent_accent_rgb(),
+            is_active: self.active_tab_id.as_ref() == Some(&tab.id),
+            width,
+            animation_key: SharedString::from(format!("tray-{}", tab.id)),
         }
     }
 
@@ -3276,6 +3416,41 @@ mod tests {
         assert!(tab.cwd_label.is_empty());
         tab.cwd_label = "~/Documents/deepterm".into();
         assert_eq!(tab.cwd_label.as_ref(), "~/Documents/deepterm");
+    }
+
+    /// 拖拽跟随的预览必须与托盘里的标签**同宽同高同圆角**——用户看到的是
+    /// 「把这个标签拿起来」，不是「弹出一个别的框」。
+    ///
+    /// 这里钉的是可测的那部分：预览视图的宽度字段直接取标签实际宽度，
+    /// 且视觉快照（方块 / 标题 / 目录 / 选中态）原样带过去。
+    #[gpui::test]
+    fn drag_preview_keeps_tab_geometry_and_visual(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let bar = cx.update(|cx| {
+            let mut tab = TabItem::new("t1", "vim");
+            tab.program = Some(crate::programs::of(None, &["vim".to_string()]));
+            tab.cwd_label = "~/Documents/deepterm".into();
+            let bar = TabBar::new_with_tabs("preview-bar", cx, vec![tab]);
+            bar.update(cx, |bar, _| {
+                bar.active_tab_id = Some("t1".into());
+            });
+            bar
+        });
+
+        // 视觉快照与托盘里那一枚同源。
+        let visual = bar.read_with(cx, |bar, _| bar.tray_tab_visual(&bar.tabs[0], px(180.0)));
+        assert_eq!(visual.title.as_ref(), "vim");
+        assert_eq!(visual.cwd.as_ref(), "~/Documents/deepterm");
+        assert!(visual.is_active, "被拖的那个通常就是当前标签");
+        assert_eq!(visual.program.tile, Some(0x019733));
+
+        // 预览按标签实际宽度构造，不是名义 260。
+        let preview = DragPreview::tab(visual, px(180.0), point(px(40.0), px(30.0)));
+        assert_eq!(preview.preview_width, px(180.0));
+        assert!(
+            preview.tray.is_some(),
+            "终端标签的预览必须走托盘视觉，不能退回旧的文字胶囊"
+        );
     }
 
     /// 编辑器标签栏必须拒绝 agent 状态——agent 只属于跑着它的终端标签。
