@@ -1,13 +1,12 @@
 use std::rc::Rc;
 use std::time::Duration;
-use unicode_segmentation::UnicodeSegmentation;
 
 use gpui::prelude::*;
 use gpui::{
     Action, Animation, AnimationExt as _, AnyElement, App, Bounds, Context, Div, ElementId, Entity,
-    FocusHandle, HighlightStyle, Hsla, IntoElement, MouseButton, Pixels, Point, Render,
-    ScrollHandle, SharedString, Stateful, StyledText, TextRun, TextStyle, Transformation, Window,
-    actions, div, ease_in_out, ease_out_quint, percentage, px, rgb, svg,
+    FocusHandle, Hsla, IntoElement, MouseButton, Pixels, Point, Render, ScrollHandle, SharedString,
+    Stateful, TextRun, TextStyle, Transformation, Window, actions, div, ease_in_out,
+    ease_out_quint, percentage, px, rgb, svg,
 };
 
 use crate::agent::{AgentStatus, CLIAgent};
@@ -92,28 +91,6 @@ fn agent_disc_needs_edge(fill: u32, surface: gpui::Hsla) -> bool {
 /// 为什么不用亮度对比度（[`agent_disc_needs_edge`] 用的那套）：那个衡量的是
 /// "前景在背景上够不够清楚"，对**色相**差异不敏感。两个等亮度但色相相反的颜色
 /// 亮度比是 1.0，却一眼能分开——文字扫光正是这种情形（高亮色与基色同为前景，
-/// 差异主要来自色相）。OKLab 是感知均匀空间，距离与人眼判断一致。
-///
-/// 经验刻度：0.02 刚可察觉，0.05 明显不同，0.15+ 差异强烈。
-fn oklab_distance(a: gpui::Rgba, b: gpui::Rgba) -> f32 {
-    let (l1, a1, b1) = to_oklab(a);
-    let (l2, a2, b2) = to_oklab(b);
-    ((l1 - l2).powi(2) + (a1 - a2).powi(2) + (b1 - b2).powi(2)).sqrt()
-}
-
-/// sRGB → OKLab（Björn Ottosson 的系数）。
-fn to_oklab(c: gpui::Rgba) -> (f32, f32, f32) {
-    let (r, g, b) = (linearize(c.r), linearize(c.g), linearize(c.b));
-    let l = (0.412_221_47 * r + 0.536_332_54 * g + 0.051_445_995 * b).cbrt();
-    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
-    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
-    (
-        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
-        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
-        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
-    )
-}
-
 const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
 const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
 const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
@@ -127,10 +104,6 @@ const ICON_SIZE_PX: f32 = 16.0;
 const FILE_ICON_SIZE_PX: f32 = 22.0;
 const AGENT_DOT_SIZE_PX: f32 = 6.0;
 
-/// Working 状态标签文字的往返扫光：一个完整「去 + 回」的周期。
-const AGENT_WORK_SHIMMER_PERIOD_MS: u64 = 2400;
-/// 限制逐帧重绘频率；文字扫光对帧率不敏感，60→30 fps 省一半重排。
-const AGENT_WORK_SHIMMER_MAX_FPS: f32 = 30.0;
 const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
 
 // ── herdr Terminals LAYOUT 的托盘尺寸 ──────────────────────────────────────
@@ -206,7 +179,10 @@ pub struct TrayTabVisual {
     pub needs_attention: bool,
     /// 方块右上角的 agent 回合状态点；`None` 不画。
     pub dot: Option<AgentStatus>,
-    /// 是否正在输出（文字扫光 + 转圈）。
+    /// agent 是否正在输出。
+    ///
+    /// 视觉上**不再有任何体现**（herdr 的标签是静态的）；它留在快照里是为了
+    /// 让拖拽预览等派生视图与原标签保持同一份数据，不必各自再取一次。
     pub streaming: bool,
     /// 扫光用的品牌色（`Icon::AgentIcon::accent_rgb`）。
     pub agent_accent_rgb: Option<u32>,
@@ -412,9 +388,6 @@ fn render_tray_tab_body(
     let is_active = visual.is_active;
     let title_color = if is_active { tray.text } else { tray.muted };
     let cwd_color = tray.dim;
-    // 扫光文字要在它上面可见：取标签自己的底色（选中 = 抬起的那块，
-    // 未选中 = 托盘底）。
-    let surface = if is_active { tray.selected } else { tray.tray };
 
     let label = div()
         .flex()
@@ -451,13 +424,11 @@ fn render_tray_tab_body(
         // 完整，再让「在哪儿」在剩余宽度里省略。名字本身也留一个最大宽度，
         // 否则一个超长进程名会把目录段整段挤没。
         //
-        // 文字宽度用「幽灵 sizer」撑住（见 `render_tab_label` 的文档）：
-        // 扫光每帧改变高亮分段，gpui 会按分段重新 shaping，行宽在整像素间
-        // 振荡；让普通文本（宽度恒定）占位、扫光以覆盖层叠上去，标签
-        // 才不会逐帧微抖。
+        // 这里**没有**任何"正在工作"的动效：herdr 的标签只是一块静态方块
+        // 加点，agent 在干活也不让文字闪。动效会把注意力从"我要切到哪个
+        // 标签"引开，而状态点已经足够表达"它在忙"。
         .child(
             div()
-                .relative()
                 .flex_none()
                 .max_w(px(TAB_TITLE_MAX_PX))
                 .min_w_0()
@@ -467,28 +438,8 @@ fn render_tray_tab_body(
                         .truncate()
                         .text_size(px(TAB_TEXT_PX))
                         .text_color(title_color)
-                        .when(visual.streaming, |this| this.opacity(0.0))
                         .child(visual.title.clone()),
-                )
-                .when(visual.streaming, |this| {
-                    this.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .child(render_working_label(
-                                &visual.animation_key,
-                                &visual.title,
-                                title_color,
-                                TabBar::agent_sweep_color(
-                                    visual.agent_accent_rgb.unwrap_or(0),
-                                    title_color,
-                                    surface,
-                                    theme.accent,
-                                ),
-                            )),
-                    )
-                }),
+                ),
         )
         .when(!visual.cwd.is_empty(), |this| {
             this.child(
@@ -498,26 +449,6 @@ fn render_tray_tab_body(
                     .text_size(px(TAB_TEXT_PX))
                     .text_color(cwd_color)
                     .child(visual.cwd.clone()),
-            )
-        })
-        // herdr 的「正在干活」指示：转圈。它由「真的在输出」驱动，而不是
-        // 回合状态——一个静默的 agent 不该永远转。
-        .when(visual.streaming, |this| {
-            this.child(
-                svg()
-                    .flex_none()
-                    .size(px(12.0))
-                    .text_color(theme.warning)
-                    .path(Icon::Loader.path())
-                    .with_animation(
-                        format!("tab-working-{}", visual.animation_key),
-                        Animation::new(Duration::from_millis(900))
-                            .repeat()
-                            .with_easing(ease_in_out),
-                        |this, delta| {
-                            this.with_transformation(Transformation::rotate(percentage(delta)))
-                        },
-                    ),
             )
         });
 
@@ -560,121 +491,6 @@ fn render_tray_tab_body(
         None => body.child(div().flex_none().w(px(16.0)).h(px(16.0))),
     };
     body
-}
-
-/// Cosine envelope: strongest at the center, zero with a flat slope at both edges.
-fn shimmer_intensity(distance: f32, radius: f32) -> f32 {
-    let position = (distance.abs() / radius).min(1.0);
-    (1.0 + (position * std::f32::consts::PI).cos()) * 0.5
-}
-
-/// 为**所有**字形生成高亮，而非只覆盖扫光带内的字形。
-///
-/// # 为什么不能只高亮带内字形
-/// gpui 的 `shape_text` 只把「颜色等 decoration 完全相同」的相邻 run 合并进同一个
-/// FontRun，而 FontRun 边界决定 CoreText 的分段 shaping（跨边界 kerning 丢失、
-/// 相邻 run 用微差字号防连字）。若带外字形不带高亮，它们会合并成一段基色 run，
-/// 扫光带每移动一帧段边界就跟着移动 → 每帧以不同边界重排 → 字形位置逐帧微漂，
-/// 视觉上就是「标签宽度稳了，但里面的字还在动」。
-///
-/// 所以这里给每个字形都发一段高亮（带外 strength=0，颜色即基色），并给颜色加上
-/// 交替的 ±ε 偏移，保证**相邻**字形颜色永不相等 → 每个字形恒为独立 run，分段
-/// 只取决于字形边界、与帧无关 → 整个动画期间 shaping 结果恒定（LineLayoutCache
-/// 键相同直接命中），文字纹丝不动。ε 比渲染时 8-bit 颜色的最小可辨差小约 40 倍，
-/// 肉眼不可见。
-fn shimmer_highlights<'a>(
-    glyphs: &'a [(std::ops::Range<usize>, f32)],
-    width: f32,
-    phase: f32,
-    base: gpui::Rgba,
-    accent: gpui::Rgba,
-) -> impl Iterator<Item = (std::ops::Range<usize>, HighlightStyle)> + 'a {
-    // 亮核半径随标签宽度成比例——**不能**加上限。
-    //
-    // 相位是余弦往返，带中心的峰值速度 = π·width / period，即每帧位移
-    // 随宽度线性增长；而亮核宽度就是 radius。一旦帧位移接近或超过亮核宽度，
-    // 带就会「跳过」字形：某个字形从进入带内到离开，期间没有任何一帧采样到
-    // 它的峰值，视觉上表现为部分字**根本不亮**。
-    //
-    // 实测（30fps、周期 2.4s，width=120px 时每帧位移 5.24px）：旧的
-    // `.clamp(2.5, 6.0)` 把 radius 卡在 6px，帧位移/亮核 = 0.87，60% 的字
-    // 达不到峰值；宽度 180px 时 47% 的字不亮。按 0.18·width 放开上限后，
-    // 该比值恒定在 0.242（< 0.35 的临界值），任意宽度下都没有字被跳过。
-    //
-    // 下限 2.5px 仍然保留：极窄标签（<14px）若亮核小于 2.5px，扫光会退化成
-    // 一根细线扫过，看不出「一道光」的形状。
-    let radius = (width * 0.18).max(2.5);
-    let center = phase * width;
-    glyphs
-        .iter()
-        .enumerate()
-        .map(move |(index, (range, position))| {
-            let strength = shimmer_intensity(*position - center, radius);
-            // 交替微调红色通道：仅用于阻止相邻同色字形被合并进同一个 FontRun，
-            // 不是视觉效果的一部分。
-            let nudge = if index % 2 == 0 { 1e-4 } else { -1e-4 };
-            let color = gpui::Rgba {
-                r: (base.r + (accent.r - base.r) * strength + nudge).clamp(0.0, 1.0),
-                g: base.g + (accent.g - base.g) * strength,
-                b: base.b + (accent.b - base.b) * strength,
-                a: base.a,
-            };
-            (
-                range.clone(),
-                HighlightStyle {
-                    color: Some(color.into()),
-                    ..Default::default()
-                },
-            )
-        })
-}
-
-/// 往返相位：0 → 1 → 0，两端由余弦自然减速。
-fn shimmer_phase(t01: f32) -> f32 {
-    (1.0 - (t01 * std::f32::consts::TAU).cos()) / 2.0
-}
-
-/// Only glyph foreground colors animate. Grapheme boundaries keep combining
-/// marks and emoji together; display-cell positions account for wide CJK text.
-/// The font, layout and background remain unchanged; colors outside the band
-/// stay visually at the base color (see `shimmer_highlights` for why they
-/// still carry an imperceptible per-glyph offset).
-fn render_working_label(
-    tab_id: &str,
-    label: &SharedString,
-    base_color: Hsla,
-    highlight_color: Hsla,
-) -> AnyElement {
-    let id = format!("tab-shimmer-{tab_id}");
-    let mut width = 0.0;
-    let glyphs: Vec<_> = label
-        .grapheme_indices(true)
-        .map(|(start, glyph)| {
-            let advance = unicode_width::UnicodeWidthStr::width(glyph) as f32;
-            let center = width + advance * 0.5;
-            width += advance;
-            (start..start + glyph.len(), center)
-        })
-        .collect();
-    let base = gpui::Rgba::from(base_color);
-    let accent = gpui::Rgba::from(highlight_color);
-    StyledText::new(label.clone())
-        .with_animation(
-            ElementId::Name(id.into()),
-            Animation::new(Duration::from_millis(AGENT_WORK_SHIMMER_PERIOD_MS))
-                .repeat()
-                .with_max_fps(AGENT_WORK_SHIMMER_MAX_FPS),
-            move |styled, delta| {
-                styled.with_highlights(shimmer_highlights(
-                    &glyphs,
-                    width,
-                    shimmer_phase(delta),
-                    base,
-                    accent,
-                ))
-            },
-        )
-        .into_any_element()
 }
 
 /// 一次「前台状态」快照：agent 身份 + 回合状态 + 程序外观。
@@ -771,15 +587,20 @@ pub struct TabItem {
     /// 这个 agent 此刻是否**真的在输出**（`Working` + 最近有 PTY 输出）。
     ///
     /// 与 [`Self::agent_status`] 分开：`Working` 是回合状态，会被迟到的
-    /// `Stop`（或不发 `Stop` 的 agent）拖住；扫光动画只在真的滚字时才转，
-    /// 所以它看的是这个字段，而不是 `agent_status == Working`。
+    /// `Stop`（或不发 `Stop` 的 agent）拖住，而这个字段反映「屏幕真的在动」。
+    ///
+    /// 标签**不**用它做任何动效（与 herdr 一致，见 `is_agent_streaming`）。
+    /// 保留它是因为它是终端层上报的事实，后续要用来做排序/提示时不必重新探测。
     pub agent_streaming: bool,
 }
 
 impl TabItem {
-    /// 是否该画「正在输出」的扫光：`Working` 是回合状态，`agent_streaming`
-    /// 才是「屏幕真的在动」。两者都为真才画——只认回合状态会让一个静默的
-    /// agent（或丢了 `Stop` 的 agent）把扫光一直转下去。
+    /// agent 是否处于「正在输出」状态：`Working` 是回合状态，`agent_streaming`
+    /// 才是「屏幕真的在动」，两者都为真才算。
+    ///
+    /// 标签栏**不再**拿它做扫光/转圈动画：herdr 的标签是静态的，动效会把
+    /// 注意力从「切到哪个标签」引开。这个判定仍有价值——静默的 agent 不该
+    /// 被当成在忙，将来做排序、提示或日志时可以直接用，不必重新探测。
     pub fn is_agent_streaming(&self) -> bool {
         self.agent_streaming && self.agent_status == Some(AgentStatus::Working)
     }
@@ -1796,15 +1617,6 @@ impl TabBar {
                 Some(theme.tab_hover_background),
             )
         };
-        // 标签底色：扫光文字要在它上面可见（见 `agent_sweep_color`）。compact
-        // 模式下标签自身透明，文字实际压在标签栏背景上，所以按标签栏取。
-        let surface = if self.compact {
-            theme.tab_bar_background
-        } else if is_active {
-            theme.tab_active_background
-        } else {
-            theme.tab_inactive_background
-        };
         let tab_inner = div()
             .id(tab_id.clone())
             .h(tab_height)
@@ -1843,7 +1655,7 @@ impl TabBar {
                 },
             )
             .child(self.render_tab_icon_slot(tab, &tab_id, is_active, cx))
-            .child(Self::render_tab_label(tab, is_active, theme, surface))
+            .child(Self::render_tab_label(tab, is_active, theme))
             .on_click(cx.listener({
                 let on_tab_click = self.on_tab_click.clone();
                 let tab_id = tab_id.clone();
@@ -2085,50 +1897,6 @@ impl TabBar {
             .into_any_element()
     }
 
-    /// 标签文字扫光的高亮色：当前 agent 的**品牌色**。
-    ///
-    /// # 为什么要做可见性兜底
-    ///
-    /// 品牌色里有一批是近黑或近白（Codex / Grok / Kimi / OpenCode / Auggie 是黑，
-    /// Cursor 是浅灰）。它们与文字**基色**撞色时，扫光扫过去什么都看不见。
-    ///
-    /// # 为什么用感知距离而不是亮度对比
-    ///
-    /// 亮度对比度是给"前景 vs 背景"判断可读性的，用在"两个前景色能否区分"
-    /// 上会严重误判：solarized-dark 的文字 `#839496` 与 Claude 橙 `#D97757`
-    /// 亮度比只有 1.01（看起来"隐形"），但两者色相迥异，感知距离 0.151，
-    /// **肉眼一眼可辨**。若按亮度判，21/23 个 agent 都会被无谓地回落掉。
-    ///
-    /// 所以这里用 OKLab 的欧氏距离（≈ ΔE）：它对色相差异敏感，与人眼判断一致。
-    /// 阈值 0.05 取自"明显不同"的下限（刚可察觉约 0.02）。
-    ///
-    /// # 为什么还要查一次背景
-    ///
-    /// "与基色分得开"只是必要条件：扫光是把**文字**染成品牌色，所以品牌色还得
-    /// 在标签底色上看得见。只看基色会放过一整类反例——浅色主题的标签底色接近
-    /// 纯白（github-light 就是 `#FFFFFF`），黑色品牌色与正文分得很开，扫光扫过去
-    /// 却直接压进底色里，**文字整段消失**。
-    ///
-    /// 两条判据都过才用品牌色，否则回落到主题 accent。实测 23 个 agent ×
-    /// 31 个主题 × 2 种激活态共 1426 个组合：8 个 agent 会在部分主题下回落
-    /// （品牌色越接近黑白，回落越多），其余组合全部保留品牌色。回落目标本身
-    /// 始终安全：accent 对正文的最小感知距离 0.051、对底色最小对比度 1.63。
-    fn agent_sweep_color(
-        brand_rgb: u32,
-        base: gpui::Hsla,
-        surface: gpui::Hsla,
-        accent: gpui::Hsla,
-    ) -> gpui::Hsla {
-        let brand = rgb(brand_rgb);
-        let distinguishable = oklab_distance(brand, base.into()) >= 0.05;
-        let visible_on_surface = contrast_ratio(brand, surface.into()) >= 1.25;
-        if distinguishable && visible_on_surface {
-            brand.into()
-        } else {
-            accent
-        }
-    }
-
     /// 标签文本（含未保存 / 需关注圆点），非激活时限宽截断
     ///
     /// 两个圆点是**两个维度**，可以同时出现：
@@ -2139,12 +1907,7 @@ impl TabBar {
     /// 红点**不**因为图标上有 agent 状态点而让位：那个点说的是"agent 在干什么"，
     /// 不会因为你切过去看过就消失；红点说的是"这次完成你还没看"。前者是状态，
     /// 后者是未读，两者不重复。详见 [`should_show_attention_dot`] 的文档。
-    fn render_tab_label(
-        tab: &TabItem,
-        is_active: bool,
-        theme: UiTheme,
-        surface: gpui::Hsla,
-    ) -> Div {
+    fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
         let show_attention = should_show_attention_dot(tab);
 
         div()
@@ -2202,45 +1965,9 @@ impl TabBar {
                     // 普通文本是单 run 排版，宽度逐帧恒定，由它撑住 tab 宽度；
                     // Working 时只把它隐形，扫光以覆盖层形式叠在上面，不参与布局。
                     // text_ellipsis 挂在 sizer 上而不是外层容器：避免覆盖层里的
-                    // 扫光文本继承截断样式，被逐帧重排出的亚像素宽度差误触发截断。
-                    .child(
-                        div()
-                            .min_w_0()
-                            .text_ellipsis()
-                            .when(tab.is_agent_streaming(), |this| this.opacity(0.))
-                            .child(tab.label.clone()),
-                    )
-                    .when(tab.is_agent_streaming(), |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .child(render_working_label(
-                                    &tab.id,
-                                    &tab.label,
-                                    if is_active {
-                                        theme.text
-                                    } else {
-                                        theme.text_muted
-                                    },
-                                    // 扫光高亮用当前 agent 的品牌色，而不是主题
-                                    // 强调色：文字在动的时候顺带说明"是哪个 agent
-                                    // 在干活"。品牌色与正文或标签底色撞色时由
-                                    // `agent_sweep_color` 回落到主题 accent。
-                                    Self::agent_sweep_color(
-                                        tab.agent_accent_rgb().unwrap_or(0),
-                                        if is_active {
-                                            theme.text
-                                        } else {
-                                            theme.text_muted
-                                        },
-                                        surface,
-                                        theme.accent,
-                                    ),
-                                )),
-                        )
-                    }),
+                    // 标签文字不做任何动效：与 herdr 一致，agent 在干活
+                    // 也只靠方块上的状态点表达，文字始终是静态的。
+                    .child(div().min_w_0().text_ellipsis().child(tab.label.clone())),
             )
     }
 
@@ -3160,93 +2887,6 @@ mod tests {
         assert!(!agent_disc_needs_edge(0x000000, rgb(0x1E1E1E).into()));
     }
 
-    #[test]
-    fn sweep_center_is_strongest_with_symmetric_soft_edges() {
-        let base = gpui::Rgba::from(rgb(0x808080));
-        let accent = gpui::Rgba::from(rgb(0x2080ff));
-        let glyphs: Vec<_> = (0..11).map(|i| (i..i + 1, i as f32)).collect();
-        let frame: Vec<_> = shimmer_highlights(&glyphs, 10.0, 0.5, base, accent).collect();
-        let color = |index| {
-            frame
-                .iter()
-                .find(|(range, _)| range.start == index)
-                .map(|(_, style)| gpui::Rgba::from(style.color.unwrap()))
-                .unwrap_or(base)
-        };
-        // 带外字形必须**视觉上**等于基色：ε 微调远小于 8-bit 最小可辨差（≈4e-3），
-        // 但不要求逐位相等（ε 的存在正是为了拆开相邻字形，见 shimmer_highlights）。
-        const VISUALLY_SAME: f32 = 5e-4;
-        assert!((color(0).r - base.r).abs() < VISUALLY_SAME);
-        assert!((color(10).r - base.r).abs() < VISUALLY_SAME);
-        assert!((color(5).b - accent.b).abs() < 1e-5);
-        assert!(color(5).b > color(4).b && color(4).b > color(3).b && color(3).b > base.b);
-        assert!((color(4).b - color(6).b).abs() < 1e-5);
-        assert!((color(3).b - color(7).b).abs() < 1e-5);
-        // 防抖不变量：每个字形都有高亮，且相邻字形颜色永不相等——
-        // 否则 gpui 会把它们合并进同一个 FontRun，段边界随帧移动导致文字微漂。
-        assert_eq!(frame.len(), glyphs.len());
-        for pair in frame.windows(2) {
-            assert_ne!(pair[0].1.color, pair[1].1.color);
-        }
-        // A sub-character movement must change intensity, not jump a solid band.
-        let next: Vec<_> = shimmer_highlights(&glyphs, 10.0, 0.51, base, accent).collect();
-        assert_ne!(frame, next);
-    }
-
-    /// 扫光带不能「跳过」字形：任何宽度的标签上，每个字都要有机会亮到峰值。
-    ///
-    /// 相位是余弦往返，带中心的峰值速度 = π·width / period，即每帧位移随宽度
-    /// **线性增长**；而亮核宽度就是 radius。一旦帧位移逼近亮核宽度，字形从进入
-    /// 带到离开之间没有任何一帧采样到它的峰值——部分字**根本不亮**。
-    ///
-    /// 这条守的是 radius 的上限回归：旧代码 `.clamp(2.5, 6.0)` 把亮核卡在 6px，
-    /// 30fps 下 width=120px 时帧位移 5.24px（比值 0.87），60% 的字达不到峰值。
-    /// 按 0.18·width 放开上限后该比值恒为 0.242，任意宽度都无字形被跳过。
-    #[test]
-    fn every_glyph_reaches_peak_across_label_widths() {
-        // base 纯黑、accent 纯白：红通道即强度（仅差 ±1e-4 的防合并微调）。
-        let base = rgb(0x000000);
-        let accent = rgb(0xFFFFFF);
-        let frames =
-            (AGENT_WORK_SHIMMER_PERIOD_MS as f32 / 1000.0 * AGENT_WORK_SHIMMER_MAX_FPS) as usize;
-
-        for width in [30.0, 60.0, 120.0, 180.0, 240.0] {
-            let count = (width / 8.0) as usize;
-            let glyphs: Vec<_> = (0..count)
-                .map(|i| (i..i + 1, (i as f32 + 0.5) * width / count as f32))
-                .collect();
-            let mut peak = vec![0.0f32; count];
-            // 按真实帧率逐帧跑满一个周期，记录每个字形见过的最强亮度。
-            for frame in 0..frames {
-                let phase = shimmer_phase(frame as f32 / frames as f32);
-                for (index, (_, style)) in
-                    shimmer_highlights(&glyphs, width, phase, base, accent).enumerate()
-                {
-                    let r = gpui::Rgba::from(style.color.unwrap()).r;
-                    peak[index] = peak[index].max(r);
-                }
-            }
-            let dim = peak.iter().filter(|p| **p < 0.9).count();
-            assert_eq!(
-                dim, 0,
-                "width={width}: {dim}/{count} 个字形整周期都没亮到峰值——\
-                 扫光带跳过了它们（radius 相对每帧位移太小）"
-            );
-        }
-    }
-
-    /// 相位必须是 0→1→0 的往返，且两端（t=0 / t=1）速度为零。
-    #[test]
-    fn shimmer_phase_round_trips_with_soft_ends() {
-        assert_eq!(shimmer_phase(0.0), 0.0);
-        assert_eq!(shimmer_phase(1.0), 0.0);
-        assert!((shimmer_phase(0.5) - 1.0).abs() < 1e-6);
-        // 对称：t 与 1-t 的相位互补（往返一致）。
-        assert!((shimmer_phase(0.25) + shimmer_phase(0.75) - 1.0).abs() < 1e-4);
-        // 中点附近相位单调上升，两端平缓（余弦包络）。
-        assert!(shimmer_phase(0.5) > shimmer_phase(0.4));
-    }
-
     use gpui::{point, size};
 
     fn make_tabs(ids: &[&str]) -> Vec<TabItem> {
@@ -3628,113 +3268,6 @@ mod tests {
         }
     }
 
-    /// 扫光高亮色优先用 agent 品牌色；与正文或标签底色撞色时才回落。
-    ///
-    /// 守两类失败：
-    /// 1. 高亮色退化成主题 accent（改动前的行为）——文字在动，但看不出是哪个 agent；
-    /// 2. 品牌色撞色时直接用它——扫光扫过去**什么都看不见**。
-    ///
-    /// 撞色有两种，必须都判：
-    /// - 与**正文基色**重合（品牌色与正文同色时扫光不可见）；
-    /// - 在**标签底色**上不可见（浅色主题的标签底色接近纯白，黑色品牌色
-    ///   扫过去直接压进底色里）。只看正文会放过后者。
-    ///
-    /// 用例取自 `assets/themes/builtin.json` 的真实值，不手编：手编极易把
-    /// 「看起来该重合」当成重合（纯黑配 #1A1A1A 实际感知距离 0.218，完全可辨）。
-    #[test]
-    fn agent_sweep_color_uses_brand_unless_indistinguishable() {
-        let accent: gpui::Hsla = rgb(0x3B82F6).into();
-        // `Hsla`/`Rgba` 没有精确 `PartialEq`（浮点分量），逐通道比较。
-        let same = |a: gpui::Hsla, b: gpui::Hsla| {
-            let (x, y) = (gpui::Rgba::from(a), gpui::Rgba::from(b));
-            (x.r - y.r).abs() < 1e-4 && (x.g - y.g).abs() < 1e-4 && (x.b - y.b).abs() < 1e-4
-        };
-        // 中性的安全底色（对纯黑/纯白都有足够对比度），用于隔离「与正文撞色」。
-        let neutral: gpui::Hsla = rgb(0x808080).into();
-
-        // solarized-dark 正文（#839496）与 Claude 橙：亮度比 1.01 但色相迥异，
-        // 感知距离 0.151 → 必须保留品牌色。这是亮度判据会误杀的典型形态。
-        let solarized_dark_text: gpui::Hsla = rgb(0x839496).into();
-        assert!(
-            same(
-                TabBar::agent_sweep_color(
-                    0xD97757,
-                    solarized_dark_text,
-                    rgb(0x002b36).into(),
-                    accent
-                ),
-                rgb(0xD97757).into()
-            ),
-            "色相迥异时必须保留品牌色，不能被亮度判据误杀"
-        );
-
-        // 与正文重合：macos26-dark 的正文就是 #FFFFFF，纯白品牌与它距离 0
-        // → 回落（底色中性，排除背景因素）。
-        let white_text: gpui::Hsla = rgb(0xFFFFFF).into();
-        assert!(
-            same(
-                TabBar::agent_sweep_color(0xFFFFFF, white_text, neutral, accent),
-                accent
-            ),
-            "品牌色与正文完全重合时必须回落，否则扫光不可见"
-        );
-
-        // 在底色上不可见：github-light 的标签底色是 #FFFFFF，纯白品牌
-        // 与正文 #24292F 分得很开（dE 0.722），但白字压白底对比度 1.00
-        // → 必须回落。只看正文的判据会在这里放行。
-        let github_light_text: gpui::Hsla = rgb(0x24292F).into();
-        let github_light_bg: gpui::Hsla = rgb(0xFFFFFF).into();
-        assert!(
-            same(
-                TabBar::agent_sweep_color(0xFFFFFF, github_light_text, github_light_bg, accent),
-                accent
-            ),
-            "品牌色在标签底色上不可见时必须回落（白字压白底）"
-        );
-
-        // 同一个纯白品牌配 macos26-light 的底色（#DEDEE4，对比度 1.29）→ 保留。
-        assert!(
-            same(
-                TabBar::agent_sweep_color(
-                    0xFFFFFF,
-                    rgb(0x1D1D1F).into(),
-                    rgb(0xDEDEE4).into(),
-                    accent
-                ),
-                rgb(0xFFFFFF).into()
-            ),
-            "品牌色在底色上可见、与正文也分得开时必须保留"
-        );
-
-        // 纯黑品牌（Codex / Grok / Kimi / OpenCode / Auggie）配 ayu-dark 的
-        // 深色底色（#0a0e14，对比度 1.09）→ 回落；同一个黑色配浅色正文和浅底
-        // → 保留。
-        assert!(
-            same(
-                TabBar::agent_sweep_color(
-                    0x000000,
-                    rgb(0xb3b1ad).into(),
-                    rgb(0x0a0e14).into(),
-                    accent
-                ),
-                accent
-            ),
-            "纯黑品牌在深色底色上不可见时必须回落"
-        );
-        assert!(
-            same(
-                TabBar::agent_sweep_color(
-                    0x000000,
-                    rgb(0x1D1D1F).into(),
-                    rgb(0xF5F5F7).into(),
-                    accent
-                ),
-                rgb(0x000000).into()
-            ),
-            "纯黑品牌配浅色正文和浅底时清晰可见"
-        );
-    }
-
     /// 托盘标签的方块取自程序表（herdr 的 `tile()`）；没有程序快照时
     /// 退回标签自带的 `Icon`，不能画出一个空方块。
     #[test]
@@ -4083,13 +3616,13 @@ mod tests {
         assert!(!should_show_attention_dot(&base(true, true)));
     }
 
-    /// 扫光只看「真的在输出」，不看回合状态。
+    /// 「正在输出」的判定看真实输出，不看回合状态。
     ///
     /// `Working` 是 agent 上报的回合状态，可能被迟到的 `Stop`（旧版 opencode
     /// 桥接甚至没有映射回合结束事件）拖住几十分钟；扫光若只看它，agent
     /// 安静下来后还会继续转。
     #[test]
-    fn shimmer_requires_streaming_not_just_working() {
+    fn streaming_requires_real_output_not_just_working() {
         use crate::agent::AgentStatus;
 
         let working = TabItem {
@@ -4099,7 +3632,7 @@ mod tests {
         };
         assert!(
             !working.is_agent_streaming(),
-            "Working 但已停止输出时不该扫光"
+            "Working 但已停止输出时不算在输出"
         );
 
         let streaming = TabItem {
@@ -4108,7 +3641,7 @@ mod tests {
         };
         assert!(
             streaming.is_agent_streaming(),
-            "Working 且正在输出时应当扫光"
+            "Working 且正在输出时算在输出"
         );
 
         let done = TabItem {
@@ -4118,7 +3651,7 @@ mod tests {
         };
         assert!(
             !done.is_agent_streaming(),
-            "回合已结束时即便有残余输出也不该扫光"
+            "回合已结束时即便有残余输出也不算在输出"
         );
     }
 
