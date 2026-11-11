@@ -1,7 +1,7 @@
 # Markdown 全语法渲染展示 — DeepTerm Typora/Notion 风格 · v2
 
 > [!TIP]
-> 本文档验证 DeepTerm Markdown 预览的 **Tier 1 + Tier 2** 全部美化效果。直接用 DeepTerm 打开 `markdown-showcase.md`（非 `#edit` 模式）即可预览。亮/暗主题均已适配。
+> 本文档验证 DeepTerm Markdown **实时编辑器**的 **Tier 1 + Tier 2** 全部美化效果。直接用 DeepTerm 打开 `markdown-showcase.md` 即进入实时渲染（只读预览 tab 已删除，实时编辑器涵盖预览能力）。亮/暗主题均已适配。
 
 ---
 

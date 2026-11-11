@@ -1,6 +1,6 @@
 //! Markdown 图片：URL 解析 → 加载（本地文件 / http(s) 远程）→ 视图侧缓存。
 //!
-//! 只读预览（[`super::markdown::Markdown`]）与实时编辑
+//! hover 浮层（[`super::markdown::Markdown`]）与实时编辑
 //! （[`super::markdown_live::view::LiveMarkdownView`]）共用这一份实现，
 //! 保证两处对同一个 `![](...)` 有完全相同的解析与加载结果。
 //!
@@ -111,7 +111,7 @@ enum Slot {
 
 /// 图片加载缓存 + 后台加载器，作为一个独立实体挂在文档视图上。
 ///
-/// 用一个独立实体（而不是视图内的 `HashMap`）的原因：只读预览的渲染入口
+/// 用一个独立实体（而不是视图内的 `HashMap`）的原因：hover 浮层的渲染入口
 /// 只拿得到 `&mut App`，拿不到自己的 `Context`，无法在那里 `cx.spawn`；
 /// 独立实体既能在渲染期更新，也能在加载完成后 `notify`，视图通过
 /// `cx.observe` 收到重绘通知。
@@ -152,15 +152,14 @@ impl ImageCache {
 
     /// 解析 `url` 并返回当前状态；未命中时启动一次后台加载。
     ///
-    /// `doc_dir` 是当前文档所在目录：相对路径以它为基准（`None` 时退回
-    /// 进程工作目录）。
+    /// `ctx` 决定相对路径去哪找（见 [`ImageContext`]）。
     pub(crate) fn slot(
         &mut self,
         url: &str,
-        doc_dir: Option<&Path>,
+        ctx: &ImageContext,
         cx: &mut Context<Self>,
     ) -> SlotState {
-        let Some(source) = resolve(url, doc_dir) else {
+        let Some(source) = resolve(url, ctx) else {
             return SlotState::Unsupported;
         };
         let key = source.cache_key();
@@ -258,13 +257,67 @@ impl ImageCache {
     }
 }
 
+/// 相对图片引用的查找上下文：基准目录按**顺序**依次尝试。
+///
+/// 这个结构回答「`![](a.png)` 到底该去哪找」。顺序与取舍对照 VS Code：
+///
+/// | 来源 | VS Code（`markdown-language-features`） | 这里 |
+/// |---|---|---|
+/// | `http(s):` / `file:` / 绝对路径 | 直接 `asWebviewUri` | 直接加载 |
+/// | 文档在某个工作区文件夹里 | **先**拼工作区根，不用文档目录 | 文档目录**优先**，再拼项目根 |
+/// | 文档不在工作区 / 没有工作区 | 拼**文档所在目录**（`dirname`） | 同左 |
+///
+/// VS Code 只用「工作区根」一档，是因为它的预览按工作区建模（`localResourceRoots`
+/// 就是文档 + 各工作区根）。deepterm 是 Typora 式笔记工具：同级相对引用
+/// （`note.assets/a.png`）必须优先命中文档目录，否则同一个文件名会串到仓库
+/// 里另一个 `assets/`。把项目根放在**后面兜底**，同时拿到 VS Code 那档能力
+/// ——`docs/foo.md` 引用仓库根的 `assets/icon.png` 也能显示。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ImageContext {
+    /// 文档所在目录（**目录**，不是文件路径）；相对引用的第一基准。
+    pub(crate) doc_dir: Option<PathBuf>,
+    /// 项目/工作区根，按由近到远排列；相对引用的兜底基准。
+    pub(crate) roots: Vec<PathBuf>,
+}
+
+impl ImageContext {
+    /// 只按文档目录解析（hover 浮层等没有项目概念的场景）。
+    pub(crate) fn from_doc_dir(doc_dir: Option<PathBuf>) -> Self {
+        Self {
+            doc_dir,
+            roots: Vec::new(),
+        }
+    }
+
+    /// 相对引用的候选基准，按尝试顺序排列。
+    fn bases(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::with_capacity(self.roots.len() + 2);
+        if let Some(dir) = &self.doc_dir {
+            out.push(dir.clone());
+        }
+        for root in &self.roots {
+            if !out.contains(root) {
+                out.push(root.clone());
+            }
+        }
+        // 都没有（无路径的临时文档 / hover）：退回进程工作目录，够用即可。
+        if out.is_empty()
+            && let Ok(cwd) = std::env::current_dir()
+        {
+            out.push(cwd);
+        }
+        out
+    }
+}
+
 /// 把 Markdown 图片目标解析成可加载的源；`None` 表示只能渲染占位卡片。
 ///
 /// 支持：`http(s)://`、协议相对 `//host/x.png`、`file://` URL、`~`、
-/// 百分号转义、绝对/相对本地路径（相对 `doc_dir`）、`..`（做词法归一化，
-/// 不越出根目录）。拒绝：未知 scheme（`data:`/`javascript:`/`ftp:` ……）、
-/// 空地址、非图片扩展名、超长地址。
-fn resolve(url: &str, doc_dir: Option<&Path>) -> Option<ImageSource> {
+/// 百分号转义、`?query` / `#fragment`（剥离，不参与本地路径）、绝对路径、
+/// 相对路径（按 [`ImageContext`] 依次尝试文档目录 → 项目根 → 工作目录）、
+/// `..`（做词法归一化，不越出根目录）。拒绝：未知 scheme
+/// （`data:`/`javascript:`/`ftp:` ……）、空地址、非图片扩展名、超长地址。
+fn resolve(url: &str, ctx: &ImageContext) -> Option<ImageSource> {
     let raw = strip_angle(url.trim());
     if raw.is_empty() || raw.len() > 4096 {
         return None;
@@ -289,23 +342,70 @@ fn resolve(url: &str, doc_dir: Option<&Path>) -> Option<ImageSource> {
         // 注意：这里不再把 `foo:bar.png` 当成未知 scheme 拒掉。Unix 上
         // 文件名合法地包含冒号（macOS 截图就有），而除 file/http 外的
         // scheme 即使当成本地路径也只是读不到文件（渲染为占位）。
-        percent_decode(raw)
+        strip_url_suffix(raw)
     };
-    let path = PathBuf::from(expand_tilde(&path_text));
-    let base = match doc_dir {
-        Some(dir) => dir.to_path_buf(),
-        None => std::env::current_dir().ok()?,
-    };
-    let joined = if path.is_absolute() {
-        path
+    // `~` 先展开，否则 `is_absolute()` 判不出来；解码也从展开后的文本算，
+    // 否则字面量候选会把 `~` 原样留下（变成相对路径，基准全错）。
+    let expanded = expand_tilde(&path_text);
+    let path = PathBuf::from(&expanded);
+    // 相对引用：按基准逐个探，每个基准里两种读法都试：
+    //
+    // 1. **解码后**（URI 语义，VS Code 的口径）：`my%20pic.png` → `my pic.png`；
+    // 2. **字面量**（Zed/Typora 的口径）：磁盘上真的有个文件叫 `my%20pic.png`。
+    //
+    // 顺序是「解码命中 > 字面命中 > 解码兜底」：解码在前贴合 VS Code 与
+    // Markdown 的 URI 语义；字面量兜住前者不存在的情况，避免把合法文件名
+    // 判死。两个都不存在时留给解码结果做占位路径——文件之后被创建时，
+    // `ImageCache` 靠文件指纹变化自动重试，而不是永远 `Unsupported`。
+    let decoded = PathBuf::from(percent_decode(&expanded));
+    let candidates = if decoded == path {
+        vec![path]
     } else {
-        base.join(path)
+        vec![decoded, path]
     };
-    let normalized = normalize_path(&joined);
-    if !crate::editor::image_viewer::is_image_file(&normalized) {
-        return None;
+    let bases: Vec<PathBuf> = if path_is_absolute(&candidates) {
+        vec![PathBuf::new()]
+    } else {
+        ctx.bases()
+    };
+    let mut fallback: Option<PathBuf> = None;
+    for base in bases {
+        for candidate in &candidates {
+            let joined = if candidate.is_absolute() {
+                candidate.clone()
+            } else {
+                base.join(candidate)
+            };
+            let normalized = normalize_path(&joined);
+            if !crate::editor::image_viewer::is_image_file(&normalized) {
+                continue;
+            }
+            if normalized.is_file() {
+                return Some(ImageSource::Local(normalized));
+            }
+            fallback.get_or_insert(normalized);
+        }
     }
-    Some(ImageSource::Local(normalized))
+    fallback.map(ImageSource::Local)
+}
+
+/// 任一候选是绝对路径（`~` 已展开）就没有基准可换。
+fn path_is_absolute(candidates: &[PathBuf]) -> bool {
+    candidates.iter().any(|c| c.is_absolute())
+}
+
+/// 剥掉 `?query` / `#fragment`：它们是 URI 的一部分，不是文件名的一部分。
+///
+/// VS Code 用 `Uri.parse("markdown-link:" + e)` 解析，查询串与锚点天然不进入
+/// 路径。deepterm 之前把整串当文件名，于是 `a.png?raw=1`（GitHub raw 链接、
+/// 各种图床的常用写法）被判成「非图片扩展名」直接放弃，卡片只显示占位。
+///
+/// `#` 在最前面时视为本地文件名的一部分（极少见，但也别把整段吃掉）。
+fn strip_url_suffix(raw: &str) -> String {
+    match raw.find(['?', '#']) {
+        Some(0) | None => raw.to_string(),
+        Some(i) => raw[..i].to_string(),
+    }
 }
 
 /// `![](<assets/a b.png>)` 的尖括号写法。
@@ -519,7 +619,7 @@ fn remote_decode_path(url: &str) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn doc_dir() -> PathBuf {
@@ -531,15 +631,30 @@ mod tests {
     }
 
     /// 干净的临时目录（同名残留先删掉，避免上一轮运行的文件干扰断言）。
+    /// 每个测试独占的临时目录。
+    ///
+    /// 键里带 tag **和**进程内唯一序号：`#[gpui::test]` 默认并发跑，共用
+    /// 同名目录时一个测试的 `remove_dir_all` 会把另一个测试刚写好的图片
+    /// 删掉——`resolve` 会真的 `is_file()` 探测，于是表现为随机失败。
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("deepterm-md-image-{tag}"));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "deepterm-md-image-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
+    fn ctx_of(dir: &Path) -> ImageContext {
+        ImageContext::from_doc_dir(Some(dir.to_path_buf()))
+    }
+
     fn local_of(url: &str) -> PathBuf {
-        match resolve(url, Some(&doc_dir())) {
+        match resolve(url, &ctx_of(&doc_dir())) {
             Some(ImageSource::Local(p)) => p,
             other => panic!("expected local source for {url:?}, got {other:?}"),
         }
@@ -583,7 +698,7 @@ mod tests {
         {
             assert_eq!(local_of("/tmp/a.png"), PathBuf::from("/tmp/a.png"));
             assert_eq!(
-                resolve("/tmp/../tmp/a.png", None),
+                resolve("/tmp/../tmp/a.png", &ImageContext::default()),
                 Some(ImageSource::Local(PathBuf::from("/tmp/a.png")))
             );
         }
@@ -595,7 +710,7 @@ mod tests {
             );
             // 盘符不是 scheme
             assert!(matches!(
-                resolve("D:/pics/a.png", None),
+                resolve("D:/pics/a.png", &ImageContext::default()),
                 Some(ImageSource::Local(_))
             ));
         }
@@ -641,12 +756,15 @@ mod tests {
             "HTTPS://x.dev/a.png?raw=1",
         ] {
             assert!(
-                matches!(resolve(url, None), Some(ImageSource::Remote(_))),
+                matches!(
+                    resolve(url, &ImageContext::default()),
+                    Some(ImageSource::Remote(_))
+                ),
                 "{url}"
             );
         }
         assert_eq!(
-            resolve("//cdn.dev/a.png", None),
+            resolve("//cdn.dev/a.png", &ImageContext::default()),
             Some(ImageSource::Remote("https://cdn.dev/a.png".into()))
         );
     }
@@ -664,7 +782,7 @@ mod tests {
             "id_rsa",
             "<>",
         ] {
-            assert_eq!(resolve(url, None), None, "{url:?}");
+            assert_eq!(resolve(url, &ImageContext::default()), None, "{url:?}");
         }
     }
 
@@ -678,12 +796,146 @@ mod tests {
         assert_eq!(local_of("<assets/a.png>"), doc_dir().join("assets/a.png"));
     }
 
+    /// `?query` / `#fragment` 是 URI 的一部分，不该被当成文件名。
+    ///
+    /// 复现的现场：`a.png?raw=1`（GitHub raw、图床常用写法）此前整串进入
+    /// 扩展名判断，`png?raw=1` 不在白名单里 → `Unsupported` → 卡片永远
+    /// 只显示占位，永远不会读盘。
+    #[test]
+    fn url_query_and_fragment_are_not_part_of_the_filename() {
+        assert_eq!(
+            local_of("assets/a.png?raw=1"),
+            doc_dir().join("assets/a.png")
+        );
+        assert_eq!(local_of("assets/a.png#pic"), doc_dir().join("assets/a.png"));
+        assert_eq!(
+            local_of("assets/a.png?x=1#pic"),
+            doc_dir().join("assets/a.png")
+        );
+        // 真正以 `#` 开头的字面文件名不能被整段吃掉。
+        assert_eq!(strip_url_suffix("#a.png"), "#a.png");
+    }
+
+    /// 文档目录找不到时，按 `roots` 依次兜底——VS Code 的「工作区根」那档。
+    ///
+    /// 真实场景：`docs/foo.md` 引用仓库根的 `assets/icon.png`。VS Code 的
+    /// 预览会拼 `getWorkspaceFolder(doc)`，所以能显示；deepterm 以前只拼
+    /// 文档目录，于是同一个文件在 VS Code 里有图、在这里只有占位。
+    #[test]
+    fn project_root_is_used_when_doc_dir_misses() {
+        let repo = temp_dir("root-fallback");
+        let docs = repo.join("docs");
+        let assets = repo.join("assets");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(docs.join("local.png"), PNG).unwrap();
+        std::fs::write(assets.join("root.png"), PNG).unwrap();
+
+        let ctx = ImageContext {
+            doc_dir: Some(docs.clone()),
+            roots: vec![repo.clone()],
+        };
+
+        // 文档目录命中：优先用它，不回退。
+        assert_eq!(
+            resolve("local.png", &ctx).and_then(local_path),
+            Some(docs.join("local.png"))
+        );
+        // 文档目录没有 → 回退项目根。
+        assert_eq!(
+            resolve("assets/root.png", &ctx).and_then(local_path),
+            Some(assets.join("root.png"))
+        );
+        // 文档目录里也有同名 `assets/root.png` 时，文档目录必须赢。
+        std::fs::create_dir_all(docs.join("assets")).unwrap();
+        std::fs::write(docs.join("assets").join("root.png"), PNG).unwrap();
+        assert_eq!(
+            resolve("assets/root.png", &ctx).and_then(local_path),
+            Some(docs.join("assets").join("root.png"))
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    fn local_path(source: ImageSource) -> Option<PathBuf> {
+        match source {
+            ImageSource::Local(p) => Some(p),
+            ImageSource::Remote(_) => None,
+        }
+    }
+
+    /// 磁盘上真的叫 `my%20pic.png` 时按字面量命中；写 `my%20pic.png` 引用
+    /// 空格文件名时按解码命中。两种写法都要能用。
+    #[test]
+    fn percent_encoding_tries_literal_then_decoded() {
+        let dir = temp_dir("percent");
+        std::fs::write(dir.join("my pic.png"), PNG).unwrap();
+        std::fs::write(dir.join("literal%20name.png"), PNG).unwrap();
+        let ctx = ImageContext::from_doc_dir(Some(dir.clone()));
+
+        assert_eq!(
+            resolve("my%20pic.png", &ctx).and_then(local_path),
+            Some(dir.join("my pic.png"))
+        );
+        assert_eq!(
+            resolve("literal%20name.png", &ctx).and_then(local_path),
+            Some(dir.join("literal%20name.png"))
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端复现用户现场：仓库根 `README.md` 引用**同目录**图片，
+    /// `docs/` 下的笔记引用**仓库根** `assets/`。
+    ///
+    /// 两者都必须在真实文件系统上解析成功——只看 `resolve` 的返回值不够，
+    /// 因为「路径拼对了」和「这个路径真有文件」是两件事，而用户看到的
+    /// 是后者。
+    #[test]
+    fn repo_relative_references_hit_real_files() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ctx = ImageContext {
+            doc_dir: Some(repo.to_path_buf()),
+            roots: vec![crate::lsp::project::project_root(repo)],
+        };
+        // 仓库根文档 → 同目录 assets/
+        assert_eq!(
+            resolve("assets/icon.png", &ctx).and_then(local_path),
+            Some(repo.join("assets").join("icon.png")),
+            "同目录相对引用必须命中仓库里的 assets/icon.png"
+        );
+
+        // 真实文档：docs/markdown-showcase.md 引用仓库根 assets/icon.png
+        let showcase = repo.join("docs").join("markdown-showcase.md");
+        assert!(showcase.is_file(), "夹具文档应存在");
+        let showcase_ctx = ImageContext {
+            doc_dir: showcase.parent().map(std::path::Path::to_path_buf),
+            roots: vec![crate::lsp::project::project_root(&showcase)],
+        };
+        assert_eq!(
+            resolve("assets/icon.png", &showcase_ctx).and_then(local_path),
+            Some(repo.join("assets").join("icon.png")),
+            "markdown-showcase.md 里的 ![](assets/icon.png) 必须能加载"
+        );
+
+        // docs/ 下的文档 → 仓库根 assets/（文档目录里没有 assets/）
+        let docs_ctx = ImageContext {
+            doc_dir: Some(repo.join("docs")),
+            roots: vec![crate::lsp::project::project_root(&repo.join("docs"))],
+        };
+        assert_eq!(
+            resolve("assets/icon.png", &docs_ctx).and_then(local_path),
+            Some(repo.join("assets").join("icon.png")),
+            "docs/ 下的文档应回退到项目根的 assets/"
+        );
+    }
+
     #[test]
     fn cache_keys_use_resolved_identity() {
-        let a = resolve("assets/a.png", Some(Path::new("/notes"))).unwrap();
-        let b = resolve("./assets/a.png", Some(Path::new("/notes"))).unwrap();
+        let a = resolve("assets/a.png", &ctx_of(Path::new("/notes"))).unwrap();
+        let b = resolve("./assets/a.png", &ctx_of(Path::new("/notes"))).unwrap();
         assert_eq!(a.cache_key(), b.cache_key());
-        let c = resolve("assets/a.png", Some(Path::new("/other"))).unwrap();
+        let c = resolve("assets/a.png", &ctx_of(Path::new("/other"))).unwrap();
         assert_ne!(a.cache_key(), c.cache_key());
     }
 
@@ -768,37 +1020,37 @@ mod tests {
         std::fs::write(dir.join("one.png"), PNG).unwrap();
 
         let cache = cx.new(|_| ImageCache::new());
-        let first = cache.update(cx, |cache, cx| cache.slot("one.png", Some(&dir), cx));
+        let first = cache.update(cx, |cache, cx| cache.slot("one.png", &ctx_of(&dir), cx));
         assert!(
             matches!(first, SlotState::Loading),
             "first lookup must kick off a background load"
         );
         cx.run_until_parked();
-        let second = cache.update(cx, |cache, cx| cache.slot("one.png", Some(&dir), cx));
+        let second = cache.update(cx, |cache, cx| cache.slot("one.png", &ctx_of(&dir), cx));
         assert!(
             matches!(second, SlotState::Ready(_, (1, 1))),
             "loaded image must come from the cache"
         );
 
         // 不存在的文件：直接 Failed（不反复读盘）。
-        let missing = cache.update(cx, |cache, cx| cache.slot("missing.png", Some(&dir), cx));
+        let missing = cache.update(cx, |cache, cx| cache.slot("missing.png", &ctx_of(&dir), cx));
         assert!(matches!(missing, SlotState::Failed));
 
         // 非图片源：Unsupported，不占用缓存。
         let unsupported = cache.update(cx, |cache, cx| {
-            cache.slot("data:image/png;base64,AA", Some(&dir), cx)
+            cache.slot("data:image/png;base64,AA", &ctx_of(&dir), cx)
         });
         assert!(matches!(unsupported, SlotState::Unsupported));
 
         // clear 后重新进入 Loading（切文档/外部重载路径）。
         cache.update(cx, |cache, cx| cache.clear(cx));
-        let reload = cache.update(cx, |cache, cx| cache.slot("one.png", Some(&dir), cx));
+        let reload = cache.update(cx, |cache, cx| cache.slot("one.png", &ctx_of(&dir), cx));
         assert!(matches!(reload, SlotState::Loading));
         cx.run_until_parked();
     }
 
     /// 1x1 PNG（本地与远程用例共用）。
-    const PNG: &[u8] = &[
+    pub(crate) const PNG: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
         0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
         0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
@@ -806,16 +1058,30 @@ mod tests {
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
 
-    /// 端到端：预览（`Markdown`）在真实窗口里渲染 `![](icon.png)`，
-    /// 相对路径必须以 `doc_dir` 为基准并最终进入 Ready。
+    /// `Markdown` 实体（hover 浮层用的渲染器）仍按文档目录解析相对图片。
+    ///
+    /// 只读预览 tab 已删除，但 `Markdown` 实体还在给 hover 浮层渲染 md；
+    /// 它的图片解析口径不能因为删预览而失修。
     #[gpui::test]
-    fn preview_render_loads_relative_image(cx: &mut gpui::TestAppContext) {
-        use gpui::{AppContext as _, Entity, IntoElement, Render, Window};
+    fn markdown_entity_resolves_relative_image(cx: &mut gpui::TestAppContext) {
+        use gpui::prelude::*;
+        use gpui::{Entity, IntoElement, Render, Window};
 
         struct Host(Entity<crate::editor::markdown::Markdown>);
         impl Render for Host {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                self.0.clone()
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                // hover 浮层的真实入口：内联渲染，不套整页外壳。
+                let style = crate::editor::markdown::MarkdownStyle::hover_style(
+                    window,
+                    cx,
+                    "Menlo".to_string(),
+                );
+                let items = crate::editor::markdown::Markdown::render_items_inline(
+                    self.0.clone(),
+                    style,
+                    cx,
+                );
+                gpui::div().flex().flex_col().children(items)
             }
         }
 
@@ -843,8 +1109,316 @@ mod tests {
         assert_eq!(
             cache.read_with(cx, |cache, _| cache.ready_count()),
             1,
-            "preview must load the image via the doc-dir-relative path"
+            "Markdown entity must load the image via the doc-dir-relative path"
         );
+    }
+
+    /// 端到端：同目录下各种常见写法都必须真的加载出图片。
+    #[gpui::test]
+    fn live_view_loads_common_forms(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Entity, IntoElement, Render, Window};
+
+        struct Host(Entity<crate::editor::markdown_live::LiveMarkdownView>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let dir = temp_dir("live-forms");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        for (d, n) in [(&dir, "a.png"), (&sub, "b.png")] {
+            std::fs::write(d.join(n), PNG).unwrap();
+        }
+        let doc = dir.join("note.md");
+        let text = [
+            "![one](a.png)",
+            "![two](./a.png)",
+            "![three](sub/b.png)",
+            "![four](/absolute.png)",
+            "![five](a.png?raw=1)",
+            "![six](a.png \"title\")",
+            "![seven](<a.png>)",
+        ]
+        .join("\n\n");
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| {
+                crate::editor::markdown_live::LiveMarkdownView::with_text(&text, cx).doc_path(&doc)
+            }))
+        });
+        let view = host.read_with(cx, |host, _| host.0.clone());
+        let cache = view.read_with(cx, |view, _| view.image_cache_entity());
+        cx.refresh().unwrap();
+        cx.run_until_parked();
+        // 缓存以**解析后的绝对路径**为键：`a.png` 的几种写法共用一个槽位，
+        // 所以这里断言的是「几个不同文件」，不是「几次请求」。
+        let ready = cache.read_with(cx, |cache, _| cache.ready_count());
+        println!("READY = {ready} (expect 2: a.png + sub/b.png)");
+        assert_eq!(
+            ready, 2,
+            "same-dir variants must all resolve to the two real files"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端矩阵：真实世界里会遇到的路径形态与目录布局。
+    ///
+    /// 重点是**文档不在仓库根**的情形（`docs/note.md` 引用仓库根 `assets/`）：
+    /// 这正是 VS Code 靠工作区根能显示、而只拼文档目录会失败的那一档。
+    #[gpui::test]
+    fn live_view_load_matrix(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Entity, IntoElement, Render, Window};
+
+        struct Host(Entity<crate::editor::markdown_live::LiveMarkdownView>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let repo = temp_dir("matrix");
+        let docs = repo.join("docs");
+        let assets = repo.join("assets");
+        let spaced = docs.join("my notes");
+        std::fs::create_dir_all(&spaced).unwrap();
+        std::fs::create_dir_all(&assets).unwrap();
+        for (d, n) in [
+            (&spaced, "pic.png"),
+            (&spaced, "大写.PNG"),
+            (&spaced, "shot:1.png"),
+            (&assets, "logo.png"),
+        ] {
+            std::fs::write(d.join(n), PNG).unwrap();
+        }
+        let doc = spaced.join("note.md");
+
+        // (标签, 引用行, 期望 ready 数, 是否给项目根兜底)
+        let cases: Vec<(&str, &str, usize, bool)> = vec![
+            ("same dir", "![a](pic.png)", 1, false),
+            ("dot slash", "![a](./pic.png)", 1, false),
+            ("uppercase ext", "![a](大写.PNG)", 1, false),
+            ("colon name", "![a](shot:1.png)", 1, false),
+            ("query", "![a](pic.png?v=1)", 1, false),
+            ("angle", "![a](<pic.png>)", 1, false),
+            ("parent dir", "![a](../my%20notes/pic.png)", 1, false),
+            // 徽章式一行多图：两张都要出图。
+            (
+                "two badges one line",
+                "![a](pic.png) ![b](pic.png)",
+                1,
+                false,
+            ),
+            ("repo root", "![a](assets/logo.png)", 1, true),
+            // 没有 roots 时仓库根那份够不到——这是修复前的行为，用来对照。
+            ("repo root (no roots)", "![a](assets/logo.png)", 0, false),
+        ];
+        for (label, ref_line, want, with_roots) in cases {
+            let (host, cx2) = cx.add_window_view(|_, cx| {
+                Host(cx.new(|cx| {
+                    let text = format!("{ref_line}\n");
+                    let view = crate::editor::markdown_live::LiveMarkdownView::with_text(&text, cx)
+                        .doc_path(&doc);
+                    if with_roots {
+                        view.image_roots(vec![repo.clone()])
+                    } else {
+                        view
+                    }
+                }))
+            });
+            let view = host.read_with(cx2, |host, _| host.0.clone());
+            let cache = view.read_with(cx2, |view, _| view.image_cache_entity());
+            cx2.refresh().unwrap();
+            cx2.run_until_parked();
+            let n = cache.read_with(cx2, |cache, _| cache.ready_count());
+            println!("{label:<22} {ref_line:<32} ready={n} (want {want})");
+            assert_eq!(n, want, "{label}: {ref_line}");
+        }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// 探查：live 视图里**哪些行形态**才会被认成图片卡片。
+    ///
+    /// `parse_image_line` 要求整行就是 `![alt](url)` 且行尾无其它内容
+    /// （见 `markdown_live/view.rs`）。用户把图片写进列表项、和文字同一行、
+    /// 或带尾随注释时，卡片根本不生成——这不是路径问题，是行形态问题。
+    #[gpui::test]
+    fn live_view_image_line_shapes(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, Entity, IntoElement, Render, Window};
+
+        struct Host(Entity<crate::editor::markdown_live::LiveMarkdownView>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let dir = temp_dir("shapes");
+        std::fs::write(dir.join("a.png"), PNG).unwrap();
+        let doc = dir.join("note.md");
+
+        let cases: Vec<(&str, &str)> = vec![
+            ("plain line", "![x](a.png)"),
+            ("indented", "    ![x](a.png)"),
+            ("nested quote list", "> - ![x](a.png)"),
+            ("task item", "- [ ] ![x](a.png)"),
+            ("trailing spaces", "![x](a.png)   "),
+            ("list item", "- ![x](a.png)"),
+            ("ordered item", "1. ![x](a.png)"),
+            ("blockquote", "> ![x](a.png)"),
+            ("inline with text", "see ![x](a.png) here"),
+            ("heading", "## ![x](a.png)"),
+            ("title", "![x](a.png \"t\")"),
+            ("two images one line", "![x](a.png) ![y](a.png)"),
+        ];
+        for (label, line) in cases {
+            let (host, cx2) = cx.add_window_view(|_, cx| {
+                Host(cx.new(|cx| {
+                    let text = format!("{line}\n");
+                    crate::editor::markdown_live::LiveMarkdownView::with_text(&text, cx)
+                        .doc_path(&doc)
+                }))
+            });
+            let view = host.read_with(cx2, |host, _| host.0.clone());
+            let cache = view.read_with(cx2, |view, _| view.image_cache_entity());
+            cx2.refresh().unwrap();
+            cx2.run_until_parked();
+            let n = cache.read_with(cx2, |cache, _| cache.ready_count());
+            println!("{label:<20} {line:<30} ready={n}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 端到端：`Markdown` 实体（hover 浮层用的渲染器）对同样的行形态是否出图。
+    ///
+    /// 与 [`live_view_image_line_shapes`] 对照——两边不一致就是缺陷：
+    /// 同一个文件在一处有图、在另一处没有。
+    #[gpui::test]
+    fn markdown_entity_image_line_shapes(cx: &mut gpui::TestAppContext) {
+        use gpui::prelude::*;
+        use gpui::{IntoElement, Render, Window};
+
+        /// 用 `render_items_inline`（hover 浮层的真实入口）渲染一次。
+        struct Host {
+            md: gpui::Entity<crate::editor::markdown::Markdown>,
+        }
+        impl Render for Host {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let style = crate::editor::markdown::MarkdownStyle::hover_style(
+                    window,
+                    cx,
+                    "Menlo".to_string(),
+                );
+                let items = Self::render_items(&self.md, style, cx);
+                gpui::div().flex().flex_col().children(items)
+            }
+        }
+        impl Host {
+            fn render_items(
+                md: &gpui::Entity<crate::editor::markdown::Markdown>,
+                style: crate::editor::markdown::MarkdownStyle,
+                cx: &mut gpui::App,
+            ) -> Vec<gpui::AnyElement> {
+                crate::editor::markdown::Markdown::render_items_inline(md.clone(), style, cx)
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let dir = temp_dir("md-entity-shapes");
+        std::fs::write(dir.join("a.png"), PNG).unwrap();
+
+        let cases: Vec<(&str, &str)> = vec![
+            ("plain line", "![x](a.png)"),
+            ("indented", "    ![x](a.png)"),
+            ("nested quote list", "> - ![x](a.png)"),
+            ("task item", "- [ ] ![x](a.png)"),
+            ("list item", "- ![x](a.png)"),
+            ("ordered item", "1. ![x](a.png)"),
+            ("blockquote", "> ![x](a.png)"),
+            ("inline with text", "see ![x](a.png) here"),
+            ("heading", "## ![x](a.png)"),
+            ("title", "![x](a.png \"t\")"),
+        ];
+        for (label, line) in cases {
+            let text = format!("{line}\n");
+            let ctx_dir = dir.clone();
+            let (host, cx2) = cx.add_window_view(|_, cx| {
+                let md = cx.new(|cx| {
+                    crate::editor::markdown::Markdown::new_with_dir(
+                        text.clone(),
+                        Some(ctx_dir.clone()),
+                        cx,
+                    )
+                });
+                Host { md }
+            });
+            let md = host.read_with(cx2, |host, _| host.md.clone());
+            let cache = md.read_with(cx2, |md, _| md.image_cache.clone());
+            cx2.refresh().unwrap();
+            cx2.run_until_parked();
+            let n = cache.read_with(cx2, |cache, _| cache.ready_count());
+            println!("md-entity {label:<20} ready={n}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 徽章式一行多图：**两张不同的图**都必须进缓存。
+    ///
+    /// 只读预览删除后实时编辑器是唯一视图，README 徽章那种写法
+    /// （`![a](x.svg) ![b](y.svg)`）不能退化成源码文本。
+    /// 注意用两张**不同**文件：同图会被缓存按路径去重，测不出「只渲染了第一张」。
+    #[gpui::test]
+    fn live_view_renders_multiple_images_on_one_line(cx: &mut gpui::TestAppContext) {
+        use gpui::prelude::*;
+        use gpui::{Entity, IntoElement, Render, Window};
+
+        struct Host(Entity<crate::editor::markdown_live::LiveMarkdownView>);
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.clone()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let dir = temp_dir("multi-image-line");
+        std::fs::write(dir.join("a.png"), PNG).unwrap();
+        std::fs::write(dir.join("b.png"), PNG).unwrap();
+        let doc = dir.join("note.md");
+
+        let (host, cx2) = cx.add_window_view(|_, cx| {
+            Host(cx.new(|cx| {
+                let text = "![a](a.png) ![b](b.png)\n";
+                crate::editor::markdown_live::LiveMarkdownView::with_text(text, cx).doc_path(&doc)
+            }))
+        });
+        let view = host.read_with(cx2, |host, _| host.0.clone());
+        let cache = view.read_with(cx2, |view, _| view.image_cache_entity());
+        cx2.refresh().unwrap();
+        cx2.run_until_parked();
+        assert_eq!(
+            cache.read_with(cx2, |cache, _| cache.ready_count()),
+            2,
+            "both images on the same line must be loaded (not just the first)"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 端到端：实时编辑（`#live`）用 `doc_path` 的**父目录**解析相对图片。
