@@ -2004,6 +2004,24 @@ impl Workspace {
             self.tab_bar.update(cx, |tab_bar, cx| {
                 tab_bar.set_active_tab(active_tab_id, cx);
             });
+
+            // 切回来的标签可能**一个面板都没被标为选中**（切走时不会清、但
+            // 新建/合并/恢复路径可能留下这种状态）。此时标签标题会取第一个
+            // 面板、叠放也没有「谁在最上层」，与用户看到的焦点不一致。
+            // 这里兜一次底：已有选中就尊重它，没有就选第一个面板。
+            let has_selection = self
+                .tabs
+                .get(tab_id)
+                .is_some_and(|info| info.container.get_selected_panel(cx).is_some());
+            if !has_selection
+                && let Some(first) = self
+                    .tabs
+                    .get(tab_id)
+                    .and_then(|info| info.container.get_first_panel())
+            {
+                let first_id = first.read(cx).panel_id.to_string();
+                self.handle_panel_selected(&first_id, cx);
+            }
             self.sync_tab_broadcast_to_panels(tab_id, cx);
             cx.emit(WorkspaceEvent::SessionChanged);
             cx.emit(WorkspaceEvent::TabBarChanged);
@@ -2164,6 +2182,11 @@ impl Workspace {
 
         self.active_tab_id = tab_id.clone();
         self.switch_to_tab(&tab_id, cx);
+        // 新标签的第一个面板要立即成为「选中面板」：否则 `is_selected`
+        // 全是 false，`refresh_tab_visual` 既选不出标题的代表面板，也排不出
+        // 叠放的最上层——表现为标题取错、切过去以后图标顺序才纠正。
+        let first_panel_id = panel.read(cx).panel_id.to_string();
+        self.handle_panel_selected(&first_panel_id, cx);
         // 立刻算一次标签视觉：新标签在第一帧就该有程序方块，而不是等到
         // 终端第一次吐出标题/PWD 才补上。
         //

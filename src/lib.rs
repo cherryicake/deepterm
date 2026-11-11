@@ -1123,6 +1123,7 @@ impl AppWindow {
                 label: tab.label.to_string(),
                 icon: tab.icon,
                 tiles: tab.stacked_tiles(None),
+                agent_status: tab.agent_status,
                 active: tab_bar
                     .read(cx)
                     .active_tab_id()

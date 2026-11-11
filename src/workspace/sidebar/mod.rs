@@ -88,6 +88,13 @@ pub struct SidebarTabItem {
     /// 的旧语义；现在标签表达的是「在跑什么」，侧边栏跟着用程序方块，
     /// 两处才不会一个新一个旧。
     pub tiles: Vec<crate::workspace::tab_bar::TileProgram>,
+    /// agent 的回合状态：侧边栏据此显示 spinner（工作中）或状态点。
+    ///
+    /// herdr 的侧边栏（`mods/tabs/main.js`）除了图标与名字，还有：
+    /// - `working` → 12px 转圈；
+    /// - `blocked` / `done` → 6px 实心点。
+    /// 顶部标签栏那边只有状态点，没有转圈——两处的指示密度本来就不同。
+    pub agent_status: Option<crate::agent::AgentStatus>,
     pub active: bool,
     pub tab_id: Option<String>,
 }

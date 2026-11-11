@@ -783,6 +783,47 @@ impl MacosSidebar {
                             .text_sm()
                             .text_color(text_color)
                             .child(tab.label.clone()),
+                    )
+                    // herdr 侧边栏的状态指示：工作中转圈，阻塞/完成点一个点。
+                    // 顶部标签栏只有状态点，这里多一个转圈是 herdr 的原样。
+                    .when(
+                        tab.agent_status == Some(crate::agent::AgentStatus::Working),
+                        |this| {
+                            this.child(
+                                gpui::svg()
+                                    .flex_none()
+                                    .size(px(12.0))
+                                    .text_color(theme.warning)
+                                    .path(Icon::Loader.path())
+                                    .with_animation(
+                                        format!("sidebar-tab-spin-{index}"),
+                                        gpui::Animation::new(std::time::Duration::from_millis(900))
+                                            .repeat()
+                                            .with_easing(gpui::ease_in_out),
+                                        |this, delta| {
+                                            this.with_transformation(gpui::Transformation::rotate(
+                                                gpui::percentage(delta),
+                                            ))
+                                        },
+                                    ),
+                            )
+                        },
+                    )
+                    .when(
+                        matches!(
+                            tab.agent_status,
+                            Some(crate::agent::AgentStatus::Waiting)
+                                | Some(crate::agent::AgentStatus::Done)
+                        ),
+                        |this| {
+                            this.child(div().flex_none().size(px(6.0)).rounded_full().bg(
+                                if tab.agent_status == Some(crate::agent::AgentStatus::Done) {
+                                    theme.success
+                                } else {
+                                    theme.warning
+                                },
+                            ))
+                        },
                     ),
             );
         }
