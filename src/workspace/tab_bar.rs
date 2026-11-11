@@ -51,10 +51,15 @@ struct TabReorderPreview {
     insert_slot: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct PanelDropPreview {
     insert_index: usize,
     tab_label: SharedString,
+    /// 被拖入的面板在标签里会显示成什么程序方块。
+    ///
+    /// 插入预览必须和落成后的那个标签长得一样，否则拖到一半看到的宽度、
+    /// 图标都不是最终结果。
+    program: TileProgram,
 }
 
 /// sRGB 分量 → 线性光（0.04045 是 sRGB 传递函数的分段点）。
@@ -110,7 +115,6 @@ fn to_oklab(c: gpui::Rgba) -> (f32, f32, f32) {
 }
 
 const TAB_REORDER_ANIMATION_DURATION_MS: u64 = 155;
-const TAB_REORDER_GAP_PX: f32 = 4.0;
 const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
 const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
@@ -1350,7 +1354,12 @@ impl TabBar {
 
         let dragged: &DraggedPanel = event.drag(cx);
         let insert_index = self.tab_insert_slot_for_position(position);
-        self.set_panel_drop_preview(insert_index, dragged.tab_label.clone(), cx);
+        self.set_panel_drop_preview(
+            insert_index,
+            dragged.tab_label.clone(),
+            dragged.tile_program(),
+            cx,
+        );
     }
 
     /// 滚动容器视口（窗口坐标），拖拽命中判定用
@@ -1412,11 +1421,13 @@ impl TabBar {
         &mut self,
         insert_index: usize,
         tab_label: SharedString,
+        program: TileProgram,
         cx: &mut Context<Self>,
     ) {
         let next_preview = PanelDropPreview {
             insert_index: insert_index.min(self.tabs.len()),
             tab_label,
+            program,
         };
 
         if self.panel_drop_preview.as_ref() == Some(&next_preview) {
@@ -1497,7 +1508,10 @@ impl TabBar {
             .get(preview.dragged_tab.from_index)
             .map(|bounds| {
                 let width: f32 = bounds.size.width.into();
-                width + TAB_REORDER_GAP_PX
+                // 用托盘的真实间距：`TAB_REORDER_GAP_PX`(4) 是旧版标签栏的
+                // 间距，托盘是 `TRAY_GAP_PX`(3)。差这 1px，重排时让位的标签
+                // 会与落点差一点点，累积在多个标签上就是肉眼可见的错位。
+                width + TRAY_GAP_PX
             })
             .unwrap_or(TAB_REORDER_FALLBACK_WIDTH_PX)
     }
@@ -1563,7 +1577,12 @@ impl TabBar {
                 .as_ref()
                 .filter(|preview| preview.insert_index == index)
             {
-                children.push(Self::render_panel_drop_preview(theme, preview));
+                children.push(Self::render_panel_drop_preview(
+                    theme,
+                    Self::tray_colors(theme),
+                    preview,
+                    px(TAB_WIDTH_PX),
+                ));
             }
             if let Some(tab) = self.tabs.get(index) {
                 children.push(self.render_tab(tab, index, cx));
@@ -2130,26 +2149,38 @@ impl TabBar {
     }
 
     /// Panel 拖入时的插入位置预览
-    fn render_panel_drop_preview(theme: UiTheme, preview: &PanelDropPreview) -> AnyElement {
+    fn render_panel_drop_preview(
+        theme: UiTheme,
+        tray: TrayColors,
+        preview: &PanelDropPreview,
+        tab_width: Pixels,
+    ) -> AnyElement {
+        // 插入预览就是"落成后的那个标签"：同一个 body、同宽同高同圆角，
+        // 只把底色换成淡淡的强调色、整体降一点透明度表示"还没落地"。
+        //
+        // 这张预览原来是一个自制的窄胶囊（高 30、宽随文字、圆角 8），
+        // 与托盘标签完全不是一个东西——拖到标签中间时会看到一条明显的
+        // 窄条，落点宽度也按它算，所以插进去以后标签宽度全乱。
+        let visual = TrayTabVisual {
+            program: preview.program.clone(),
+            title: preview.tab_label.clone(),
+            cwd: SharedString::default(),
+            is_modified: false,
+            needs_attention: false,
+            dot: None,
+            streaming: false,
+            agent_accent_rgb: None,
+            // 关键：与普通标签一样**不是选中态**，宽度取**托盘里标签的
+            // 实际宽度**而不是名义 260——多标签时标签会被压缩到 96px 下限，
+            // 预览却按 260 画，插进去之前看到的就是一条比谁都宽的黑洞。
+            is_active: false,
+            width: tab_width,
+            animation_key: SharedString::from(format!("panel-drop-{}", preview.insert_index)),
+        };
         div()
             .id(format!("panel-drop-preview-{}", preview.insert_index))
-            .h(px(TAB_HEIGHT_PX))
-            .px(px(TAB_PADDING_X_PX))
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .gap(px(6.0))
-            .rounded(px(TAB_RADIUS_PX))
-            .border_1()
-            .border_color(theme.border_strong.opacity(0.55))
-            .bg(theme.tab_hover_background.opacity(0.6))
-            .opacity(0.75)
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(theme.text_muted)
-                    .child(preview.tab_label.clone()),
-            )
+            .opacity(0.65)
+            .child(render_tray_tab_body(&visual, tray, theme, None, false))
             .into_any_element()
     }
 
@@ -2288,14 +2319,29 @@ impl TabBar {
         let tray = Self::tray_colors(theme);
         let on_panel_drop = self.on_panel_drop.clone();
 
-        let mut tabs: Vec<AnyElement> = Vec::with_capacity(self.tabs.len());
-        for index in 0..self.tabs.len() {
+        // 插入预览要占「落成后那个标签」的位置与宽度。标签在托盘里会被
+        // 压缩（多标签时贴着 `TAB_MIN_WIDTH_PX` 下限），所以取已有标签的
+        // 实际布局宽度；一个标签都没有时退回名义宽度。
+        let tab_width = self
+            .current_tab_bounds()
+            .first()
+            .map(|bounds| bounds.size.width)
+            .filter(|width| *width > px(0.0))
+            .unwrap_or(px(TAB_WIDTH_PX));
+
+        let mut tabs: Vec<AnyElement> =
+            Vec::with_capacity(self.tabs.len() + usize::from(self.panel_drop_preview.is_some()));
+        // `0..=len`：插入位可以等于 `len`（追加到末尾）。少遍历这一格，
+        // 拖到最右边时预览根本不画，用户会以为"拖不进去"。
+        for index in 0..=self.tabs.len() {
             if let Some(preview) = self
                 .panel_drop_preview
                 .as_ref()
                 .filter(|preview| preview.insert_index == index)
             {
-                tabs.push(Self::render_panel_drop_preview(theme, preview));
+                tabs.push(Self::render_panel_drop_preview(
+                    theme, tray, preview, tab_width,
+                ));
             }
             if let Some(tab) = self.tabs.get(index) {
                 tabs.push(self.render_tray_tab(tab, index, tray, cx));
@@ -2522,18 +2568,21 @@ impl TabBar {
             self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
         let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
 
-        // 标签在托盘里可能被压缩（窗口窄、标签多）：拖拽预览必须按**实际**
-        // 布局宽度画，否则一抓起来就比原标签宽一截。`bounds_for_item` 的
-        // 宽度就是上一帧真实布局的宽度。
+        // 标签本体**永远按名义宽度参与布局**（`TAB_WIDTH_PX` + `flex_shrink`），
+        // 由托盘去压缩它。绝不能拿"上一帧量到的宽度"回填给自己：
+        // 那是个自我固化的反馈环——一旦某帧被压到 96px，之后每帧都按
+        // 96px 起算，`flex_shrink` 再也压不回 260，标签就永远窄着。
+        // （曾经这么写过，表现是插入/删除标签后整排宽度再也回不去。）
+        let visual = self.tray_tab_visual(tab, px(TAB_WIDTH_PX));
+
+        // 只有**拖拽预览**需要实际宽度：它是脱离托盘的独立视图，没有
+        // flex 容器帮它收缩，必须自己拿准上一帧的布局宽度，才不会比原标签宽。
         let actual_width = self
             .current_tab_bounds()
             .get(index)
             .map(|bounds| bounds.size.width)
             .filter(|width| *width > px(0.0))
             .unwrap_or(px(TAB_WIDTH_PX));
-
-        // 视觉只算一次，托盘与拖拽预览共用同一份快照。
-        let visual = self.tray_tab_visual(tab, actual_width);
         let mut drag_visual = visual.clone();
         // 预览里的动画键加后缀：同一个标签在托盘与预览里同时存在，扫光 / 转圈
         // 的动画 id 必须唯一，否则两处争同一份动画状态。
@@ -3513,6 +3562,70 @@ mod tests {
             preview.tray.is_some(),
             "终端标签的预览必须走托盘视觉，不能退回旧的文字胶囊"
         );
+    }
+
+    /// 标签本体必须按**名义宽度**参与布局，不能把"上一帧量到的宽度"回填给自己。
+    ///
+    /// 那是个自我固化的反馈环：某帧被 `flex_shrink` 压到 96px 以后，下一帧
+    /// 以 96px 为基准重新布局，`flex_shrink` 再没有余量把它撑回 260——标签
+    /// 就永远窄着，插入/删除标签后整排宽度再也回不去。
+    ///
+    /// 拖拽预览是另一回事：它脱离托盘、没有 flex 容器帮它收缩，必须自己
+    /// 拿准实际宽度。两者不能共用同一个取值。
+    #[gpui::test]
+    fn tab_layout_width_is_nominal_not_measured(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let tabs: Vec<TabItem> = (0..3)
+            .map(|i| TabItem::new(format!("t{i}"), format!("tab {i}")))
+            .collect();
+        let bar = cx.update(|cx| TabBar::new_with_tabs("width-bar", cx, tabs));
+
+        // `tray_tab_visual` 收到的宽度就是 body 的 `w(..)`；托盘渲染走名义宽度。
+        let visual = bar.read_with(cx, |bar, _| {
+            bar.tray_tab_visual(&bar.tabs[0], px(TAB_WIDTH_PX))
+        });
+        assert_eq!(
+            visual.width,
+            px(TAB_WIDTH_PX),
+            "标签本体必须按名义宽度布局，否则 flex_shrink 会把它永久压窄"
+        );
+
+        // 下限必须小于名义宽度，否则"可压缩"这件事本身就不成立。
+        assert!(
+            px(TAB_MIN_WIDTH_PX) < px(TAB_WIDTH_PX),
+            "TAB_MIN_WIDTH_PX 必须小于 TAB_WIDTH_PX，否则 flex_shrink 无从生效"
+        );
+    }
+
+    /// 插入预览必须和落成后的标签**同宽同高同圆角**，且宽度跟随托盘的
+    /// 实际标签宽度——多标签时标签会被压缩到 96px，预览却按 260 画的话，
+    /// 插进去之前看到的就是一条比谁都宽的黑洞。
+    ///
+    /// 这里钉住三条不变量（都是上一版真实踩过的）：
+    /// 1. 预览与标签共用同一个 body（圆角/高度/方块都来自 `TrayTabVisual`）；
+    /// 2. 预览宽度由调用方传入，不是内部写死；
+    /// 3. 预览不是选中态（不会画出「抬起」的底色，以免看起来像已存在）。
+    #[test]
+    fn panel_drop_preview_matches_tab_geometry() {
+        let program = TabItem::new("probe", "vim").tile_program();
+        let preview = PanelDropPreview {
+            insert_index: 1,
+            tab_label: "vim".into(),
+            program: program.clone(),
+        };
+
+        // body 的高度与圆角来自常量，预览与标签共用同一套。
+        // 注意高度**恰好**等于旧胶囊的 30px（36 - 3×2 = 30）——这是巧合，
+        // 不是"没有改动"：真正变的是圆角、方块、两段文字与底色。
+        assert_eq!(TRAY_TAB_HEIGHT_PX, TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0);
+        assert_ne!(
+            TAB_RADIUS_TRAY_PX, TAB_RADIUS_PX,
+            "托盘标签圆角不再复用旧胶囊的 8px"
+        );
+
+        // 预览保留程序方块：插进标签栏后显示什么，拖动中就显示什么。
+        assert_eq!(preview.program.name, program.name);
+        assert_eq!(preview.tab_label.as_ref(), "vim");
     }
 
     /// 两条拖拽入口必须画出**同一个**标签：顶部标签栏拖的是 `TabItem`，

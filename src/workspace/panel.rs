@@ -26,6 +26,32 @@ pub struct DraggedPanel {
     pub source_tab_id: String,
     pub tab_label: SharedString,
     pub icon: Option<Icon>,
+    /// 拖起来那一刻的标签视觉（程序方块等）。
+    ///
+    /// 与 [`Self::icon`] 分开：`icon` 是 OS / Workspace 图标，只够画旧式标签；
+    /// 拖回顶部标签栏时要长出与普通标签**一模一样**的插入预览，需要程序表
+    /// 给的方块（品牌底色 + 图形）。在拖拽源处抓一次快照，比在落点处
+    /// 反查 panel 更可靠——落点已经拿不到源 panel 的上下文了。
+    pub visual: Option<crate::workspace::tab_bar::TrayTabVisual>,
+}
+
+impl DraggedPanel {
+    /// 落成后这个标签会显示的程序方块。
+    ///
+    /// 有拖拽快照就用它（与顶部标签栏同一个来源）；纯文本面板没有快照，
+    /// 退回 OS 图标 + 标签名，仍然保证插入预览有方块可画。
+    pub fn tile_program(&self) -> crate::workspace::tab_bar::TileProgram {
+        match &self.visual {
+            Some(visual) => visual.program.clone(),
+            None => crate::workspace::tab_bar::TileProgram {
+                icon: self.icon.map(|icon| icon.path().to_string()),
+                name: self.tab_label.to_string(),
+                tile: None,
+                color: None,
+                tint: true,
+            },
+        }
+    }
 }
 
 /// Panel placement threshold for drag operations (start at 35% of dimension)
@@ -846,6 +872,7 @@ impl Panel {
                             source_tab_id,
                             tab_label: drag_title.clone().into(),
                             icon: self.remote_os.map(|os| os.icon()),
+                            visual: drag_visual.clone(),
                         },
                         move |_drag_data, position, window, cx| {
                             // 阻止事件冒泡，避免被上层拖拽逻辑打断导致预览不同步
