@@ -52,7 +52,11 @@ actions!(
         FocusSplitLeft,
         FocusSplitRight,
         FocusSplitUp,
-        FocusSplitDown
+        FocusSplitDown,
+        /// 把当前面板向右分屏（herdr 的 `pane.split direction=right`）。
+        SplitRight,
+        /// 把当前面板向下分屏（herdr 的 `pane.split direction=down`）。
+        SplitDown
     ]
 );
 
@@ -199,6 +203,11 @@ pub struct TabInfo {
     pub container: SplitContainer,
     /// 广播状态 - 每个WorkSpace类型的tab有独立的广播状态
     pub broadcast_enabled: bool,
+    /// 被放大的面板 id（herdr 的 `pane.zoom`）。
+    ///
+    /// 缩放是**每个标签各自的状态**，不是窗口级的：一个标签里放大某块面板，
+    /// 切到别的标签再切回来，它应该还是放大的。`None` 表示正常分屏。
+    pub zoomed_panel: Option<String>,
 }
 
 impl TabInfo {
@@ -213,6 +222,7 @@ impl TabInfo {
             tab_type: TabType::Normal,
             container: SplitContainer::Panel(panel),
             broadcast_enabled: false,
+            zoomed_panel: None,
         }
     }
 }
@@ -574,6 +584,8 @@ impl Workspace {
                     },
                     container,
                     broadcast_enabled: tab.broadcast_enabled,
+                    // 缩放是运行时状态，不跨会话恢复：重启后按正常分屏显示。
+                    zoomed_panel: None,
                 };
                 (tab.id.clone(), tab_info)
             })
@@ -1033,6 +1045,15 @@ impl Workspace {
             }
             PanelEvent::BroadcastToggle { .. } => {
                 self.handle_broadcast_toggle(cx);
+            }
+            PanelEvent::SplitRight => {
+                self.split_selected_panel(PanelPlacement::Right, window, cx);
+            }
+            PanelEvent::SplitDown => {
+                self.split_selected_panel(PanelPlacement::Bottom, window, cx);
+            }
+            PanelEvent::ToggleZoom => {
+                self.toggle_selected_panel_zoom(cx);
             }
             PanelEvent::TabLabelChanged {
                 panel_id,
@@ -1537,6 +1558,129 @@ impl Workspace {
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.emit(WorkspaceEvent::TabBarChanged);
         cx.notify();
+    }
+
+    /// 把当前选中的面板向右 / 向下分屏，新面板里起一个本地终端。
+    ///
+    /// 对应 herdr 面板标题栏的两个按钮（`pane.split direction=right|down`）。
+    /// 新面板继承源面板的工作目录——在 `src/` 里按分屏，多半就是想在那儿
+    /// 再开一个 shell，从 `~` 重新 cd 一遍是纯损耗。
+    pub fn split_selected_panel(
+        &mut self,
+        placement: PanelPlacement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = self.active_tab_id.clone();
+        let Some(tab_info) = self.tabs.get(&tab_id) else {
+            return;
+        };
+        // 目标：选中的那个，没有就第一个。
+        let Some(target) = tab_info
+            .container
+            .get_selected_panel(cx)
+            .or_else(|| tab_info.container.get_first_panel())
+        else {
+            return;
+        };
+        let target_id = target.read(cx).panel_id.to_string();
+
+        // 新面板的工作目录跟源面板走。
+        let cwd = target.read(cx).content().terminal_view().and_then(|view| {
+            match view.read(cx).session_state(cx) {
+                TerminalSessionState::Local { cwd, .. } => cwd.map(std::path::PathBuf::from),
+                _ => None,
+            }
+        });
+
+        let workspace_id = self.workspace_id.clone();
+        let panel_id = format!("panel-{}", self.next_panel_id);
+        let new_panel = cx.new(|cx| {
+            Panel::with_terminal_working_directory(
+                panel_id.clone(),
+                workspace_id,
+                Some(format!("tab-{}", self.next_tab_id).into()),
+                None,
+                cwd,
+                cx,
+            )
+        });
+        self.next_panel_id += 1;
+
+        let workspace_id = self.workspace_id.clone();
+        new_panel.update(cx, |p, cx| {
+            p.set_workspace_id(workspace_id);
+            p.set_broadcast_enabled(false, cx);
+        });
+
+        // 分屏后标签里就多于一个面板了。
+        let Some(tab_info) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        tab_info.container = tab_info.container.split_at(
+            &target_id,
+            placement,
+            SplitContainer::Panel(new_panel.clone()),
+            cx,
+        );
+        if tab_info.tab_type != TabType::Workspace {
+            tab_info.tab_type = TabType::Workspace;
+        }
+
+        let subscription = cx.subscribe_in(
+            &new_panel,
+            window,
+            |this, _, event: &PanelEvent, window, cx| {
+                this.handle_panel_event(event, window, cx);
+            },
+        );
+        self.panel_subscriptions
+            .insert(new_panel.read(cx).panel_id.to_string(), subscription);
+
+        // 新面板接手选中状态与焦点。
+        self.handle_panel_selected(&panel_id, cx);
+        if let Some(handle) = new_panel.read(cx).active_content_focus_handle(cx) {
+            window.focus(&handle, cx);
+        }
+        self.refresh_tab_visual(&tab_id, cx);
+        cx.emit(WorkspaceEvent::SessionChanged);
+        cx.emit(WorkspaceEvent::TabBarChanged);
+        cx.notify();
+    }
+
+    /// 放大 / 缩回当前面板（herdr 的 `pane.zoom`）。
+    ///
+    /// 缩放只改渲染，不动 `SplitContainer` 的分屏结构与尺寸比例：缩回时
+    /// 布局必须精确复原，重建容器做不到这一点。
+    pub fn toggle_selected_panel_zoom(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.active_tab_id.clone();
+        let Some(tab_info) = self.tabs.get_mut(&tab_id) else {
+            return;
+        };
+        // 只有一个面板时缩放没有意义（放大前后长得一样）。
+        if tab_info.container.panel_count() < 2 {
+            return;
+        }
+        let already_zoomed = tab_info.zoomed_panel.is_some();
+        tab_info.zoomed_panel = if already_zoomed {
+            None
+        } else {
+            tab_info
+                .container
+                .get_selected_panel(cx)
+                .or_else(|| tab_info.container.get_first_panel())
+                .map(|panel| panel.read(cx).panel_id.to_string())
+        };
+        cx.notify();
+    }
+
+    /// 当前面板是否处于放大状态（面板标题栏据此切换 zoom / unzoom 图标）。
+    pub fn is_panel_zoomed(&self, panel_id: &str, cx: &App) -> bool {
+        let _ = cx;
+        self.tabs
+            .get(&self.active_tab_id)
+            .and_then(|info| info.zoomed_panel.as_deref())
+            .is_some_and(|zoomed| zoomed == panel_id)
     }
 
     /// 处理tab拖拽到panel上的事件
@@ -2374,6 +2518,7 @@ impl Workspace {
                 tab_type: closed.tab_type.clone(),
                 container: closed.container.clone(),
                 broadcast_enabled: closed.broadcast_enabled,
+                zoomed_panel: None,
             },
         );
         self.tab_bar.update(cx, |tab_bar, cx| {
@@ -2683,13 +2828,28 @@ impl Render for Workspace {
             .get(&self.active_tab_id)
             .map(|tab_info| &tab_info.container);
 
-        // 更新所有panel的is_solo状态
+        // 更新所有 panel 的 is_solo 与标题栏按钮可用性
         if let Some(container) = active_container {
             let panel_count = container.panel_count();
+            let zoomed = self
+                .tabs
+                .get(&self.active_tab_id)
+                .and_then(|info| info.zoomed_panel.clone());
             let panels = container.collect_panels_vec();
             for panel in panels {
+                let is_zoomed = zoomed
+                    .as_deref()
+                    .is_some_and(|id| panel.read(cx).panel_id == id);
+                let can_split = panel.read(cx).content().terminal_view().is_some();
                 panel.update(cx, |p, cx| {
                     p.set_solo(panel_count == 1, cx);
+                    // 放大按钮只在真有多块面板时出现——单面板放大无效果。
+                    p.can_zoom = panel_count > 1;
+                    p.can_split = can_split;
+                    if p.is_zoomed != is_zoomed {
+                        p.is_zoomed = is_zoomed;
+                        cx.notify();
+                    }
                 });
             }
         }
@@ -2718,7 +2878,24 @@ impl Render for Workspace {
                     .pr(px(8.0))
                     .pb(px(8.0))
                     .when_some(active_container, |this, container| {
-                        this.child(self.render_split_container(container, &[], cx))
+                        // 缩放：被放大的面板独占整个内容区，分屏结构不变
+                        // （取消放大即原样回来）。herdr 的 `pane.zoom` 同义。
+                        let zoomed = self
+                            .tabs
+                            .get(&self.active_tab_id)
+                            .and_then(|info| info.zoomed_panel.clone())
+                            .filter(|id| container.contains_panel(id, cx));
+                        match zoomed {
+                            Some(panel_id) => this.child(
+                                container
+                                    .find_panel(&panel_id, cx)
+                                    .map(|panel| div().size_full().overflow_hidden().child(panel))
+                                    .unwrap_or_else(|| {
+                                        self.render_split_container(container, &[], cx)
+                                    }),
+                            ),
+                            None => this.child(self.render_split_container(container, &[], cx)),
+                        }
                     }),
             )
             .on_action(cx.listener(|this, _: &NewLocalTerminal, window, cx| {
@@ -2726,6 +2903,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &CloseSelectedPanel, window, cx| {
                 this.close_selected_panel(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split_selected_panel(PanelPlacement::Right, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
+                this.split_selected_panel(PanelPlacement::Bottom, window, cx);
             }))
             // 新 tab：cmd-t / ctrl-shift-t（直接新建本地终端 tab，同 tab 栏 + 按钮行为）
             .on_action(cx.listener(|this, _: &NewTerminalTab, window, cx| {

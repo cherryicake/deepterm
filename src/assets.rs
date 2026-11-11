@@ -79,6 +79,11 @@ pub enum Icon {
     // （它只有 server/monitor/layers 这类通用图标，没有各发行版 logo）。
     /// 顶部「标签页组」胶囊里的层叠方块（同 herdr 的 stack.svg）。
     Stack,
+    /// 面板标题栏：向右分屏 / 向下分屏 / 放大 / 缩回（herdr 的 pane 图标）。
+    SplitRight,
+    SplitDown,
+    Zoom,
+    Unzoom,
     Bell,
     Reveal,
     Sidebar,
@@ -159,6 +164,10 @@ impl Icon {
             Icon::Loader => SharedString::new_static("icons/loader.svg"),
             Icon::ProgressIndicator => SharedString::new_static("icons/progress.indicator.svg"),
             Icon::Stack => SharedString::new_static("icons/stack.svg"),
+            Icon::SplitRight => SharedString::new_static("icons/split-right.svg"),
+            Icon::SplitDown => SharedString::new_static("icons/split-down.svg"),
+            Icon::Zoom => SharedString::new_static("icons/zoom.svg"),
+            Icon::Unzoom => SharedString::new_static("icons/unzoom.svg"),
             Icon::Bell => SharedString::new_static("icons/bell.svg"),
             Icon::Reveal => SharedString::new_static("icons/reveal.svg"),
             Icon::Sidebar => SharedString::new_static("icons/sidebar.svg"),

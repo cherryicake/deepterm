@@ -2594,14 +2594,26 @@ impl TabBar {
     fn tray_colors(theme: UiTheme) -> TrayColors {
         let dark = theme.text.l > 0.5;
         // 托盘底：比应用背景深一档（暗色主题）或深半档（亮色主题）。
-        let tray = if dark {
-            theme.app_background.blend(gpui::rgba(0x00000026).into())
-        } else {
-            theme.app_background.blend(gpui::rgba(0x00000012).into())
-        };
-        // 选中标签：抬起一档，与托盘拉开距离；描边再亮一点，形成 herdr 的
-        // 1px「边缘高光」。
-        let selected = theme.elevated_background;
+        //
+        // 固定比例在纯黑背景上失效：ayu-dark / github-dark / flexoki-dark 的
+        // 应用背景已经接近 `#000`，再叠 15% 黑等于没变（对比度 1.01–1.02），
+        // 整条标签栏糊进标题栏。按「必须在背景上看得出来」校正，方向随主题
+        // 明暗：暗色主题再压深，亮色主题也压深（托盘本来就该比背景沉一档）。
+        let tray = Self::ensure_contrast_on_background(theme, dark);
+        // 选中标签：从 `elevated_background` **推导**，而不是直接取用。
+        //
+        // 31 个主题里有 6 个（macos26-dark、solarized-light、kanagawa-wave、
+        // tokyo-night-storm、tokyo-night-day、gruvbox-light）的
+        // `elevated_background` 与 `app_background` 同色，于是「选中的那个」
+        // 和「托盘底」只差 1.01–1.04 —— 一眼看不出哪个标签是当前标签。
+        // herdr 只有一套主题、色值是手调的；deepterm 得保证任意主题下都成立，
+        // 所以这里按「必须在托盘上看得出来」来校正。
+        //
+        // 校正方向还要兼顾文字：只保证「标签 vs 托盘」会把选中底色推到纯白，
+        // 于是白底配白字（flexoki-light 的文字对比度曾掉到 1.10）。所以推
+        // 的时候把「文字仍可读」也当成约束一起满足。
+        let selected = Self::pick_selected_surface(theme, tray, dark);
+        // 描边再亮（暗色）/再深（亮色）一点，形成 herdr 的 1px「边缘高光」。
         let selected_edge = if dark {
             theme.border.blend(gpui::rgba(0xffffff14).into())
         } else {
@@ -2623,9 +2635,165 @@ impl TabBar {
             } else {
                 gpui::rgba(0x00000008).into()
             }),
+            // 目录段（herdr 的 `C.dim`）：`icon_muted` 在多数主题里是给
+            // 「禁用态」用的，淡到几乎看不见（macos26-light 上对托盘底只有
+            // 1.33 —— 目录名基本消失）。这里同样做下限校正。
             text: theme.text,
             muted: theme.text_muted,
-            dim: theme.icon_muted,
+            dim: Self::ensure_contrast(theme.icon_muted, tray, 2.4, dark),
+        }
+    }
+
+    /// 托盘底色：从应用背景压深一档，并保证与背景之间有可辨的最小差异。
+    ///
+    /// 暗色主题压深会很快撞到纯黑，所以在压深不够时改向**提亮**找空间——
+    /// 关键是「托盘与背景不同」，而不是非得是更暗的那一方。亮色主题没有这个
+    /// 问题（深色空间充足），保持压深即可。
+    fn ensure_contrast_on_background(theme: UiTheme, dark: bool) -> Hsla {
+        const MIN: f32 = 1.06;
+        let app = theme.app_background;
+
+        let down: Hsla = if dark {
+            app.blend(gpui::rgba(0x00000026).into())
+        } else {
+            app.blend(gpui::rgba(0x00000012).into())
+        };
+        if Self::contrast_ratio(down, app) >= MIN {
+            return down;
+        }
+        // 压深不够（背景已近纯黑）：反向提亮。
+        for step in 1..=24 {
+            let candidate =
+                app.blend(Hsla::from(gpui::rgba(0xffffff)).opacity(step as f32 * 0.012));
+            if Self::contrast_ratio(candidate, app) >= MIN {
+                return candidate;
+            }
+        }
+        down
+    }
+
+    /// 选一个既能在托盘上「浮出来」、又不会让文字读不清的选中底色。
+    ///
+    /// 两个约束方向相反：底色越远离托盘越显眼，但推到纯白/纯黑时文字就糊了。
+    /// 所以不能只朝一个方向死推，而是先试主题原值，不行再朝**两个方向**
+    /// 各推一遍，取第一个同时满足两条约束的结果。
+    fn pick_selected_surface(theme: UiTheme, tray: Hsla, dark: bool) -> Hsla {
+        const MIN_SURFACE: f32 = 1.12;
+        const MIN_TEXT: f32 = 4.0;
+
+        let ok = |surface: Hsla| {
+            Self::contrast_ratio(surface, tray) >= MIN_SURFACE
+                && Self::contrast_ratio(theme.text, surface) >= MIN_TEXT
+        };
+        let base = theme.elevated_background;
+        if ok(base) {
+            return base;
+        }
+        // 暗色主题先尝试提亮（更符合「抬起」的直觉），亮色主题先尝试压暗。
+        let directions: [Hsla; 2] = if dark {
+            [gpui::rgba(0xffffffff).into(), gpui::rgba(0x00000000).into()]
+        } else {
+            [gpui::rgba(0x00000000).into(), gpui::rgba(0xffffffff).into()]
+        };
+        for toward in directions {
+            for step in 1..=24 {
+                let candidate = base.blend(toward.opacity(step as f32 * 0.04));
+                if ok(candidate) {
+                    return candidate;
+                }
+            }
+        }
+        // 两条都满足不了（极菜谱）：优先保证文字可读，底色差异交给描边。
+        // 取与托盘明暗相反的一端，至少不会文字糊在底上。
+        if dark {
+            theme.text.blend(gpui::rgba(0x00000000).into())
+        } else {
+            theme.text
+        }
+    }
+
+    /// 把 `color` 往「更多对比」的方向推，直到它与 `against` 的对比度
+    /// 达到 `min_ratio`（已经达标则原样返回）。
+    ///
+    /// 只调明度、不加色相：从主题令牌推导出来的颜色必须仍然属于这套主题的
+    /// 色系，混入第三种色相会立刻显得不对。逐步混合 `text` 色收到同样效果，
+    /// 且天然落在主题的明暗轴上——暗色主题往亮推、亮色主题往暗推。
+    fn ensure_contrast(color: Hsla, against: Hsla, min_ratio: f32, dark: bool) -> Hsla {
+        if Self::contrast_ratio(color, against) >= min_ratio {
+            return color;
+        }
+        // 朝着与背景相反的方向推：暗底提亮、亮底压暗。
+        let toward: Hsla = if dark {
+            gpui::rgba(0xffffffff).into()
+        } else {
+            gpui::rgba(0x00000000).into()
+        };
+        // 0.04 一档、最多 24 档（≈ 完全推到纯黑/纯白）：够覆盖所有主题，
+        // 又不会因为极少数病态配色跑满循环。
+        for step in 1..=24 {
+            let alpha = step as f32 * 0.04;
+            let candidate = color.blend(toward.opacity(alpha));
+            if Self::contrast_ratio(candidate, against) >= min_ratio {
+                return candidate;
+            }
+        }
+        // 推到头仍不达标：用最极端但仍属本主题明暗轴的那一端。
+        toward
+    }
+
+    /// WCAG 相对亮度对比度。用于把「看得出来吗」变成可断言的数字。
+    fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+        let (la, lb) = (Self::relative_luminance(a), Self::relative_luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    fn relative_luminance(color: Hsla) -> f32 {
+        let rgba = gpui::Rgba::from(color);
+        let lin = |c: f32| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(rgba.r) + 0.7152 * lin(rgba.g) + 0.0722 * lin(rgba.b)
+    }
+
+    /// 面板标题栏的图标：**单色、无底色**，与顶部标签栏的彩色方块刻意不同。
+    ///
+    /// herdr 就是这么做的：顶部标签栏（`terminals-bar`）的 `tile()` 是
+    /// 「品牌底色 + 15px 图形」的实心方块；而面板标题栏（`pane`）的
+    /// `icon(p.program, 14, t.dim)` 只画图形本身，颜色取主题的弱化文字色。
+    ///
+    /// 这不是疏漏而是层次：顶部是**导航**，需要靠色块快速辨认；面板标题栏
+    /// 是**当前正在看的那一个**，再摆一块高饱和色块只会和内容抢注意力。
+    ///
+    /// 彩色 logo（Claude / Codex 等 `tint == false`）仍然按原样显示——
+    /// 把它们染成单色反而认不出是谁。
+    pub fn render_pane_header_icon(tiles: &[TileProgram], color: Hsla) -> AnyElement {
+        let Some(tile) = tiles.last() else {
+            return div().into_any_element();
+        };
+        let size = 14.0;
+        match tile.icon.as_ref() {
+            Some(path) if tile.tint => svg()
+                .flex_none()
+                .size(px(size))
+                .text_color(color)
+                .path(SharedString::from(path.clone()))
+                .into_any_element(),
+            Some(path) => gpui::img(SharedString::from(path.clone()))
+                .w(px(size))
+                .h(px(size))
+                .into_any_element(),
+            // 没有图标：给一个方块占位，避免标题文字左右抖动。
+            None => div()
+                .flex_none()
+                .size(px(size))
+                .rounded(px(3.0))
+                .bg(color.opacity(0.35))
+                .into_any_element(),
         }
     }
 
@@ -3472,6 +3640,60 @@ mod tests {
         // 高度：预览必须按**标签在托盘里的实际高度**画（托盘高减去上下
         // 内边距），不是托盘外框高度——直接用 36 会让预览比原标签高 6px。
         assert_eq!(TRAY_TAB_HEIGHT_PX, TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0);
+    }
+
+    /// 31 个内置主题下，托盘的关键对比度都必须站得住。
+    ///
+    /// `tray_colors` 全部从主题令牌推导，而令牌是按**各自的用途**调的
+    /// （`elevated_background` 表示「抬起一档」、`icon_muted` 表示「禁用」），
+    /// 直接拿来当托盘色会在部分主题上失效。实测过的两类具体故障：
+    ///
+    /// - 6 个主题的 `elevated_background` 与背景同色 → 选中标签与托盘底
+    ///   只差 1.01–1.04，看不出当前标签是哪个；
+    /// - `icon_muted` 在 macos26-light 上对托盘底只有 1.33 → 目录名消失。
+    ///
+    /// 所以这里对每个主题跑真实的推导，把「看得出来吗」钉成数字。
+    #[test]
+    fn tray_colors_stay_readable_across_all_builtin_themes() {
+        let themes = crate::theme::load_builtin_themes_for_tests();
+        assert!(themes.len() >= 30, "内置主题数量异常：{}", themes.len());
+
+        let mut failures = Vec::new();
+        for app in &themes {
+            let theme = app.ui;
+            let tray = TabBar::tray_colors(theme);
+
+            // 选中的标签必须能从托盘底里「浮」出来。
+            let sel = TabBar::contrast_ratio(tray.selected, tray.tray);
+            if sel < 1.08 {
+                failures.push(format!("{}: 选中标签对托盘底仅 {sel:.2}", app.id));
+            }
+            // 未选中标签的标题必须读得清。
+            let muted = TabBar::contrast_ratio(tray.muted, tray.tray);
+            if muted < 2.5 {
+                failures.push(format!("{}: 未选中标签文字对托盘底仅 {muted:.2}", app.id));
+            }
+            // 目录段比标题淡一档，但也不能淡到看不见。
+            let dim = TabBar::contrast_ratio(tray.dim, tray.tray);
+            if dim < 2.0 {
+                failures.push(format!("{}: 目录段对托盘底仅 {dim:.2}", app.id));
+            }
+            // 托盘本身要能从应用背景里分出来（否则整条标签栏糊进标题栏）。
+            let tray_vs_app = TabBar::contrast_ratio(tray.tray, theme.app_background);
+            if tray_vs_app < 1.02 {
+                failures.push(format!("{}: 托盘对应用背景仅 {tray_vs_app:.2}", app.id));
+            }
+            // 选中标签上的文字。
+            let text = TabBar::contrast_ratio(tray.text, tray.selected);
+            if text < 3.0 {
+                failures.push(format!("{}: 选中标签文字仅 {text:.2}", app.id));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "托盘配色问题：\n{}",
+            failures.join("\n")
+        );
     }
 
     /// 预览不能只有一个"浮动"的方块和文字：未选中标签本身是透明底，在托盘里

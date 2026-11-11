@@ -125,6 +125,13 @@ pub enum PanelEvent {
     BroadcastToggle {
         panel_id: String,
     },
+    /// 面板标题栏的「向右分屏」（herdr 的 `pane.split direction=right`）。
+    SplitRight,
+    /// 面板标题栏的「向下分屏」（herdr 的 `pane.split direction=down`）。
+    SplitDown,
+    /// 面板标题栏的「放大 / 缩回」（herdr 的 `pane.zoom`）。
+    ToggleZoom,
+
     SessionChanged,
     /// Tab 标签变更事件（由终端工作目录/前台进程变化触发）
     TabLabelChanged {
@@ -216,6 +223,15 @@ pub struct Panel {
     pub is_selected: bool,
     /// 鼠标是否悬停在 Panel 上（控制标题栏按钮显隐）
     is_hovered: bool,
+    /// 本面板是否处于放大状态（由 Workspace 的 `zoomed_panel` 同步下来）。
+    ///
+    /// 存一份副本而不是每次去问 Workspace：标题栏渲染时手里只有 `Panel`，
+    /// 反查要跨实体拿 `Workspace`，而这是个每帧都要读的布尔值。
+    pub is_zoomed: bool,
+    /// 所在标签的面板数 ≥2 时才允许放大（放大单面板等于什么都没做）。
+    pub can_zoom: bool,
+    /// 是否可以分屏（终端面板才行；纯文本占位面板没有终端可继承目录）。
+    pub can_split: bool,
     /// Content displayed in this panel
     content: PanelContent,
     /// 广播状态 - 由Workspace同步给所有Panel
@@ -243,6 +259,9 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_zoomed: false,
+            can_zoom: false,
+            can_split: false,
             is_hovered: false,
             content,
             broadcast_enabled: false,
@@ -490,6 +509,9 @@ impl Panel {
             remote_os: None,
             is_solo: false,
             is_selected: false,
+            is_zoomed: false,
+            can_zoom: false,
+            can_split: false,
             is_hovered: false,
             content: PanelContent::Terminal(terminal_view),
             broadcast_enabled: false,
@@ -823,6 +845,28 @@ impl Panel {
         )
     }
 
+    /// 面板标题栏的小图标按钮（herdr 的 `pane.button()`）。
+    ///
+    /// herdr 是 `p(3).rounded(4).text_color(t.dim)` + hover 时浮出底色、
+    /// 图形换正常文字色；图形 14px。这里保持一致，只是底色换成本主题令牌。
+    fn pane_button(
+        id: String,
+        icon: Icon,
+        theme: crate::theme::UiTheme,
+        on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .flex_none()
+            .p(px(3.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .text_color(theme.icon_muted)
+            .hover(move |style| style.bg(theme.title_bar_hover).text_color(theme.text))
+            .on_click(on_click)
+            .child(svg().size(px(14.0)).path(icon.path()))
+    }
+
     /// 渲染标题栏
     fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
@@ -914,25 +958,62 @@ impl Panel {
                             }
                         },
                     )
-                    // 标题栏左侧的程序方块：与顶部标签、侧边栏同源
-                    // （`foreground_program` 的程序表），不再画远程 OS 图标。
-                    // 一条终端无论在哪一栏出现，采用的都是「它在跑什么」。
-                    .child(
-                        // 标题栏高 28px，用与侧边栏一致的小尺寸方块。
-                        crate::workspace::tab_bar::TabBar::render_program_tiles_small(
-                            &title_tiles,
-                            cx.theme().ui,
-                        ),
-                    )
+                    // 标题栏左侧的程序图标：与顶部标签**同源但不同风格**。
+                    //
+                    // herdr 顶部的 `tile()` 是品牌色实心方块（导航要醒目），
+                    // 面板标题栏的 `icon(program, 14, t.dim)` 只画单色图形、
+                    // 取主题弱化色（正在看的那一个不必再抢注意力）。这里照做。
+                    .child(crate::workspace::tab_bar::TabBar::render_pane_header_icon(
+                        &title_tiles,
+                        theme.text_muted,
+                    ))
+                    .mr(px(6.0))
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
             .when(self.is_hovered, |this| {
+                let zoomed = self.is_zoomed;
+                let can_split = self.can_split;
                 this.child(
-                    // 右侧按钮组：广播按钮 + 关闭按钮
+                    // 右侧按钮组：分屏 / 放大 / 广播 / 关闭
                     div()
                         .flex()
                         .items_center()
                         .gap_2()
+                        // herdr 的三个 pane 按钮：只在面板数 ≥2 时才有意义的是
+                        // zoom；分屏在单面板时也允许（正是要裂开它）。
+                        .when(can_split, |this| {
+                            this.child(Self::pane_button(
+                                format!("split-right-{}", panel_id),
+                                Icon::SplitRight,
+                                theme,
+                                cx.listener(|_this, _: &gpui::ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(PanelEvent::SplitRight);
+                                }),
+                            ))
+                        })
+                        .when(can_split, |this| {
+                            this.child(Self::pane_button(
+                                format!("split-down-{}", panel_id),
+                                Icon::SplitDown,
+                                theme,
+                                cx.listener(|_this, _: &gpui::ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(PanelEvent::SplitDown);
+                                }),
+                            ))
+                        })
+                        .when(self.can_zoom, |this| {
+                            this.child(Self::pane_button(
+                                format!("zoom-{}", panel_id),
+                                if zoomed { Icon::Unzoom } else { Icon::Zoom },
+                                theme,
+                                cx.listener(move |_this, _: &gpui::ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.emit(PanelEvent::ToggleZoom);
+                                }),
+                            ))
+                        })
                         .child(
                             // 广播按钮 - 开启/关闭终端输入广播功能
                             div()

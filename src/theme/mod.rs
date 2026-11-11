@@ -671,6 +671,14 @@ const OFFICIAL_VISIBILITY_EXCEPTIONS: &[(&str, &str)] = &[
     ("gruvbox-light", "normal.black"),
 ];
 
+/// 测试用：把全部内置主题交给其它模块的配色断言遍历。
+///
+/// 不直接 `pub` 出去：运行时只该按 id 取单个主题，整表遍历是断言专用。
+#[doc(hidden)]
+pub fn load_builtin_themes_for_tests() -> Vec<AppTheme> {
+    load_builtin_themes().expect("builtin themes must parse")
+}
+
 fn load_builtin_themes() -> anyhow::Result<Vec<AppTheme>> {
     let bundle: ThemeBundleFile =
         serde_json::from_str(include_str!("../../assets/themes/builtin.json"))?;
