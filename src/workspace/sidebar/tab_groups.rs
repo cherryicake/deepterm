@@ -759,12 +759,20 @@ impl MacosSidebar {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(
+                            .child(if tab.tiles.is_empty() {
+                                // 没有程序信息（会话恢复期、非终端标签）：
+                                // 退回旧式单色图标，不留空白。
                                 gpui::svg()
                                     .size(px(SIDEBAR_ROW_ICON))
                                     .path(icon.path())
-                                    .text_color(text_color),
-                            ),
+                                    .text_color(text_color)
+                                    .into_any_element()
+                            } else {
+                                // 与顶部标签栏同源：程序方块（多 panel 时叠放）。
+                                crate::workspace::tab_bar::TabBar::render_program_tiles_small(
+                                    &tab.tiles, theme,
+                                )
+                            }),
                     )
                     .child(
                         div()

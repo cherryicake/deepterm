@@ -159,12 +159,23 @@ const TAB_TEXT_PX: f32 = 13.0;
 const TAB_TITLE_MAX_PX: f32 = 150.0;
 /// 程序方块边长。
 const TILE_SIZE_PX: f32 = 26.0;
-/// 叠放的程序方块之间的水平错位：26px 的方块只露出 11px，后面那个盖住
-/// 前面那个的右半部分——像一叠卡片，一眼能数出"这个标签里有几个东西在跑"。
-const TILE_STACK_STEP_PX: f32 = 11.0;
-/// 叠放最多显示几个。再多就把前面（下层）的丢掉只留最后一组：
-/// 一个标签里有 8 个分屏时，画 8 个方块既看不清也挤掉了标题。
-const TILE_STACK_MAX: usize = 4;
+/// 叠放最下层相对单方块的比例。
+///
+/// 层次靠**逐层递进的缩放**表达（见 [`TILE_STACK_SCALE_STEP`]），不靠描边：
+/// 给每层描边会在深色主题上叠出一圈黑边，看着像贴纸，也不扁平。
+const TILE_STACK_SCALE: f32 = 0.84;
+/// 每往上一层放大的比例。最上层接近满尺寸，读作「被拿到最前面」。
+const TILE_STACK_SCALE_STEP: f32 = 0.07;
+/// 叠放错位：每多一层向右偏这么多。约等于方块的四分之一，露出的是**图形
+/// 边角**而不是半个方块——再多就认不出底下那个程序了。
+const TILE_STACK_STEP_PX: f32 = 5.0;
+/// 叠放最多显示几个。再多只留最上（选中）的那几层：一个标签里有 8 个分屏
+/// 时画 8 个既看不清又挤掉标题。
+const TILE_STACK_MAX: usize = 3;
+/// 叠放层在 panel 切换时的过渡时长。短于标签重排（155ms）——
+/// 切 panel 是"点一下"的动作，动画只用来交代"哪一层上来了"，
+/// 拖久了会觉得卡。
+const TILE_STACK_ANIM_MS: u64 = 130;
 /// 方块内图形的边长。
 const TILE_GLYPH_PX: f32 = 15.0;
 
@@ -2891,21 +2902,43 @@ impl TabBar {
         }
     }
 
-    /// 程序方块（herdr 的 `tile()`）：26px 圆角方块，品牌底色 + 图形，
-    /// agent 有回合状态时在右上角压一个状态点。
+    /// 小尺寸版本，给侧边栏这类行高 28px 的位置用。
     ///
-    /// 图形有两种画法，与 herdr 一致：
-    /// - `tint`：SVG 当 alpha mask，用 `color`（或主题文字色）着色；
-    /// - 否则：当彩色图片画（Claude / Codex / Kimi 这类自带配色的 logo）。
-    /// 标签左侧的程序方块：一个 panel 时就是 herdr 的原样单方块；多个
-    /// panel 时横向叠放，**最后一个在最上层**（调用方已把选中的排到最后）。
-    ///
-    /// 叠放是 herdr 没有的形态——它的标签只管一个终端。这里给 deepterm 的
-    /// 分屏标签用：`[vim][claude][node]` 错开叠起来，既表达「这个标签里跑着
-    /// 三个程序」，又不至于把宽度撑爆；选中的那个永远露出完整图形。
-    ///
-    /// 每层都套一圈托盘色描边（2px），让相邻方块之间有一条"切缝"，否则
-    /// 两个深色方块叠在一起会糊成一块。
+    /// 托盘里的方块是 26px；侧边栏的图标位只有 16px，直接塞进去会被裁掉
+    /// 或者把行撑高。这里按比例缩到 18px、错位 4px，多 panel 时同样叠放，
+    /// 只是更紧凑。
+    pub fn render_program_tiles_small(tiles: &[TileProgram], theme: UiTheme) -> AnyElement {
+        let tray = Self::tray_colors(theme);
+        let size = 18.0;
+        let step_px = 4.0;
+        let visible = tiles.len().min(TILE_STACK_MAX);
+        let shown = &tiles[tiles.len() - visible..];
+
+        if visible <= 1 {
+            let Some(tile) = shown.first() else {
+                return div().size(px(size)).into_any_element();
+            };
+            return Self::render_tile_at(tile, size, 0.62, None, false, tray, theme);
+        }
+
+        let width = px(size) + px(step_px) * (visible as f32 - 1.0);
+        let mut stack = div().relative().flex_none().w(width).h(px(size));
+        for (index, tile) in shown.iter().enumerate() {
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .left(px(step_px) * index as f32)
+                    .top_0()
+                    // 小尺寸下不做动画：侧边栏会随切换重绘，短寿命的动画
+                    // 只是无谓的开销，也会让列表看起来在抖。
+                    .child(Self::render_tile_at(
+                        tile, size, 0.62, None, false, tray, theme,
+                    )),
+            );
+        }
+        stack.into_any_element()
+    }
+
     fn render_program_tiles(
         tiles: &[TileProgram],
         status: Option<AgentStatus>,
@@ -2916,41 +2949,70 @@ impl TabBar {
         // 只保留最后 `visible` 个：最后那个是选中项，必须完整可见。
         let shown = &tiles[tiles.len() - visible..];
 
+        let single = shown.first().cloned().unwrap_or(TileProgram {
+            icon: None,
+            name: String::new(),
+            tile: None,
+            color: None,
+            tint: true,
+        });
         if visible <= 1 {
-            let program = shown.first().cloned().unwrap_or(TileProgram {
-                icon: None,
-                name: String::new(),
-                tile: None,
-                color: None,
-                tint: true,
-            });
-            return Self::render_program_tile(&program, status, tray, theme);
+            return Self::render_program_tile(&single, status, tray, theme);
         }
 
         let step = px(TILE_STACK_STEP_PX);
-        let ring = px(2.0);
-        let cell = px(TILE_SIZE_PX) + ring * 2.0;
-        let width = cell + step * (visible as f32 - 1.0);
+        // 最高的一层（最上层）最大。
+        let top_px =
+            TILE_SIZE_PX * (TILE_STACK_SCALE + TILE_STACK_SCALE_STEP * (visible as f32 - 1.0));
+        // 整叠宽度：最后一层完整、前面每层各让出 `step`。
+        let width = px(top_px) + step * (visible as f32 - 1.0);
+        // 高度取满尺寸的槽位：叠放的方块比单个略小，但**占位高度不变**，
+        // 否则标签里的文字基线会随 panel 数量上下跳。
+        let slot = px(TILE_SIZE_PX);
 
-        let mut stack = div().relative().flex_none().w(width).h(cell);
+        let mut stack = div()
+            .relative()
+            .flex_none()
+            .w(width)
+            .h(slot)
+            .flex()
+            .items_center();
 
         for (index, tile) in shown.iter().enumerate() {
             let is_top = index + 1 == visible;
+            // 从下到上逐层放大：这是唯一的层次线索，不加任何描边。
+            let layer_px = TILE_SIZE_PX * (TILE_STACK_SCALE + TILE_STACK_SCALE_STEP * index as f32);
+            // 过渡：新上来的那层从左侧小幅滑入并淡入，其余层同时把位置
+            // 让到位。动画 id 带上程序名，切 panel 时新旧两层拿到不同的
+            // id，才会各自播放一次而不是直接跳变。
+            let anim_id = format!("stack-{}", tile.name);
+            let target_left = step * index as f32;
             stack = stack.child(
+                // 定位交给动画闭包统一设置：闭包里的 `left` 会覆盖外层的，
+                // 两处都写等于让「起点」和「终点」各说各话。
                 div()
                     .absolute()
-                    .left(step * index as f32)
-                    .top_0()
-                    .size(cell)
-                    .rounded(px(9.0))
-                    // 描边用托盘底：叠放时它既是"切缝"，也与托盘背景融为一体。
-                    .bg(tray.tray)
-                    .p(ring)
-                    .child(Self::render_program_tile(
+                    // 竖向居中：叠放整体比槽位矮一点，居中才不会看着像浮在上面。
+                    .top(px((TILE_SIZE_PX - layer_px) / 2.0))
+                    .size(px(layer_px))
+                    .with_animation(
+                        anim_id,
+                        Animation::new(Duration::from_millis(TILE_STACK_ANIM_MS))
+                            .with_easing(ease_out_quint()),
+                        move |this, delta| {
+                            // 从左侧 4px 处滑入 + 淡入，落到目标位置。
+                            let dx = px(4.0) * (1.0 - delta);
+                            this.left(target_left + dx).opacity(0.55 + 0.45 * delta)
+                        },
+                    )
+                    // 后画的盖住先画的：越靠后越上层。
+                    .child(Self::render_tile_at(
                         tile,
-                        // 状态点只挂最上层：它代表"当前选中的那个 panel"，
-                        // 下层方块各自的状态点会在重叠处互相打架。
+                        layer_px,
+                        TILE_GLYPH_PX / TILE_SIZE_PX,
                         is_top.then_some(status).flatten(),
+                        // 不描边：层次全靠缩放递进与位移，保持扁平。
+                        false,
                         tray,
                         theme,
                     )),
@@ -2959,44 +3021,82 @@ impl TabBar {
         stack.into_any_element()
     }
 
+    /// 叠放中的一层：缩小的程序方块。
+    ///
+    /// `is_top` 为真时多一圈与托盘同色的细边，把最上层从下层方块里「摘」
+    /// 出来。下层不描边：每层都描边就会显得边框很厚、外面还多一圈黑边。
+    /// 单个程序方块（herdr 的 `tile()`）：26px 圆角方块，品牌底色 + 图形，
+    /// agent 有回合状态时在右上角压一个状态点。
     fn render_program_tile(
         program: &TileProgram,
         status: Option<AgentStatus>,
         tray: TrayColors,
         theme: UiTheme,
     ) -> AnyElement {
-        let size = px(TILE_SIZE_PX);
-        let fill: Hsla = program
+        Self::render_tile_at(
+            program,
+            TILE_SIZE_PX,
+            TILE_GLYPH_PX / TILE_SIZE_PX,
+            status,
+            false,
+            tray,
+            theme,
+        )
+    }
+
+    /// 在任意尺寸下画一个程序方块——**所有**方块渲染的唯一实现。
+    ///
+    /// 托盘单方块、托盘叠放层、侧边栏/标题栏小方块都走它：三种尺寸下
+    /// 圆角、描边、图形着色、状态点必须长得一样，各写一份必然漂移。
+    ///
+    /// - `glyph_ratio`：图形占方块的比例（26px 方块里是 15/26）。
+    /// - `ring`：是否描一圈托盘色的边。只有叠放的最上层需要——它把方块
+    ///   从下层里「摘」出来；下层与单方块都不描边，否则会显厚、像贴纸。
+    fn render_tile_at(
+        tile: &TileProgram,
+        size: f32,
+        glyph_ratio: f32,
+        status: Option<AgentStatus>,
+        ring: bool,
+        tray: TrayColors,
+        theme: UiTheme,
+    ) -> AnyElement {
+        let fill: Hsla = tile
             .tile
             .map(|value| rgb(value).into())
             .unwrap_or(tray.chip);
+        let glyph_px = size * glyph_ratio;
 
-        let glyph: AnyElement = match program.icon.as_ref() {
-            Some(path) if program.tint => svg()
-                .size(px(TILE_GLYPH_PX))
-                .text_color(program.color.map(|v| rgb(v).into()).unwrap_or(theme.text))
+        let glyph: AnyElement = match tile.icon.as_ref() {
+            Some(path) if tile.tint => svg()
+                .size(px(glyph_px))
+                .text_color(tile.color.map(|v| rgb(v).into()).unwrap_or(theme.text))
                 .path(SharedString::from(path.clone()))
                 .into_any_element(),
             Some(path) => gpui::img(SharedString::from(path.clone()))
-                .w(px(TILE_GLYPH_PX))
-                .h(px(TILE_GLYPH_PX))
+                .w(px(glyph_px))
+                .h(px(glyph_px))
                 .into_any_element(),
             None => div().into_any_element(),
         };
 
+        // 圆角随尺寸收缩：26px 用 7，18px 用 5——大圆角在小方块上会显得
+        // 像药丸，反而模糊了"这是个程序图标"。
+        let radius = if size >= 24.0 {
+            7.0
+        } else if size >= 20.0 {
+            6.0
+        } else {
+            5.0
+        };
+        let dot_size = if size >= 24.0 { 11.0 } else { 9.0 };
+
         div()
             .relative()
             .flex_none()
-            .size(size)
-            .rounded(px(7.0))
-            .border_1()
-            .border_color(if matches!(program.tile, Some(0x000000..=0x1f1f1f)) {
-                // 近黑底色（Claude / Codex / Kimi 的 `#1c1d21`）在暗色标签上
-                // 会糊成一片，补一道极淡描边把方块「切」出来。
-                gpui::rgba(0xffffff14).into()
-            } else {
-                gpui::transparent_black()
-            })
+            .size(px(size))
+            .rounded(px(radius))
+            .when(ring, |this| this.border_2().border_color(tray.tray))
             .bg(fill)
             .flex()
             .items_center()
@@ -3006,11 +3106,11 @@ impl TabBar {
                 this.child(
                     div()
                         .absolute()
-                        // herdr 是 `top(-4).right(-4).size(11)` + 2px 描边，
-                        // 托盘底色的描边把点从方块上「摘」出来。
-                        .top(px(-4.0))
-                        .right(px(-4.0))
-                        .size(px(11.0))
+                        // herdr 是 `top(-4).right(-4)` + 2px 描边，把点从方块上
+                        // 「摘」出来；小尺寸下收一点，避免压到相邻层。
+                        .top(px(if size >= 24.0 { -4.0 } else { -3.0 }))
+                        .right(px(if size >= 24.0 { -4.0 } else { -3.0 }))
+                        .size(px(dot_size))
                         .rounded_full()
                         .border_2()
                         .border_color(tray.tray)
@@ -4068,6 +4168,43 @@ mod tests {
             !should_show_attention_dot(&viewed),
             "看过之后红点必须消失，否则「未读」语义就没了"
         );
+    }
+
+    /// 叠放必须「扁平」：每层缩放后**小于**单个方块，层间只靠位移分开，
+    /// 且顶层缩放不能小于下层的字号可辨下限。
+    ///
+    /// 用户反馈过两版问题：一是每层都描边 → 边框很厚、外面还有一圈黑边；
+    /// 二是错位太大 → 叠得又宽又散。这条把几何与「只有顶层描边」钉住。
+    #[test]
+    fn stacked_tiles_stay_flat_and_compact() {
+        // 每层都比单方块小，否则叠起来比单个还大，"折叠"感就没了。
+        assert!(TILE_STACK_SCALE < 1.0, "叠放层必须缩小，不能与单方块同尺寸");
+        // 缩得不能太狠：18px 以下图形就糊了。
+        let layer = TILE_SIZE_PX * TILE_STACK_SCALE;
+        assert!(layer >= 18.0, "叠放层 {layer}px 太小，图形会糊成一团");
+        // 最上层必须比下层大，层次才看得出来——叠放层一律不描边，
+        // 缩放递进是唯一的层次线索。
+        assert!(
+            TILE_STACK_SCALE_STEP > 0.0,
+            "逐层缩放必须有递进，否则叠起来像一块"
+        );
+        let top = TILE_SIZE_PX
+            * (TILE_STACK_SCALE + TILE_STACK_SCALE_STEP * (TILE_STACK_MAX as f32 - 1.0));
+        assert!(top <= TILE_SIZE_PX + 0.5, "最上层 {top}px 不应超过单个方块");
+        // 错位要明显小于层宽，否则叠出来是一串而不是一叠。
+        assert!(
+            TILE_STACK_STEP_PX < layer / 2.0,
+            "错位 {}px 相对 {layer}px 的层宽太大，会显得又宽又散",
+            TILE_STACK_STEP_PX
+        );
+        // 整叠宽度仍要明显窄于两个并排方块，才值得用"叠"。
+        let width = layer + TILE_STACK_STEP_PX * (TILE_STACK_MAX as f32 - 1.0);
+        assert!(
+            width < TILE_SIZE_PX * 2.0,
+            "{width}px 的整叠已超过两个方块宽，叠放失去意义"
+        );
+        // 层数上限不能是 1：那就等于没做叠放。
+        assert!(TILE_STACK_MAX >= 2);
     }
 
     /// 一个标签里有多个 panel 时，程序方块按「叠放」渲染：选中的那个在

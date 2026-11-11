@@ -1122,6 +1122,7 @@ impl AppWindow {
             .map(|tab| SidebarTabItem {
                 label: tab.label.to_string(),
                 icon: tab.icon,
+                tiles: tab.stacked_tiles(None),
                 active: tab_bar
                     .read(cx)
                     .active_tab_id()

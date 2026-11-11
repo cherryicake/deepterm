@@ -20,7 +20,7 @@ use crate::workspace::tab_bar::{DragPreview, DraggedTab};
 pub use crate::ssh::SshConnectionConfig;
 
 /// 拖拽的 Panel 数据
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DraggedPanel {
     pub panel_id: String,
     pub source_tab_id: String,
@@ -849,6 +849,24 @@ impl Panel {
         // 视觉来源（`TrayTabVisual::from_terminal_view`）。两个入口拖同一条
         // 终端，画面必须一致，否则用户会以为拖的是两样东西。
         let drag_visual = self.drag_tray_visual(cx);
+        // 标题栏左侧的方块要在拖拽闭包之外先算好：闭包会把 `drag_visual`
+        // move 进去（预览要用它）。
+        let title_tiles = drag_visual
+            .as_ref()
+            .map(|visual| visual.tiles.clone())
+            .unwrap_or_else(|| {
+                vec![crate::workspace::tab_bar::TileProgram {
+                    icon: self.remote_os.map(|os| os.icon().path().to_string()),
+                    name: self
+                        .active_tab_label
+                        .as_ref()
+                        .map(|label| label.to_string())
+                        .unwrap_or_default(),
+                    tile: None,
+                    color: None,
+                    tint: true,
+                }]
+            });
 
         div()
             .h(px(28.0))
@@ -896,15 +914,16 @@ impl Panel {
                             }
                         },
                     )
-                    .when_some(self.remote_os, |this, os| {
-                        this.child(
-                            svg()
-                                .size(px(14.0))
-                                .path(os.icon().path())
-                                .text_color(theme.text_muted)
-                                .mr(px(6.0)),
-                        )
-                    })
+                    // 标题栏左侧的程序方块：与顶部标签、侧边栏同源
+                    // （`foreground_program` 的程序表），不再画远程 OS 图标。
+                    // 一条终端无论在哪一栏出现，采用的都是「它在跑什么」。
+                    .child(
+                        // 标题栏高 28px，用与侧边栏一致的小尺寸方块。
+                        crate::workspace::tab_bar::TabBar::render_program_tiles_small(
+                            &title_tiles,
+                            cx.theme().ui,
+                        ),
+                    )
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
             .when(self.is_hovered, |this| {

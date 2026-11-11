@@ -77,10 +77,17 @@ struct TabGroupItem {
     editing_subscription: Option<Subscription>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct SidebarTabItem {
     pub label: String,
+    /// 旧式单色图标：只在没有程序方块信息时使用（会话恢复期、非终端标签）。
     pub icon: Option<Icon>,
+    /// 这个标签里各 panel 正在跑的程序（与顶部标签栏同一份数据）。
+    ///
+    /// 侧边栏原先把 `tab.icon` 画成一行单色小图标，那是「这是哪种标签」
+    /// 的旧语义；现在标签表达的是「在跑什么」，侧边栏跟着用程序方块，
+    /// 两处才不会一个新一个旧。
+    pub tiles: Vec<crate::workspace::tab_bar::TileProgram>,
     pub active: bool,
     pub tab_id: Option<String>,
 }
