@@ -177,8 +177,8 @@ pub struct MarkdownElementBuilder {
     pending_fragments: Vec<(usize, String)>,
     /// 文档级图片缓存（后台加载 + 按解析后身份缓存位图）。
     image_cache: Entity<crate::editor::md_image::ImageCache>,
-    /// 当前文档所在目录：相对图片路径以它为基准。
-    doc_dir: Option<std::path::PathBuf>,
+    /// 相对图片引用的查找上下文（文档目录 + 项目根兜底）。
+    image_ctx: crate::editor::md_image::ImageContext,
 }
 
 impl MarkdownElementBuilder {
@@ -189,7 +189,7 @@ impl MarkdownElementBuilder {
         highlight_cache: HighlightCache,
         item_ix: usize,
         image_cache: Entity<crate::editor::md_image::ImageCache>,
-        doc_dir: Option<std::path::PathBuf>,
+        image_ctx: crate::editor::md_image::ImageContext,
     ) -> Self {
         let mut base_div = div();
         base_div.style().refine(&style.container_style);
@@ -221,7 +221,7 @@ impl MarkdownElementBuilder {
             fragment_counter: 0,
             pending_fragments: Vec::new(),
             image_cache,
-            doc_dir,
+            image_ctx,
         }
     }
 
@@ -337,7 +337,7 @@ impl MarkdownElementBuilder {
                     // 但**尊重样式自己的设置**：hover 卡片只有 520~680px 宽，
                     // 又没有可见的横向滚动条，不换行就等于「长内容渲染不出来」。
                     //
-                    // 所以判据是 `style.code_block.text.white_space`：预览 tab 的
+                    // 所以判据是 `style.code_block.text.white_space`：live 编辑器的
                     // `MarkdownStyle::themed` 不设这一项（保持 Nowrap，行为不变），
                     // 而 `hover_style` 显式设成 `Normal` 来要求换行。
                     //
@@ -671,7 +671,7 @@ impl MarkdownElementBuilder {
                     let code_block_id = self.code_block_ids.pop().unwrap_or_default();
                     let language = self.code_block_language.last().cloned().flatten();
 
-                    // 卡片 chrome（语言徽章 + 复制按钮）只给预览/live 卡片；
+                    // 卡片 chrome（语言徽章 + 复制按钮）只给 live 卡片；
                     // hover 浮层（`code_block_chrome = false`）只渲染代码高亮
                     // 本身，不标语言、不给复制入口。
                     if self.style.code_block_chrome {
@@ -1257,7 +1257,8 @@ impl MarkdownElementBuilder {
         }
     }
 
-    /// Notion 风格的图片卡片（含 caption）：预览与实时编辑共用，保证两处样式一致。
+    /// Notion 风格的图片卡片（含 caption）：实时编辑器与 hover 浮层共用，
+    /// 保证两处样式一致。
     /// `alt` 为空时回退显示 url；`alt_runs` 保留 alt 文本的加粗/斜体（若有）。
     ///
     /// 图片由 [`crate::editor::md_image::ImageCache`] 后台加载并缓存：渲染路径
@@ -1294,10 +1295,10 @@ impl MarkdownElementBuilder {
         alt_runs: Option<Vec<TextRun>>,
         cx: &mut gpui::App,
     ) -> AnyElement {
-        let doc_dir = self.doc_dir.as_deref();
+        let ctx = &self.image_ctx;
         let state = self
             .image_cache
-            .update(cx, |cache, cx| cache.slot(url, doc_dir, cx));
+            .update(cx, |cache, cx| cache.slot(url, ctx, cx));
         Self::image_card_slot(url, alt_text, alt_runs, state, cx)
     }
 

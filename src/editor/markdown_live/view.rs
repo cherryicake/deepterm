@@ -204,6 +204,12 @@ pub struct LiveMarkdownView {
     show_outline: bool,
     /// 本文档路径（编辑器传入）：图片粘贴/拖拽按 Typora 存入 `<stem>.assets/`。
     doc_path: Option<PathBuf>,
+    /// 相对图片引用的兜底根（项目/工作区根，由近到远）。
+    ///
+    /// 文档目录始终是**第一**基准；这里只在文档目录找不到时兜底，
+    /// 让 `docs/foo.md` 引用仓库根的 `assets/icon.png` 也能显示
+    /// （VS Code 靠 `getWorkspaceFolder` 覆盖同一场景）。
+    image_roots: Vec<PathBuf>,
     /// 源码模式（`Cmd+/` / 状态条切换）：全文档显示源码标记（Typora 源码模式）。
     show_source: bool,
     /// 文档级宽度：`true` = 全宽（所有行脱离 780px 阅读窄栏、占满编辑器宽度），
@@ -353,6 +359,7 @@ impl LiveMarkdownView {
             cursor_animator: crate::components::cursor_animation::CursorAnimator::new(),
             show_outline: false,
             doc_path: None,
+            image_roots: Vec::new(),
             show_source: false,
             wide_doc: false,
             skip_reformat: false,
@@ -402,12 +409,23 @@ impl LiveMarkdownView {
         self
     }
 
-    /// 文档落盘路径：图片粘贴/拖拽以此定位 `<stem>.assets/`（Typora 布局）。
+    /// 文档落盘路径：图片粘贴/拖拽以此定位 `<stem>.assets/`（Typora 布局），
+    /// 同时也是相对图片引用的第一基准（取其父目录）。
     pub fn doc_path(mut self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         if !path.as_os_str().is_empty() {
             self.doc_path = Some(path.to_path_buf());
         }
+        self
+    }
+
+    /// 相对图片引用的兜底根（项目/工作区根，由近到远）。
+    ///
+    /// 文档目录永远优先；这些目录只在文档目录里找不到同名图片时才尝试，
+    /// 用来兜住「笔记在子目录、图片放在仓库根」这类 VS Code 里能显示、
+    /// 纯文档目录相对却找不到的引用。
+    pub fn image_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.image_roots = roots;
         self
     }
 
@@ -4018,8 +4036,36 @@ impl LiveMarkdownView {
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        let state = cache.update(cx, |cache, cx| cache.slot(url, doc_dir.as_deref(), cx));
+        let mut ctx = crate::editor::md_image::ImageContext::from_doc_dir(doc_dir);
+        ctx.roots = self.image_roots.clone();
+        let state = cache.update(cx, |cache, cx| cache.slot(url, &ctx, cx));
         MarkdownElementBuilder::image_card_slot(url, alt, None, state, cx)
+    }
+
+    /// 一行里的多张图片：横向排布（`README` 徽章风格），自动换行。
+    ///
+    /// 单张也走这里，保证「纯图片行」的间距/宽度上限只有一处口径。
+    fn image_strip(
+        &mut self,
+        images: &[(String, String)],
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut strip = gpui::div()
+            .w_full()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_start()
+            .gap_2();
+        for (alt, url) in images {
+            strip = strip.child(
+                gpui::div()
+                    .flex_shrink_0()
+                    .max_w(px(320.0))
+                    .child(self.image_card_cached(url, alt, cx)),
+            );
+        }
+        strip.into_any_element()
     }
 
     /// 测试探针：图片缓存实体（渲染路径实际使用的那一个）。
@@ -4304,24 +4350,131 @@ fn table_block_all_empty(lines: &[Line], block: (usize, usize)) -> bool {
     true
 }
 
-/// If the whole line is a single `![alt](url)` image, return `(alt, url)`.
-fn parse_image_line(line: &str) -> Option<(String, String)> {
-    let t = line.trim();
-    let inner = t.strip_prefix("![")?;
-    let close = inner.find("](")?;
-    let alt = inner[..close].to_string();
-    let rest = &inner[close + 2..];
-    let end = rest.find(')')?;
-    let spec = rest[..end].trim();
-    // `![](<a b.png>)`：尖括号里可以有空格；`![](a.png "title")`：忽略标题。
-    let url = match spec.strip_prefix('<') {
-        Some(angle) => angle.split('>').next().unwrap_or(angle).to_string(),
-        None => spec.split_whitespace().next().unwrap_or("").to_string(),
-    };
-    if url.is_empty() || !rest[end + 1..].trim().is_empty() {
+/// 整行是否**只由图片组成**（一张或多张，可被空白分隔）。
+///
+/// 这是 README 徽章那种写法的判据：`![a](x.svg) ![b](y.svg)` 一行两张。
+/// 返回全部 `(alt, url)`；只要行里还有别的文字就返回 `None`——那种行交给
+/// 文本渲染。
+///
+/// 已知限制：与文字混排的行内图片（`see ![a](a.png) here`）仍按链接的样子
+/// 显示 alt 文本，不做内联图片替换。`LiveLine` 是单一 `StyledText`，插入图片
+/// 会打乱光标↔字节偏移映射；要做需要把整行拆成「文本段 + 图片段」的布局，
+/// 属于独立改动。
+fn parse_image_line_multi(line: &str) -> Option<Vec<(String, String)>> {
+    let (body, _) = image_body_span(line)?;
+    let mut rest = body.trim();
+    if rest.is_empty() {
         return None;
     }
-    Some((alt, url))
+    let mut out = Vec::new();
+    while let Some(tail) = rest.strip_prefix("![") {
+        let close = tail.find("](")?;
+        let alt = tail[..close].to_string();
+        let after = &tail[close + 2..];
+        let end = after.find(')')?;
+        let spec = after[..end].trim();
+        // `![](<a b.png>)`：尖括号里可以有空格；`![](a.png "title")`：忽略标题。
+        let url = match spec.strip_prefix('<') {
+            Some(angle) => angle.split('>').next().unwrap_or(angle).to_string(),
+            None => spec.split_whitespace().next().unwrap_or("").to_string(),
+        };
+        if url.is_empty() {
+            return None;
+        }
+        out.push((alt, url));
+        rest = after[end + 1..].trim_start();
+    }
+    // 剩下的必须为空：还有文字就不是「纯图片行」。
+    if rest.is_empty() && !out.is_empty() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// 行的内容区（剥掉块前缀）及其在源行里的字节偏移。
+///
+/// 前缀指的是列表符号（`- ` / `* ` / `+ ` / `1. `）、任务框（`- [x] `）、
+/// 引用箭头（`> `，可嵌套）与 ATX 标题井号（`## `）。
+///
+/// 这些前缀在渲染态由**容器**负责画（竖线、圆点、标题字号），正文只负责
+/// 内容。图片卡片要贴在正文该在的位置，所以偏移必须一起返回——卡片插进
+/// 列表项时仍要缩进到项目符号右侧，而不是顶到行首。
+fn image_body_span(line: &str) -> Option<(&str, usize)> {
+    let mut at = 0usize;
+    loop {
+        let rest = &line[at..];
+        // 引用箭头（连同它后面那一个空格）
+        let after_ws = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+        let rest = &rest[after_ws..];
+        at += after_ws;
+        if rest.starts_with('>') {
+            at += 1;
+            // `>` 后允许一个空格
+            if line[at..].starts_with(' ') {
+                at += 1;
+            }
+            continue;
+        }
+        // 列表符号：`-` / `*` / `+` 或 `1.` / `1)`
+        let trimmed = rest;
+        let mut consumed;
+        match trimmed.as_bytes().first() {
+            Some(b'-' | b'*' | b'+') => {
+                consumed = 1;
+                // 列表符号后必须是空白，否则 `-foo` 不是列表
+                if !trimmed[1..].starts_with([' ', '\t']) {
+                    return Some((&line[at..], at));
+                }
+                consumed += 1;
+                // 任务框 `[x]` / `[ ]`
+                let after_marker = &trimmed[consumed..];
+                if after_marker.starts_with('[')
+                    && let Some(close) = after_marker.find(']')
+                    && close <= 2
+                {
+                    consumed += close + 1;
+                    if trimmed[consumed..].starts_with(' ') {
+                        consumed += 1;
+                    }
+                }
+            }
+            Some(b'0'..=b'9') => {
+                let digits = trimmed
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(trimmed.len());
+                if digits == 0 || digits > 9 {
+                    return Some((&line[at..], at));
+                }
+                consumed = digits;
+                match trimmed.as_bytes().get(consumed) {
+                    Some(b'.' | b')') => {
+                        consumed += 1;
+                        if trimmed[consumed..].starts_with([' ', '\t']) {
+                            consumed += 1;
+                        } else {
+                            return Some((&line[at..], at));
+                        }
+                    }
+                    _ => return Some((&line[at..], at)),
+                }
+            }
+            _ => {
+                // ATX 标题：1~6 个 `#` 后接空白
+                let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+                if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with([' ', '\t']) {
+                    consumed = hashes;
+                    while trimmed[consumed..].starts_with([' ', '\t']) {
+                        consumed += 1;
+                    }
+                } else {
+                    return Some((&line[at..], at));
+                }
+            }
+        }
+        at += consumed;
+        // 剥完一层前缀再看下一层（`> - ![](a.png)` 这种嵌套）
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -6039,69 +6192,31 @@ impl Render for LiveMarkdownView {
                     // Ordered display numbers sequence like the preview
                     // (windowed; see display_numbers).
                     let display_number = display_numbers.get(pi).copied().flatten();
-                    let el: gpui::AnyElement = match &row.plan.kind {
-                        RowKind::Blank => {
-                            // Blanks have no text hitbox: explicit click moves
-                            // the cursor here. The cursor line also paints the
-                            // caret inside an (empty) LiveLine.
-                            let line = row.line;
-                            let blank = div()
-                                .id(("live-blank", line))
-                                .debug_selector(|| "live-blank-row".into())
-                                .w_full()
-                                .h(px(26.))
-                                // The scroll column is a fixed-height flex
-                                // container: without shrink-0 a blank row's
-                                // fixed 26px collapses to 0 on any doc taller
-                                // than the viewport (unclickable + caret
-                                // overlap). Every row element needs this.
-                                .flex_shrink_0()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _e, window, cx| {
-                                        window.focus(&this.focus, cx);
-                                        // Col clamps to the line end, like
-                                        // guise's hit() (whitespace-only
-                                        // lines land at their end, not col 0).
-                                        this.edit_no_scroll(cx, |m| {
-                                            m.move_to(line, usize::MAX, false)
-                                        });
-                                        cx.notify();
-                                        cx.stop_propagation();
-                                    }),
-                                );
-                            if paints.get(&pi).is_some_and(|p| p.caret_vis.is_some()) {
-                                blank
-                                    .child(live_line(pi, &mut paints, &entity, &colors))
-                                    .into_any_element()
-                            } else {
-                                blank.into_any_element()
-                            }
-                        }
-                        RowKind::Rule => {
-                            if row.plan.revealed {
-                                div()
-                                    .flex_shrink_0()
-                                    .py(px(2.))
-                                    .child(live_line(pi, &mut paints, &entity, &colors))
-                                    .into_any_element()
-                            } else {
-                                // Preview parity: 1px soft rule, my_6.
-                                // The rule itself has no text: clicks land the
-                                // cursor on this source line (revealing it).
+                    let el: gpui::AnyElement =
+                        match &row.plan.kind {
+                            RowKind::Blank => {
+                                // Blanks have no text hitbox: explicit click moves
+                                // the cursor here. The cursor line also paints the
+                                // caret inside an (empty) LiveLine.
                                 let line = row.line;
-                                let mut d = div()
-                                    .id(("live-rule", line))
-                                    .flex_shrink_0()
-                                    .h(px(1.))
+                                let blank = div()
+                                    .id(("live-blank", line))
+                                    .debug_selector(|| "live-blank-row".into())
                                     .w_full()
-                                    .my_6()
-                                    .bg(colors.rule)
-                                    .rounded_full()
+                                    .h(px(26.))
+                                    // The scroll column is a fixed-height flex
+                                    // container: without shrink-0 a blank row's
+                                    // fixed 26px collapses to 0 on any doc taller
+                                    // than the viewport (unclickable + caret
+                                    // overlap). Every row element needs this.
+                                    .flex_shrink_0()
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _e, window, cx| {
                                             window.focus(&this.focus, cx);
+                                            // Col clamps to the line end, like
+                                            // guise's hit() (whitespace-only
+                                            // lines land at their end, not col 0).
                                             this.edit_no_scroll(cx, |m| {
                                                 m.move_to(line, usize::MAX, false)
                                             });
@@ -6109,271 +6224,321 @@ impl Render for LiveMarkdownView {
                                             cx.stop_propagation();
                                         }),
                                     );
-                                if is_first {
-                                    d = d.mt_0();
+                                if paints.get(&pi).is_some_and(|p| p.caret_vis.is_some()) {
+                                    blank
+                                        .child(live_line(pi, &mut paints, &entity, &colors))
+                                        .into_any_element()
+                                } else {
+                                    blank.into_any_element()
                                 }
-                                if is_last {
-                                    d = d.mb_0();
-                                }
-                                d.into_any_element()
                             }
-                        }
-                        RowKind::Heading(level) => {
-                            let level = *level;
-                            let mut head = match level {
-                                1 => div().mt_8().mb_4().pb_2(),
-                                2 => div().mt_7().mb_3().pb_2(),
-                                3 => div().mt_6().mb_3(),
-                                4 => div().mt_6().mb_2(),
-                                _ => div().mt_4().mb_2(),
-                            };
-                            if is_first {
-                                head = head.mt_0();
-                            }
-                            if is_last {
-                                head = head.mb_0();
-                            }
-                            head = head
-                                .w_full()
-                                .flex_shrink_0()
-                                .flex()
-                                .flex_wrap()
-                                .items_start()
-                                .group("heading");
-                            head.style().refine(&style.heading);
-                            if let Some(r) = style
-                                .heading_level_styles
-                                .get(level as usize - 1)
-                                .cloned()
-                                .flatten()
-                            {
-                                head.style().refine(&gpui::StyleRefinement {
-                                    text: r,
-                                    ..Default::default()
-                                });
-                            }
-                            if level <= 2
-                                && let Some(color) = style.heading_border_color
-                            {
-                                head = head.border_b_1().border_color(color);
-                            }
-                            let anchor = div()
-                                .ml_2()
-                                .flex_shrink_0()
-                                .text_size(px(13.))
-                                .text_color(ui.text_muted.opacity(0.35))
-                                .invisible()
-                                .group_hover("heading", |s| s.visible())
-                                .child("#")
-                                .into_any_element();
-                            head.child(div().flex_1().min_w_0().child(live_line(
-                                pi,
-                                &mut paints,
-                                &entity,
-                                &colors,
-                            )))
-                            .child(anchor)
-                            .into_any_element()
-                        }
-                        RowKind::Bullet { cols }
-                        | RowKind::Ordered { cols, .. }
-                        | RowKind::Task { cols, .. } => {
-                            // Preview parity: nesting indent 24px per level,
-                            // item row flex/gap/mb/lh, preview-exact gutters.
-                            let depth = cols / 2;
-                            let indent = px(depth as f32 * 24.0);
-                            let gutter: gpui::AnyElement = match &row.plan.kind {
-                                RowKind::Task { checked, .. } => {
-                                    let checked = *checked;
-                                    let line = row.line;
-                                    let box_el = if checked {
-                                        div()
-                                            .size(px(16.))
-                                            .rounded(px(4.))
-                                            .bg(colors.success)
-                                            .border_1()
-                                            .border_color(colors.success)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .child(
-                                                svg()
-                                                    .size(px(10.))
-                                                    .text_color(gpui::white())
-                                                    .path(Icon::Check.path()),
-                                            )
-                                            .into_any_element()
-                                    } else {
-                                        div()
-                                            .size(px(16.))
-                                            .rounded(px(4.))
-                                            .border_1()
-                                            .border_color(ui.text_muted.opacity(0.35))
-                                            .bg(gpui::transparent_black())
-                                            .into_any_element()
-                                    };
+                            RowKind::Rule => {
+                                if row.plan.revealed {
                                     div()
-                                        .id(("live-task", line))
-                                        .w(px(22.))
                                         .flex_shrink_0()
-                                        .mt(px(3.))
-                                        .child(div().child(box_el).on_mouse_down(
+                                        .py(px(2.))
+                                        .child(live_line(pi, &mut paints, &entity, &colors))
+                                        .into_any_element()
+                                } else {
+                                    // Preview parity: 1px soft rule, my_6.
+                                    // The rule itself has no text: clicks land the
+                                    // cursor on this source line (revealing it).
+                                    let line = row.line;
+                                    let mut d = div()
+                                        .id(("live-rule", line))
+                                        .flex_shrink_0()
+                                        .h(px(1.))
+                                        .w_full()
+                                        .my_6()
+                                        .bg(colors.rule)
+                                        .rounded_full()
+                                        .on_mouse_down(
                                             MouseButton::Left,
-                                            cx.listener(move |this, _e, _w, cx| {
-                                                this.toggle_task_at(line, cx);
+                                            cx.listener(move |this, _e, window, cx| {
+                                                window.focus(&this.focus, cx);
+                                                this.edit_no_scroll(cx, |m| {
+                                                    m.move_to(line, usize::MAX, false)
+                                                });
+                                                cx.notify();
                                                 cx.stop_propagation();
                                             }),
-                                        ))
-                                        .into_any_element()
+                                        );
+                                    if is_first {
+                                        d = d.mt_0();
+                                    }
+                                    if is_last {
+                                        d = d.mb_0();
+                                    }
+                                    d.into_any_element()
                                 }
-                                RowKind::Ordered { number, .. } => {
-                                    let n = display_number.unwrap_or(*number);
-                                    div()
-                                        .w(px(24.))
+                            }
+                            RowKind::Heading(level) => {
+                                let level = *level;
+                                let mut head = match level {
+                                    1 => div().mt_8().mb_4().pb_2(),
+                                    2 => div().mt_7().mb_3().pb_2(),
+                                    3 => div().mt_6().mb_3(),
+                                    4 => div().mt_6().mb_2(),
+                                    _ => div().mt_4().mb_2(),
+                                };
+                                if is_first {
+                                    head = head.mt_0();
+                                }
+                                if is_last {
+                                    head = head.mb_0();
+                                }
+                                head = head
+                                    .w_full()
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_start()
+                                    .group("heading");
+                                head.style().refine(&style.heading);
+                                if let Some(r) = style
+                                    .heading_level_styles
+                                    .get(level as usize - 1)
+                                    .cloned()
+                                    .flatten()
+                                {
+                                    head.style().refine(&gpui::StyleRefinement {
+                                        text: r,
+                                        ..Default::default()
+                                    });
+                                }
+                                if level <= 2
+                                    && let Some(color) = style.heading_border_color
+                                {
+                                    head = head.border_b_1().border_color(color);
+                                }
+                                let anchor = div()
+                                    .ml_2()
+                                    .flex_shrink_0()
+                                    .text_size(px(13.))
+                                    .text_color(ui.text_muted.opacity(0.35))
+                                    .invisible()
+                                    .group_hover("heading", |s| s.visible())
+                                    .child("#")
+                                    .into_any_element();
+                                let src = self.buffer.line(row.line).unwrap_or("");
+                                let inner: gpui::AnyElement = match (!row.plan.revealed)
+                                    .then(|| parse_image_line_multi(src))
+                                    .flatten()
+                                {
+                                    Some(images) => self.image_strip(&images, cx),
+                                    None => live_line(pi, &mut paints, &entity, &colors)
+                                        .into_any_element(),
+                                };
+                                head.child(div().flex_1().min_w_0().child(inner))
+                                    .child(anchor)
+                                    .into_any_element()
+                            }
+                            RowKind::Bullet { cols }
+                            | RowKind::Ordered { cols, .. }
+                            | RowKind::Task { cols, .. } => {
+                                // Preview parity: nesting indent 24px per level,
+                                // item row flex/gap/mb/lh, preview-exact gutters.
+                                let depth = cols / 2;
+                                let indent = px(depth as f32 * 24.0);
+                                let gutter: gpui::AnyElement = match &row.plan.kind {
+                                    RowKind::Task { checked, .. } => {
+                                        let checked = *checked;
+                                        let line = row.line;
+                                        let box_el = if checked {
+                                            div()
+                                                .size(px(16.))
+                                                .rounded(px(4.))
+                                                .bg(colors.success)
+                                                .border_1()
+                                                .border_color(colors.success)
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .child(
+                                                    svg()
+                                                        .size(px(10.))
+                                                        .text_color(gpui::white())
+                                                        .path(Icon::Check.path()),
+                                                )
+                                                .into_any_element()
+                                        } else {
+                                            div()
+                                                .size(px(16.))
+                                                .rounded(px(4.))
+                                                .border_1()
+                                                .border_color(ui.text_muted.opacity(0.35))
+                                                .bg(gpui::transparent_black())
+                                                .into_any_element()
+                                        };
+                                        div()
+                                            .id(("live-task", line))
+                                            .w(px(22.))
+                                            .flex_shrink_0()
+                                            .mt(px(3.))
+                                            .child(div().child(box_el).on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, _e, _w, cx| {
+                                                    this.toggle_task_at(line, cx);
+                                                    cx.stop_propagation();
+                                                }),
+                                            ))
+                                            .into_any_element()
+                                    }
+                                    RowKind::Ordered { number, .. } => {
+                                        let n = display_number.unwrap_or(*number);
+                                        div()
+                                            .w(px(24.))
+                                            .flex()
+                                            .justify_end()
+                                            .flex_shrink_0()
+                                            .text_size(px(14.))
+                                            .font_weight(gpui::FontWeight(500.))
+                                            .pr(px(4.))
+                                            .child(format!("{n}."))
+                                            .text_color(ui.text_muted)
+                                            .into_any_element()
+                                    }
+                                    _ => div()
+                                        .w(px(16.))
                                         .flex()
-                                        .justify_end()
+                                        .justify_center()
                                         .flex_shrink_0()
-                                        .text_size(px(14.))
-                                        .font_weight(gpui::FontWeight(500.))
-                                        .pr(px(4.))
-                                        .child(format!("{n}."))
-                                        .text_color(ui.text_muted)
+                                        .text_size(px(22.))
+                                        .child("•")
+                                        .text_color(ui.accent)
+                                        .into_any_element(),
+                                };
+                                let mut item = div()
+                                    .flex()
+                                    .flex_row()
+                                    .flex_shrink_0()
+                                    .items_start()
+                                    .gap_1()
+                                    .w_full()
+                                    .mb_2()
+                                    .line_height(rems(1.75))
+                                    .pl(indent);
+                                if is_first {
+                                    item = item.mt_2();
+                                }
+                                // 图片独占列表项时渲染成卡片（预览同款）；否则
+                                // 照常渲染文本行。`- ![](a.png)` 在预览里有图，
+                                // 实时编辑不能只画一个 `![](…)` 文本。
+                                let src_line = self.buffer.line(row.line).unwrap_or("");
+                                let body: gpui::AnyElement = match (!row.plan.revealed)
+                                    .then(|| parse_image_line_multi(src_line))
+                                    .flatten()
+                                {
+                                    Some(images) => self.image_strip(&images, cx),
+                                    None => live_line(pi, &mut paints, &entity, &colors)
+                                        .into_any_element(),
+                                };
+                                item.child(gutter)
+                                    .child(div().flex_1().w_0().min_w_0().child(body))
+                                    .into_any_element()
+                            }
+                            RowKind::Quote { .. } => {
+                                // Single quote lines are grouped above; unreachable.
+                                div()
+                                    .flex_shrink_0()
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
+                                    .into_any_element()
+                            }
+                            RowKind::Setext => {
+                                // A setext underline (`===`/`---` under a heading
+                                // line): the preview consumes it into the heading,
+                                // so in rendered mode it is a small gap whose
+                                // click targets the line; revealed, it shows the
+                                // raw marker for editing.
+                                if row.plan.revealed {
+                                    div()
+                                        .flex_shrink_0()
+                                        .child(live_line(pi, &mut paints, &entity, &colors))
+                                        .into_any_element()
+                                } else {
+                                    let line = row.line;
+                                    div()
+                                        .id(("live-setext", line))
+                                        .flex_shrink_0()
+                                        .w_full()
+                                        .h(px(8.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _e, window, cx| {
+                                                window.focus(&this.focus, cx);
+                                                this.edit_no_scroll(cx, |m| {
+                                                    m.move_to(line, usize::MAX, false)
+                                                });
+                                                cx.notify();
+                                                cx.stop_propagation();
+                                            }),
+                                        )
                                         .into_any_element()
                                 }
-                                _ => div()
-                                    .w(px(16.))
+                            }
+                            RowKind::Math => {
+                                // Display formula: centered italic line
+                                // (Typora-style; KaTeX approx, no TeX engine).
+                                div()
+                                    .w_full()
+                                    .flex_shrink_0()
                                     .flex()
                                     .justify_center()
-                                    .flex_shrink_0()
-                                    .text_size(px(22.))
-                                    .child("•")
-                                    .text_color(ui.accent)
-                                    .into_any_element(),
-                            };
-                            let mut item = div()
-                                .flex()
-                                .flex_row()
-                                .flex_shrink_0()
-                                .items_start()
-                                .gap_1()
-                                .w_full()
-                                .mb_2()
-                                .line_height(rems(1.75))
-                                .pl(indent);
-                            if is_first {
-                                item = item.mt_2();
+                                    .my_2()
+                                    .line_height(rems(1.75))
+                                    .child(live_line(pi, &mut paints, &entity, &colors))
+                                    .into_any_element()
                             }
-                            item.child(gutter)
-                                .child(div().flex_1().w_0().min_w_0().child(live_line(
-                                    pi,
-                                    &mut paints,
-                                    &entity,
-                                    &colors,
-                                )))
-                                .into_any_element()
-                        }
-                        RowKind::Quote { .. } => {
-                            // Single quote lines are grouped above; unreachable.
-                            div()
-                                .flex_shrink_0()
-                                .child(live_line(pi, &mut paints, &entity, &colors))
-                                .into_any_element()
-                        }
-                        RowKind::Setext => {
-                            // A setext underline (`===`/`---` under a heading
-                            // line): the preview consumes it into the heading,
-                            // so in rendered mode it is a small gap whose
-                            // click targets the line; revealed, it shows the
-                            // raw marker for editing.
-                            if row.plan.revealed {
+                            RowKind::MathDelim { .. } => {
+                                // A hidden `$$` delimiter: revealed it shows the
+                                // raw marker; otherwise a small click gap
+                                // (Setext parity) that targets the line.
+                                if row.plan.revealed {
+                                    div()
+                                        .flex_shrink_0()
+                                        .child(live_line(pi, &mut paints, &entity, &colors))
+                                        .into_any_element()
+                                } else {
+                                    let line = row.line;
+                                    div()
+                                        .id(("live-math", line))
+                                        .flex_shrink_0()
+                                        .w_full()
+                                        .h(px(8.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _e, window, cx| {
+                                                window.focus(&this.focus, cx);
+                                                this.edit_no_scroll(cx, |m| {
+                                                    m.move_to(line, usize::MAX, false)
+                                                });
+                                                cx.notify();
+                                                cx.stop_propagation();
+                                            }),
+                                        )
+                                        .into_any_element()
+                                }
+                            }
+                            RowKind::Code { .. }
+                            | RowKind::Fence { .. }
+                            | RowKind::Table
+                            | RowKind::FrontMatter => {
+                                // Ungrouped source-only rows (revealed blocks,
+                                // lone fences, frontmatter): plain mono lines.
                                 div()
                                     .flex_shrink_0()
                                     .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
-                            } else {
-                                let line = row.line;
-                                div()
-                                    .id(("live-setext", line))
-                                    .flex_shrink_0()
-                                    .w_full()
-                                    .h(px(8.))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _e, window, cx| {
-                                            window.focus(&this.focus, cx);
-                                            this.edit_no_scroll(cx, |m| {
-                                                m.move_to(line, usize::MAX, false)
-                                            });
-                                            cx.notify();
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .into_any_element()
                             }
-                        }
-                        RowKind::Math => {
-                            // Display formula: centered italic line
-                            // (Typora-style; KaTeX approx, no TeX engine).
-                            div()
-                                .w_full()
-                                .flex_shrink_0()
-                                .flex()
-                                .justify_center()
-                                .my_2()
-                                .line_height(rems(1.75))
-                                .child(live_line(pi, &mut paints, &entity, &colors))
-                                .into_any_element()
-                        }
-                        RowKind::MathDelim { .. } => {
-                            // A hidden `$$` delimiter: revealed it shows the
-                            // raw marker; otherwise a small click gap
-                            // (Setext parity) that targets the line.
-                            if row.plan.revealed {
+                            RowKind::Paragraph => {
+                                // Paragraphs are grouped above; unreachable
+                                // (kept as a defensive plain row).
                                 div()
                                     .flex_shrink_0()
                                     .child(live_line(pi, &mut paints, &entity, &colors))
                                     .into_any_element()
-                            } else {
-                                let line = row.line;
-                                div()
-                                    .id(("live-math", line))
-                                    .flex_shrink_0()
-                                    .w_full()
-                                    .h(px(8.))
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, _e, window, cx| {
-                                            window.focus(&this.focus, cx);
-                                            this.edit_no_scroll(cx, |m| {
-                                                m.move_to(line, usize::MAX, false)
-                                            });
-                                            cx.notify();
-                                            cx.stop_propagation();
-                                        }),
-                                    )
-                                    .into_any_element()
                             }
-                        }
-                        RowKind::Code { .. }
-                        | RowKind::Fence { .. }
-                        | RowKind::Table
-                        | RowKind::FrontMatter => {
-                            // Ungrouped source-only rows (revealed blocks,
-                            // lone fences, frontmatter): plain mono lines.
-                            div()
-                                .flex_shrink_0()
-                                .child(live_line(pi, &mut paints, &entity, &colors))
-                                .into_any_element()
-                        }
-                        RowKind::Paragraph => {
-                            // Paragraphs are grouped above; unreachable
-                            // (kept as a defensive plain row).
-                            div()
-                                .flex_shrink_0()
-                                .child(live_line(pi, &mut paints, &entity, &colors))
-                                .into_any_element()
-                        }
-                    };
+                        };
                     if row.line == cursor.line {
                         caret_el_ix = Some(row_els.len());
                     }
@@ -6911,14 +7076,14 @@ impl Render for LiveMarkdownView {
                     }
                     for pi in idxs {
                         let src = self.buffer.line(rows[*pi].line).unwrap_or("");
-                        if !rows[*pi].plan.revealed
-                            && let Some((alt, url)) = parse_image_line(src)
+                        // 纯图片行（一张或多张）渲染成图片；含文字的行走文本。
+                        match (!rows[*pi].plan.revealed)
+                            .then(|| parse_image_line_multi(src))
+                            .flatten()
                         {
-                            // 本地图片走视图缓存 + 后台加载（render 里不再
-                            // 同步读盘/解码）；其余 URL 走原有卡片分支。
-                            d = d.child(self.image_card_cached(&url, &alt, cx));
-                        } else {
-                            d = d.child(live_line(*pi, &mut paints, &entity, &colors));
+                            // 徽章式一行多图横排；单图也走这条路。
+                            Some(images) => d = d.child(self.image_strip(&images, cx)),
+                            None => d = d.child(live_line(*pi, &mut paints, &entity, &colors)),
                         }
                     }
                     let a = rows[idxs[0]].line;
@@ -7005,7 +7170,18 @@ impl Render for LiveMarkdownView {
                         );
                     }
                     for pi in idxs {
-                        card = card.child(live_line(*pi, &mut paints, &entity, &colors));
+                        let src = self.buffer.line(rows[*pi].line).unwrap_or("");
+                        // 引用里的独占图片行同样渲染成卡片（预览同款）。
+                        let el: gpui::AnyElement = match (!rows[*pi].plan.revealed)
+                            .then(|| parse_image_line_multi(src))
+                            .flatten()
+                        {
+                            Some(images) => self.image_strip(&images, cx),
+                            None => {
+                                live_line(*pi, &mut paints, &entity, &colors).into_any_element()
+                            }
+                        };
+                        card = card.child(el);
                     }
                     if idxs.iter().any(|pi| rows[*pi].line == cursor.line) {
                         caret_el_ix = Some(row_els.len());

@@ -30,7 +30,7 @@ DeepTerm 是一个使用 **Rust** 编写、基于 **GPUI**（Zed 的 GPU 加速 
 
 - **GPU 终端**：基于 `alacritty_terminal`，支持标签页、分屏、搜索、Shell 集成、Kitty 图形协议、桌面通知与主题热重载。
 - **SSH / SFTP**：主机管理与系统凭据存储，远程终端、远程文件浏览与编辑、上传下载、反向端口转发和远程 LSP。
-- **代码编辑器**：tree-sitter 语法高亮，LSP 补全/悬浮/诊断/跳转，Git 状态与 Diff（只读评审视图，单栏/并排可切换），Vim 模式，Markdown 实时预览和图片查看。
+- **代码编辑器**：tree-sitter 语法高亮，LSP 补全/悬浮/诊断/跳转，Git 状态与 Diff（只读评审视图，单栏/并排可切换），Vim 模式，Markdown 实时渲染编辑和图片查看。
 - **AI CLI Agent**：自动识别 Claude Code、Codex、OpenCode 等 28 种命令行 Agent，并在标签页显示工作中、等待确认、已完成三种状态。
 - **会话体验**：多窗口、标签页组、会话恢复，以及 `/open`、`/scp` 内建命令。
 

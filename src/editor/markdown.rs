@@ -6,9 +6,8 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, ClipboardItem, Context, Entity, FocusHandle, Hsla, IntoElement, KeyBinding, ListAlignment,
-    ListState, Render, SharedString, StyleRefinement, TextRun, TextStyleRefinement, WhiteSpace,
-    Window, actions, div, list, px, rems,
+    App, ClipboardItem, Context, Entity, FocusHandle, Hsla, IntoElement, SharedString,
+    StyleRefinement, TextRun, TextStyleRefinement, WhiteSpace, Window, actions, div, px, rems,
 };
 
 use crate::editor::syntax::SyntaxHighlighter;
@@ -32,7 +31,7 @@ pub struct MarkdownStyle {
     pub code_block: StyleRefinement,
     /// 代码块是否带卡片附带的交互 chrome：左上角语言徽章 + 右上角复制按钮。
     ///
-    /// `true`（预览 tab / live 卡片）；`false`（hover 浮层）—— 浮层里只留
+    /// `true`（live 编辑器里的代码卡片）；`false`（hover 浮层）—— 浮层里只留
     /// 代码本身的高亮，不标语言、不给复制入口。
     pub code_block_chrome: bool,
     pub inline_code: TextStyleRefinement,
@@ -167,7 +166,7 @@ impl MarkdownStyle {
     }
     /// hover 浮层专用的紧凑样式。
     ///
-    /// 与 [`Self::themed`]（整页阅读，15px / 1.75 行高 / 780px 窄栏）刻意不同：
+    /// 与 [`Self::themed`]（阅读版式，15px / 1.75 行高）刻意不同：
     /// hover 卡片只有 680×320，要塞进签名、文档段落和代码块，字号与行高都得
     /// 收紧，否则几行就被撑到折行、滚动条立刻出现。
     ///
@@ -327,40 +326,47 @@ pub struct Markdown {
     pub(crate) focus_handle: FocusHandle,
     copied_code_blocks: std::collections::HashSet<usize>,
     highlight_cache: HighlightCache,
-    list_state: ListState,
     pub(crate) selection: MarkdownSelection,
     /// fragment_id -> text, populated lazily during render for copy. Wrapped in Rc<RefCell> so builder can write without Entity borrow during render.
     pub(crate) fragment_texts: Rc<RefCell<std::collections::HashMap<usize, String>>>,
     /// 文档级图片缓存：后台加载 + 按解析后的身份缓存位图（见 [`md_image`]）。
     pub(crate) image_cache: Entity<crate::editor::md_image::ImageCache>,
-    /// 文档所在目录：相对图片路径以它为基准（`None` = 进程工作目录）。
-    pub(crate) doc_dir: Option<std::path::PathBuf>,
+    /// 相对图片引用的查找上下文：文档目录优先，项目/工作区根兜底。
+    pub(crate) image_ctx: crate::editor::md_image::ImageContext,
     /// 图片加载完成后由 `image_cache` 触发重绘，订阅必须持有。
     _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl Markdown {
-    pub fn init(cx: &mut gpui::App) {
-        crate::keymap::bind(
-            cx,
-            [
-                KeyBinding::new("cmd-c", Copy, Some("Markdown")),
-                KeyBinding::new("ctrl-c", Copy, Some("Markdown")),
-                KeyBinding::new("cmd-a", SelectAll, Some("Markdown")),
-                KeyBinding::new("ctrl-a", SelectAll, Some("Markdown")),
-            ],
-        );
-    }
-
+    /// 这些 action 由经 `Markdown::render_items_inline` 渲染出的可选文本
+    /// （`SelectableText`）转发；`Markdown` 自身不再持有焦点，也**不再**注册
+    /// `"Markdown"` 按键上下文——整页预览 tab 删除后没有任何元素设置它，
+    /// 留着只会是一组永不解发的绑定。实时编辑器的复制/全选走自己的
+    /// `"LiveMarkdown"` 上下文（见 `editor::init`）。
     pub fn new(source: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
         Self::new_with_dir(source, None, cx)
     }
 
-    /// 与 [`Self::new`] 相同，但带上文档所在目录：`![](assets/a.png)` 这类
-    /// 相对引用以 `doc_dir` 为基准解析（不传则退回进程工作目录）。
+    /// 与 [`Self::new`] 相同，但带上相对图片引用的查找上下文。
+    ///
+    /// `Markdown` 实体现在只服务 hover 浮层（只读预览 tab 已删除），浮层
+    /// 里的图片通常没有项目根概念，所以调用点大多只给 `doc_dir`。
     pub fn new_with_dir(
         source: impl Into<SharedString>,
         doc_dir: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_context(
+            source,
+            crate::editor::md_image::ImageContext::from_doc_dir(doc_dir),
+            cx,
+        )
+    }
+
+    /// 完整版本：相对图片引用除文档目录外，再按 `image_ctx.roots` 兜底。
+    fn new_with_context(
+        source: impl Into<SharedString>,
+        image_ctx: crate::editor::md_image::ImageContext,
         cx: &mut Context<Self>,
     ) -> Self {
         let source = source.into();
@@ -374,11 +380,10 @@ impl Markdown {
             focus_handle,
             copied_code_blocks: std::collections::HashSet::new(),
             highlight_cache: Rc::new(RefCell::new(HashMap::new())),
-            list_state: ListState::new(0, ListAlignment::Top, px(200.0)),
             selection: MarkdownSelection::default(),
             fragment_texts: Default::default(),
             image_cache,
-            doc_dir,
+            image_ctx,
             _subscriptions,
         };
         this.set_text(source, cx);
@@ -405,7 +410,6 @@ impl Markdown {
     fn parse(&mut self) {
         self.events = Rc::new(parse_markdown(&self.source));
         self.item_ranges = compute_item_ranges(&self.events);
-        self.list_state.reset(self.item_ranges.len());
     }
 
     pub(crate) fn local_selection_for_fragment(
@@ -574,71 +578,6 @@ impl Markdown {
 
 crate::impl_focusable!(Markdown);
 
-impl Render for Markdown {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
-        let markdown = cx.entity();
-        let list_state = self.list_state.clone();
-        let style = MarkdownStyle::themed(_window, cx);
-        // Register actions for copy/select-all when focused
-        let markdown_for_copy = markdown.clone();
-        let markdown_for_select_all = markdown.clone();
-
-        // Notion/Typora 版式：居中窄栏，最大 780px (≈72ch)，
-        // 外层负责背景与居中，内层窄栏承载 list，实现优雅的阅读宽度。
-        div()
-            .id("markdown")
-            .key_context("Markdown")
-            .track_focus(&self.focus_handle)
-            .on_action({
-                let markdown = markdown_for_copy.clone();
-                move |_: &Copy, window, cx| {
-                    markdown.update(cx, |m, cx| m.copy_selection(window, cx));
-                }
-            })
-            .on_action({
-                let markdown = markdown_for_select_all.clone();
-                move |_: &SelectAll, _window, cx| {
-                    markdown.update(cx, |markdown, cx| {
-                        markdown.select_all(cx);
-                    });
-                }
-            })
-            .flex()
-            .flex_col()
-            .items_center()
-            .size_full()
-            .overflow_hidden()
-            .bg(theme.app_background)
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _event, _window, cx| {
-                    if !this.selection.pending && this.selection.has_selection {
-                        this.clear_selection(cx);
-                    }
-                }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(780.))
-                    .px_8()
-                    .py_8()
-                    .size_full()
-                    .overflow_hidden()
-                    .child(
-                        list(list_state, move |ix, _window, cx| {
-                            Self::render_item(markdown.clone(), ix, cx, style.clone())
-                        })
-                        .w_full()
-                        .h_full(),
-                    ),
-            )
-    }
-}
-
 impl Markdown {
     /// 渲染单个条目。**不要 `window` 参数**：这里只用 `cx` 取样式与资源，
     /// 多带一个 `&mut Window` 会让内联调用方（hover 卡片，绘制阶段拿不到
@@ -649,7 +588,7 @@ impl Markdown {
         cx: &mut gpui::App,
         style: MarkdownStyle,
     ) -> gpui::AnyElement {
-        let (copied, events, range, highlight_cache, image_cache, doc_dir) =
+        let (copied, events, range, highlight_cache, image_cache, image_ctx) =
             markdown.update(cx, |markdown, _cx| {
                 let range = markdown.item_ranges[ix].clone();
                 (
@@ -658,7 +597,7 @@ impl Markdown {
                     range,
                     markdown.highlight_cache.clone(),
                     markdown.image_cache.clone(),
-                    markdown.doc_dir.clone(),
+                    markdown.image_ctx.clone(),
                 )
             });
 
@@ -669,7 +608,7 @@ impl Markdown {
             highlight_cache,
             ix,
             image_cache,
-            doc_dir,
+            image_ctx,
         )
         .build(&events[range], cx);
 
@@ -678,9 +617,11 @@ impl Markdown {
 
     /// 把全部条目**内联**渲染成元素列表（不带整页外壳）。
     ///
-    /// [`Render::render`] 给的是整页版式：居中 780px 窄栏 + 自己的背景色，
-    /// 那是 markdown 预览 tab 用的。hover 卡片要保留自己的外观，只借用
-    /// markdown 的解析与语法高亮，所以必须走这个入口。
+    /// 这是 `Markdown` 目前**唯一**的渲染入口。md 阅读 tab 已交给
+    /// [`crate::editor::markdown_live::LiveMarkdownView`]（渲染 + 就地编辑，
+    /// 涵盖只读预览的全部能力），所以不再有「整页版式」那套外壳；
+    /// `Markdown` 现在只服务于 hover 浮层这类**内联**场景——那里必须保留
+    /// 调用方自己的外观，只借用 markdown 的解析与语法高亮。
     ///
     /// 对照 Zed `hover_popover.rs`：它也是 `MarkdownElement::new(...)` 内联
     /// 放进浮层，而不是把 markdown 实体整个渲染出来。
