@@ -536,9 +536,8 @@ impl Workspace {
             state.workspace_id.clone()
         };
 
-        // 标签名与会话里存的一致即可：恢复完成后由 `refresh_all_tab_visuals`
-        // 按「当前选中的 panel 正在跑什么」重新计算。恢复期间还没有终端的
-        // 实时进程信息，所以这里不做任何编号/改名。
+        // 标签名先与会话里存的一致；恢复完成后由 `refresh_all_tab_visuals`
+        // 按「当前选中的 panel 正在跑什么」重新计算。
         let label_for = |tab: &TabSessionState| -> String { tab.label.clone() };
 
         let tab_items = state
@@ -2165,6 +2164,13 @@ impl Workspace {
 
         self.active_tab_id = tab_id.clone();
         self.switch_to_tab(&tab_id, cx);
+        // 立刻算一次标签视觉：新标签在第一帧就该有程序方块，而不是等到
+        // 终端第一次吐出标题/PWD 才补上。
+        //
+        // herdr 那边不存在这个空窗：它的 `lead()` 永远能从一个已存在的
+        // pane 取到 `program`。deepterm 的标签是独立实体，不主动填就是空的，
+        // 于是「新建的标签没图标，点一下才出现」。
+        self.refresh_tab_visual(&tab_id, cx);
 
         cx.defer_in(window, move |_, window, cx| {
             if let Some(handle) = panel.read(cx).active_content_focus_handle(cx) {
@@ -2213,7 +2219,7 @@ impl Workspace {
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(tab_id, cx);
         });
-        // 被关闭的可能是Workspace标签：剩余Workspace标签重新编号
+        // 剩余标签重算视觉（面板数量/选中项都可能受影响）
         self.refresh_all_tab_visuals(cx);
 
         // 如果关闭的是当前活动tab，切换到相邻 tab（以渲染顺序为准：优先下一个，否则上一个）

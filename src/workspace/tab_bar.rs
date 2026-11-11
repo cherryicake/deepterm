@@ -3740,6 +3740,58 @@ mod tests {
         assert!(TILE_STACK_MAX >= 2);
     }
 
+    /// 新建的终端标签**第一帧**就该有程序方块，不能等终端吐出标题/PWD。
+    ///
+    /// herdr 没有这个空窗：它的标签视觉是从已存在的 pane 里 `lead()` 出来的，
+    /// 天然总有 `program`。deepterm 的标签是独立实体，不在创建时主动填
+    /// `tiles` 就是空的——表现就是「新标签没图标，点一下才出现」。
+    #[gpui::test]
+    fn fresh_tab_has_a_program_tile_before_any_output(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+
+        // 一个刚建出来、还没跑过命令的 shell：`foreground_program` 应回落到
+        // shell 程序本身，而不是空。
+        let shell_program = crate::programs::of(None, &["bash".to_string()]);
+        // 键是 `shell`（图标/底色都来自条目），名字保留具体 shell 名
+        // （bash / zsh / fish）——标题里要区分是哪个 shell，而 herdr 的
+        // `tile()` 用的也只是条目的 icon/tile，不看 name。
+        assert_eq!(shell_program.key, "shell", "bash 属于 shell 类别");
+        assert!(shell_program.shell, "shell 标记必须置上");
+        assert_eq!(shell_program.name, "bash", "名字保留具体 shell");
+        assert!(
+            shell_program.icon.is_some(),
+            "shell 条目必须带图标，否则新标签画不出方块"
+        );
+        assert!(shell_program.tile.is_some(), "shell 条目必须带方块底色");
+
+        let mut tab = TabItem::new("fresh", "bash");
+        let tile = TileProgram::from_program(&shell_program);
+        tab.tiles = vec![tile.clone()];
+
+        // 叠放列表非空 → `render_program_tiles` 会画出一个方块。
+        assert_eq!(tab.stacked_tiles(None).len(), 1);
+        assert_eq!(
+            tab.stacked_tiles(None)[0].icon,
+            tile.icon,
+            "首个方块必须就是 shell 的图标"
+        );
+
+        // 反向确认：没有 `tiles` 时才会退化成「无方块」——这正是修复前的状态。
+        let bare = TabItem::new("bare", "bash");
+        assert!(bare.tiles.is_empty());
+
+        // 空 argv（终端刚建、还没跑任何命令）必须直接落到 shell 条目：
+        // 这是「新标签第一帧就有 Bash 图标」的数据前提。若这里返回空
+        // Program，无论 workspace 那边怎么刷新都画不出方块。
+        let fresh = crate::programs::of(None, &[]);
+        assert_eq!(fresh.key, "shell", "空 argv 应解析成 shell");
+        assert!(fresh.shell);
+        assert!(
+            fresh.icon.is_some() && fresh.tile.is_some(),
+            "shell 条目必须同时有图标与底色，否则第一帧是空方块"
+        );
+    }
+
     /// 一个标签里有多个 panel 时，程序方块按「叠放」渲染：选中的那个在
     /// **最后**（绘制顺序的最后 = 视觉最上层），其余保持面板顺序。
     ///
