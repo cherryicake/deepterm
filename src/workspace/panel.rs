@@ -927,6 +927,10 @@ impl Panel {
                     .h_full()
                     .flex()
                     .items_center()
+                    // 图标与标题之间的间距（herdr 的 pane 标题栏是 `gap(8)`）。
+                    // 原来这里写的是 `.mr(6)`，但它挂在整个容器上，并没有
+                    // 落在图标与文字之间——两者贴在一起。
+                    .gap(px(6.0))
                     .id(format!("panel-title-{}", panel_id))
                     .on_drag(
                         DraggedPanel {
@@ -967,7 +971,6 @@ impl Panel {
                         &title_tiles,
                         theme.text_muted,
                     ))
-                    .mr(px(6.0))
                     .child(div().text_xs().text_color(theme.text_muted).child(title)),
             )
             .when(self.is_hovered, |this| {

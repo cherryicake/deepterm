@@ -2772,8 +2772,10 @@ impl TabBar {
     /// 彩色 logo（Claude / Codex 等 `tint == false`）仍然按原样显示——
     /// 把它们染成单色反而认不出是谁。
     pub fn render_pane_header_icon(tiles: &[TileProgram], color: Hsla) -> AnyElement {
+        // 没有程序信息时返回**零宽**占位：父容器带 `gap`，若给个有宽度的
+        // 空盒子，标题会被凭空推开一段。
         let Some(tile) = tiles.last() else {
-            return div().into_any_element();
+            return div().flex_none().w(px(0.0)).into_any_element();
         };
         let size = 14.0;
         match tile.icon.as_ref() {
