@@ -159,6 +159,12 @@ const TAB_TEXT_PX: f32 = 13.0;
 const TAB_TITLE_MAX_PX: f32 = 150.0;
 /// 程序方块边长。
 const TILE_SIZE_PX: f32 = 26.0;
+/// 叠放的程序方块之间的水平错位：26px 的方块只露出 11px，后面那个盖住
+/// 前面那个的右半部分——像一叠卡片，一眼能数出"这个标签里有几个东西在跑"。
+const TILE_STACK_STEP_PX: f32 = 11.0;
+/// 叠放最多显示几个。再多就把前面（下层）的丢掉只留最后一组：
+/// 一个标签里有 8 个分屏时，画 8 个方块既看不清也挤掉了标题。
+const TILE_STACK_MAX: usize = 4;
 /// 方块内图形的边长。
 const TILE_GLYPH_PX: f32 = 15.0;
 
@@ -170,8 +176,15 @@ const TILE_GLYPH_PX: f32 = 15.0;
 /// 走同一个 [`render_tray_tab_body`]。
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrayTabVisual {
-    /// 左侧程序方块的内容。
+    /// 左侧程序方块的内容（多个 panel 时这是**最上层**那个，也是状态点
+    /// 与扫光所代表的那个）。
     pub program: TileProgram,
+    /// 横向叠放的全部程序方块（从下到上）。只有一个时与 `program` 相同。
+    ///
+    /// 叠放是 herdr 没有的：它的标签对应单个终端；deepterm 的标签可以是
+    /// 多个分屏 panel，把各自的程序方块错开叠起来，一眼能看出「这个标签
+    /// 里有几个东西在跑」，选中的那个在最上层。
+    pub tiles: Vec<TileProgram>,
     /// 名字段。
     pub title: SharedString,
     /// 目录段（空串表示不画）。
@@ -228,7 +241,8 @@ impl TrayTabVisual {
             tint: program.is_tinted() || agent.is_some(),
         };
         Self {
-            program: tile,
+            program: tile.clone(),
+            tiles: vec![tile],
             title: title.into(),
             cwd: cwd.into(),
             is_modified: false,
@@ -520,8 +534,8 @@ fn render_tray_tab_body(
                 this
             }
         })
-        .child(TabBar::render_program_tile(
-            &visual.program,
+        .child(TabBar::render_program_tiles(
+            &visual.tiles,
             visual.dot,
             tray,
             theme,
@@ -690,6 +704,19 @@ pub struct TileProgram {
     pub tint: bool,
 }
 
+impl TileProgram {
+    /// 从程序表解析结果构造方块。
+    pub fn from_program(program: &crate::programs::Program) -> Self {
+        Self {
+            icon: program.icon.clone(),
+            name: program.name.clone(),
+            tile: program.tile,
+            color: program.color,
+            tint: program.is_tinted(),
+        }
+    }
+}
+
 /// 标签页项
 #[derive(Clone)]
 pub struct TabItem {
@@ -721,6 +748,15 @@ pub struct TabItem {
     /// `None` 表示「还不知道」（恢复会话、刚建标签、编辑器标签）——此时方块
     /// 退回主题色 + 既有 `icon`，不要凭空编一个程序名。
     pub program: Option<crate::programs::Program>,
+    /// 这个标签里**每个 panel** 正在跑的程序（按面板顺序），供叠放渲染。
+    ///
+    /// herdr 的标签永远对应一个终端，所以它的 `tile()` 只画一个方块；
+    /// deepterm 的标签可以容纳多个分屏 panel，于是把它们的程序方块横向
+    /// 叠起来——一眼能看出「这个标签里有几个东西在跑」。
+    ///
+    /// 空表示没有面板程序信息（编辑器标签、恢复会话的旧状态），此时退回
+    /// 单个 `program` 方块。顺序即绘制顺序，最后一个在最上层。
+    pub tiles: Vec<TileProgram>,
     /// 这个 agent 此刻是否**真的在输出**（`Working` + 最近有 PTY 输出）。
     ///
     /// 与 [`Self::agent_status`] 分开：`Working` 是回合状态，会被迟到的
@@ -748,9 +784,27 @@ impl TabItem {
             needs_attention: false,
             cwd_label: SharedString::default(),
             program: None,
+            tiles: Vec::new(),
             agent_status: None,
             agent_streaming: false,
         }
+    }
+
+    /// 标签上要画的全部程序方块：多个 panel 时横向叠放，**选中的那个排在最后**
+    /// （绘制顺序的最后 = 视觉最上层）。
+    ///
+    /// 没有 `tiles` 时退回单个 `program`（与 herdr 的单终端标签一致）。
+    pub fn stacked_tiles(&self, selected_index: Option<usize>) -> Vec<TileProgram> {
+        if self.tiles.is_empty() {
+            return vec![self.tile_program()];
+        }
+        let mut tiles = self.tiles.clone();
+        // 把选中的那个挪到末尾：重叠渲染时后面的盖住前面的。
+        if let Some(index) = selected_index.filter(|index| *index < tiles.len()) {
+            let selected = tiles.remove(index);
+            tiles.push(selected);
+        }
+        tiles
     }
 
     /// 标签左侧方块上要画的程序（herdr 的「program tile」）。
@@ -1312,6 +1366,37 @@ impl TabBar {
 
         cx.notify();
         previous
+    }
+
+    /// 用「每个 panel 正在跑的程序」刷新一个标签的方块叠列与标题。
+    ///
+    /// `panels` 是**已经按面板顺序排好的程序**（选中项在末尾，见调用方），
+    /// `title`/`cwd` 取自选中那个 panel。这是「多终端合成一个标签」的显示
+    /// 规则：herdr 一个标签对应一个终端，deepterm 一个标签可以是分屏，
+    /// 所以用叠放图标 + 选中 panel 的标题来表达「这一格是什么」。
+    pub fn set_tab_panels(
+        &mut self,
+        tab_id: &str,
+        panels: Vec<TileProgram>,
+        title: SharedString,
+        cwd: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let changed = tab.tiles != panels || tab.label != title || tab.cwd_label != cwd;
+        if !changed {
+            return;
+        }
+        tab.tiles = panels;
+        tab.label = title;
+        tab.cwd_label = cwd;
+        // 注意：不动 `tab.program`。它由现有的 `TabLabelChanged` /
+        // `AgentStateChanged` 事件维护，代表"这台标签的前台程序"，
+        // 还带着 `shell` / `agent` / `process` 这些叠放列表里放不下的语义。
+        // 渲染时"最上层是哪个"由 `stacked_tiles` 的排序决定，不靠它。
+        cx.notify();
     }
 
     pub fn active_tab_id(&self) -> Option<&SharedString> {
@@ -2163,6 +2248,7 @@ impl TabBar {
         // 窄条，落点宽度也按它算，所以插进去以后标签宽度全乱。
         let visual = TrayTabVisual {
             program: preview.program.clone(),
+            tiles: vec![preview.program.clone()],
             title: preview.tab_label.clone(),
             cwd: SharedString::default(),
             is_modified: false,
@@ -2698,8 +2784,14 @@ impl TabBar {
         let dot = (tab.program.is_some() || matches!(tab.icon, Some(Icon::AgentIcon { .. })))
             .then_some(tab.agent_status)
             .flatten();
+        // 叠放顺序由 `stacked_tiles` 定：选中的 panel 在最后 = 最上层。
+        // 这里没有"面板选中索引"的信息（`TabBar` 只认识标签），所以按
+        // `tiles` 的原序叠放；调用方（workspace）在写入 `tiles` 时已经把
+        // 选中的那个排到了末尾。
+        let tiles = tab.stacked_tiles(None);
         TrayTabVisual {
-            program: tab.tile_program(),
+            program: tiles.last().cloned().unwrap_or_else(|| tab.tile_program()),
+            tiles,
             title: tab.label.clone(),
             cwd: tab.cwd_label.clone(),
             is_modified: tab.is_modified,
@@ -2805,6 +2897,68 @@ impl TabBar {
     /// 图形有两种画法，与 herdr 一致：
     /// - `tint`：SVG 当 alpha mask，用 `color`（或主题文字色）着色；
     /// - 否则：当彩色图片画（Claude / Codex / Kimi 这类自带配色的 logo）。
+    /// 标签左侧的程序方块：一个 panel 时就是 herdr 的原样单方块；多个
+    /// panel 时横向叠放，**最后一个在最上层**（调用方已把选中的排到最后）。
+    ///
+    /// 叠放是 herdr 没有的形态——它的标签只管一个终端。这里给 deepterm 的
+    /// 分屏标签用：`[vim][claude][node]` 错开叠起来，既表达「这个标签里跑着
+    /// 三个程序」，又不至于把宽度撑爆；选中的那个永远露出完整图形。
+    ///
+    /// 每层都套一圈托盘色描边（2px），让相邻方块之间有一条"切缝"，否则
+    /// 两个深色方块叠在一起会糊成一块。
+    fn render_program_tiles(
+        tiles: &[TileProgram],
+        status: Option<AgentStatus>,
+        tray: TrayColors,
+        theme: UiTheme,
+    ) -> AnyElement {
+        let visible = tiles.len().min(TILE_STACK_MAX);
+        // 只保留最后 `visible` 个：最后那个是选中项，必须完整可见。
+        let shown = &tiles[tiles.len() - visible..];
+
+        if visible <= 1 {
+            let program = shown.first().cloned().unwrap_or(TileProgram {
+                icon: None,
+                name: String::new(),
+                tile: None,
+                color: None,
+                tint: true,
+            });
+            return Self::render_program_tile(&program, status, tray, theme);
+        }
+
+        let step = px(TILE_STACK_STEP_PX);
+        let ring = px(2.0);
+        let cell = px(TILE_SIZE_PX) + ring * 2.0;
+        let width = cell + step * (visible as f32 - 1.0);
+
+        let mut stack = div().relative().flex_none().w(width).h(cell);
+
+        for (index, tile) in shown.iter().enumerate() {
+            let is_top = index + 1 == visible;
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .left(step * index as f32)
+                    .top_0()
+                    .size(cell)
+                    .rounded(px(9.0))
+                    // 描边用托盘底：叠放时它既是"切缝"，也与托盘背景融为一体。
+                    .bg(tray.tray)
+                    .p(ring)
+                    .child(Self::render_program_tile(
+                        tile,
+                        // 状态点只挂最上层：它代表"当前选中的那个 panel"，
+                        // 下层方块各自的状态点会在重叠处互相打架。
+                        is_top.then_some(status).flatten(),
+                        tray,
+                        theme,
+                    )),
+            );
+        }
+        stack.into_any_element()
+    }
+
     fn render_program_tile(
         program: &TileProgram,
         status: Option<AgentStatus>,
@@ -3914,6 +4068,78 @@ mod tests {
             !should_show_attention_dot(&viewed),
             "看过之后红点必须消失，否则「未读」语义就没了"
         );
+    }
+
+    /// 一个标签里有多个 panel 时，程序方块按「叠放」渲染：选中的那个在
+    /// **最后**（绘制顺序的最后 = 视觉最上层），其余保持面板顺序。
+    ///
+    /// 这是"多终端合成一格"的核心显示规则，坏掉的表现是：切了 panel 但
+    /// 标签上的图标不跟着换到最前面，或者干脆只显示一个方块。
+    #[test]
+    fn stacked_tiles_put_the_selected_panel_on_top() {
+        let vim = crate::programs::of(None, &["vim".to_string()]);
+        let node = crate::programs::of(None, &["node".to_string()]);
+        let claude = crate::programs::of(Some("claude-code"), &[]);
+
+        let mut tab = TabItem::new("t", "vim");
+        tab.tiles = vec![
+            TileProgram::from_program(&vim),
+            TileProgram::from_program(&node),
+            TileProgram::from_program(&claude),
+        ];
+
+        // 没有选中信息：原序。
+        let plain = tab.stacked_tiles(None);
+        assert_eq!(plain.len(), 3);
+        assert_eq!(plain[0].name, vim.name);
+        assert_eq!(plain[2].name, claude.name);
+
+        // 选中中间那个（node）：它被挪到末尾 = 最上层。
+        let stacked = tab.stacked_tiles(Some(1));
+        assert_eq!(stacked.len(), 3, "叠放不能丢方块");
+        assert_eq!(
+            stacked.last().map(|t| t.name.as_str()),
+            Some(node.name.as_str()),
+            "选中的 panel 必须排在最上层"
+        );
+        assert_eq!(stacked[0].name, vim.name, "其余保持相对顺序");
+        assert_eq!(stacked[1].name, claude.name);
+
+        // 越界的选中索引不该 panic，也不该丢东西。
+        let out_of_range = tab.stacked_tiles(Some(99));
+        assert_eq!(out_of_range.len(), 3);
+
+        // 一个 panel 都没有 `tiles` 时退回单个 program 方块。
+        let single = TabItem::new("t2", "zsh");
+        assert_eq!(single.stacked_tiles(None).len(), 1);
+    }
+
+    /// 发行版 OS 图标已整体移除：`RemoteOS::icon()` 只给通用图标，
+    /// 且 `assets/icons/` 下不再有那些发行版 logo。
+    #[test]
+    fn os_logos_are_gone_from_the_bundle() {
+        use gpui::AssetSource as _;
+        for stale in [
+            "icons/macos.svg",
+            "icons/ubuntu.svg",
+            "icons/debian.svg",
+            "icons/centos.svg",
+            "icons/arch.svg",
+            "icons/windows.svg",
+            "icons/linuxmint.svg",
+            "icons/fedora.svg",
+            "icons/rhel.svg",
+            "icons/opensuse.svg",
+            "icons/manjaro.svg",
+            "icons/linux.svg",
+            "icons/workspace.svg",
+        ] {
+            assert!(
+                crate::assets::Assets.load(stale).is_err()
+                    || matches!(crate::assets::Assets.load(stale), Ok(None)),
+                "{stale} 应当已从资源里删除"
+            );
+        }
     }
 
     /// 每个 `CLIAgent` 的图标都必须在嵌入资源里真实存在。

@@ -21,8 +21,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::ssh::platform::RemoteOS;
-
 /// WSL 发行版在 UNC 里的前缀。
 const WSL_UNC_PREFIX: &str = r"\\wsl$\";
 
@@ -338,14 +336,12 @@ pub fn query_distro_cwd(distro: Option<&str>, token: &str) -> Option<String> {
     (!cwd.is_empty() && cwd.starts_with('/')).then_some(cwd)
 }
 
-/// 发行版的展示图标（按已知发行版映射，未知回落 Linux）。
-pub fn distro_icon(distro: &str) -> crate::assets::Icon {
-    let os = RemoteOS::from_id(distro);
-    if os == RemoteOS::Unknown {
-        crate::assets::Icon::Linux
-    } else {
-        os.icon()
-    }
+/// 发行版的展示图标。
+///
+/// 发行版 logo 已整体移除（见 `RemoteOS::icon` 的文档），所有发行版共用
+/// 同一个「远程机器」通用图标。
+pub fn distro_icon(_distro: &str) -> crate::assets::Icon {
+    crate::assets::Icon::Server
 }
 
 #[cfg(test)]

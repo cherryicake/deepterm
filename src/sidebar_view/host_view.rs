@@ -830,7 +830,7 @@ impl HostView {
                     .child(
                         gpui::svg()
                             .size(px(16.0))
-                            .path(host.os_icon.unwrap_or(Icon::Linux).path())
+                            .path(host.os_icon.unwrap_or(Icon::Server).path())
                             .text_color(if is_selected {
                                 theme.accent
                             } else {

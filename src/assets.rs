@@ -38,7 +38,6 @@ impl AssetSource for Assets {
 pub enum Icon {
     Folder,
     File,
-    Linux,
     Server,
     Screen,
     Macbook,
@@ -74,19 +73,10 @@ pub enum Icon {
     EyeOff,
     Loader,
     ProgressIndicator,
-    // OS icons
-    Macos,
-    Ubuntu,
-    Debian,
-    Centos,
-    Arch,
-    Windows,
-    LinuxMint,
-    Fedora,
-    Rhel,
-    Opensuse,
-    Manjaro,
-    Workspace,
+    // 发行版 / OS logo（Macos / Ubuntu / Debian / Centos / Arch / Windows /
+    // LinuxMint / Fedora / Rhel / Opensuse / Manjaro）已移除：终端标签按
+    // 「跑着什么程序」显示，主机列表改用通用的 `Server`——与 herdr 一致
+    // （它只有 server/monitor/layers 这类通用图标，没有各发行版 logo）。
     /// 顶部「标签页组」胶囊里的层叠方块（同 herdr 的 stack.svg）。
     Stack,
     Bell,
@@ -139,7 +129,6 @@ impl Icon {
         match self {
             Icon::Folder => SharedString::new_static("icons/folder.fill.svg"),
             Icon::File => SharedString::new_static("icons/file.svg"),
-            Icon::Linux => SharedString::new_static("icons/linux.svg"),
             Icon::Server => SharedString::new_static("icons/server.svg"),
             Icon::Screen => SharedString::new_static("icons/screen.svg"),
             Icon::Macbook => SharedString::new_static("icons/macbook.svg"),
@@ -169,18 +158,6 @@ impl Icon {
             Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
             Icon::Loader => SharedString::new_static("icons/loader.svg"),
             Icon::ProgressIndicator => SharedString::new_static("icons/progress.indicator.svg"),
-            Icon::Macos => SharedString::new_static("icons/macos.svg"),
-            Icon::Ubuntu => SharedString::new_static("icons/ubuntu.svg"),
-            Icon::Debian => SharedString::new_static("icons/debian.svg"),
-            Icon::Centos => SharedString::new_static("icons/centos.svg"),
-            Icon::Arch => SharedString::new_static("icons/arch.svg"),
-            Icon::Windows => SharedString::new_static("icons/windows.svg"),
-            Icon::LinuxMint => SharedString::new_static("icons/linuxmint.svg"),
-            Icon::Fedora => SharedString::new_static("icons/fedora.svg"),
-            Icon::Rhel => SharedString::new_static("icons/rhel.svg"),
-            Icon::Opensuse => SharedString::new_static("icons/opensuse.svg"),
-            Icon::Manjaro => SharedString::new_static("icons/manjaro.svg"),
-            Icon::Workspace => SharedString::new_static("icons/workspace.svg"),
             Icon::Stack => SharedString::new_static("icons/stack.svg"),
             Icon::Bell => SharedString::new_static("icons/bell.svg"),
             Icon::Reveal => SharedString::new_static("icons/reveal.svg"),

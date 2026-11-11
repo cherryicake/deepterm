@@ -378,56 +378,75 @@ impl Workspace {
         self.sync_tab_broadcast_to_panels(tab_id, cx);
     }
 
-    /// 生成带序号的 Workspace 标签名称。
-    /// 编号从 0 开始递增；编号为 0 时不显示编号（直接返回 "WorkSpace"），
-    /// 其后依次为 "WorkSpace[1]"、"WorkSpace[2]"...
-    fn workspace_label_for_index(index: usize) -> String {
-        if index == 0 {
-            "WorkSpace".to_string()
-        } else {
-            format!("WorkSpace[{}]", index)
-        }
-    }
-
-    /// 重新为所有 Workspace 类型的 tab 分配编号。
+    /// 刷新一个标签的标题与图标叠列：标题取**当前选中 panel** 正在运行的
+    /// 程序名 + 目录，图标取该标签下所有 panel 的程序方块（选中项在最上层）。
     ///
-    /// 规则：按标签栏中的显示顺序，从 0 开始递增；编号为 0 时显示 "WorkSpace"
-    /// （不显示编号），其后依次为 "WorkSpace[1]"、"WorkSpace[2]"...
-    /// 在 Workspace 标签新增（分割/合并）、移除、降级为普通标签或重排后调用，
-    /// 保证编号始终从 0 连续递增。
-    fn renumber_workspace_tabs(&mut self, cx: &mut Context<Self>) {
-        let workspace_tab_ids: Vec<String> = self
-            .tab_bar
-            .read(cx)
-            .tabs
-            .iter()
-            .filter(|item| {
-                self.tabs
-                    .get(item.id.as_ref())
-                    .is_some_and(|info| matches!(info.tab_type, TabType::Workspace))
-            })
-            .map(|item| item.id.to_string())
-            .collect();
+    /// 依据 herdr 的做法：标签表达的是「这一格正在干什么」，不是「它是个
+    /// 组合容器」。deepterm 的标签可以容纳多个分屏 panel，于是把各 panel 的
+    /// 程序方块横向叠起来，选中的那个置顶。
+    ///
+    /// 只有一个 panel 时与普通标签完全一致（叠放退化成一个方块）。
+    fn refresh_tab_visual(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            return;
+        };
+        let panels = tab_info.container.collect_panels_vec();
+        if panels.is_empty() {
+            return;
+        }
 
-        for (position, tab_id) in workspace_tab_ids.into_iter().enumerate() {
-            let new_label = Self::workspace_label_for_index(position);
-            let Some(tab_info) = self.tabs.get_mut(&tab_id) else {
+        // 每个 panel 的当前程序；顺序即面板顺序。
+        let mut entries: Vec<(bool, crate::workspace::tab_bar::TileProgram, String, String)> =
+            Vec::with_capacity(panels.len());
+        for panel in &panels {
+            let panel = panel.read(cx);
+            let selected = panel.is_selected;
+            let Some(view) = panel.content().terminal_view() else {
+                // 非终端 panel（纯文本占位）：不参与图标叠列，但仍可能被选中。
                 continue;
             };
-            if tab_info.label == new_label {
-                continue;
-            }
-            tab_info.label = new_label.clone();
+            let view = view.read(cx);
+            let (title, cwd) = view.tab_title_parts(cx);
+            entries.push((
+                selected,
+                crate::workspace::tab_bar::TileProgram::from_program(&view.foreground_program(cx)),
+                title,
+                cwd,
+            ));
+        }
 
-            self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.modify_tab(
-                    &tab_id,
-                    |tab| {
-                        tab.label = new_label.clone().into();
-                    },
-                    cx,
-                );
-            });
+        if entries.is_empty() {
+            return;
+        }
+
+        // 选中的放最后 = 叠放时最上层；标题也取它。
+        let selected_pos = entries.iter().position(|(selected, ..)| *selected);
+        let (title, cwd) = match selected_pos {
+            Some(index) => (entries[index].2.clone(), entries[index].3.clone()),
+            None => (entries[0].2.clone(), entries[0].3.clone()),
+        };
+        let mut ordered = entries;
+        if let Some(index) = selected_pos {
+            let picked = ordered.remove(index);
+            ordered.push(picked);
+        }
+        let tiles: Vec<_> = ordered.into_iter().map(|(_, tile, ..)| tile).collect();
+
+        // 标签自己的 label 也同步成"选中 panel 的程序名"：会话恢复、
+        // 侧边栏列表、拖拽预览都读它，不能只改渲染层。
+        if let Some(tab_info) = self.tabs.get_mut(tab_id) {
+            tab_info.label = title.clone();
+        }
+        self.tab_bar.update(cx, |tab_bar, cx| {
+            tab_bar.set_tab_panels(tab_id, tiles, title.into(), cwd.into(), cx);
+        });
+    }
+
+    /// 刷新所有标签的标题与图标叠列（标签增删、合并、重排后的统一收口）。
+    fn refresh_all_tab_visuals(&mut self, cx: &mut Context<Self>) {
+        let tab_ids: Vec<String> = self.tabs.keys().cloned().collect();
+        for tab_id in tab_ids {
+            self.refresh_tab_visual(&tab_id, cx);
         }
     }
 
@@ -517,45 +536,15 @@ impl Workspace {
             state.workspace_id.clone()
         };
 
-        // 修正旧版本会话中可能残留的断档/起始错误编号：按顺序重新为
-        // Workspace 标签编号（从 0 开始，为 0 时不显示编号），与运行时规则保持一致。
-        let workspace_labels: HashMap<String, String> = {
-            let mut next_index = 0usize;
-            state
-                .tabs
-                .iter()
-                .filter(|tab| matches!(tab.tab_type, TabSessionType::Workspace))
-                .map(|tab| {
-                    let label = Self::workspace_label_for_index(next_index);
-                    next_index += 1;
-                    (tab.id.clone(), label)
-                })
-                .collect()
-        };
-        let label_for = |tab: &TabSessionState| -> String {
-            workspace_labels
-                .get(&tab.id)
-                .cloned()
-                .unwrap_or_else(|| tab.label.clone())
-        };
+        // 标签名与会话里存的一致即可：恢复完成后由 `refresh_all_tab_visuals`
+        // 按「当前选中的 panel 正在跑什么」重新计算。恢复期间还没有终端的
+        // 实时进程信息，所以这里不做任何编号/改名。
+        let label_for = |tab: &TabSessionState| -> String { tab.label.clone() };
 
         let tab_items = state
             .tabs
             .iter()
-            .map(|tab| {
-                let icon = match tab.tab_type {
-                    // Workspace tab 是一个布局容器，不代表某一台终端；恢复会话时必须保留
-                    // Workspace 自己的图标，不能用第一个 Panel 的系统图标覆盖它。
-                    TabSessionType::Workspace => Some(crate::assets::Icon::Workspace),
-                    TabSessionType::Normal => tab
-                        .icon_os
-                        .as_deref()
-                        .map(RemoteOS::from_id)
-                        .filter(|os| *os != RemoteOS::Unknown)
-                        .map(|os| os.icon()),
-                };
-                TabItem::new(&tab.id, label_for(tab)).with_icon(icon)
-            })
+            .map(|tab| TabItem::new(&tab.id, label_for(tab)))
             .collect();
         let tab_bar = TabBar::new_with_tabs("tab-bar", cx, tab_items);
 
@@ -1053,34 +1042,20 @@ impl Workspace {
                 title,
                 cwd,
             } => {
-                if let Some((tab_id, tab_type)) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
+                let _ = (label, program, title, cwd);
+                // 不再区分标签类型：一个标签显示什么，**完全由它里面的 panel
+                // 决定**（选中 panel 的程序名 + 目录，以及各 panel 的图标叠列）。
+                // 以前这里把 Workspace 标签钉死成 "WorkSpace"，于是多个终端
+                // 合成一格后就看不出它在跑什么了。
+                if let Some(tab_id) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
                     tab_info
                         .container
                         .contains_panel(panel_id, cx)
-                        .then_some((tab_id.clone(), tab_info.tab_type.clone()))
+                        .then(|| tab_id.clone())
                 }) {
-                    // Workspace 类型的 tab 保持 "WorkSpace" 标签不变；
-                    // Panel 标题栏的更新已在 Panel 内部通过 cx.notify() 完成。
-                    if matches!(tab_type, TabType::Normal) {
-                        if let Some(tab_info) = self.tabs.get_mut(&tab_id) {
-                            tab_info.label = label.clone();
-                        }
-                        self.tab_bar.update(cx, |tab_bar, cx| {
-                            tab_bar.modify_tab(
-                                &tab_id,
-                                |tab| {
-                                    tab.label = title.clone().into();
-                                    tab.cwd_label = cwd.clone().into();
-                                    // 程序方块（图标 + 底色 + 显示名）与标题同源：
-                                    // 前台从 `vim` 换成 `htop` 时标题和图标必须一起变。
-                                    tab.program = Some(program.clone());
-                                },
-                                cx,
-                            );
-                        });
-                        cx.emit(WorkspaceEvent::SessionChanged);
-                        cx.emit(WorkspaceEvent::TabBarChanged);
-                    }
+                    self.refresh_tab_visual(&tab_id, cx);
+                    cx.emit(WorkspaceEvent::SessionChanged);
+                    cx.emit(WorkspaceEvent::TabBarChanged);
                 }
             }
             PanelEvent::SessionChanged => {
@@ -1143,6 +1118,10 @@ impl Workspace {
                     });
                 }
 
+                // agent 上下线会改变这个 panel 的前台程序（claude → shell），
+                // 叠列里对应的方块必须跟着换。
+                self.refresh_tab_visual(&tab_id, cx);
+
                 cx.emit(WorkspaceEvent::TabBarChanged);
             }
         }
@@ -1150,26 +1129,11 @@ impl Workspace {
 
     /// agent 退出后 tab 图标应该回落到什么。
     ///
-    /// 与恢复会话时的判定表保持一致（见 `restore_from_session_state` 里
-    /// `TabSessionType` 的 match）：Workspace tab 保留自己的图标，
-    /// 普通 tab 回落到触发本次事件的 panel 检测到的远端系统图标；
-    /// 本地终端没有 `remote_os`，回落为 `None`（不显示图标）。
-    ///
-    /// 只看 `panel_id` 这一个 panel 而不是扫全 tab：同一 tab 里能同时有
-    /// 本地与远程 split，而图标本来就只是「这台 tab 大概是干什么的」的
-    /// 一个粗略提示，取第一个远端系统并不比取触发事件的那个更正确。
-    fn fallback_tab_icon(&self, tab_id: &str, panel_id: &str, cx: &App) -> Option<Icon> {
-        let tab_info = self.tabs.get(tab_id)?;
-        if matches!(tab_info.tab_type, TabType::Workspace) {
-            return Some(Icon::Workspace);
-        }
-
-        tab_info
-            .container
-            .find_panel(panel_id, cx)
-            .and_then(|panel| panel.read(cx).remote_os)
-            .filter(|os| *os != RemoteOS::Unknown)
-            .map(|os| os.icon())
+    /// 现在标签图标由「各 panel 前台程序」叠放决定（`refresh_tab_visual`），
+    /// 不再有 Workspace / 发行版那一套兜底：agent 退出后前台就是 shell，
+    /// 程序表会把方块画成 shell 的终端图形。因此这里不再提供回落图标。
+    fn fallback_tab_icon(&self, _tab_id: &str, _panel_id: &str, _cx: &App) -> Option<Icon> {
+        None
     }
 
     /// 处理广播状态切换
@@ -1367,6 +1331,9 @@ impl Workspace {
         }
 
         if changed {
+            // 标签的标题与"哪个图标在最上层"都跟着选中 panel 变。
+            let tab_id = self.active_tab_id.clone();
+            self.refresh_tab_visual(&tab_id, cx);
             // 通知文件树跟随切换到当前选中 panel 的终端目录
             cx.emit(WorkspaceEvent::SessionChanged);
         }
@@ -1512,7 +1479,7 @@ impl Workspace {
                 tab_bar.remove_tab(&target_tab_id, cx);
             });
             // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
-            self.renumber_workspace_tabs(cx);
+            self.refresh_all_tab_visuals(cx);
             if self.active_tab_id == target_tab_id {
                 self.activate_next_tab(cx);
             }
@@ -1558,7 +1525,7 @@ impl Workspace {
                 );
             });
             // 该tab降级为普通标签：剩余Workspace标签重新编号
-            self.renumber_workspace_tabs(cx);
+            self.refresh_all_tab_visuals(cx);
         }
 
         // 重新订阅所有panel
@@ -1614,25 +1581,18 @@ impl Workspace {
                 .container
                 .split_at(target_panel_id, placement, dragged_container, cx);
 
-        // 更新目标tab为Workspace类型（标签编号由 renumber_workspace_tabs 统一分配，
-        // 目标tab已是Workspace时保持原标签不变）
+        // 合并后目标标签容纳多个 panel。它显示什么**完全由里面的 panel
+        // 决定**（图标叠列 + 选中 panel 的标题），不再是「一个叫 WorkSpace
+        // 的容器」——这是与 herdr 对齐的关键：标签说的是「这格在跑什么」。
         target_tab_info.container = new_container;
         target_tab_info.tab_type = TabType::Workspace;
 
-        // 更新TabBar显示（Workspace使用统一图标）
         self.tab_bar.update(cx, |tab_bar, cx| {
             tab_bar.remove_tab(&dragged_tab_id, cx);
-            tab_bar.modify_tab(
-                &target_tab_id,
-                |tab| {
-                    tab.icon = Some(crate::assets::Icon::Workspace);
-                },
-                cx,
-            );
         });
 
-        // 被拖拽的tab已移除、目标tab新成为Workspace：重新为Workspace标签编号
-        self.renumber_workspace_tabs(cx);
+        // 被拖拽的tab已移除、目标tab新容纳多个 panel：按各 panel 程序重算视觉
+        self.refresh_all_tab_visuals(cx);
 
         // 重新订阅所有panel
         self.subscribe_to_panels(window, cx);
@@ -1726,22 +1686,11 @@ impl Workspace {
         // 更新container
         tab_info.container = new_container;
 
-        // 如果当前不是WorkSpace类型，更新为WorkSpace类型
+        // 面板变多了，但标签的外观仍由「里面的 panel 在跑什么」决定，
+        // 不需要为它换成一个 Workspace 专用图标。
         if tab_info.tab_type != TabType::Workspace {
             tab_info.tab_type = TabType::Workspace;
-
-            // 更新TabBar显示（Workspace使用统一图标）；标签编号由 renumber_workspace_tabs 统一分配
-            self.tab_bar.update(cx, |tab_bar, cx| {
-                tab_bar.modify_tab(
-                    &active_tab_id,
-                    |tab| {
-                        tab.icon = Some(crate::assets::Icon::Workspace);
-                    },
-                    cx,
-                );
-            });
-            // 新增了一个Workspace标签：重新从0开始编号
-            self.renumber_workspace_tabs(cx);
+            self.refresh_all_tab_visuals(cx);
         }
 
         // 保存被拖拽panel的ID和广播状态，用于后续设置
@@ -1819,7 +1768,7 @@ impl Workspace {
                 tab_bar.remove_tab(&active_tab_id, cx);
             });
             // 被移除的可能是Workspace标签：剩余Workspace标签重新编号
-            self.renumber_workspace_tabs(cx);
+            self.refresh_all_tab_visuals(cx);
             if self.active_tab_id == active_tab_id {
                 self.activate_next_tab(cx);
             }
@@ -1864,7 +1813,7 @@ impl Workspace {
                 );
             });
             // 该tab降级为普通标签：剩余Workspace标签重新编号
-            self.renumber_workspace_tabs(cx);
+            self.refresh_all_tab_visuals(cx);
         }
 
         // 创建新的tab
@@ -1935,7 +1884,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         // 标签顺序变化：按新的显示顺序重新为Workspace标签编号
-        self.renumber_workspace_tabs(cx);
+        self.refresh_all_tab_visuals(cx);
         cx.emit(WorkspaceEvent::SessionChanged);
         cx.emit(WorkspaceEvent::TabBarChanged);
     }
@@ -2265,7 +2214,7 @@ impl Workspace {
             tab_bar.remove_tab(tab_id, cx);
         });
         // 被关闭的可能是Workspace标签：剩余Workspace标签重新编号
-        self.renumber_workspace_tabs(cx);
+        self.refresh_all_tab_visuals(cx);
 
         // 如果关闭的是当前活动tab，切换到相邻 tab（以渲染顺序为准：优先下一个，否则上一个）
         if self.active_tab_id == tab_id {
@@ -2403,7 +2352,7 @@ impl Workspace {
             item.is_remote = is_remote;
             tab_bar.add_tab(item, cx);
         });
-        self.renumber_workspace_tabs(cx);
+        self.refresh_all_tab_visuals(cx);
         // 恢复 panel 事件订阅（关闭时被 retain 清掉）
         self.subscribe_to_panels(window, cx);
         self.switch_to_tab(&tab_id, cx);
@@ -3032,15 +2981,6 @@ pub(crate) fn should_mark_unread(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Workspace 标签编号规则：从 0 开始递增，编号为 0 时不显示编号
-    #[test]
-    fn workspace_label_for_index_hides_zero() {
-        assert_eq!(Workspace::workspace_label_for_index(0), "WorkSpace");
-        assert_eq!(Workspace::workspace_label_for_index(1), "WorkSpace[1]");
-        assert_eq!(Workspace::workspace_label_for_index(2), "WorkSpace[2]");
-        assert_eq!(Workspace::workspace_label_for_index(10), "WorkSpace[10]");
-    }
 
     /// 红点只在「后台 tab 跑完一个回合」时点亮。
     #[test]

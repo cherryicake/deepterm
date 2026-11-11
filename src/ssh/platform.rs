@@ -106,23 +106,15 @@ impl RemoteOS {
         None
     }
 
-    /// Map to the corresponding icon
+    /// 主机在列表 / 标签里的通用图标。
+    ///
+    /// 曾经按发行版逐一映射到各自的 logo；那套图标已整体移除：
+    /// 终端标签应当显示「正在跑什么程序」（与 herdr 一致），而主机列表
+    /// 只需要一个「这是一台远程机器」的提示，发行版差异用文字更准确
+    /// （`display_name`）。herdr 也只有 server / monitor / layers 这类
+    /// 通用图标，没有发行版 logo。
     pub fn icon(self) -> Icon {
-        match self {
-            RemoteOS::Macos => Icon::Macos,
-            RemoteOS::Ubuntu => Icon::Ubuntu,
-            RemoteOS::Debian => Icon::Debian,
-            RemoteOS::Centos => Icon::Centos,
-            RemoteOS::Arch => Icon::Arch,
-            RemoteOS::Windows => Icon::Windows,
-            RemoteOS::LinuxMint => Icon::LinuxMint,
-            RemoteOS::Fedora => Icon::Fedora,
-            RemoteOS::Rhel => Icon::Rhel,
-            RemoteOS::Opensuse => Icon::Opensuse,
-            RemoteOS::Manjaro => Icon::Manjaro,
-            RemoteOS::Linux => Icon::Linux,
-            RemoteOS::Unknown => Icon::Server,
-        }
+        Icon::Server
     }
 
     /// Get a display name for the OS

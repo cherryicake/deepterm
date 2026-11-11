@@ -293,36 +293,46 @@ impl CLIAgent {
         }
     }
 
+    /// 图标**一律取自 herdr 的程序图标集**（`assets/icons/programs/`）。
+    ///
+    /// 原先这里维护了一套深途自己的 `assets/icons/agents/*.svg`（18 个），
+    /// 与 herdr 的同名文件内容并不一致，等于同一个 Claude 有两个看起来
+    /// 不同的 logo。现在统一到 herdr 一套：谁有专属图标就用专属的，
+    /// 没有就落到通用的 `agent.svg`——与 herdr 程序表里 `agent` 条目一致。
+    ///
+    /// 没有专属图标的 agent（aider / auggie / empryo 等）在 herdr 的
+    /// `programs.json` 里本来也不存在，所以笼统地画「一个 agent」是对的。
     pub fn icon_path(self) -> &'static str {
         match self {
-            CLIAgent::Claude => "icons/agents/claude.svg",
-            CLIAgent::Codex => "icons/agents/codex.svg",
-            CLIAgent::TraeCode => "icons/agents/traecli.svg",
-            CLIAgent::Gemini => "icons/agents/gemini.svg",
-            CLIAgent::Amp => "icons/agents/amp.svg",
-            CLIAgent::OpenCode => "icons/agents/opencode.svg",
-            CLIAgent::Copilot => "icons/agents/copilot.svg",
-            CLIAgent::Cursor => "icons/agents/cursor.svg",
-            CLIAgent::Goose => "icons/agents/goose.svg",
-            CLIAgent::Droid => "icons/agents/droid.svg",
-            CLIAgent::Grok => "icons/agents/grok.svg",
-            CLIAgent::Pi => "icons/agents/pi.svg",
-            CLIAgent::OhMyPi => "icons/agents/omp.svg",
-            CLIAgent::Qwen => "icons/agents/qwen.svg",
-            CLIAgent::Kimi => "icons/agents/kimi.svg",
-            CLIAgent::QoderCLI => "icons/agents/qodercli.svg",
-            CLIAgent::Crush => "icons/agents/crush.svg",
-            CLIAgent::CodeBuddy => "icons/agents/codebuddy.svg",
-            CLIAgent::Aider
+            CLIAgent::Claude => "icons/programs/claude.svg",
+            CLIAgent::Codex => "icons/programs/codex.svg",
+            CLIAgent::Gemini => "icons/programs/gemini.svg",
+            CLIAgent::Amp => "icons/programs/amp.svg",
+            CLIAgent::OpenCode => "icons/programs/opencode.svg",
+            CLIAgent::Copilot => "icons/programs/copilot.svg",
+            CLIAgent::Cursor => "icons/programs/cursor.svg",
+            CLIAgent::Grok => "icons/programs/grok.svg",
+            CLIAgent::Pi => "icons/programs/pi.svg",
+            CLIAgent::Kimi => "icons/programs/kimi.svg",
+            CLIAgent::QoderCLI | CLIAgent::QoderCLICn => "icons/programs/qoder.svg",
+            CLIAgent::Crush => "icons/programs/crush.svg",
+            CLIAgent::Hermes => "icons/programs/hermes.svg",
+            CLIAgent::Antigravity => "icons/programs/antigravity.svg",
+            CLIAgent::Muse => "icons/programs/muse.svg",
+            CLIAgent::PrimeAgent => "icons/programs/prime-agent.svg",
+            // trae / goose / droid / omp / qwen / codebuddy 在 herdr 的程序表里
+            // 没有对应条目，用通用 agent 图形，不再各自维护一份。
+            CLIAgent::TraeCode
+            | CLIAgent::Goose
+            | CLIAgent::Droid
+            | CLIAgent::OhMyPi
+            | CLIAgent::Qwen
+            | CLIAgent::CodeBuddy
+            | CLIAgent::Aider
             | CLIAgent::Auggie
-            | CLIAgent::Hermes
             | CLIAgent::Vibe
-            | CLIAgent::Antigravity
             | CLIAgent::Empryo
-            | CLIAgent::PrimeAgent
-            | CLIAgent::QoderCLICn
-            | CLIAgent::Muse
-            | CLIAgent::Jcode => "icons/bot.svg",
+            | CLIAgent::Jcode => "icons/programs/agent.svg",
         }
     }
 
@@ -1108,24 +1118,29 @@ mod tests {
         );
     }
 
-    /// 只有没有自有图形的 agent 才回退到通用机器人图标——
+    /// 只有没有自有图形的 agent 才回退到通用 agent 图标——
     /// 否则新增 agent 时很容易忘了加图标，然后所有人长得一样。
+    ///
+    /// 「有自有图形」的标准是 **herdr 的 `programs.json` 里有这个程序**：
+    /// 图标集合整体取自 herdr，它在表里没有的 agent 这里也不该有。
     #[test]
     fn only_the_unbranded_agents_use_the_fallback_glyph() {
         let expected = [
             CLIAgent::Aider,
             CLIAgent::Auggie,
-            CLIAgent::Hermes,
             CLIAgent::Vibe,
-            CLIAgent::Antigravity,
             CLIAgent::Empryo,
-            CLIAgent::PrimeAgent,
-            CLIAgent::QoderCLICn,
-            CLIAgent::Muse,
             CLIAgent::Jcode,
+            // 以下在 herdr 程序表里没有对应条目（只有别的变体才有图形）。
+            CLIAgent::TraeCode,
+            CLIAgent::Goose,
+            CLIAgent::Droid,
+            CLIAgent::OhMyPi,
+            CLIAgent::Qwen,
+            CLIAgent::CodeBuddy,
         ];
         for agent in CLIAgent::ALL {
-            let fallback = agent.icon_path() == "icons/bot.svg";
+            let fallback = agent.icon_path() == "icons/programs/agent.svg";
             assert_eq!(
                 fallback,
                 expected.contains(&agent),
@@ -1137,7 +1152,7 @@ mod tests {
     /// 每个 `icon_path()` 都必须真的能取到资源。
     ///
     /// 路径是字符串拼出来的，编译器不看；漏拷一个 SVG 只会在运行时表现成
-    /// 一个空白方块。tty7 的 `icons/bot.svg` 就一直只被引用、从未随包发布。
+    /// 一个空白方块。
     #[test]
     fn every_icon_path_resolves_to_an_embedded_asset() {
         use gpui::AssetSource as _;
