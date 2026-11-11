@@ -10,6 +10,7 @@ pub mod editor;
 pub mod file_manager;
 pub mod keymap;
 pub mod lsp;
+pub mod programs;
 pub mod settings;
 pub mod sidebar_view;
 pub mod ssh;
@@ -947,7 +948,32 @@ impl AppWindow {
         workspace.update(cx, |_, cx| {
             cx.emit(WorkspaceEvent::TabBarChanged);
         });
+        // 胶囊挂在**当前** workspace 的标签栏上：切换分组后要把入口重新挂到
+        // 新的那一条，否则胶囊还指着上一组的标签栏（点了没反应）。
+        self.rebind_workspace_chip(cx);
         cx.notify();
+    }
+
+    /// 把顶部胶囊（标签页组入口）挂到当前活动 workspace 的标签栏上。
+    ///
+    /// 胶囊的文案来自标签页组名，点击回落到侧边栏的选择器，因此只需要挂一次
+    /// 入口；文案随后由 `sync_sidebar_tab_groups` 每帧刷新。
+    fn rebind_workspace_chip(&self, cx: &mut Context<Self>) {
+        // 切换分组后标签栏是另一条，入口（回调）得重新挂上去；文案由
+        // `sync_sidebar_tab_groups` 的下一帧覆盖，这里先沿用旧的以免闪一下空。
+        let sidebar_for_chip = self.sidebar.clone();
+        let on_chip: crate::workspace::tab_bar::NewTabCallback =
+            std::rc::Rc::new(move |window, cx| {
+                sidebar_for_chip.update(cx, |sidebar, cx| {
+                    sidebar.open_tab_group_select(window, cx);
+                });
+            });
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.tab_bar.update(cx, |bar, cx| {
+                let label = bar.workspace_chip_label().cloned();
+                bar.set_workspace_chip(label, Some(on_chip), cx);
+            });
+        });
     }
 
     fn defer_save_session(&mut self, cx: &mut Context<Self>) {
@@ -982,6 +1008,26 @@ impl AppWindow {
     ) {
         self.pending_save_task.take();
         self.save_session_with_default(default_state, cx);
+    }
+
+    /// 消费侧边栏「展开标签页组选择器」的请求（顶部胶囊点出来的）。
+    ///
+    /// 胶囊在标签栏里，真正的 `MacosSelect` 在侧边栏顶部：两者不在同一棵
+    /// 子树，只能经侧边栏的一个一次性标志中转。放在每帧渲染前消费，
+    /// 保证侧边栏已经按展开后的状态完成了一次布局，弹窗才落得对位置。
+    fn flush_tab_group_select_request(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let requested = self.sidebar.update(cx, |sidebar, _| {
+            sidebar.take_tab_group_select_open_request()
+        });
+        if requested {
+            self.tab_group_select.update(cx, |select, cx| {
+                select.open(window, cx);
+            });
+        }
     }
 
     fn sync_sidebar_tab_groups(&self, cx: &mut Context<Self>) {
@@ -1030,7 +1076,37 @@ impl AppWindow {
         );
         self.tab_group_select.update(cx, |select, cx| {
             select.set_items_with_separator(item_labels, separator_after, cx);
-            select.set_selected(selected_label, cx);
+            select.set_selected(selected_label.clone(), cx);
+        });
+
+        // 顶部「空间胶囊」：herdr 的 Terminals LAYOUT 用一个胶囊显示当前 space
+        // 并点开选择器；deepterm 的对应概念是标签页组。文案与下拉的选中项同源，
+        // 只有在一级页（文件树）时才给胶囊——二级页（Host / 主题 / 字体…）的
+        // 选中态属于「菜单」，用它当胶囊文案会让人以为自己在某个标签页组里。
+        //
+        // 胶囊挂在**当前活动 workspace** 的标签栏上（不是默认那条）：切了分组
+        // 之后入口要跟着走，否则点它还在说上一组的名字。
+        let chip_label = (!matches!(
+            current_view,
+            crate::workspace::sidebar::SidebarView::Host
+                | crate::workspace::sidebar::SidebarView::Keychain
+                | crate::workspace::sidebar::SidebarView::Theme
+                | crate::workspace::sidebar::SidebarView::Font
+        ))
+        .then(|| selected_label.clone());
+        // 点胶囊 = 展开侧边栏的标签页组选择器（herdr 的 space picker 对应物），
+        // 与侧边栏顶部那个下拉是同一份 items / 同一个选中态。
+        let sidebar_for_chip = self.sidebar.clone();
+        let on_chip: crate::workspace::tab_bar::NewTabCallback =
+            std::rc::Rc::new(move |window, cx| {
+                sidebar_for_chip.update(cx, |sidebar, cx| {
+                    sidebar.open_tab_group_select(window, cx);
+                });
+            });
+        self.workspace.update(cx, |workspace, cx| {
+            workspace.tab_bar.update(cx, |bar, cx| {
+                bar.set_workspace_chip(chip_label, Some(on_chip.clone()), cx);
+            });
         });
     }
 
@@ -1605,6 +1681,7 @@ impl AppWindow {
 impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
+        self.flush_tab_group_select_request(window, cx);
 
         let editor_is_empty = self.editor.read(cx).is_empty();
 

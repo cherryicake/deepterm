@@ -185,6 +185,28 @@ impl MacosSelect {
         cx.notify();
     }
 
+    /// 以程序方式展开下拉（不经过触发器点击）。
+    ///
+    /// 顶部「空间胶囊」点开标签页组选择器时用：胶囊在标签栏里，真正的
+    /// `MacosSelect` 挂在侧边栏顶部，两者位置不同，只能由外部请求展开。
+    /// 触发器还没布局过（bounds 为默认值）时忽略——那一刻弹窗会画到
+    /// 窗口左上角，显式拒绝比画错地方好。
+    pub fn open(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_open || self.trigger_bounds.get().size.width <= px(0.0) {
+            return;
+        }
+        self.is_closing = false;
+        self._close_task = None;
+        self.is_open = true;
+        self.anim_epoch = self.anim_epoch.wrapping_add(1);
+        self.highlighted_index = self
+            .all_items
+            .iter()
+            .position(|item| item == &self.selected_item)
+            .unwrap_or(0);
+        cx.notify();
+    }
+
     fn toggle(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.is_closing {
             return;

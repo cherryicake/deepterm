@@ -1,0 +1,1138 @@
+{
+  "shells": [
+    "zsh",
+    "bash",
+    "fish",
+    "sh",
+    "dash",
+    "nu",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "elvish",
+    "xonsh",
+    "tcsh",
+    "csh",
+    "ksh",
+    "ion"
+  ],
+  "interpreters": [
+    "node",
+    "bun",
+    "bunx",
+    "deno",
+    "python",
+    "python3",
+    "npx",
+    "pnpm",
+    "yarn",
+    "uv",
+    "uvx",
+    "ruby",
+    "bundle",
+    "env",
+    "sudo",
+    "nice",
+    "time",
+    "watch",
+    "nodemon"
+  ],
+  "programs": {
+    "claude": {
+      "name": "Claude Code",
+      "icon": "icons/programs/claude.svg",
+      "run": [
+        "claude"
+      ],
+      "match": [
+        "claude-code"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "codex": {
+      "name": "Codex",
+      "icon": "icons/programs/codex.svg",
+      "run": [
+        "codex",
+        "--no-daemon"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "pi": {
+      "name": "Pi",
+      "icon": "icons/programs/pi.svg",
+      "run": [
+        "pi"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "pig": {
+      "name": "PiG",
+      "icon": "icons/programs/pig.svg",
+      "run": [
+        "pig"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "opencode": {
+      "name": "OpenCode",
+      "icon": "icons/programs/opencode.svg",
+      "run": [
+        "opencode"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "cursor": {
+      "name": "Cursor",
+      "icon": "icons/programs/cursor.svg",
+      "run": [
+        "cursor-agent"
+      ],
+      "match": [
+        "cursor-agent"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "copilot": {
+      "name": "Copilot",
+      "icon": "icons/programs/copilot.svg",
+      "run": [
+        "copilot"
+      ],
+      "match": [
+        "github-copilot"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "amp": {
+      "name": "Amp",
+      "icon": "icons/programs/amp.svg",
+      "run": [
+        "amp"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "grok": {
+      "name": "Grok",
+      "icon": "icons/programs/grok.svg",
+      "run": [
+        "grok"
+      ],
+      "match": [
+        "grok-build"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "dsh-tui": {
+      "name": "DeepSeek Harness",
+      "icon": "icons/programs/dsh-tui.svg",
+      "run": [
+        "dsh-tui"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "antigravity": {
+      "name": "Antigravity",
+      "icon": "icons/programs/antigravity.svg",
+      "run": [
+        "agy"
+      ],
+      "match": [
+        "agy"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "kimi": {
+      "name": "Kimi",
+      "icon": "icons/programs/kimi.svg",
+      "run": [
+        "kimi"
+      ],
+      "match": [
+        "kimi-code",
+        "kimicodecli"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "kiro": {
+      "name": "Kiro",
+      "icon": "icons/programs/kiro.svg",
+      "run": [
+        "kiro-cli"
+      ],
+      "match": [
+        "kiro-cli"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "hermes": {
+      "name": "Hermes",
+      "icon": "icons/programs/hermes.svg",
+      "run": [
+        "hermes"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "mastracode": {
+      "name": "Mastra Code",
+      "icon": "icons/programs/mastracode.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "qoder": {
+      "name": "Qoder",
+      "icon": "icons/programs/qoder.svg",
+      "run": [
+        "qodercli"
+      ],
+      "match": [
+        "qodercli"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "muse": {
+      "name": "Muse",
+      "icon": "icons/programs/muse.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "crush": {
+      "name": "Crush",
+      "icon": "icons/programs/crush.svg",
+      "run": [
+        "crush"
+      ],
+      "tint": false,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "command-code": {
+      "name": "Command Code",
+      "icon": "icons/programs/command-code.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "prime-agent": {
+      "name": "Prime",
+      "icon": "icons/programs/prime-agent.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "gemini": {
+      "name": "Gemini",
+      "icon": "icons/programs/gemini.svg",
+      "run": [
+        "gemini"
+      ],
+      "tint": true,
+      "tile": "#8e75b2",
+      "color": "#ffffff"
+    },
+    "ollama": {
+      "name": "Ollama",
+      "icon": "icons/programs/ollama.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "agent": {
+      "name": "Agent",
+      "icon": "icons/programs/agent.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "shell": {
+      "name": "Shell",
+      "icon": "icons/programs/shell.svg",
+      "tint": true,
+      "tile": "#16241a",
+      "color": "#4ec95f"
+    },
+    "program": {
+      "name": "Program",
+      "icon": "icons/programs/program.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "vim": {
+      "name": "Vim",
+      "icon": "icons/programs/vim.svg",
+      "match": [
+        "vi",
+        "view"
+      ],
+      "tint": true,
+      "tile": "#019733",
+      "color": "#ffffff"
+    },
+    "nvim": {
+      "name": "Neovim",
+      "icon": "icons/programs/nvim.svg",
+      "tint": true,
+      "tile": "#57a143",
+      "color": "#ffffff"
+    },
+    "hx": {
+      "name": "Helix",
+      "icon": "icons/programs/hx.svg",
+      "match": [
+        "helix"
+      ],
+      "tint": true,
+      "tile": "#281733",
+      "color": "#ffffff"
+    },
+    "emacs": {
+      "name": "Emacs",
+      "icon": "icons/programs/emacs.svg",
+      "tint": true,
+      "tile": "#7f5ab6",
+      "color": "#ffffff"
+    },
+    "nano": {
+      "name": "nano",
+      "icon": "icons/programs/nano.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "less": {
+      "name": "Pager",
+      "icon": "icons/programs/less.svg",
+      "match": [
+        "more",
+        "man",
+        "bat"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "lazygit": {
+      "name": "Git Changes",
+      "icon": "icons/programs/lazygit.svg",
+      "match": [
+        "gitui",
+        "tig"
+      ],
+      "tint": true,
+      "tile": "#3f8f4f",
+      "color": "#ffffff"
+    },
+    "git": {
+      "name": "Git",
+      "icon": "icons/programs/git.svg",
+      "tint": true,
+      "tile": "#f03c2e",
+      "color": "#ffffff"
+    },
+    "gh": {
+      "name": "GitHub",
+      "icon": "icons/programs/gh.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "glab": {
+      "name": "GitLab",
+      "icon": "icons/programs/glab.svg",
+      "tint": true,
+      "tile": "#fc6d26",
+      "color": "#ffffff"
+    },
+    "htop": {
+      "name": "Activity",
+      "icon": "icons/programs/htop.svg",
+      "match": [
+        "btop",
+        "top",
+        "btm",
+        "glances"
+      ],
+      "tint": true,
+      "tile": "#1f6f43",
+      "color": "#a7f3c4"
+    },
+    "ssh": {
+      "name": "SSH",
+      "icon": "icons/programs/ssh.svg",
+      "match": [
+        "mosh",
+        "et"
+      ],
+      "tint": true,
+      "tile": "#5b4bd6",
+      "color": "#ffffff"
+    },
+    "tmux": {
+      "name": "tmux",
+      "icon": "icons/programs/tmux.svg",
+      "match": [
+        "zellij",
+        "screen"
+      ],
+      "tint": true,
+      "tile": "#1bb91f",
+      "color": "#ffffff"
+    },
+    "rg": {
+      "name": "Search",
+      "icon": "icons/programs/rg.svg",
+      "match": [
+        "grep",
+        "fzf",
+        "fd",
+        "find"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "curl": {
+      "name": "curl",
+      "icon": "icons/programs/curl.svg",
+      "match": [
+        "wget",
+        "http",
+        "httpie",
+        "xh"
+      ],
+      "tint": true,
+      "tile": "#073551",
+      "color": "#ffffff"
+    },
+    "ffmpeg": {
+      "name": "FFmpeg",
+      "icon": "icons/programs/ffmpeg.svg",
+      "tint": true,
+      "tile": "#007808",
+      "color": "#ffffff"
+    },
+    "make": {
+      "name": "Make",
+      "icon": "icons/programs/make.svg",
+      "match": [
+        "just",
+        "ninja"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#d6d8db"
+    },
+    "cmake": {
+      "name": "CMake",
+      "icon": "icons/programs/cmake.svg",
+      "tint": true,
+      "tile": "#064f8c",
+      "color": "#ffffff"
+    },
+    "jupyter": {
+      "name": "Jupyter",
+      "icon": "icons/programs/jupyter.svg",
+      "tint": true,
+      "tile": "#f37626",
+      "color": "#ffffff"
+    },
+    "node": {
+      "name": "Node",
+      "icon": "icons/programs/node.svg",
+      "tint": true,
+      "tile": "#5fa04e",
+      "color": "#ffffff"
+    },
+    "bun": {
+      "name": "Bun",
+      "icon": "icons/programs/bun.svg",
+      "match": [
+        "bunx"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "deno": {
+      "name": "Deno",
+      "icon": "icons/programs/deno.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "python": {
+      "name": "Python",
+      "icon": "icons/programs/python.svg",
+      "match": [
+        "python3",
+        "ipython",
+        "pip",
+        "pip3"
+      ],
+      "tint": true,
+      "tile": "#3776ab",
+      "color": "#ffffff"
+    },
+    "uv": {
+      "name": "uv",
+      "icon": "icons/programs/uv.svg",
+      "match": [
+        "uvx"
+      ],
+      "tint": true,
+      "tile": "#de5fe9",
+      "color": "#ffffff"
+    },
+    "poetry": {
+      "name": "Poetry",
+      "icon": "icons/programs/poetry.svg",
+      "tint": true,
+      "tile": "#60a5fa",
+      "color": "#ffffff"
+    },
+    "ruby": {
+      "name": "Ruby",
+      "icon": "icons/programs/ruby.svg",
+      "match": [
+        "irb",
+        "bundle",
+        "gem",
+        "rails"
+      ],
+      "tint": true,
+      "tile": "#cc342d",
+      "color": "#ffffff"
+    },
+    "go": {
+      "name": "Go",
+      "icon": "icons/programs/go.svg",
+      "tint": true,
+      "tile": "#00add8",
+      "color": "#ffffff"
+    },
+    "cargo": {
+      "name": "Cargo",
+      "icon": "icons/programs/cargo.svg",
+      "match": [
+        "rustc",
+        "rustup"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "java": {
+      "name": "Java",
+      "icon": "icons/programs/java.svg",
+      "match": [
+        "javac",
+        "jshell"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "gradle": {
+      "name": "Gradle",
+      "icon": "icons/programs/gradle.svg",
+      "match": [
+        "gradlew"
+      ],
+      "tint": true,
+      "tile": "#02303a",
+      "color": "#ffffff"
+    },
+    "mvn": {
+      "name": "Maven",
+      "icon": "icons/programs/mvn.svg",
+      "match": [
+        "mvnw"
+      ],
+      "tint": true,
+      "tile": "#c71a36",
+      "color": "#ffffff"
+    },
+    "dotnet": {
+      "name": ".NET",
+      "icon": "icons/programs/dotnet.svg",
+      "tint": true,
+      "tile": "#512bd4",
+      "color": "#ffffff"
+    },
+    "php": {
+      "name": "PHP",
+      "icon": "icons/programs/php.svg",
+      "match": [
+        "artisan"
+      ],
+      "tint": true,
+      "tile": "#777bb4",
+      "color": "#ffffff"
+    },
+    "composer": {
+      "name": "Composer",
+      "icon": "icons/programs/composer.svg",
+      "tint": true,
+      "tile": "#885630",
+      "color": "#ffffff"
+    },
+    "iex": {
+      "name": "Elixir",
+      "icon": "icons/programs/iex.svg",
+      "match": [
+        "elixir",
+        "mix"
+      ],
+      "tint": true,
+      "tile": "#4b275f",
+      "color": "#ffffff"
+    },
+    "erl": {
+      "name": "Erlang",
+      "icon": "icons/programs/erl.svg",
+      "tint": true,
+      "tile": "#a90533",
+      "color": "#ffffff"
+    },
+    "ghci": {
+      "name": "Haskell",
+      "icon": "icons/programs/ghci.svg",
+      "match": [
+        "ghc",
+        "stack",
+        "cabal"
+      ],
+      "tint": true,
+      "tile": "#5d4f85",
+      "color": "#ffffff"
+    },
+    "ocaml": {
+      "name": "OCaml",
+      "icon": "icons/programs/ocaml.svg",
+      "match": [
+        "utop",
+        "dune",
+        "opam"
+      ],
+      "tint": true,
+      "tile": "#ec6813",
+      "color": "#ffffff"
+    },
+    "zig": {
+      "name": "Zig",
+      "icon": "icons/programs/zig.svg",
+      "tint": true,
+      "tile": "#f7a41d",
+      "color": "#ffffff"
+    },
+    "swift": {
+      "name": "Swift",
+      "icon": "icons/programs/swift.svg",
+      "tint": true,
+      "tile": "#f05138",
+      "color": "#ffffff"
+    },
+    "kotlin": {
+      "name": "Kotlin",
+      "icon": "icons/programs/kotlin.svg",
+      "match": [
+        "kotlinc"
+      ],
+      "tint": true,
+      "tile": "#7f52ff",
+      "color": "#ffffff"
+    },
+    "scala": {
+      "name": "Scala",
+      "icon": "icons/programs/scala.svg",
+      "match": [
+        "sbt"
+      ],
+      "tint": true,
+      "tile": "#dc322f",
+      "color": "#ffffff"
+    },
+    "lua": {
+      "name": "Lua",
+      "icon": "icons/programs/lua.svg",
+      "match": [
+        "luajit"
+      ],
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "perl": {
+      "name": "Perl",
+      "icon": "icons/programs/perl.svg",
+      "tint": true,
+      "tile": "#0073a1",
+      "color": "#ffffff"
+    },
+    "R": {
+      "name": "R",
+      "icon": "icons/programs/r.svg",
+      "match": [
+        "Rscript"
+      ],
+      "tint": true,
+      "tile": "#276dc3",
+      "color": "#ffffff"
+    },
+    "julia": {
+      "name": "Julia",
+      "icon": "icons/programs/julia.svg",
+      "tint": true,
+      "tile": "#9558b2",
+      "color": "#ffffff"
+    },
+    "dart": {
+      "name": "Dart",
+      "icon": "icons/programs/dart.svg",
+      "tint": true,
+      "tile": "#0175c2",
+      "color": "#ffffff"
+    },
+    "flutter": {
+      "name": "Flutter",
+      "icon": "icons/programs/flutter.svg",
+      "tint": true,
+      "tile": "#02569b",
+      "color": "#ffffff"
+    },
+    "tsc": {
+      "name": "TypeScript",
+      "icon": "icons/programs/tsc.svg",
+      "match": [
+        "tsx",
+        "ts-node"
+      ],
+      "tint": true,
+      "tile": "#3178c6",
+      "color": "#ffffff"
+    },
+    "npm": {
+      "name": "npm",
+      "icon": "icons/programs/npm.svg",
+      "match": [
+        "npx"
+      ],
+      "tint": true,
+      "tile": "#cb3837",
+      "color": "#ffffff"
+    },
+    "pnpm": {
+      "name": "pnpm",
+      "icon": "icons/programs/pnpm.svg",
+      "tint": true,
+      "tile": "#f69220",
+      "color": "#ffffff"
+    },
+    "yarn": {
+      "name": "Yarn",
+      "icon": "icons/programs/yarn.svg",
+      "tint": true,
+      "tile": "#2c8ebb",
+      "color": "#ffffff"
+    },
+    "vite": {
+      "name": "Vite",
+      "icon": "icons/programs/vite.svg",
+      "tint": true,
+      "tile": "#9135ff",
+      "color": "#ffffff"
+    },
+    "next": {
+      "name": "Next.js",
+      "icon": "icons/programs/next.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "astro": {
+      "name": "Astro",
+      "icon": "icons/programs/astro.svg",
+      "tint": true,
+      "tile": "#bc52ee",
+      "color": "#ffffff"
+    },
+    "nuxt": {
+      "name": "Nuxt",
+      "icon": "icons/programs/nuxt.svg",
+      "match": [
+        "nuxi"
+      ],
+      "tint": true,
+      "tile": "#00dc82",
+      "color": "#ffffff"
+    },
+    "turbo": {
+      "name": "Turborepo",
+      "icon": "icons/programs/turbo.svg",
+      "tint": true,
+      "tile": "#ff1e56",
+      "color": "#ffffff"
+    },
+    "webpack": {
+      "name": "webpack",
+      "icon": "icons/programs/webpack.svg",
+      "tint": true,
+      "tile": "#8dd6f9",
+      "color": "#1a1a1a"
+    },
+    "esbuild": {
+      "name": "esbuild",
+      "icon": "icons/programs/esbuild.svg",
+      "tint": true,
+      "tile": "#ffcf00",
+      "color": "#1a1a1a"
+    },
+    "vitest": {
+      "name": "Vitest",
+      "icon": "icons/programs/vitest.svg",
+      "tint": true,
+      "tile": "#00ff74",
+      "color": "#1a1a1a"
+    },
+    "jest": {
+      "name": "Jest",
+      "icon": "icons/programs/jest.svg",
+      "tint": true,
+      "tile": "#c21325",
+      "color": "#ffffff"
+    },
+    "pytest": {
+      "name": "pytest",
+      "icon": "icons/programs/pytest.svg",
+      "tint": true,
+      "tile": "#0a9edc",
+      "color": "#ffffff"
+    },
+    "eslint": {
+      "name": "ESLint",
+      "icon": "icons/programs/eslint.svg",
+      "tint": true,
+      "tile": "#4b32c3",
+      "color": "#ffffff"
+    },
+    "prettier": {
+      "name": "Prettier",
+      "icon": "icons/programs/prettier.svg",
+      "tint": true,
+      "tile": "#f7b93e",
+      "color": "#1a1a1a"
+    },
+    "biome": {
+      "name": "Biome",
+      "icon": "icons/programs/biome.svg",
+      "tint": true,
+      "tile": "#60a5fa",
+      "color": "#ffffff"
+    },
+    "ruff": {
+      "name": "Ruff",
+      "icon": "icons/programs/ruff.svg",
+      "tint": true,
+      "tile": "#d7ff64",
+      "color": "#1a1a1a"
+    },
+    "expo": {
+      "name": "Expo",
+      "icon": "icons/programs/expo.svg",
+      "tint": true,
+      "tile": "#1c2024",
+      "color": "#ffffff"
+    },
+    "tauri": {
+      "name": "Tauri",
+      "icon": "icons/programs/tauri.svg",
+      "tint": true,
+      "tile": "#24c8d8",
+      "color": "#ffffff"
+    },
+    "electron": {
+      "name": "Electron",
+      "icon": "icons/programs/electron.svg",
+      "tint": true,
+      "tile": "#47848f",
+      "color": "#ffffff"
+    },
+    "prisma": {
+      "name": "Prisma",
+      "icon": "icons/programs/prisma.svg",
+      "tint": true,
+      "tile": "#2d3748",
+      "color": "#ffffff"
+    },
+    "supabase": {
+      "name": "Supabase",
+      "icon": "icons/programs/supabase.svg",
+      "tint": true,
+      "tile": "#3fcf8e",
+      "color": "#ffffff"
+    },
+    "django-admin": {
+      "name": "Django",
+      "icon": "icons/programs/django-admin.svg",
+      "tint": true,
+      "tile": "#092e20",
+      "color": "#ffffff"
+    },
+    "flask": {
+      "name": "Flask",
+      "icon": "icons/programs/flask.svg",
+      "tint": true,
+      "tile": "#3babc3",
+      "color": "#ffffff"
+    },
+    "fastapi": {
+      "name": "FastAPI",
+      "icon": "icons/programs/fastapi.svg",
+      "tint": true,
+      "tile": "#009688",
+      "color": "#ffffff"
+    },
+    "psql": {
+      "name": "PostgreSQL",
+      "icon": "icons/programs/psql.svg",
+      "match": [
+        "postgres"
+      ],
+      "tint": true,
+      "tile": "#4169e1",
+      "color": "#ffffff"
+    },
+    "mysql": {
+      "name": "MySQL",
+      "icon": "icons/programs/mysql.svg",
+      "match": [
+        "mariadb"
+      ],
+      "tint": true,
+      "tile": "#4479a1",
+      "color": "#ffffff"
+    },
+    "sqlite3": {
+      "name": "SQLite",
+      "icon": "icons/programs/sqlite3.svg",
+      "match": [
+        "sqlite"
+      ],
+      "tint": true,
+      "tile": "#003b57",
+      "color": "#ffffff"
+    },
+    "redis-cli": {
+      "name": "Redis",
+      "icon": "icons/programs/redis-cli.svg",
+      "match": [
+        "redis-server"
+      ],
+      "tint": true,
+      "tile": "#ff4438",
+      "color": "#ffffff"
+    },
+    "mongosh": {
+      "name": "MongoDB",
+      "icon": "icons/programs/mongosh.svg",
+      "match": [
+        "mongo"
+      ],
+      "tint": true,
+      "tile": "#47a248",
+      "color": "#ffffff"
+    },
+    "docker": {
+      "name": "Docker",
+      "icon": "icons/programs/docker.svg",
+      "match": [
+        "docker-compose",
+        "lazydocker"
+      ],
+      "tint": true,
+      "tile": "#2496ed",
+      "color": "#ffffff"
+    },
+    "podman": {
+      "name": "Podman",
+      "icon": "icons/programs/podman.svg",
+      "tint": true,
+      "tile": "#892ca0",
+      "color": "#ffffff"
+    },
+    "kubectl": {
+      "name": "Kubernetes",
+      "icon": "icons/programs/kubectl.svg",
+      "match": [
+        "k9s",
+        "minikube",
+        "kind"
+      ],
+      "tint": true,
+      "tile": "#326ce5",
+      "color": "#ffffff"
+    },
+    "helm": {
+      "name": "Helm",
+      "icon": "icons/programs/helm.svg",
+      "tint": true,
+      "tile": "#0f1689",
+      "color": "#ffffff"
+    },
+    "terraform": {
+      "name": "Terraform",
+      "icon": "icons/programs/terraform.svg",
+      "match": [
+        "tofu"
+      ],
+      "tint": true,
+      "tile": "#844fba",
+      "color": "#ffffff"
+    },
+    "ansible": {
+      "name": "Ansible",
+      "icon": "icons/programs/ansible.svg",
+      "match": [
+        "ansible-playbook"
+      ],
+      "tint": true,
+      "tile": "#ee0000",
+      "color": "#ffffff"
+    },
+    "gcloud": {
+      "name": "Google Cloud",
+      "icon": "icons/programs/gcloud.svg",
+      "tint": true,
+      "tile": "#4285f4",
+      "color": "#ffffff"
+    },
+    "vercel": {
+      "name": "Vercel",
+      "icon": "icons/programs/vercel.svg",
+      "tint": true,
+      "tile": "#1c1d21",
+      "color": "#ffffff"
+    },
+    "netlify": {
+      "name": "Netlify",
+      "icon": "icons/programs/netlify.svg",
+      "tint": true,
+      "tile": "#00c7b7",
+      "color": "#ffffff"
+    },
+    "wrangler": {
+      "name": "Cloudflare",
+      "icon": "icons/programs/wrangler.svg",
+      "tint": true,
+      "tile": "#f38020",
+      "color": "#ffffff"
+    },
+    "fly": {
+      "name": "Fly.io",
+      "icon": "icons/programs/fly.svg",
+      "match": [
+        "flyctl"
+      ],
+      "tint": true,
+      "tile": "#24175b",
+      "color": "#ffffff"
+    },
+    "caddy": {
+      "name": "Caddy",
+      "icon": "icons/programs/caddy.svg",
+      "tint": true,
+      "tile": "#1f88c0",
+      "color": "#ffffff"
+    },
+    "nginx": {
+      "name": "nginx",
+      "icon": "icons/programs/nginx.svg",
+      "tint": true,
+      "tile": "#009639",
+      "color": "#ffffff"
+    },
+    "nix": {
+      "name": "Nix",
+      "icon": "icons/programs/nix.svg",
+      "match": [
+        "nix-shell",
+        "nixos-rebuild"
+      ],
+      "tint": true,
+      "tile": "#5277c3",
+      "color": "#ffffff"
+    },
+    "brew": {
+      "name": "Homebrew",
+      "icon": "icons/programs/brew.svg",
+      "tint": true,
+      "tile": "#fbb040",
+      "color": "#1a1a1a"
+    },
+    "apt": {
+      "name": "apt",
+      "icon": "icons/programs/apt.svg",
+      "match": [
+        "apt-get",
+        "dpkg"
+      ],
+      "tint": true,
+      "tile": "#a81d33",
+      "color": "#ffffff"
+    },
+    "dnf": {
+      "name": "dnf",
+      "icon": "icons/programs/dnf.svg",
+      "match": [
+        "rpm-ostree"
+      ],
+      "tint": true,
+      "tile": "#51a2da",
+      "color": "#ffffff"
+    },
+    "pacman": {
+      "name": "pacman",
+      "icon": "icons/programs/pacman.svg",
+      "match": [
+        "yay",
+        "paru"
+      ],
+      "tint": true,
+      "tile": "#1793d1",
+      "color": "#ffffff"
+    }
+  }
+}

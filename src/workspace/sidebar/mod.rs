@@ -269,6 +269,8 @@ pub struct MacosSidebar {
     on_tab_single_click: Option<TabClickCallback>,
 
     tab_group_menu_open: bool,
+    /// 顶部胶囊请求展开标签页组选择器（一次性，见 `open_tab_group_select`）。
+    tab_group_select_open_requested: bool,
     tab_group_menu_group_id: Option<String>,
     tab_group_popup_menu: Option<Entity<PopupMenu>>,
     tab_group_menu_position: Option<gpui::Point<Pixels>>,
@@ -334,6 +336,7 @@ impl MacosSidebar {
             on_tab_double_click: None,
             on_tab_single_click: None,
             tab_group_menu_open: false,
+            tab_group_select_open_requested: false,
             tab_group_menu_group_id: None,
             tab_group_popup_menu: None,
             tab_group_menu_position: None,
@@ -510,6 +513,29 @@ impl MacosSidebar {
 
     pub fn is_visible(&self) -> bool {
         self.visible
+    }
+
+    /// 顶部「空间胶囊」被点击：把侧边栏拉出来，并让标签页组选择器展开。
+    ///
+    /// herdr 的 Terminals LAYOUT 里，胶囊点开的是 space picker；deepterm 没有
+    /// space，对应物就是侧边栏菜单顶部的标签页组下拉。侧边栏收起时先展开，
+    /// 否则选择器会浮在一块正在退场的侧栏上。
+    pub fn open_tab_group_select(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        // 侧边栏已经有一条命令通道指向 `tab_group_select`（见 `AppWindow`），
+        // 这里只负责把入口「点亮」：先展开侧边栏，下一帧再由 AppWindow 转发
+        // 展开请求。用 `pending` 标志而不是直接持有实体，避免 sidebar 反向
+        // 依赖组件树上层。
+        if !self.visible {
+            let _ = self.toggle();
+        }
+        self.tab_group_select_open_requested = true;
+        let _ = window;
+        cx.notify();
+    }
+
+    /// 取走「展开标签页组选择器」的一次性请求（由 `AppWindow` 每帧消费）。
+    pub fn take_tab_group_select_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.tab_group_select_open_requested)
     }
 
     /// 当前动画 epoch（用于外部组件同步动画）。

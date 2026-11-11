@@ -87,6 +87,8 @@ pub enum Icon {
     Opensuse,
     Manjaro,
     Workspace,
+    /// 顶部「标签页组」胶囊里的层叠方块（同 herdr 的 stack.svg）。
+    Stack,
     Bell,
     Reveal,
     Sidebar,
@@ -179,6 +181,7 @@ impl Icon {
             Icon::Opensuse => SharedString::new_static("icons/opensuse.svg"),
             Icon::Manjaro => SharedString::new_static("icons/manjaro.svg"),
             Icon::Workspace => SharedString::new_static("icons/workspace.svg"),
+            Icon::Stack => SharedString::new_static("icons/stack.svg"),
             Icon::Bell => SharedString::new_static("icons/bell.svg"),
             Icon::Reveal => SharedString::new_static("icons/reveal.svg"),
             Icon::Sidebar => SharedString::new_static("icons/sidebar.svg"),

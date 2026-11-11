@@ -171,8 +171,21 @@ pub enum DriverEvent {
 /// 存在的意义是把「查不了」和「查了、但不是 agent」分开——这两件事都会让
 /// `detect_agent_for_local` 拿不到 `CLIAgent`，但对界面意味着相反的动作。
 /// 折叠成 `Option` 会逼调用方猜，猜错的代价是图标乱闪或该消失时不消失。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalAgentProbe {
+    /// 前台进程的 argv（探测到的话）。`None` = 没探到，调用方保持现有快照。
+    ///
+    /// 与 `agent` 分开：`agent` 是「argv 里认出了 agent」，而标签上的程序方块
+    /// 需要的是完整 argv——`vim`、`node .../vite`、未知脚本都得能显示。
+    pub argv: Option<Vec<String>>,
+    /// 探测结论：[`LocalAgentProbe::Agent`] 认出了 agent，[`LocalAgentProbe::NoAgent`]
+    /// 是有效结论（前台确实不是 agent），[`LocalAgentProbe::Unavailable`] 不是结论。
+    pub outcome: LocalAgentOutcome,
+}
+
+/// [`LocalAgentProbe`] 的三态结论（历史名字保留，见 [`LocalAgentProbe`]）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LocalAgentProbe {
+pub enum LocalAgentOutcome {
     /// 认出来了：前台跑的就是这个 agent。
     Agent(CLIAgent),
     /// **有效结论**：拿到了前台进程的 argv，但没有任何 token 命中已知 agent
@@ -1189,6 +1202,13 @@ pub struct Terminal {
     /// 只回答"是哪个 agent"，**不代表它在忙**——回合状态一律以
     /// `agent_session` 为准（见 [`Self::agent_session`]）。
     foreground_agent: Option<CLIAgent>,
+    /// 前台进程的完整 argv（末次探测结果）。
+    ///
+    /// 与 `foreground_agent` 同源、同一次探测产出：agent 识别只是 argv 的一种
+    /// 解读，而标签上的程序方块（`crate::programs`）需要完整命令行才能认出
+    /// `node .../vite` 这类被解释器包着的程序。拆成两个字段而不是一个结构体，
+    /// 是因为 `foreground_agent` 还有 hook 声明这条独立来源。
+    foreground_argv: Option<Vec<String>>,
     /// hook 事件驱动的 agent 回合状态。
     ///
     /// 与 `foreground_agent` 的两种解耦情况：
@@ -1427,6 +1447,7 @@ impl Terminal {
             remote_process_name: None,
             port_forward_status: None,
             foreground_agent: None,
+            foreground_argv: None,
             agent_session: None,
             agent_interrupt_pending: None,
             agent_last_event: None,
@@ -1649,6 +1670,7 @@ impl Terminal {
                 remote_process_name: None,
                 port_forward_status: None,
                 foreground_agent: None,
+                foreground_argv: None,
                 agent_session: None,
                 agent_interrupt_pending: None,
                 agent_last_event: None,
@@ -1832,6 +1854,7 @@ impl Terminal {
             remote_process_name: None,
             port_forward_status: None,
             foreground_agent: None,
+            foreground_argv: None,
             agent_session: None,
             agent_interrupt_pending: None,
             agent_last_event: None,
@@ -2168,6 +2191,7 @@ impl Terminal {
                 remote_process_name: None,
                 port_forward_status: None,
                 foreground_agent: None,
+                foreground_argv: None,
                 agent_session: None,
                 agent_interrupt_pending: None,
                 agent_last_event: None,
@@ -2320,6 +2344,11 @@ impl Terminal {
     /// 注意 `Some` 不代表它在忙：回合状态在 [`Self::agent_session`]。
     pub fn foreground_agent(&self) -> Option<CLIAgent> {
         self.foreground_agent
+    }
+
+    /// 前台进程的 argv（末次探测结果）。`None` = 前台是 shell，或还没探过。
+    pub fn foreground_argv(&self) -> Option<&[String]> {
+        self.foreground_argv.as_deref()
     }
 
     /// agent 的回合状态。`None` = 没有 agent 在前台，或没装 hook 所以没有状态来源。
@@ -2857,10 +2886,29 @@ impl Terminal {
     /// 取舍是「宁可多留一会儿」而不是「宁可闪一下」：图标多留一会儿是轻微
     /// 的信息滞后，闪一下则是明显的视觉噪声。
     pub fn apply_detected_agent(&mut self, probe: LocalAgentProbe, cx: &mut Context<Self>) {
-        match probe {
-            LocalAgentProbe::Agent(agent) => self.set_foreground_agent(Some(agent), cx),
-            LocalAgentProbe::NoAgent => self.set_foreground_agent(None, cx),
-            LocalAgentProbe::Unavailable => {}
+        let LocalAgentProbe { argv, outcome } = probe;
+        // 「查不了」：身份与 argv 都保持现状（见 [`LocalAgentOutcome`]）——
+        // 这一支必须在写 argv **之前**判掉，否则一次短暂的读失败会把
+        // 前台程序抹成「什么都没有」。
+        let agent = match outcome {
+            LocalAgentOutcome::Agent(agent) => Some(agent),
+            LocalAgentOutcome::NoAgent => None,
+            LocalAgentOutcome::Unavailable => return,
+        };
+
+        // argv 是「终端里跑的是什么」的唯一原始输入：标签方块的程序识别
+        // （`crate::programs`）全靠它，而不只是 agent 身份。
+        // `NoAgent` 且 argv 为 `None` 表示 shell 回到了前台，此时清空是**结论**，
+        // 不是「查不了」——两者在上面已经分流。
+        let argv_changed = argv.as_ref() != self.foreground_argv.as_ref();
+        self.foreground_argv = argv;
+
+        let agent_changed = self.foreground_agent != agent;
+        self.set_foreground_agent(agent, cx);
+        // 身份没变但程序变了（`vim` → `nvim`、shell → `htop`）也要让上层
+        // 重画，否则标签会一直举着旧图标。
+        if argv_changed && !agent_changed {
+            cx.emit(Event::TitleChanged);
         }
     }
 
@@ -2874,30 +2922,42 @@ impl Terminal {
         pty_master_fd: Option<i32>,
         shell_process_group_id: Option<i32>,
     ) -> LocalAgentProbe {
-        // 「查不了」和「查了，不是 agent」必须区分开——见 [`LocalAgentProbe`]。
+        // 「查不了」和「查了，不是 agent」必须区分开——见 [`LocalAgentOutcome`]。
+        let unavailable = LocalAgentProbe {
+            argv: None,
+            outcome: LocalAgentOutcome::Unavailable,
+        };
         let Some(fd) = pty_master_fd else {
-            return LocalAgentProbe::Unavailable;
+            return unavailable;
         };
         // SAFETY（中文）：`tcgetpgrp` 只读查询，传入存活的 pty master fd；
         // 失败返回 -1，由下面判掉。
         let pgid = unsafe { libc::tcgetpgrp(fd) };
         if pgid < 0 {
-            return LocalAgentProbe::Unavailable;
+            return unavailable;
         }
         // shell 在前台：这是**确定**的「前台不是 agent」，属于有效结论。
+        // argv 交给上层按 shell 名补（`shell_program` 有更准的那一份）。
         if shell_process_group_id == Some(pgid) {
-            return LocalAgentProbe::NoAgent;
+            return LocalAgentProbe {
+                argv: None,
+                outcome: LocalAgentOutcome::NoAgent,
+            };
         }
         // 取不到 argv（进程已退出、权限不足）：退回「查不了」，
         // 不能据此断言前台不是 agent。
         let Some(argv) = crate::terminal::foreground_argv::foreground_argv(pgid as u32) else {
-            return LocalAgentProbe::Unavailable;
+            return unavailable;
         };
-        match CLIAgent::detect_from_argv_with(&argv, &HashMap::new()) {
-            Some(agent) => LocalAgentProbe::Agent(agent),
+        let outcome = match CLIAgent::detect_from_argv_with(&argv, &HashMap::new()) {
+            Some(agent) => LocalAgentOutcome::Agent(agent),
             // 拿到了 argv 但没有一个 token 命中已知 agent：
             // 前台确实跑着某个程序，只是我们不认识它。
-            None => LocalAgentProbe::NoAgent,
+            None => LocalAgentOutcome::NoAgent,
+        };
+        LocalAgentProbe {
+            argv: Some(argv),
+            outcome,
         }
     }
 

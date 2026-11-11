@@ -26,7 +26,7 @@ type TabCallback = Rc<dyn Fn(SharedString, &mut Window, &mut App) + Send + Sync>
 /// 可选 [`TabCallback`]。
 type OptionalTabCallback = Option<TabCallback>;
 /// 无参数回调（如新建标签页）。
-type NewTabCallback = Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
+pub type NewTabCallback = Rc<dyn Fn(&mut Window, &mut App) + Send + Sync>;
 /// Tab 重排回调：参数为被拖拽的 tab 与插入位（before 语义）。
 type TabReorderCallback = Rc<dyn Fn(DraggedTab, usize, &mut App) + Send + Sync>;
 /// Panel 拖放到 TabBar 的回调：参数为被拖放的 panel 与可选的插入位。
@@ -128,6 +128,30 @@ const AGENT_WORK_SHIMMER_PERIOD_MS: u64 = 2400;
 /// 限制逐帧重绘频率；文字扫光对帧率不敏感，60→30 fps 省一半重排。
 const AGENT_WORK_SHIMMER_MAX_FPS: f32 = 30.0;
 const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
+
+// ── herdr Terminals LAYOUT 的托盘尺寸 ──────────────────────────────────────
+/// 托盘高度（标签自身高度 = 托盘高度 - 上下各 3px 内边距 = 30）。
+const TRAY_HEIGHT_PX: f32 = 36.0;
+/// 托盘内边距。
+const TRAY_PADDING_PX: f32 = 3.0;
+/// 托盘圆角。
+const TRAY_RADIUS_PX: f32 = 16.0;
+/// 标签间距。
+const TRAY_GAP_PX: f32 = 3.0;
+/// 标签宽度：等宽 + `flex_shrink(1)`，标签条不会随内容抖动。
+const TAB_WIDTH_PX: f32 = 260.0;
+/// 标签最小宽度：可被压缩，但不能压到看不见（再多标签也保证图标 + 名字）。
+const TAB_MIN_WIDTH_PX: f32 = 96.0;
+/// 标签圆角（比托盘小一档，形成「槽里嵌胶囊」的层次）。
+const TAB_RADIUS_TRAY_PX: f32 = 13.0;
+/// 标签文字大小。
+const TAB_TEXT_PX: f32 = 13.0;
+/// 标签名字段的最大宽度：超过就省略，保证目录段总有位置。
+const TAB_TITLE_MAX_PX: f32 = 150.0;
+/// 程序方块边长。
+const TILE_SIZE_PX: f32 = 26.0;
+/// 方块内图形的边长。
+const TILE_GLYPH_PX: f32 = 15.0;
 
 /// 拖拽预览视图
 pub struct DragPreview {
@@ -319,6 +343,44 @@ fn render_working_label(
         .into_any_element()
 }
 
+/// 一次「前台状态」快照：agent 身份 + 回合状态 + 程序外观。
+///
+/// 三者都来自同一次前台探测，必须一起写入标签：分开传（`set_tab_agent` 再
+/// 跟一个 `modify_tab` 改程序）会在两帧之间出现「图标是 vim、状态点还是
+/// agent 的」这种撕裂组合。参数超过 7 个也会被 clippy 拦，聚成结构体后
+/// 调用点读起来也清楚。
+#[derive(Clone, Debug, Default)]
+pub struct TabAgentSnapshot {
+    /// 前台 CLI agent；`None` = 前台不是 agent（或 agent 已退出）。
+    pub agent: Option<CLIAgent>,
+    /// agent 的回合状态（只在 `agent` 为 `Some` 时有意义）。
+    pub status: AgentStatus,
+    /// 此刻是否真的在输出（见 [`TabItem::agent_streaming`]）。
+    pub streaming: bool,
+    /// agent 退出后图标回落成什么（由调用方决定）。
+    pub fallback: Option<Icon>,
+    /// 前台程序快照；`None` = 这一帧没有新信息，保持原值。
+    pub program: Option<crate::programs::Program>,
+}
+
+/// 标签左侧方块的内容（herdr terminals-bar 的 `tile()`）。
+///
+/// 与 [`crate::programs::Program`] 分开：这里是**渲染视图**——图标可能来自
+/// 程序表，也可能回落成标签自带的 `Icon`（恢复会话时还没有程序快照）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileProgram {
+    /// 图标路径（`icons/programs/vim.svg` 或 `icons/macos.svg`）。
+    pub icon: Option<String>,
+    /// 显示名，目前用于无障碍与拖拽预览。
+    pub name: String,
+    /// 方块底色（程序表里的品牌色）。
+    pub tile: Option<u32>,
+    /// 单色图形的颜色。
+    pub color: Option<u32>,
+    /// 是否按 `color` 着色（单色 mask）；否则当彩色图片画。
+    pub tint: bool,
+}
+
 /// 标签页项
 #[derive(Clone)]
 pub struct TabItem {
@@ -340,6 +402,16 @@ pub struct TabItem {
     ///
     /// `None` 表示「没有 agent」，此时不画状态点。
     pub agent_status: Option<AgentStatus>,
+    /// 标签的目录段（herdr terminals-bar 的 `where`）：弱化色画在名字之后。
+    ///
+    /// 空串表示没有可显示的目录。与 [`Self::label`] 同源（都来自
+    /// `TerminalView::tab_title_parts`），只是拆成了两段。
+    pub cwd_label: SharedString,
+    /// 前台程序快照：标签左侧方块的图标、底色与名字都来自它。
+    ///
+    /// `None` 表示「还不知道」（恢复会话、刚建标签、编辑器标签）——此时方块
+    /// 退回主题色 + 既有 `icon`，不要凭空编一个程序名。
+    pub program: Option<crate::programs::Program>,
     /// 这个 agent 此刻是否**真的在输出**（`Working` + 最近有 PTY 输出）。
     ///
     /// 与 [`Self::agent_status`] 分开：`Working` 是回合状态，会被迟到的
@@ -365,8 +437,36 @@ impl TabItem {
             is_remote: false,
             is_loading: false,
             needs_attention: false,
+            cwd_label: SharedString::default(),
+            program: None,
             agent_status: None,
             agent_streaming: false,
+        }
+    }
+
+    /// 标签左侧方块上要画的程序（herdr 的「program tile」）。
+    ///
+    /// 没有程序快照时回落成「用现有 `icon` + 主题色」的假程序，
+    /// 保证所有调用点都能无分支地画方块。
+    pub fn tile_program(&self) -> TileProgram {
+        match &self.program {
+            Some(program) => TileProgram {
+                icon: program
+                    .icon
+                    .clone()
+                    .or_else(|| self.icon.map(|icon| icon.path().to_string())),
+                name: program.name.clone(),
+                tile: program.tile,
+                color: program.color,
+                tint: program.is_tinted(),
+            },
+            None => TileProgram {
+                icon: self.icon.map(|icon| icon.path().to_string()),
+                name: self.label.to_string(),
+                tile: None,
+                color: None,
+                tint: true,
+            },
         }
     }
 
@@ -557,6 +657,12 @@ pub struct TabBar {
     on_tab_reconnect: OptionalTabCallback,
     /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
     on_context_menu: Option<ContextMenuCallback>,
+    /// 顶部「空间胶囊」的文案（herdr 的 space picker）：标签页组名。
+    ///
+    /// `None` = 不显示胶囊（编辑器栏、或调用方没接线）。
+    workspace_chip_label: Option<SharedString>,
+    /// 点击胶囊的回调（打开标签页组选择器）。
+    on_workspace_chip: Option<NewTabCallback>,
 }
 
 impl TabBar {
@@ -587,6 +693,8 @@ impl TabBar {
             on_tab_duplicate: None,
             on_tab_reconnect: None,
             on_context_menu: None,
+            workspace_chip_label: None,
+            on_workspace_chip: None,
         }
     }
 
@@ -712,6 +820,27 @@ impl TabBar {
         self.on_context_menu = Some(Rc::new(callback));
     }
 
+    /// 设置顶部「空间胶囊」：文案 + 点击回调；`None` 表示不显示。
+    pub fn set_workspace_chip(
+        &mut self,
+        label: Option<SharedString>,
+        on_click: Option<NewTabCallback>,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.workspace_chip_label != label
+            || self.on_workspace_chip.is_some() != on_click.is_some();
+        self.workspace_chip_label = label;
+        self.on_workspace_chip = on_click;
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// 当前胶囊文案（接线方切换 workspace 时用它保留/改写入口）。
+    pub fn workspace_chip_label(&self) -> Option<&SharedString> {
+        self.workspace_chip_label.as_ref()
+    }
+
     /// 获取右键菜单的目标标签 ID
     pub fn context_menu_tab_id(&self) -> Option<SharedString> {
         self.context_menu_tab_id.clone()
@@ -823,16 +952,20 @@ impl TabBar {
     pub fn set_tab_agent(
         &mut self,
         tab_id: &str,
-        agent: Option<CLIAgent>,
-        status: AgentStatus,
-        streaming: bool,
-        fallback: Option<Icon>,
+        snapshot: TabAgentSnapshot,
         cx: &mut Context<Self>,
     ) -> Option<AgentStatus> {
         if !self.accepts_agent_state {
             return None;
         }
 
+        let TabAgentSnapshot {
+            agent,
+            status,
+            streaming,
+            fallback,
+            program,
+        } = snapshot;
         let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
 
         // 没有 agent 就没有状态点，也不必记住状态：留着会让「agent 退出后
@@ -847,14 +980,26 @@ impl TabBar {
             None => fallback,
         };
 
+        // 图标与程序方块现在各司其职：图标保留给**列表/侧栏**等旧调用点，
+        // 标签本体画的是 `program`（herdr 的程序表，含 shell/vim/htop 等
+        // 非 agent 程序）。两者都由同一次前台探测产出，一起更新才不会错位。
+        let program_changed = program.as_ref() != tab.program.as_ref();
+
         let previous = tab.agent_status;
-        if tab.agent_status == status && tab.icon == icon && tab.agent_streaming == streaming {
+        if tab.agent_status == status
+            && tab.icon == icon
+            && tab.agent_streaming == streaming
+            && !program_changed
+        {
             return previous;
         }
 
         tab.agent_status = status;
         tab.icon = icon;
         tab.agent_streaming = streaming;
+        if let Some(program) = program {
+            tab.program = Some(program);
+        }
 
         cx.notify();
         previous
@@ -1730,8 +1875,13 @@ impl TabBar {
     }
 }
 
-impl Render for TabBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl TabBar {
+    /// 紧凑模式（编辑器标签栏）的渲染：沿用改造前的样式。
+    ///
+    /// 终端标签栏换成 herdr 的托盘样式（见 [`Self::render_tray`]）之后，
+    /// 编辑器栏保持原样：它显示的是文件，不是「终端里跑着什么程序」，
+    /// 套用程序方块与 260px 宽标签只会让人误读。
+    fn render_compact(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().ui;
         let on_panel_drop = self.on_panel_drop.clone();
 
@@ -1812,6 +1962,683 @@ impl Render for TabBar {
                     .child(self.render_tab_list(cx))
                     .children(new_tab_button),
             )
+            .into_any_element()
+    }
+
+    /// herdr Terminals LAYOUT 的顶栏标签：一条可横向滚动的「托盘」，
+    /// 里面是间距 3px、圆角 13px 的标签，选中的那块抬起来。
+    ///
+    /// 与旧版标签栏的区别（都是 herdr 的取舍，不是随手改的尺寸）：
+    /// - 标签**等宽**（`w(260)` + `flex_shrink(1)` + `min_w(0)`）：外壳不随内容
+    ///   抖动，切换标签时标签条不会左右蹦；这也是 herdr 敢把 cwd 画在标签里的前提。
+    /// - 选中态靠**底色 + 1px 描边**，未选中只有 hover 时的一点高光，两者不会
+    ///   看成同一种状态。
+    /// - 左侧方块是「程序」（vim / node / claude），不是「操作系统」：图标、
+    ///   底色、名字全部来自 `crate::programs`，与 herdr 的 `tile()` 一致。
+    /// - 关闭按钮**常驻占位、hover 才显形**，且与程序方块分处两端：herdr 是
+    ///   让方块在被悬停时变成 X，但那会让「点标签左侧」变成「关掉这个标签」，
+    ///   手一抖就关掉正在看的东西，这里有意不跟。
+    fn render_tray(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().ui;
+        let tray = Self::tray_colors(theme);
+        let on_panel_drop = self.on_panel_drop.clone();
+
+        let mut tabs: Vec<AnyElement> = Vec::with_capacity(self.tabs.len());
+        for index in 0..self.tabs.len() {
+            if let Some(preview) = self
+                .panel_drop_preview
+                .as_ref()
+                .filter(|preview| preview.insert_index == index)
+            {
+                tabs.push(Self::render_panel_drop_preview(theme, preview));
+            }
+            if let Some(tab) = self.tabs.get(index) {
+                tabs.push(self.render_tray_tab(tab, index, tray, cx));
+            }
+        }
+
+        div()
+            .id(self.id.clone())
+            .h_full()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            // 左键不冒泡到标题栏：否则点标签会先被标题栏当成「按在拖拽区」，
+            // 触发窗口移动（macOS 上还会抢走双击）。
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_drop(cx.listener({
+                let on_panel_drop = on_panel_drop.clone();
+                move |this, dragged: &DraggedPanel, window, cx| {
+                    let insert_index = this
+                        .panel_drop_preview
+                        .as_ref()
+                        .map(|preview| preview.insert_index);
+                    this.reset_panel_drop_preview(cx);
+                    if let Some(ref callback) = on_panel_drop {
+                        callback(dragged.clone(), insert_index, window, cx);
+                    }
+                }
+            }))
+            .on_action(Self::context_menu_action_listener::<CopyTabAddress>(
+                cx,
+                self.on_tab_copy_address.clone(),
+            ))
+            .on_action(Self::context_menu_action_listener::<DuplicateTab>(
+                cx,
+                self.on_tab_duplicate.clone(),
+            ))
+            .on_action(Self::context_menu_action_listener::<ReconnectTab>(
+                cx,
+                self.on_tab_reconnect.clone(),
+            ))
+            // 左侧「空间胶囊」：herdr 用一个胶囊显示当前 space 并点开选择器。
+            // deepterm 的对应概念是**标签页组**，胶囊显示组名、点开分组选择器。
+            // 没接回调时整块不出现（例如单组场景），保持标签条贴左。
+            .when_some(
+                self.on_workspace_chip
+                    .clone()
+                    .zip(self.workspace_chip_label.clone()),
+                |this, (callback, label)| {
+                    this.child(
+                        div()
+                            .id("workspace-chip")
+                            .flex_none()
+                            .h(px(30.0))
+                            .pl(px(10.0))
+                            .pr(px(12.0))
+                            .gap(px(8.0))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .bg(tray.chip)
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(tray.hover))
+                            .child(
+                                svg()
+                                    .size(px(15.0))
+                                    .text_color(tray.dim)
+                                    .path(Icon::Stack.path()),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(160.0))
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .text_color(tray.text)
+                                    .child(label),
+                            )
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(move |_event, window, cx| {
+                                cx.stop_propagation();
+                                callback(window, cx);
+                            }),
+                    )
+                },
+            )
+            .child(
+                // 托盘：标签列表的底，`p(3)` + `gap(3)` + 圆角 16 —— herdr 的
+                // 「一条胶囊槽里嵌着胶囊标签」。
+                div()
+                    .id("tab-tray")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_shrink_1()
+                    .min_w_0()
+                    // 高度取「36 与父高度」的较小者：标题栏标准高 44，托盘 36；
+                    // 但若被塞进更矮的容器（测试窗口、紧凑布局）也不能溢出，
+                    // 否则垂直居中后内容被裁掉、标签点不中。
+                    .h(px(TRAY_HEIGHT_PX))
+                    .max_h_full()
+                    .p(px(TRAY_PADDING_PX))
+                    .gap(px(TRAY_GAP_PX))
+                    .flex_nowrap()
+                    .rounded(px(TRAY_RADIUS_PX))
+                    .bg(tray.tray)
+                    // 溢出滚动**挂在托盘自身**：它宽度是内容推出来的（`flex_shrink_1`
+                    // + `min_w_0` 才是上限），套一层 `flex_1` 的内层容器会让托盘在
+                    // 「内容宽度 ↔ 弹性子项宽度」之间循环求解，实测解出来是 0 宽，
+                    // 标签永远点不到。
+                    .overflow_x_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .on_drag_move::<DraggedPanel>(cx.listener(|this, event, _window, cx| {
+                        this.handle_panel_drag_move(event, cx);
+                    }))
+                    .on_drag_move::<DraggedTab>(cx.listener(|this, event, _window, cx| {
+                        this.handle_tab_drag_move(event, cx);
+                    }))
+                    .on_drop(cx.listener({
+                        let on_tab_reorder = self.on_tab_reorder.clone();
+                        let on_tab_click = self.on_tab_click.clone();
+                        move |this, dragged: &DraggedTab, window, cx| {
+                            cx.stop_propagation();
+                            let insert_slot = this
+                                .reorder_preview
+                                .as_ref()
+                                .filter(|preview| preview.dragged_tab.tab_id == dragged.tab_id)
+                                .map(|preview| preview.insert_slot);
+                            let is_own_tab = this.tabs.iter().any(|t| t.id == dragged.tab_id);
+                            let fire_click_as_fallback =
+                                |window: &mut Window, cx: &mut Context<TabBar>| {
+                                    if is_own_tab && let Some(ref on_click) = on_tab_click {
+                                        on_click(dragged.tab_id.clone(), window, cx);
+                                    }
+                                };
+                            if let Some(insert_slot) = insert_slot {
+                                let did_reorder = this.apply_tab_reorder(dragged, insert_slot);
+                                this.reset_tab_reorder_preview(cx);
+                                if let Some(ref callback) = on_tab_reorder
+                                    && did_reorder.is_some()
+                                {
+                                    callback(dragged.clone(), insert_slot, cx);
+                                } else if did_reorder.is_none() {
+                                    fire_click_as_fallback(window, cx);
+                                }
+                            } else {
+                                this.clear_tab_reorder_preview(cx);
+                                fire_click_as_fallback(window, cx);
+                            }
+                        }
+                    }))
+                    .children(tabs),
+            )
+            // 托盘右侧的弹性留白：标签条不铺满整行，空隙留给窗口拖拽
+            // （TitleBar 的拖拽区在 TabBar 之后，这里只是不让标签条吃掉它）。
+            // `min_w_0` 是必须的：否则这块留白会把托盘挤到最小内容宽度以下。
+            .child(div().flex_1().min_w_0().h_full())
+            // 右侧「新建标签」图标按钮（herdr 的 iconButton）。
+            //
+            // herdr 在这个位置还有第二个按钮（命令面板 `app.palette`）。
+            // deepterm 没有命令面板，硬凑一个按钮只会多出一个来路不明的
+            // 图标——设置入口本来就在侧边栏，这里不复制一份。
+            .when_some(self.on_new_tab.clone(), |this, callback| {
+                this.child(Self::render_tray_icon_button(
+                    "tm-new",
+                    Icon::Plus,
+                    tray,
+                    callback,
+                ))
+            })
+            .into_any_element()
+    }
+
+    /// 托盘右侧的图标按钮（herdr 的 `iconButton`）：17px 图形、7px 内边距、
+    /// 8px 圆角，hover 时浮出一块底色。
+    fn render_tray_icon_button(
+        id: &'static str,
+        icon: Icon,
+        tray: TrayColors,
+        on_click: NewTabCallback,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .flex_none()
+            .p(px(7.0))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .hover(move |style| style.bg(tray.chip))
+            .child(svg().size(px(17.0)).text_color(tray.dim).path(icon.path()))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_click(move |_event, window, cx| {
+                cx.stop_propagation();
+                on_click(window, cx);
+            })
+            .into_any_element()
+    }
+
+    /// 托盘里的单个标签（herdr `terminals-bar` 的 `tab()`）。
+    ///
+    /// 布局：`[程序方块] [名字 (flex_none)] [目录 (truncate)]`，右侧 hover 时
+    /// 让方块变成关闭按钮——与 herdr「图标位置显示关闭」的取舍一致：不额外
+    /// 占宽，标签等宽也不抖。
+    fn render_tray_tab(
+        &self,
+        tab: &TabItem,
+        index: usize,
+        tray: TrayColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().ui;
+        let tab_id = tab.id.clone();
+        let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
+        let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab_id);
+        let program = tab.tile_program();
+
+        let start_offset =
+            self.tab_offset_for_preview(self.previous_reorder_preview.as_ref(), index);
+        let end_offset = self.tab_offset_for_preview(self.reorder_preview.as_ref(), index);
+        let start_opacity =
+            self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
+        let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
+
+        let title_color = if is_active { tray.text } else { tray.muted };
+        let cwd_color = tray.dim;
+        // 扫光文字要在它上面可见：取标签自己的底色（选中 = 抬起的那块，
+        // 未选中 = 托盘底）。
+        let surface = if is_active { tray.selected } else { tray.tray };
+
+        // 程序方块常驻，**不**被关闭按钮顶替：方块是「这是什么程序」的身份，
+        // 悬停时把它换成 X 会让「点左边选标签」变成「点左边关标签」——
+        // 手一抖就关掉正在看的东西。关闭按钮固定占右侧 16px，hover 才显形，
+        // 占位恒定所以标签宽度不会跟着抖动。
+        //
+        // agent 回合状态点压在程序方块上（herdr 同款）。只在真有程序方块
+        // 时画：恢复会话等场景下 program/icon 都可能为空，空方块上点一个
+        // 点既没信息量，也会让一次状态变化改到与它无关的几何。
+        let dot = (tab.program.is_some() || matches!(tab.icon, Some(Icon::AgentIcon { .. })))
+            .then_some(tab.agent_status)
+            .flatten();
+        let icon_slot = Self::render_program_tile(&program, dot, tray, theme);
+
+        let label =
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .gap(px(6.0))
+                .items_center()
+                // 两个语义圆点：灰点 = 未保存改动，红点 = 「需要你看一眼」
+                // （后台铃 / agent 跑完一回合）。与旧版一致，herdr 的托盘不画它们，
+                // 但 deepterm 的编辑器与铃铛依赖这两个点做未读提示。
+                .when(tab.is_modified, |this| {
+                    this.child(
+                        div()
+                            .size(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(if is_active {
+                                tray.muted
+                            } else {
+                                tray.muted.opacity(0.7)
+                            }),
+                    )
+                })
+                .when(should_show_attention_dot(tab), |this| {
+                    this.child(
+                        div()
+                            .size(px(7.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(theme.error),
+                    )
+                })
+                // herdr 把名字设为 `flex_none`、目录设 `truncate`：先保证「这是什么」
+                // 完整，再让「在哪儿」在剩余宽度里省略。名字本身也留一个最大宽度，
+                // 否则一个超长进程名会把目录段整段挤没。
+                //
+                // 文字宽度用「幽灵 sizer」撑住（见 `render_tab_label` 的文档）：
+                // 扫光每帧改变高亮分段，gpui 会按分段重新 shaping，行宽在整像素间
+                // 振荡；让普通文本（宽度恒定）占位、扫光以覆盖层叠上去，标签
+                // 才不会逐帧微抖。
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .max_w(px(TAB_TITLE_MAX_PX))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(TAB_TEXT_PX))
+                                .text_color(title_color)
+                                .when(tab.is_agent_streaming(), |this| this.opacity(0.0))
+                                .child(tab.label.clone()),
+                        )
+                        .when(tab.is_agent_streaming(), |this| {
+                            this.child(div().absolute().top_0().left_0().child(
+                                render_working_label(
+                                    &tab.id,
+                                    &tab.label,
+                                    title_color,
+                                    Self::agent_sweep_color(
+                                        tab.agent_accent_rgb().unwrap_or(0),
+                                        title_color,
+                                        surface,
+                                        theme.accent,
+                                    ),
+                                ),
+                            ))
+                        }),
+                )
+                .when(!tab.cwd_label.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(TAB_TEXT_PX))
+                            .text_color(cwd_color)
+                            .child(tab.cwd_label.clone()),
+                    )
+                })
+                // herdr 的「正在干活」指示：转圈。它由 `agent_streaming`（真的在
+                // 输出）驱动，而不是回合状态——一个静默的 agent 不该永远转。
+                .when(tab.is_agent_streaming(), |this| {
+                    this.child(
+                        svg()
+                            .flex_none()
+                            .size(px(12.0))
+                            .text_color(theme.warning)
+                            .path(Icon::Loader.path())
+                            .with_animation(
+                                format!("tab-working-{}", tab.id),
+                                Animation::new(Duration::from_millis(900))
+                                    .repeat()
+                                    .with_easing(ease_in_out),
+                                |this, delta| {
+                                    this.with_transformation(Transformation::rotate(percentage(
+                                        delta,
+                                    )))
+                                },
+                            ),
+                    )
+                });
+
+        let tab_inner = div()
+            .id(tab_id.clone())
+            .h_full()
+            .w(px(TAB_WIDTH_PX))
+            .flex_shrink_1()
+            .min_w(px(TAB_MIN_WIDTH_PX))
+            .pl(px(5.0))
+            .pr(px(12.0))
+            .gap(px(9.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .rounded(px(TAB_RADIUS_TRAY_PX))
+            .border_1()
+            .when(is_active, |this| {
+                this.bg(tray.selected).border_color(tray.selected_edge)
+            })
+            .when(!is_active, |this| {
+                this.border_color(gpui::transparent_black())
+                    .hover(move |style| style.bg(tray.hover))
+            })
+            .cursor_pointer()
+            .on_hover(cx.listener({
+                let tab_id = tab_id.clone();
+                move |this, hovered: &bool, _window, cx| {
+                    let next = hovered.then(|| tab_id.clone());
+                    if this.hovered_tab_id != next {
+                        this.hovered_tab_id = next;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_drag(
+                DraggedTab {
+                    tab_id: tab_id.clone(),
+                    from_index: index,
+                },
+                {
+                    let label = tab.label.clone();
+                    move |_drag_data, position, window, cx| {
+                        cx.stop_propagation();
+                        let preview = DragPreview::new(label.clone(), position, window, cx);
+                        cx.new(move |_cx| preview)
+                    }
+                },
+            )
+            .child(icon_slot)
+            .child(label)
+            .child(Self::render_tray_close_slot(
+                tab_id.clone(),
+                is_active,
+                is_hovered,
+                tray,
+                self.on_tab_close.clone(),
+                cx,
+            ))
+            .on_click(cx.listener({
+                let on_tab_click = self.on_tab_click.clone();
+                let tab_id = tab_id.clone();
+                move |_this, _event: &gpui::ClickEvent, window, cx| {
+                    if let Some(ref callback) = on_tab_click {
+                        callback(tab_id.clone(), window, cx);
+                    }
+                }
+            }))
+            // 左键：阻止冒泡到标题栏触发窗口拖拽
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            // 中键关闭（浏览器/终端通用习惯）
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener({
+                    let on_tab_close = self.on_tab_close.clone();
+                    let tab_id = tab_id.clone();
+                    move |_this, _event, window, cx| {
+                        if let Some(ref callback) = on_tab_close {
+                            callback(tab_id.clone(), window, cx);
+                        }
+                    }
+                }),
+            )
+            .context_menu(format!("tab-menu-{}", tab_id), {
+                let tab_id = tab_id.clone();
+                let on_context_menu = self.on_context_menu.clone();
+                let tabs = cx.entity();
+                move |menu: PopupMenu, window, cx| {
+                    tabs.update(cx, |bar, _| {
+                        bar.context_menu_tab_id = Some(tab_id.clone());
+                    });
+                    if let Some(ref cb) = on_context_menu {
+                        cb(tab_id.clone(), menu, window, cx)
+                    } else {
+                        menu
+                    }
+                }
+            });
+
+        let needs_animation = start_offset != end_offset || start_opacity != end_opacity;
+        if needs_animation {
+            let animation_id = format!("tab-reorder-{}-{}", tab_id, self.reorder_animation_epoch);
+            div()
+                .child(tab_inner)
+                .flex_shrink_0()
+                .with_animation(
+                    animation_id,
+                    Animation::new(Duration::from_millis(TAB_REORDER_ANIMATION_DURATION_MS))
+                        .with_easing(ease_out_quint()),
+                    move |this, delta| {
+                        let offset = start_offset + (end_offset - start_offset) * delta;
+                        let opacity = start_opacity + (end_opacity - start_opacity) * delta;
+                        this.left(px(offset)).opacity(opacity)
+                    },
+                )
+                .into_any_element()
+        } else {
+            tab_inner.into_any_element()
+        }
+    }
+
+    /// hover 时方块位置显示关闭按钮（herdr / 旧版 deepterm 的共同取舍：
+    /// 不额外占宽，标签等宽不抖）。
+    fn render_tray_close_slot(
+        tab_id: SharedString,
+        is_active: bool,
+        is_hovered: bool,
+        tray: TrayColors,
+        on_tab_close: OptionalTabCallback,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(format!("tab-close-{}", tab_id))
+            .flex_none()
+            .w(px(16.0))
+            .h(px(16.0))
+            .rounded(px(4.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            // 常驻占位、hover 才显形：占位恒定，标签不会因为「鼠标移上来」
+            // 改变宽度（那会让整排标签左右跳）。
+            .opacity(if is_hovered { 1.0 } else { 0.0 })
+            .hover(move |style| style.bg(tray.hover))
+            .child(
+                svg()
+                    .size(px(12.0))
+                    .text_color(if is_active { tray.text } else { tray.muted })
+                    .path(Icon::XmarkCircleFill.path()),
+            )
+            // 用 click 而不是 mouse_down：mouse_down 里 stop_propagation 会把
+            // 父标签的 click 候选一起掐掉，正中点击反而选不中这个标签。
+            .on_click(
+                cx.listener(move |_this, _event: &gpui::ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(ref callback) = on_tab_close {
+                        callback(tab_id.clone(), window, cx);
+                    }
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// herdr terminals-bar 的托盘颜色：标签条自己是一块比背景略深的底，
+    /// 选中的标签从这块底上「浮」出来。
+    ///
+    /// 五档颜色全部从主题令牌推导，不写死 herdr 的 `#1d1f22` / `#34373c`
+    /// 那套 hex：deepterm 有 31 个明暗主题，写死会在一半主题上糊掉。
+    fn tray_colors(theme: UiTheme) -> TrayColors {
+        let dark = theme.text.l > 0.5;
+        // 托盘底：比应用背景深一档（暗色主题）或深半档（亮色主题）。
+        let tray = if dark {
+            theme.app_background.blend(gpui::rgba(0x00000026).into())
+        } else {
+            theme.app_background.blend(gpui::rgba(0x00000012).into())
+        };
+        // 选中标签：抬起一档，与托盘拉开距离；描边再亮一点，形成 herdr 的
+        // 1px「边缘高光」。
+        let selected = theme.elevated_background;
+        let selected_edge = if dark {
+            theme.border.blend(gpui::rgba(0xffffff14).into())
+        } else {
+            theme.border.blend(gpui::rgba(0x00000014).into())
+        };
+        TrayColors {
+            tray,
+            selected,
+            selected_edge,
+            // 未选中标签 hover：极轻的白色（暗色）/ 黑色（亮色）覆盖。
+            hover: if dark {
+                gpui::rgba(0xffffff0d).into()
+            } else {
+                gpui::rgba(0x0000000a).into()
+            },
+            // 胶囊（左侧空间按钮）与右侧图标按钮的底。
+            chip: theme.panel_background.blend(if dark {
+                gpui::rgba(0xffffff0a).into()
+            } else {
+                gpui::rgba(0x00000008).into()
+            }),
+            text: theme.text,
+            muted: theme.text_muted,
+            dim: theme.icon_muted,
+        }
+    }
+
+    /// 程序方块（herdr 的 `tile()`）：26px 圆角方块，品牌底色 + 图形，
+    /// agent 有回合状态时在右上角压一个状态点。
+    ///
+    /// 图形有两种画法，与 herdr 一致：
+    /// - `tint`：SVG 当 alpha mask，用 `color`（或主题文字色）着色；
+    /// - 否则：当彩色图片画（Claude / Codex / Kimi 这类自带配色的 logo）。
+    fn render_program_tile(
+        program: &TileProgram,
+        status: Option<AgentStatus>,
+        tray: TrayColors,
+        theme: UiTheme,
+    ) -> AnyElement {
+        let size = px(TILE_SIZE_PX);
+        let fill: Hsla = program
+            .tile
+            .map(|value| rgb(value).into())
+            .unwrap_or(tray.chip);
+
+        let glyph: AnyElement = match program.icon.as_ref() {
+            Some(path) if program.tint => svg()
+                .size(px(TILE_GLYPH_PX))
+                .text_color(program.color.map(|v| rgb(v).into()).unwrap_or(theme.text))
+                .path(SharedString::from(path.clone()))
+                .into_any_element(),
+            Some(path) => gpui::img(SharedString::from(path.clone()))
+                .w(px(TILE_GLYPH_PX))
+                .h(px(TILE_GLYPH_PX))
+                .into_any_element(),
+            None => div().into_any_element(),
+        };
+
+        div()
+            .relative()
+            .flex_none()
+            .size(size)
+            .rounded(px(7.0))
+            .border_1()
+            .border_color(if matches!(program.tile, Some(0x000000..=0x1f1f1f)) {
+                // 近黑底色（Claude / Codex / Kimi 的 `#1c1d21`）在暗色标签上
+                // 会糊成一片，补一道极淡描边把方块「切」出来。
+                gpui::rgba(0xffffff14).into()
+            } else {
+                gpui::transparent_black()
+            })
+            .bg(fill)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(glyph)
+            .when_some(status.and_then(agent_dot), |this, (dot_rgb, shape)| {
+                this.child(
+                    div()
+                        .absolute()
+                        // herdr 是 `top(-4).right(-4).size(11)` + 2px 描边，
+                        // 托盘底色的描边把点从方块上「摘」出来。
+                        .top(px(-4.0))
+                        .right(px(-4.0))
+                        .size(px(11.0))
+                        .rounded_full()
+                        .border_2()
+                        .border_color(tray.tray)
+                        .when(shape == AgentDot::Filled, |this| this.bg(rgb(dot_rgb)))
+                        .when(shape == AgentDot::Hollow, |this| {
+                            this.border_1().border_color(rgb(dot_rgb))
+                        }),
+                )
+            })
+            .into_any_element()
+    }
+}
+
+/// 托盘样式的颜色集合（见 [`TabBar::tray_colors`]）。
+#[derive(Clone, Copy)]
+struct TrayColors {
+    tray: Hsla,
+    selected: Hsla,
+    selected_edge: Hsla,
+    hover: Hsla,
+    chip: Hsla,
+    text: Hsla,
+    muted: Hsla,
+    dim: Hsla,
+}
+
+impl Render for TabBar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 紧凑模式就是编辑器标签栏：那边保持旧样式，终端栏走新的托盘样式。
+        if self.compact {
+            return self.render_compact(window, cx).into_any_element();
+        }
+        self.render_tray(cx).into_any_element()
     }
 }
 
@@ -2116,7 +2943,7 @@ mod tests {
 
     #[gpui::test]
     fn tab_right_click_opens_menu_and_action_reaches_handler(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| crate::theme::init(cx));
+        cx.update(crate::theme::init);
 
         let menu_built = std::sync::Arc::new(std::sync::Mutex::new(false));
         let action_tab = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
@@ -2189,7 +3016,7 @@ mod tests {
     /// 预览）。此时原位 drop 必须把这次落点补发为一次点击。
     #[gpui::test]
     fn jittered_press_still_fires_tab_click(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| crate::theme::init(cx));
+        cx.update(crate::theme::init);
 
         let clicked = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let reordered = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -2403,6 +3230,54 @@ mod tests {
         );
     }
 
+    /// 托盘标签的方块取自程序表（herdr 的 `tile()`）；没有程序快照时
+    /// 退回标签自带的 `Icon`，不能画出一个空方块。
+    #[test]
+    fn tile_program_prefers_program_table_and_falls_back_to_icon() {
+        let mut tab = TabItem::new("t", "vim").with_icon(Some(Icon::Terminal));
+        // 没有程序快照：用标签自带图标，底色留给主题。
+        let fallback = tab.tile_program();
+        assert_eq!(
+            fallback.icon.as_deref(),
+            Some(Icon::Terminal.path().as_ref())
+        );
+        assert_eq!(fallback.tile, None);
+        assert!(fallback.tint, "回落时按单色 mask 着色，跟随主题文字色");
+
+        // 有程序快照：图标/底色/名字全部来自程序表。
+        tab.program = Some(crate::programs::of(None, &["vim".to_string()]));
+        let from_table = tab.tile_program();
+        assert_eq!(
+            from_table.icon.as_deref(),
+            Some("icons/programs/vim.svg"),
+            "程序表里的 vim 必须有它自己的图标"
+        );
+        assert_eq!(from_table.tile, Some(0x019733), "Vim 的品牌绿");
+        assert_eq!(from_table.name, "Vim");
+    }
+
+    /// 单色程序（`tint`）与彩色程序（Claude / Codex 这类自带配色的 logo）
+    /// 必须分别走 SVG 着色与图片两条渲染路径。
+    #[test]
+    fn tile_program_distinguishes_tinted_and_picture_icons() {
+        let tinted = crate::programs::of(None, &["python".to_string()]);
+        assert!(tinted.is_tinted(), "python 的图标是单色 mask");
+        assert!(!tinted.icon.clone().unwrap().is_empty());
+
+        let picture = crate::programs::of(Some("claude-code"), &[]);
+        assert!(!picture.is_tinted(), "Claude 的 logo 自带彩色，不能当 mask");
+        assert_eq!(picture.tile, Some(0x1C1D21));
+    }
+
+    /// 两段式标签：名字与目录分开存，空目录不占位（herdr 的 `where`）。
+    #[test]
+    fn cwd_label_stays_empty_when_unknown() {
+        let mut tab = TabItem::new("t", "zsh");
+        assert!(tab.cwd_label.is_empty());
+        tab.cwd_label = "~/Documents/deepterm".into();
+        assert_eq!(tab.cwd_label.as_ref(), "~/Documents/deepterm");
+    }
+
     /// 编辑器标签栏必须拒绝 agent 状态——agent 只属于跑着它的终端标签。
     ///
     /// 同一窗口里有**两个** `TabBar`：终端栏（`tab-bar`）与编辑器栏
@@ -2425,10 +3300,12 @@ mod tests {
         let outcome = bar.update(cx, |bar, cx| {
             bar.set_tab_agent(
                 "file-1",
-                Some(CLIAgent::Claude),
-                AgentStatus::Working,
-                true,
-                None,
+                TabAgentSnapshot {
+                    agent: Some(CLIAgent::Claude),
+                    status: AgentStatus::Working,
+                    streaming: true,
+                    ..Default::default()
+                },
                 cx,
             )
         });
@@ -2460,10 +3337,12 @@ mod tests {
         bar.update(cx, |bar, cx| {
             bar.set_tab_agent(
                 "tab-1",
-                Some(CLIAgent::Claude),
-                AgentStatus::Working,
-                true,
-                None,
+                TabAgentSnapshot {
+                    agent: Some(CLIAgent::Claude),
+                    status: AgentStatus::Working,
+                    streaming: true,
+                    ..Default::default()
+                },
                 cx,
             );
         });

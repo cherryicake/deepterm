@@ -36,7 +36,7 @@ use crate::workspace::session_state::{
 };
 use crate::workspace::split_manager::{SplitContainer, SplitDirection, SplitNavDirection};
 use crate::workspace::tab_bar::{
-    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabBar, TabItem,
+    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabAgentSnapshot, TabBar, TabItem,
 };
 
 // Define workspace actions
@@ -1046,7 +1046,13 @@ impl Workspace {
             PanelEvent::BroadcastToggle { .. } => {
                 self.handle_broadcast_toggle(cx);
             }
-            PanelEvent::TabLabelChanged { panel_id, label } => {
+            PanelEvent::TabLabelChanged {
+                panel_id,
+                label,
+                program,
+                title,
+                cwd,
+            } => {
                 if let Some((tab_id, tab_type)) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
                     tab_info
                         .container
@@ -1063,7 +1069,11 @@ impl Workspace {
                             tab_bar.modify_tab(
                                 &tab_id,
                                 |tab| {
-                                    tab.label = label.clone().into();
+                                    tab.label = title.clone().into();
+                                    tab.cwd_label = cwd.clone().into();
+                                    // 程序方块（图标 + 底色 + 显示名）与标题同源：
+                                    // 前台从 `vim` 换成 `htop` 时标题和图标必须一起变。
+                                    tab.program = Some(program.clone());
                                 },
                                 cx,
                             );
@@ -1093,6 +1103,7 @@ impl Workspace {
                 agent,
                 status,
                 streaming,
+                program,
             } => {
                 // 找到包含该 panel 的 tab，更新其 agent 图标 / 状态点。
                 let Some(tab_id) = self.tabs.iter().find_map(|(tab_id, tab_info)| {
@@ -1110,7 +1121,17 @@ impl Workspace {
                 let is_active = tab_id == self.active_tab_id;
 
                 let previous = self.tab_bar.update(cx, |tab_bar, cx| {
-                    tab_bar.set_tab_agent(&tab_id, *agent, *status, *streaming, fallback, cx)
+                    tab_bar.set_tab_agent(
+                        &tab_id,
+                        TabAgentSnapshot {
+                            agent: *agent,
+                            status: *status,
+                            streaming: *streaming,
+                            fallback,
+                            program: Some(program.clone()),
+                        },
+                        cx,
+                    )
                 });
 
                 // 「需关注」红点只认 Working → Done 这个**边沿**，而不是

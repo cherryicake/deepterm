@@ -2507,6 +2507,76 @@ impl TerminalView {
         }
     }
 
+    /// herdr 风格的标签两段式文本：`(名称, 目录)`。
+    ///
+    /// herdr 的 terminals-bar 把标签拆成「名字」与「所在目录」两段：名字用
+    /// 主文字色、目录用弱化色，中间留一个 gap——一条标签同时回答「这是什么」
+    /// 和「在哪儿」。deepterm 的 `tab_label` 把两者拼成一个字符串喂给旧版
+    /// 单行标签，这里按同样的信息源拆开，名字仍是 `tab_label` 的前半段，
+    /// 保证搜索/拖拽预览等旧调用点行为不变。
+    ///
+    /// 返回值里目录为空串表示没有可显示的目录（远程尚未上报、取不到 cwd），
+    /// 调用方据此不画第二段。
+    pub fn tab_title_parts(&self, cx: &App) -> (String, String) {
+        let term = self.terminal.read(cx);
+
+        if term.is_remote() {
+            let host = self
+                .ssh_config
+                .as_ref()
+                .map(|c| c.nickname.clone().unwrap_or_else(|| c.host.clone()))
+                .unwrap_or_else(|| self.title().to_string());
+            let process = term.remote_process_name();
+            let username = self.ssh_config.as_ref().map(|c| c.username.as_str());
+            let cwd = self
+                .current_remote_working_directory(cx)
+                .map(|p| {
+                    if let Some(user) = username {
+                        let home_path = format!("/home/{}", user);
+                        if p == home_path {
+                            return "~".to_string();
+                        }
+                        let home_prefix = format!("{}/", home_path);
+                        if let Some(rest) = p.strip_prefix(&home_prefix) {
+                            return format!("~/{}", rest);
+                        }
+                    }
+                    if p == "/home" { "/home".to_string() } else { p }
+                })
+                .unwrap_or_default();
+            // 远程：名字段带上主机，目录段是远端 cwd。进程名在 herdr 里是
+            // 程序方块的身份（图标已说明），这里只在没有进程名时退而用它。
+            let name = match process {
+                Some(proc) => format!("{} · {}", host, proc),
+                None => host,
+            };
+            return (name, cwd);
+        }
+
+        let process_name = term
+            .foreground_process_name()
+            .or_else(|| term.shell_name().map(|s| s.to_string()));
+        let cwd = self.current_local_working_directory(cx);
+        let cwd_display = cwd.as_ref().and_then(|p| {
+            let path = p.to_string_lossy();
+            let home = dirs::home_dir()?;
+            let home_str = home.to_string_lossy();
+            if path.starts_with(home_str.as_ref()) {
+                Some(format!("~{}", &path[home_str.len()..]))
+            } else {
+                Some(path.to_string())
+            }
+        });
+
+        match (process_name, cwd_display) {
+            (Some(proc), Some(cwd)) => (proc, cwd),
+            (Some(proc), None) => (proc, String::new()),
+            // 没有前台程序（shell 自己）：名字用 shell 名，目录单独一段。
+            (None, Some(cwd)) => (term.shell_name().unwrap_or("Terminal").to_string(), cwd),
+            (None, None) => ("Local Terminal".to_string(), String::new()),
+        }
+    }
+
     /// Tab 图标/状态点所需的 agent 快照：`(身份, 回合状态)`。
     ///
     /// 两者在同一个 `terminal.read` 里取出，保证不会读到「新身份配旧状态」的
@@ -2514,6 +2584,41 @@ impl TerminalView {
     ///
     /// 没有 agent 时身份为 `None`，状态回落 `AgentStatus::default()`（`Idle`）：
     /// 此时调用方应当忽略状态，只用 `None` 去把 tab 图标换回 OS 图标。
+    /// 当前前台程序在 `crate::programs` 表里的外观（图标 / 方块色 / 名称）。
+    ///
+    /// 输入是**同一次探测**产出的 argv 与（可能的）agent 身份：
+    ///
+    /// - 本地终端：`Terminal::foreground_argv` 是 `tcgetpgrp` + `/proc` /
+    ///   `sysctl` 拿到的前台进程命令行，`vim` / `node .../vite` 都能认出来；
+    ///   shell 回到前台时 argv 为 `None`，直接按 shell 名解析。
+    /// - 远程终端：没有本机进程可查，退回 SSH 上报的前台进程名
+    ///   （[`Terminal::remote_process_name`]）与 shell 名。
+    ///
+    /// agent 身份优先：它是唯一知道「我到底是谁」的来源，进程名常被包装成
+    /// `node` / `python`。这与 herdr 的 `programs::of(app, argv)` 同一套顺序。
+    pub fn foreground_program(&self, cx: &App) -> crate::programs::Program {
+        let term = self.terminal.read(cx);
+        let app = term.foreground_agent().map(|agent| agent.slug());
+        let own_argv = term.foreground_argv();
+        let remote = term.remote_process_name();
+        let shell = term.shell_name();
+        if own_argv.is_none()
+            && let Some(name) = remote
+        {
+            // 远程：只有进程名，够查表了（`claude` / `vim` / `htop` …）。
+            return crate::programs::of(app, &[name.to_string()]);
+        }
+        match own_argv {
+            Some(argv) if !argv.is_empty() => crate::programs::of(app, argv),
+            // 前台是 shell（没有前台程序）：按 shell 程序路径解析，
+            // 让标签显示 `Shell` 的绿色终端方块而不是空图标。
+            _ => crate::programs::of(
+                app,
+                &shell.map(str::to_string).into_iter().collect::<Vec<_>>(),
+            ),
+        }
+    }
+
     pub fn agent_tab_state(&self, cx: &App) -> (Option<CLIAgent>, AgentStatus) {
         let term = self.terminal.read(cx);
         let agent = term.foreground_agent();
@@ -6356,8 +6461,8 @@ mod tests {
         // 模拟一次「检测什么都不知道」：headless 没有 pty fd，
         // 检测会返回 `Unavailable`（缺 fd 属于「查不了」，不是「没有 agent」）。
         assert_eq!(
-            Terminal::detect_agent_for_local(None, None),
-            crate::terminal::terminal::LocalAgentProbe::Unavailable,
+            Terminal::detect_agent_for_local(None, None).outcome,
+            crate::terminal::terminal::LocalAgentOutcome::Unavailable,
             "前提：缺 fd 必须是「查不了」，不能是有效结论"
         );
         view.update(cx, |view, cx| {
@@ -6392,7 +6497,7 @@ mod tests {
     #[gpui::test]
     fn conclusive_no_agent_probe_clears_the_icon(cx: &mut TestAppContext) {
         use crate::agent::CLIAgent;
-        use crate::terminal::terminal::LocalAgentProbe;
+        use crate::terminal::terminal::{LocalAgentOutcome, LocalAgentProbe};
 
         cx.update(|cx| {
             crate::theme::init(cx);
@@ -6419,7 +6524,13 @@ mod tests {
         // 拿到了 argv 但没有一个 token 命中：这是**结论**。
         view.update(cx, |view, cx| {
             view.terminal.update(cx, |term, cx| {
-                term.apply_detected_agent(LocalAgentProbe::NoAgent, cx)
+                term.apply_detected_agent(
+                    LocalAgentProbe {
+                        argv: Some(vec!["vim".to_string()]),
+                        outcome: LocalAgentOutcome::NoAgent,
+                    },
+                    cx,
+                )
             });
         });
         cx.run_until_parked();

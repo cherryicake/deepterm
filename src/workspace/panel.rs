@@ -104,6 +104,18 @@ pub enum PanelEvent {
     TabLabelChanged {
         panel_id: String,
         label: String,
+        /// 同一时刻的前台程序快照。标签的「程序方块」用它上色/换图标，
+        /// 与 `label` 同源（都由 `TerminalView::tab_label` 那套状态推出），
+        /// 一起下发才不会出现「标题是 vim、图标还是 shell」的错位。
+        program: crate::programs::Program,
+        /// 标签的「名字段」（herdr 两段式标签的前半）。
+        ///
+        /// 与 `label` 分开：`label` 仍是拼好的 `进程: 目录` 全文，会话恢复、
+        /// 侧边栏列表、拖拽预览都还按它显示；新标签栏画的是 `title` + `cwd`
+        /// 两段。
+        title: String,
+        /// 标签的目录段（herdr 的两段式标签：名字 + 目录）。
+        cwd: String,
     },
     /// 后台铃：所属 tab 点亮需关注红点，切到该 tab 后自动清除。
     BellRang {
@@ -121,6 +133,12 @@ pub enum PanelEvent {
         /// 此刻是否真的在输出（见 `TerminalView::agent_output_streaming`）。
         /// tab 的扫光只看这个，不看 `status`。
         streaming: bool,
+        /// 前台程序快照（图标 / 方块色 / 名称），见 `TerminalView::foreground_program`。
+        ///
+        /// 与 agent 一起下发而不是让 workspace 回头去读：两者都来自同一次
+        /// 前台探测，分开读会出现「图标是 vim、状态点还是 agent 的」这种
+        /// 撕裂帧。
+        program: crate::programs::Program,
     },
 }
 
@@ -311,9 +329,14 @@ impl Panel {
                 }
                 TerminalViewEvent::WorkingDirectoryChanged | TerminalViewEvent::TitleChanged => {
                     let label = view.read(cx).tab_label(cx);
+                    let (title, cwd) = view.read(cx).tab_title_parts(cx);
+                    let program = view.read(cx).foreground_program(cx);
                     cx.emit(PanelEvent::TabLabelChanged {
                         panel_id: close_panel_id.clone(),
                         label,
+                        program,
+                        title,
+                        cwd,
                     });
                     cx.notify(); // 触发 Panel 标题栏重绘
                     if matches!(event, TerminalViewEvent::WorkingDirectoryChanged) {
@@ -330,11 +353,13 @@ impl Panel {
                     // 「变了」，具体变成什么以 terminal 当前状态为准。
                     let (agent, status) = view.read(cx).agent_tab_state(cx);
                     let streaming = view.read(cx).agent_output_streaming(cx);
+                    let program = view.read(cx).foreground_program(cx);
                     cx.emit(PanelEvent::AgentStateChanged {
                         panel_id: close_panel_id.clone(),
                         agent,
                         status,
                         streaming,
+                        program,
                     });
                 }
             },
