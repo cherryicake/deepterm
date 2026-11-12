@@ -907,16 +907,16 @@ pub const SETTINGS_REL_PATH: &str = ".claude/settings.json";
 /// settings.json 里的 entry——不必去翻 Claude 自己的目录。
 pub const HOOK_SCRIPT_REL_DIR: &str = ".deepterm/hooks";
 
-/// hook 脚本文件名。
+/// Claude 专用 hook 脚本的文件名（在 [`HOOK_SCRIPT_REL_DIR`] 下）。
 ///
-/// **必须**与 [`REPORTER_REL_PATH`] 指向同一个文件：安装侧写的是
-/// `REPORTER_REL_PATH`，而 settings.json 里的 hook 命令拼的是这里。
-/// 两者曾不一致（这里是 `claude-hook.sh`、安装写 `agent-report.sh`），
-/// 于是 `[ -x "$HOME/..." ]` 守卫永远为假、hook 静默退出——**所有平台、
-/// 所有 agent 的事件上报都不曾生效**，状态点因此永远是 Idle。
+/// **它与 [`REPORTER_REL_PATH`] 是两个不同的文件，不要混淆**：
+/// - 这个名字给 **Claude** 用：`install_claude_hook_*` 把 [`hook_script()`]
+///   写到它，`plan_install` 又把指向它的命令写进 `settings.json`。两侧同源。
+/// - [`REPORTER_REL_PATH`]（`agent-report.sh`）是**其他 agent** 的通用上报
+///   脚本，`reporter_command()` 引用它。
 ///
-/// 不要再各写一份字面量：直接从 `REPORTER_REL_PATH` 取末段。
-pub const HOOK_SCRIPT_FILE_NAME: &str = "agent-report.sh";
+/// 两者内容不同（事件名大小写、agent 白名单都不一样），所以不能合并。
+pub const HOOK_SCRIPT_FILE_NAME: &str = "claude-hook.sh";
 
 /// 生成 hook 脚本的完整内容。
 ///
@@ -2427,27 +2427,25 @@ mod tests {
         assert!(has_deepterm_hook(&installed));
     }
 
-    /// 装进去的 hook 命令必须指向**实际写下的那个脚本**。
+    /// 写进 settings.json 的 hook 命令必须指向 Claude 专用脚本。
     ///
-    /// 这条守的是一个曾让整套上报静默失效的 bug：安装侧写
-    /// `REPORTER_REL_PATH`（`agent-report.sh`），而 `plan_install` 拼的
-    /// hook 命令用的是 `HOOK_SCRIPT_FILE_NAME`（当时写的是
-    /// `claude-hook.sh`）。命令里的 `[ -x ... ] && ...` 守卫让它在文件
-    /// 不存在时**静默退出**——不报错、不日志，表现就是"状态点永远不出现"。
-    ///
-    /// 两个常量分处模块两端，光看代码看不出它们必须相等，所以直接断言。
+    /// Claude 与其它 agent 走两套脚本：Claude 用 [`hook_script()`] 写到
+    /// [`HOOK_SCRIPT_FILE_NAME`]，其它 agent 用 [`agent_report_script()`]
+    /// 写到 [`REPORTER_REL_PATH`]。这条钉住前者，避免两者被误改成同一个
+    /// ——那样 `[ -x ]` 守卫会因文件不存在而静默退出。
     #[test]
-    fn hook_command_points_at_the_reporter_script() {
+    fn hook_command_points_at_the_claude_script() {
         let settings = plan_install(b"{}").expect("空配置应当可安装");
         let text = String::from_utf8(settings).expect("产出应为 UTF-8");
+        let expected = format!("$HOME/{HOOK_SCRIPT_REL_DIR}/{HOOK_SCRIPT_FILE_NAME}");
         assert!(
-            text.contains(REPORTER_REL_PATH),
-            "hook 命令必须引用实际上报脚本 {REPORTER_REL_PATH}，实际产出：{text}"
+            text.contains(&expected),
+            "hook 命令必须引用 {expected}，实际产出：{text}"
         );
-        assert_eq!(
-            format!("{HOOK_SCRIPT_REL_DIR}/{HOOK_SCRIPT_FILE_NAME}"),
-            REPORTER_REL_PATH,
-            "HOOK_SCRIPT_FILE_NAME 与 REPORTER_REL_PATH 必须指向同一个文件"
+        // 反向确认：不要误用通用上报脚本（事件名与白名单都不同）。
+        assert!(
+            !text.contains(REPORTER_REL_PATH),
+            "Claude 的 hook 不应指向通用的 agent-report.sh"
         );
     }
 
