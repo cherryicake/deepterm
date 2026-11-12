@@ -55,6 +55,7 @@ fn main() {
         }
     }
     builder.init();
+    deepterm::utils::logging::install_panic_hook();
 
     log::info!("=== DeepTerm 启动 ===");
     if let Some(path) = &log_path {

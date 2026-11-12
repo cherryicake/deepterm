@@ -42,6 +42,8 @@ fn main() {
         }
     }
     builder.init();
+    // 守护进程更要装：它崩了没有窗口、没有 stderr，只剩日志这一条线索。
+    logging::install_panic_hook();
 
     log::info!("=== deepcore 启动 ===");
     if let Some(path) = log_path {
