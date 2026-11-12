@@ -2516,12 +2516,17 @@ impl TabBar {
     /// `width` 由调用方给：标签在托盘里允许被压缩，预览要按同一个宽度画，
     /// 否则一松手就「变宽了」。
     fn tray_tab_visual(&self, tab: &TabItem, width: Pixels) -> TrayTabVisual {
-        // agent 回合状态点压在程序方块上（herdr 同款）。只在真有程序方块
-        // 时画：恢复会话等场景下 program/icon 都可能为空，空方块上点一个点
-        // 既没信息量，也会让一次状态变化改到与它无关的几何。
-        let dot = (tab.program.is_some() || matches!(tab.icon, Some(Icon::AgentIcon { .. })))
-            .then_some(tab.agent_status)
-            .flatten();
+        // agent 回合状态点压在程序方块右上角（herdr 的 `tile()` 同款）。
+        //
+        // 「有没有方块」要看 `tiles`，不能只看 `tab.program`：标签现在画的是
+        // `tiles`（多面板时是叠放列表），而 `tab.program` 只由旧的
+        // `TabLabelChanged` / `AgentStateChanged` 事件维护，
+        // `set_tab_panels` 有意不碰它。此前这里只判 `program.is_some()`，
+        // 于是走过新路径的标签 `program` 为空、状态点永远画不出来。
+        let has_tile = !tab.tiles.is_empty()
+            || tab.program.is_some()
+            || matches!(tab.icon, Some(Icon::AgentIcon { .. }));
+        let dot = has_tile.then_some(tab.agent_status).flatten();
         // 叠放顺序由 `stacked_tiles` 定：选中的 panel 在最后 = 最上层。
         // 这里没有"面板选中索引"的信息（`TabBar` 只认识标签），所以按
         // `tiles` 的原序叠放；调用方（workspace）在写入 `tiles` 时已经把
@@ -3396,6 +3401,46 @@ mod tests {
 
         // Idle 不画点：agent 开着但没干活，图标本身已经说明它的存在。
         assert_eq!(agent_dot(Idle), None);
+    }
+
+    /// agent 状态点要真的画在方块右上角。
+    ///
+    /// 这条曾经失效过：`dot` 的取值条件只判 `tab.program.is_some()`，而标签
+    /// 现在画的是 `tiles`、`set_tab_panels` 又有意不碰 `program`，于是走过
+    /// 新路径的标签 `program` 为空 —— 状态点永远不画，agent 在跑也看不出来。
+    #[gpui::test]
+    fn stacked_tiles_still_carry_the_agent_status_dot(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+
+        let mut tab = TabItem::new("t", "claude");
+        tab.tiles = vec![TileProgram::from_program(&crate::programs::of(
+            Some("claude-code"),
+            &[],
+        ))];
+        // 关键：`program` 保持为 `None`，模拟"只经由 tiles 拿到方块"的新路径。
+        assert!(tab.program.is_none());
+        tab.agent_status = Some(AgentStatus::Working);
+
+        let bar = cx.update(|cx| TabBar::new_with_tabs("dot-bar", cx, vec![tab.clone()]));
+        let visual = bar.read_with(cx, |bar, _| {
+            bar.tray_tab_visual(&bar.tabs[0], px(TAB_WIDTH_PX))
+        });
+        assert_eq!(
+            visual.dot,
+            Some(AgentStatus::Working),
+            "有程序方块时 agent 状态点必须带出来"
+        );
+
+        // 没有任何方块信息时不该画点（空方块上点一个点没有信息量）。
+        let bare = TabItem {
+            agent_status: Some(AgentStatus::Working),
+            ..TabItem::new("bare", "x")
+        };
+        let bar2 = cx.update(|cx| TabBar::new_with_tabs("dot-bar-2", cx, vec![bare]));
+        let visual2 = bar2.read_with(cx, |bar, _| {
+            bar.tray_tab_visual(&bar.tabs[0], px(TAB_WIDTH_PX))
+        });
+        assert_eq!(visual2.dot, None, "没有方块就不该有状态点");
     }
 
     /// 状态点颜色必须来自 `AgentStatus::dot_rgb()`，不能在本模块另起一套。
