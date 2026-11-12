@@ -11,7 +11,7 @@
 //! 第 2 条不能只看"没有连接"：用户可能关掉窗口、终端还在跑，这时候
 //! 守护进程必须活着。
 
-use std::os::unix::net::{UnixListener, UnixStream};
+use super::transport::{self, Listener, Stream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -27,9 +27,25 @@ const IDLE_EXIT: Duration = Duration::from_secs(300);
 
 /// 接受循环的轮询间隔。
 ///
-/// `UnixListener` 没有超时的 `accept`，用非阻塞 + `sleep` 实现。
+/// 监听器没有带超时的 `accept`，用非阻塞 + `sleep` 实现（Unix）；
+/// Windows 的命名管道是阻塞 accept，靠关停信号与进程退出结束。
 /// 50ms 的响应延迟对"连上守护进程"这件事完全够用，又不至于忙等。
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
+
+/// 跨平台的 `accept`。
+///
+/// Unix 的 `accept` 返回 `(stream, addr)`，Windows 的命名管道只返回
+/// `stream`——差异收在这里，接受循环本身两边共用。
+fn listener_accept(listener: &Listener) -> std::io::Result<Stream> {
+    #[cfg(unix)]
+    {
+        listener.accept().map(|(stream, _addr)| stream)
+    }
+    #[cfg(windows)]
+    {
+        listener.accept()
+    }
+}
 
 /// 启动守护进程的监听循环（阻塞）。
 pub fn run() -> std::io::Result<()> {
@@ -45,16 +61,24 @@ pub fn run() -> std::io::Result<()> {
 
     let path = super::socket_path();
 
-    // 先探一下：已经有守护进程在跑就别抢 socket。
-    if path.exists() && UnixStream::connect(&path).is_ok() {
+    // 先探一下：已经有守护进程在跑就别抢同一个地址。
+    //
+    // Unix 上还要清掉残留的 socket 文件（上次没清理干净时 bind 会失败）；
+    // Windows 的命名管道没有对应的文件，`exists()` 恒为 false，清也没意义。
+    let already_running = if cfg!(windows) {
+        transport::connect(&path).is_ok()
+    } else {
+        path.exists() && transport::connect(&path).is_ok()
+    };
+    if already_running {
         log::info!("守护进程已在运行（{}），本实例退出", path.display());
         return Ok(());
     }
-    // 残留的 socket 文件（上次没清理干净）。
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
 
-    let listener = UnixListener::bind(&path)?;
-    listener.set_nonblocking(true)?;
+    let listener = transport::bind(&path)?;
+    transport::set_nonblocking(&listener, true)?;
 
     // pid 文件：便于排障与"这个 socket 是谁的"。
     let _ = std::fs::write(dir.join("daemon.pid"), std::process::id().to_string());
@@ -71,9 +95,15 @@ pub fn run() -> std::io::Result<()> {
             break;
         }
 
-        match listener.accept() {
-            Ok((stream, _addr)) => {
-                let _ = stream.set_nonblocking(false);
+        // Windows 的命名管道是阻塞 accept：没有客户端时会一直停在这里，
+        // 上面的空闲退出判断根本轮不到执行。守护进程因此永不自行退出——
+        // 对一个"活着才有意义"的常驻进程来说这可以接受，但要有明确说明，
+        // 免得以后有人把"空闲退出"当成跨平台行为来依赖。
+        //
+        // Unix 侧靠下面的 `WouldBlock` 分支做空闲退出。
+        match listener_accept(&listener) {
+            Ok(stream) => {
+                let _ = transport::set_blocking(&stream, true);
                 connections.fetch_add(1, Ordering::SeqCst);
                 *idle_since.lock().expect("idle") = std::time::Instant::now();
 
@@ -94,6 +124,10 @@ pub fn run() -> std::io::Result<()> {
                     })
                     .ok();
             }
+            // Unix：非阻塞 accept 没连接时返回 `WouldBlock`，顺便检查空闲退出。
+            //
+            // Windows 的命名管道是**阻塞** accept，这条分支在那里不会命中；
+            // 它的空闲退出由下面 `Err(e)` 之前的平台分支处理。
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 空闲退出：没有连接，也没有终端。
                 let idle = *idle_since.lock().expect("idle");
@@ -113,6 +147,7 @@ pub fn run() -> std::io::Result<()> {
         }
     }
 
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(dir.join("daemon.pid"));
     log::info!("守护进程已退出");

@@ -188,6 +188,15 @@ windows = { version = "0.52", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Wdk_System_Threading",
+    # 守护进程的 IPC 在 Windows 上走命名管道（`daemon::windows`）：
+    # CreateNamedPipeW / ConnectNamedPipe 在 Pipes，CreateFileW / ReadFile /
+    # WriteFile 在 Storage::FileSystem。
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    # 命名管道的读写要用 OVERLAPPED 参数（这里传 None），CreateFileW 与
+    # CreateNamedPipeW 的安全描述符指针在 Security 下。
+    "Win32_System_IO",
+    "Win32_Security",
 ] }
 russh = { version = "0.61.1", default-features = false, features = [
     "flate2",

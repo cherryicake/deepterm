@@ -27,7 +27,7 @@ const CONNECT_RETRY: Duration = Duration::from_millis(50);
 /// 分发给各自的接收端。
 pub struct Client {
     /// 往守护进程写帧。
-    writer: std::sync::Mutex<BufWriter<std::os::unix::net::UnixStream>>,
+    writer: std::sync::Mutex<BufWriter<super::transport::Stream>>,
     /// 控制面的 JSON 回复。
     replies: async_channel::Receiver<Frame>,
     /// 各终端 channel 的输出接收端。
@@ -45,7 +45,7 @@ impl Client {
     /// 连接守护进程；没在跑就拉起来。
     pub fn connect_or_start() -> std::io::Result<Self> {
         let path = super::socket_path();
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(&path) {
+        if let Ok(stream) = super::transport::connect(&path) {
             return Self::from_stream(stream);
         }
         spawn_daemon()?;
@@ -53,7 +53,7 @@ impl Client {
         let deadline = Instant::now() + STARTUP_TIMEOUT;
         let mut last_error = None;
         while Instant::now() < deadline {
-            match std::os::unix::net::UnixStream::connect(&path) {
+            match super::transport::connect(&path) {
                 Ok(stream) => return Self::from_stream(stream),
                 Err(e) => {
                     last_error = Some(e);
@@ -70,12 +70,12 @@ impl Client {
     ///
     /// 给"关窗口时顺带检查一下"这类场景用：不该因为一次探测就起一个守护进程。
     pub fn connect_existing() -> std::io::Result<Self> {
-        let stream = std::os::unix::net::UnixStream::connect(super::socket_path())?;
+        let stream = super::transport::connect(&super::socket_path())?;
         Self::from_stream(stream)
     }
 
-    fn from_stream(stream: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
-        let read_stream = stream.try_clone()?;
+    fn from_stream(stream: super::transport::Stream) -> std::io::Result<Self> {
+        let read_stream = super::transport::try_clone(&stream)?;
         let (reply_tx, reply_rx) = async_channel::unbounded::<Frame>();
         let routes: Arc<
             std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>,

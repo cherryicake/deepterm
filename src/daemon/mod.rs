@@ -11,6 +11,8 @@ pub mod registry;
 pub mod server;
 pub mod session;
 pub mod terminal;
+#[cfg(windows)]
+pub mod windows;
 
 use std::path::PathBuf;
 
@@ -44,18 +46,86 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join(SOCKET_FILE_NAME)
 }
 
+/// 跨平台的传输层抽象。
+///
+/// Unix 用 `UnixStream`/`UnixListener`（`$XDG_RUNTIME_DIR` 下的 socket，
+/// 目录权限 0700）；Windows 用命名管道（可按用户 SID 设 ACL）。
+/// 两端都实现 `Read + Write`，所以 `protocol.rs` 的分帧代码完全共用——
+/// 跨平台一致才不会有"Linux 上好好的、Windows 上粘包"这类只在一边出现的问题。
 #[cfg(unix)]
-mod transport {
+pub mod transport {
     pub use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
+
+    /// 连接一个已有 socket。
+    pub fn connect(path: &std::path::Path) -> std::io::Result<Stream> {
+        Stream::connect(path)
+    }
+
+    /// 绑定监听。调用方负责先清理残留的 socket 文件。
+    pub fn bind(path: &std::path::Path) -> std::io::Result<Listener> {
+        Listener::bind(path)
+    }
+
+    /// 设为非阻塞（`listen` 的接受循环要用它做超时轮询）。
+    pub fn set_nonblocking(listener: &Listener, on: bool) -> std::io::Result<()> {
+        listener.set_nonblocking(on)
+    }
+
+    /// 让一条已接受的连接回到阻塞模式。
+    pub fn set_blocking(stream: &Stream, on: bool) -> std::io::Result<()> {
+        stream.set_nonblocking(!on)
+    }
+
+    /// 复制一份流（一条连接要同时被读线程和写线程持有）。
+    pub fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
+        stream.try_clone()
+    }
+
+    /// socket 路径 → 传输层能用的名字。
+    pub fn address(path: &std::path::Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
 }
 
 #[cfg(windows)]
-mod transport {
-    // Windows 上换 Named Pipe。实现留到阶段 7。
-    pub use super::windows::pipe::{Listener, Stream};
+pub mod transport {
+    pub use super::windows::{Listener, Stream};
+
+    pub fn connect(path: &std::path::Path) -> std::io::Result<Stream> {
+        Stream::connect(&address(path))
+    }
+
+    pub fn bind(path: &std::path::Path) -> std::io::Result<Listener> {
+        Listener::bind(&address(path))
+    }
+
+    /// 命名管道没有"非阻塞 accept"这回事；接受循环靠 `accept` 自身的
+    /// 阻塞 + 外部关停信号退出（见 `listen::run`）。
+    pub fn set_nonblocking(_listener: &Listener, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    pub fn set_blocking(_stream: &Stream, _on: bool) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// 命名管道句柄可以再复制一份（`DuplicateHandle`），供读写两个线程用。
+    pub fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
+        stream.try_clone_handle()
+    }
+
+    /// 运行时目录 + 固定文件名 → `\\.\pipe\deepterm-<user>`。
+    ///
+    /// 用用户名而不是路径：管道名是全局命名空间，塞进完整路径既没必要
+    /// 也更容易撞上非法字符。
+    pub fn address(path: &std::path::Path) -> String {
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
+        // 文件名部分（`daemon.sock`）在管道下没有意义，只用目录区分会话。
+        let _ = path;
+        format!("{PIPE_PREFIX}-{user}")
+    }
 }
 
-#[cfg(unix)]
 pub use transport::{Listener, Stream};
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-//! 连接的服务端实现：在一条 `UnixStream` 上跑收发循环。
+//! 连接的服务端实现：在一条传输流（Unix socket / 命名管道）上跑收发循环。
 //!
 //! 与 `server.rs`（纯逻辑的请求分发）分开：这里全是 IO 与线程，
 //! 那边是可以单测的决策逻辑。
@@ -28,11 +28,11 @@ struct Connection {
 /// 返回时连接已关闭。这个函数由 accept 线程 spawn 出去，**不能**阻塞在
 /// 接受循环里。
 pub fn serve_connection(
-    stream: std::os::unix::net::UnixStream,
+    stream: super::transport::Stream,
     registry: Arc<Registry>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let write_stream = match stream.try_clone() {
+    let write_stream = match super::transport::try_clone(&stream) {
         Ok(s) => s,
         Err(e) => {
             log::warn!("守护进程：无法克隆连接: {e}");

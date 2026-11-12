@@ -219,14 +219,28 @@ core（`hc machine add` 会用 `curl | sh` 装一个），那样终端进程才�
 本方案下关闭 deepterm 不中断 SSH 连接，远端的 `htop`、长编译照常跑——
 "关掉 GUI 终端不死"这条需求已经满足。
 
-### 4.6 Windows
+### 4.6 Windows（已实现，未验证）
 
-没有 Unix socket，用 **Named Pipe**（`\\.\pipe\deepterm-daemon-<user>`）。
-PTY 侧是 ConPTY；`alacritty_terminal` 的 `Pty` 抽象已经覆盖 Windows
-（现有代码就是这么跑的，见 `local_pty.rs` 模块文档），所以守护进程本身
-不用为 Windows 写第二套 PTY，只需换 IPC 传输。
+没有 Unix socket，用**命名管道**（`\\.\pipe\deepterm-<用户名>`）。
+选管道而不是本地 TCP 端口：管道可以按用户 SID 设 ACL，别的用户连不上；
+`127.0.0.1:port` 对同机所有用户开放，等于把终端交给全机。
 
-**风险最高的就是这一块**，留到最后做。
+PTY 侧不用做任何事：`alacritty_terminal` 的 `Pty` 抽象已覆盖 ConPTY
+（现有代码本来就这么跑）。守护进程只为 IPC 换一层传输，见
+`daemon/mod.rs` 的 `transport` 模块——两端都实现 `Read + Write`，
+分帧代码 (`protocol.rs`) 完全共用。这是刻意的：分帧逻辑跨平台一致，
+才不会出现"Linux 上好好的、Windows 上粘包"这种只在一边出现的 bug。
+
+> ⚠️ **`src/daemon/windows.rs` 一次都没有被 rustc 编译过。**
+> 开发环境是 Linux，没有 Windows 目标也没有机器。已按 `windows` 0.52
+> 的源码逐个对齐 API 签名与 feature 清单，但首次在 Windows 上构建
+> 预计还要修几处编译错误（文件头列了具体位置）。这些都是编译期问题，
+> 不会静默产生错误行为——跑一次 `cargo check --target x86_64-pc-windows-msvc`
+> 就能全部暴露。
+
+一个已知差异：Windows 的命名管道是**阻塞** accept，没有"非阻塞轮询"
+这条路，所以那边守护进程不会像 Unix 那样空闲超时退出。对一个"活着才有
+意义"的常驻进程来说可以接受，但不能把"空闲退出"当成跨平台行为来依赖。
 
 ## 5. 分阶段实施
 
