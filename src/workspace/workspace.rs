@@ -3327,7 +3327,7 @@ mod tests {
     fn source_files_with_key_bindings() -> Vec<(&'static str, &'static str)> {
         vec![
             ("workspace.rs", include_str!("workspace.rs")),
-            ("main.rs", include_str!("../main.rs")),
+            ("deepterm.rs", include_str!("../bin/deepterm.rs")),
             ("editor.rs", include_str!("../editor/editor.rs")),
             (
                 "terminal_view.rs",

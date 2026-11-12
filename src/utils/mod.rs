@@ -7,6 +7,7 @@
 pub mod console;
 pub mod encoding;
 pub mod fs_atomic;
+pub mod logging;
 pub mod path;
 pub mod safe_open;
 pub mod shell;

@@ -126,20 +126,38 @@ deepterm 用 `alacritty_terminal::Term`，**`Term` 没有实现 `Serialize`**
 ### 4.2 进程与 IPC
 
 ```
-deepterm (UI)
-    │  Unix socket: ~/.local/state/deepterm/daemon.sock
-    │  或 XDG_RUNTIME_DIR/deepterm/daemon.sock
+deepterm (GUI)                    deepcore (守护进程)
+    │  Unix socket: $XDG_RUNTIME_DIR/deepterm/daemon.sock
+    │  Windows: \\.\pipe\deepterm-daemon
     ▼
-deepterm-daemon   ← 同一个可执行文件的隐藏子命令 `deepterm __daemon`
-    ├── 终端注册表（内存 + terminals.json 落盘）
-    └── 每个终端一个 Pty + 一个 Term + 一个 reader 线程
+    └──────── 9 字节头分帧 ────────▶ 终端注册表
+                                       └── 每终端一个 Pty + Term + poller 线程
 ```
 
-选**同一个可执行文件的子命令**而不是独立二进制：
+**两个独立二进制**，源码在 `src/bin/deepterm.rs` 与 `src/bin/deepcore.rs`：
 
-- 打包/分发不变（现在只有一个 `deepterm` 产物）；
-- 版本天然一致，不会出现"新客户端配旧守护进程"；
-- herdr 那种独立 `hc` 的好处（命令行能直接调用）对 deepterm 现阶段不重要。
+| | `deepterm` | `deepcore` |
+| --- | --- | --- |
+| 角色 | GUI 客户端 | 终端守护进程 |
+| 链接图形栈 | 是 | **否**（产物小一半） |
+| 生命周期 | 跟着窗口 | 独立，活过 GUI |
+
+选独立二进制而不是 `deepterm __daemon` 的三个理由：
+
+1. **生命周期独立**。GUI 崩溃、升级重装、或被 `pkill deepterm` 之类按名字
+   杀进程的操作命中时，都不该牵动守护进程——而"活过 GUI 退出"正是它存在
+   的全部意义。同一个二进制时进程管理器会把它们当一回事。
+2. **不链接图形栈**。共用二进制意味着守护进程也带着 GPUI/wgpu/字体栈，
+   它永远用不到，却要为此付出启动时间与常驻内存。
+3. **权限与打包边界清楚**。单独一个文件便于设 capability（Windows）
+   或放进 systemd user unit（Linux）。
+
+代价是版本一致性要靠约定：GUI 连上时用 `ping` 比对版本，对不上就重拉。
+
+**如何找到 `deepcore`**（`daemon::client::daemon_binary_path`）：
+`$DEEPTERM_DEEPCORE` → 与 GUI 同目录 → `PATH`。发布包里两个二进制始终并排
+（deb 的 `/usr/bin`、macOS 的 `Contents/MacOS/`、Windows 的安装目录），
+所以"同目录"覆盖绝大多数情况。
 
 启动时自动拉起：连不上就 `Command::new(current_exe).arg("__daemon")` 后台起，
 再重试连接。

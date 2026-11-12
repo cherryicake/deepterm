@@ -1328,6 +1328,89 @@ impl TerminalView {
         )
     }
 
+    /// 挂接式终端的 scrollback 行数。
+    ///
+    /// 取用户设置：守护进程按固定值开了 10k 行回滚，但客户端想要的可能更小
+    /// （省内存）。这里**只是客户端的显示上限**——真正的历史在守护进程里，
+    /// 改大改小都不影响数据还在，重新挂接就能拿到更多。
+    fn persistent_scrollback_lines(cx: &App) -> usize {
+        cx.try_global::<crate::settings::SettingsStore>()
+            .and_then(|store| store.get::<crate::settings::content::TerminalContent>())
+            .map(|content| content.scrollback_lines)
+            .unwrap_or(10_000)
+    }
+
+    /// 在守护进程里起一个终端并挂接到视图。
+    ///
+    /// 与 [`Self::new_with_working_directory`] 的区别只有一点：**PTY 不在本进程里**。
+    /// 因此关掉窗口不会杀掉 shell，重开时用 [`Self::attach_existing`] 接回来。
+    ///
+    /// 守护进程不可用时返回 `Err`，调用方应退回普通的本地终端——持久化是
+    /// 增强功能，不能成为"终端打不开"的新故障点。
+    pub fn new_persistent(
+        cx: &mut App,
+        working_directory: Option<PathBuf>,
+        command: Option<&str>,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+    ) -> Result<Entity<Self>, String> {
+        let address = crate::daemon::session::spawn_terminal(
+            working_directory.as_deref(),
+            command,
+            args,
+            cols,
+            rows,
+        )?;
+        Self::attach_existing(cx, &address, working_directory, command, args)
+            .ok_or_else(|| "无法挂接刚创建的终端".to_string())
+    }
+
+    /// 挂接一个已经存在于守护进程里的终端。
+    ///
+    /// 返回 `None` 表示挂接失败（终端已经退出，或守护进程不可用）。
+    pub fn attach_existing(
+        cx: &mut App,
+        address: &str,
+        working_directory: Option<PathBuf>,
+        command: Option<&str>,
+        args: &[String],
+    ) -> Option<Entity<Self>> {
+        let session = match crate::daemon::session::attach(address) {
+            Ok(session) => session,
+            Err(e) => {
+                log::warn!("挂接终端 {address} 失败: {e}");
+                return None;
+            }
+        };
+        // 输入与尺寸回写：各持一份 `Session`，直接用自己的 channel，
+        // 不查表——查表在 detach 之后会静默写到别的终端上。
+        let input_session = session.clone();
+        let resize_session = session.clone();
+        let terminal = Terminal::new_attached(
+            cx,
+            address.to_string(),
+            80,
+            24,
+            Self::persistent_scrollback_lines(cx),
+            move |bytes| input_session.write(bytes),
+            move |cols, rows, _scale| resize_session.resize(cols, rows, 0, 0),
+        );
+
+        let view = Self::create_terminal_view(
+            cx,
+            terminal.clone(),
+            working_directory,
+            None,
+            "Terminal".into(),
+            command.map(str::to_owned),
+            args.to_vec(),
+        );
+
+        crate::daemon::session::pump_into(session, terminal, cx);
+        Some(view)
+    }
+
     /// 使用指定命令创建新的本地终端（起点目录可继承：复制 / 重连标签）。
     ///
     /// # 参数

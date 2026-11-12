@@ -21,11 +21,21 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 
 /// 一条与守护进程的连接。
+///
+/// **整个应用共用一条**：每条连接在守护进程侧要占两个线程，而 UI 上可能有
+/// 几十个终端。共用一条连接后，各路终端的数据由 reader 线程按 channel
+/// 分发给各自的接收端。
 pub struct Client {
     /// 往守护进程写帧。
     writer: std::sync::Mutex<BufWriter<std::os::unix::net::UnixStream>>,
-    /// 收到的帧。控制回复与终端输出都在这个流里，由调用方按 channel 分发。
-    incoming: async_channel::Receiver<Frame>,
+    /// 控制面的 JSON 回复。
+    replies: async_channel::Receiver<Frame>,
+    /// 各终端 channel 的输出接收端。
+    ///
+    /// 挂接（attach）时在这里登记一个新 channel；reader 线程看到属于它的
+    /// 数据帧就投进对应的 `Sender`。没有登记的输出直接丢弃（那是别的
+    /// 连接留下的，或已经 detach 的）。
+    routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>>,
     /// reader 线程是否已退出（守护进程没了）。
     closed: Arc<AtomicBool>,
     next_id: AtomicU64,
@@ -66,9 +76,13 @@ impl Client {
 
     fn from_stream(stream: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
         let read_stream = stream.try_clone()?;
-        let (tx, rx) = async_channel::unbounded::<Frame>();
+        let (reply_tx, reply_rx) = async_channel::unbounded::<Frame>();
+        let routes: Arc<
+            std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>,
+        > = Arc::default();
         let closed = Arc::new(AtomicBool::new(false));
         let closed_flag = closed.clone();
+        let reader_routes = routes.clone();
 
         std::thread::Builder::new()
             .name("daemon-client-read".into())
@@ -77,8 +91,32 @@ impl Client {
                 loop {
                     match read_frame(&mut reader) {
                         Ok(Some(frame)) => {
-                            if tx.try_send(frame).is_err() {
-                                break;
+                            if frame.channel == CONTROL {
+                                if reply_tx.try_send(frame).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            // 终端输出：交给登记过这个 channel 的接收端。
+                            let channel = frame.channel;
+                            let sender = reader_routes
+                                .lock()
+                                .expect("client routes")
+                                .get(&channel)
+                                .cloned();
+                            match sender {
+                                Some(tx) => {
+                                    if tx.try_send(frame).is_err() {
+                                        // 接收端没了：删掉登记，免得一直投递。
+                                        reader_routes
+                                            .lock()
+                                            .expect("client routes")
+                                            .remove(&channel);
+                                    }
+                                }
+                                // 没有登记的 channel：这是已经 detach 的终端
+                                // 残留的输出，丢掉即可。
+                                None => {}
                             }
                         }
                         Ok(None) => break,
@@ -93,7 +131,8 @@ impl Client {
 
         Ok(Self {
             writer: std::sync::Mutex::new(BufWriter::new(stream)),
-            incoming: rx,
+            replies: reply_rx,
+            routes,
             closed,
             next_id: AtomicU64::new(1),
         })
@@ -104,9 +143,22 @@ impl Client {
         self.closed.load(Ordering::SeqCst)
     }
 
-    /// 收到的帧流。
-    pub fn incoming(&self) -> &async_channel::Receiver<Frame> {
-        &self.incoming
+    /// 登记一个终端 channel，返回它的输出接收端。
+    ///
+    /// 每个 `attach` 拿到的 channel 对应一个接收端。接收端被丢弃时
+    /// reader 线程会自动注销该 channel。
+    pub fn attach_channel(&self, channel: u32) -> async_channel::Receiver<Frame> {
+        let (tx, rx) = async_channel::unbounded();
+        self.routes
+            .lock()
+            .expect("client routes")
+            .insert(channel, tx);
+        rx
+    }
+
+    /// 注销一个 channel。
+    pub fn detach_channel(&self, channel: u32) {
+        self.routes.lock().expect("client routes").remove(&channel);
     }
 
     /// 发一个控制请求并等回复。
@@ -135,7 +187,7 @@ impl Client {
                     "守护进程没有回复",
                 ));
             }
-            match self.incoming.recv_blocking() {
+            match self.replies.recv_blocking() {
                 Ok(frame) => {
                     if frame.channel != CONTROL || frame.kind != Kind::Json {
                         // 不是控制回复（可能是终端输出），丢弃。
@@ -204,17 +256,81 @@ impl Client {
 }
 
 /// 后台拉起守护进程。
+/// 守护进程的可执行文件名。
+pub const DAEMON_BIN: &str = "deepcore";
+
+/// 拉起守护进程。
+///
+/// # 怎么找到 `deepcore`
+///
+/// 1. `$DEEPTERM_DEEPCORE`（测试与自定义安装）；
+/// 2. 与当前可执行文件**同目录**——发布包里两个二进制并排放，
+///    这一条覆盖绝大多数情况；
+/// 3. `PATH`。
+///
+/// 不硬编码安装路径：开发时是 `target/debug/`，打包后可能是
+/// `/usr/lib/deepterm/` 或 `DeepTerm.app/Contents/MacOS/`。
 fn spawn_daemon() -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = daemon_binary_path().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "找不到 {DAEMON_BIN}（应与 {} 在同一目录，或在 PATH 里）",
+                DAEMON_BIN
+            ),
+        )
+    })?;
     log::info!("拉起守护进程: {}", exe.display());
-    std::process::Command::new(exe)
-        .arg("__daemon")
+    let mut command = std::process::Command::new(&exe);
+    // Windows 上别弹控制台窗口。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()?;
     Ok(())
 }
+
+/// 定位 `deepcore` 可执行文件。
+///
+/// 抽成独立函数是为了可测：`spawn_daemon` 没法在测试里安全调用
+/// （真会起进程），而"找不找得到"恰恰是最容易因为打包布局变化而坏掉的地方。
+pub fn daemon_binary_path() -> Option<std::path::PathBuf> {
+    if let Some(configured) = std::env::var_os(DAEMON_ENV).filter(|v| !v.is_empty()) {
+        let path = std::path::PathBuf::from(configured);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    let name = format!("{DAEMON_BIN}{}", std::env::consts::EXE_SUFFIX);
+    // 与 GUI 同目录（发布包的常态）。
+    if let Ok(current) = std::env::current_exe()
+        && let Some(dir) = current.parent()
+    {
+        let sibling = dir.join(&name);
+        if sibling.is_file() {
+            return Some(sibling);
+        }
+    }
+    // PATH 兜底。
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join(&name))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or(None)
+}
+
+/// 指定 `deepcore` 路径的环境变量（测试与自定义安装）。
+pub const DAEMON_ENV: &str = "DEEPTERM_DEEPCORE";
 
 #[cfg(test)]
 mod tests {
@@ -237,6 +353,45 @@ mod tests {
             start.elapsed()
         );
         unsafe { std::env::remove_var(super::super::RUNTIME_DIR_ENV) };
+    }
+
+    /// 配置了 `$DEEPTERM_DEEPCORE` 就必须用它。
+    ///
+    /// 这条保护测试隔离与自定义安装：没有它，`daemon_binary_path` 会退到
+    /// "同目录找 deepcore"，而 `cargo test` 的产物目录里确实有那个文件，
+    /// 于是一次误调用就真的把用户的守护进程拉起来了。
+    #[test]
+    fn the_configured_daemon_binary_wins() {
+        let dir = std::env::temp_dir().join(format!("deepcore-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let fake = dir.join(format!("{DAEMON_BIN}{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(
+            &fake,
+            b"#!/bin/sh
+",
+        )
+        .expect("write");
+
+        // SAFETY：本用例独占该变量。
+        unsafe { std::env::set_var(DAEMON_ENV, &fake) };
+        assert_eq!(daemon_binary_path().as_deref(), Some(fake.as_path()));
+        unsafe { std::env::remove_var(DAEMON_ENV) };
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// 配置指向不存在的文件时要忽略它，而不是返回一个坏路径。
+    #[test]
+    fn a_bogus_configured_path_is_ignored() {
+        // SAFETY：本用例独占该变量。
+        unsafe { std::env::set_var(DAEMON_ENV, "/nonexistent/deepcore-xyz") };
+        let resolved = daemon_binary_path();
+        assert_ne!(
+            resolved.as_deref(),
+            Some(std::path::Path::new("/nonexistent/deepcore-xyz")),
+            "不存在的路径不该被采用"
+        );
+        unsafe { std::env::remove_var(DAEMON_ENV) };
     }
 
     /// 启动超时必须是个合理的值：太短会让慢机器上的守护进程起不来。

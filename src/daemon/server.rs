@@ -157,16 +157,25 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(super::registry::DEFAULT_ROWS as u64) as u16;
 
+    // shell integration 必须与本地终端走**同一套**准备逻辑：否则守护进程
+    // 起出来的 shell 拿不到 OSC 7 上报，`cd` 之后文件树不跟随、提示符标记
+    // 收不到，用户会觉得"开了持久化之后功能少了一半"。
+    let mut env = crate::terminal::mappings::default_terminal_env();
     let shell = match shell_program {
-        Some(program) => alacritty_terminal::tty::Shell::new(program, args),
-        // 没指定 shell 就用本机默认的，逻辑交给 registry。
-        None => match default_shell() {
-            Some(shell) => shell,
+        Some(program) => {
+            crate::terminal::terminal::configure_local_shell_integration(program, args, &mut env)
+        }
+        // 没指定 shell 就用本机默认的。
+        None => match default_shell_program() {
+            Some(program) => crate::terminal::terminal::configure_local_shell_integration(
+                program,
+                Vec::new(),
+                &mut env,
+            ),
             None => return json!({"ok": false, "error": "找不到可用的 shell"}),
         },
     };
 
-    let env = crate::terminal::mappings::default_terminal_env();
     let mut spawn = SpawnRequest::new(shell);
     spawn.cwd = cwd;
     spawn.env = env;
@@ -179,17 +188,17 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
     }
 }
 
-/// 本机的默认 shell。
-fn default_shell() -> Option<alacritty_terminal::tty::Shell> {
+/// 本机的默认 shell 程序路径。
+///
+/// 只返回程序名，不返回 `tty::Shell`：调用方还要拿它去套 shell integration。
+fn default_shell_program() -> Option<String> {
     #[cfg(windows)]
     {
-        let program = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
-        return Some(alacritty_terminal::tty::Shell::new(program, Vec::new()));
+        return Some(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
     }
     #[cfg(not(windows))]
     {
-        let program = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        Some(alacritty_terminal::tty::Shell::new(program, Vec::new()))
+        Some(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()))
     }
 }
 
@@ -267,6 +276,6 @@ mod tests {
     /// 默认 shell 必须能解析出来，否则守护进程起不了任何终端。
     #[test]
     fn a_default_shell_is_available() {
-        assert!(default_shell().is_some(), "本机应能找到默认 shell");
+        assert!(default_shell_program().is_some(), "本机应能找到默认 shell");
     }
 }

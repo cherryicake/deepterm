@@ -393,7 +393,13 @@ fn powershell_cwd_sync_args(program: &str, args: &[String]) -> Option<Vec<String
     Some(args)
 }
 
-fn configure_local_shell_integration(
+/// 给一个本地 shell 套上 deepterm 的 shell integration（OSC 7 cwd 上报、
+/// 提示符标记等），并把需要的环境变量写进 `env`。
+///
+/// `pub(crate)` 而非私有：守护进程起 shell 时必须走**同一套**准备逻辑，
+/// 否则同一个 shell 在守护进程模式下拿不到 integration，`cd` 后文件树
+/// 不跟随、agent 提示符标记收不到——表现成"开了持久化之后功能少了一半"。
+pub(crate) fn configure_local_shell_integration(
     program: String,
     mut args: Vec<String>,
     env: &mut HashMap<String, String>,
@@ -2811,6 +2817,26 @@ impl Terminal {
         cx.emit(Event::Wakeup);
     }
 
+    /// 守护进程报告：这个终端里的**程序退出了**。
+    ///
+    /// 与"连接断了"是两件事，必须分开处理：
+    /// - 程序退出 → 和本地终端的 `ChildExit` 一样，走 `CloseTerminal` /
+    ///   `ProcessExited`，界面该关面板就关面板；
+    /// - 连接断了 → 什么都不做，程序还在守护进程里跑，等重连
+    ///   （见 `daemon::session` 的说明）。
+    ///
+    /// 混为一谈的后果：网线一抖，用户所有终端都被判成"已退出"并关掉面板，
+    /// 而实际上程序全都还活着。
+    pub fn handle_program_exit(&mut self, cx: &mut Context<Self>) {
+        log::info!("挂接式终端的程序已退出: {:?}", self.attached_address());
+        // 先把最后一点输出刷上屏，再报退出——否则用户永远看不到
+        // 那条 "command not found" 之后的提示。
+        self.flush_kitty_replies();
+        self.sync_kitty_state();
+        self.note_output();
+        cx.emit(Event::CloseTerminal);
+    }
+
     /// 记录一次「输出进网格」：快照失效 + 输出时刻 + 代际自增。
     ///
     /// 三件事永远一起发生——代际用于缓存/搜索失效，时刻用于扫光动画与
@@ -4780,6 +4806,19 @@ impl Terminal {
     /// - PTY 模式远程：显式 `close()` 发 `Shutdown`；只靠 drop 回调闭包会让
     ///   alacritty 事件循环在 channel 断开时 panic，且 ssh 子进程可能挂着。
     pub fn kill(&mut self) {
+        // 挂接式终端：程序不归本进程所有，**不能**在这里结束它。
+        //
+        // 这条分支是"关掉 deepterm 终端不死"的最后一环：面板关闭 / 标签
+        // 关闭 / 换会话时都会走 `kill`，如果照本地终端那样把 PTY 关掉，
+        // 用户的程序就被我们自己杀了。真正的终止要走守护进程的
+        // `remove` / `spawn` 生命周期，那是显式动作。
+        if self.is_attached() {
+            log::debug!(
+                "挂接式终端不随视图销毁而终止: {:?}",
+                self.attached_address()
+            );
+            return;
+        }
         // 本地终端：通知读线程退出，释放 PTY / 回收 shell 子进程。
         if let Some(sender) = &self.local_sender {
             sender.shutdown();

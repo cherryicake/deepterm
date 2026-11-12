@@ -418,6 +418,31 @@ impl Panel {
         .detach();
     }
 
+    /// 新建终端视图：**优先**放进守护进程，失败则退回进程内 PTY。
+    ///
+    /// 退回这一点很重要：守护进程起不来（只读 HOME、受限沙箱、旧二进制）
+    /// 是可能发生的，而"持久化不可用"不该升级成"终端打不开"。用户最多
+    /// 失去"关窗口不杀程序"这一条增强，其余行为完全不变。
+    fn create_terminal_view(
+        cx: &mut gpui::App,
+        working_directory: Option<PathBuf>,
+        command: Option<&str>,
+        args: &[String],
+    ) -> Entity<TerminalView> {
+        match TerminalView::new_persistent(cx, working_directory.clone(), command, args, 80, 24) {
+            Ok(view) => view,
+            Err(e) => {
+                log::warn!("守护进程不可用（{e}），退回进程内终端");
+                match command {
+                    Some(command) => {
+                        TerminalView::new_with_command(cx, command, args, working_directory)
+                    }
+                    None => TerminalView::new_with_working_directory(cx, working_directory),
+                }
+            }
+        }
+    }
+
     pub fn with_terminal(
         panel_id: impl Into<String>,
         workspace_id: impl Into<String>,
@@ -426,7 +451,7 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = TerminalView::new(cx);
+        let terminal_view = Self::create_terminal_view(cx, dirs::home_dir(), None, &[]);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self::new_common(
             panel_id,
@@ -447,7 +472,7 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = TerminalView::new_with_working_directory(cx, working_directory);
+        let terminal_view = Self::create_terminal_view(cx, working_directory, None, &[]);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self::new_common(
             panel_id,

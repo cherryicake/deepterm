@@ -257,9 +257,16 @@ embed-resource = "2"
 # bench target 需要独立启用：dev-dependencies 的 cfg(test) 不作用于其代码。
 alloc-probe = []
 
+# GUI 客户端。
 [[bin]]
 name = "deepterm"
-path = "src/main.rs"
+path = "src/bin/deepterm.rs"
+
+# 终端守护进程：独立进程，持有所有 PTY，让终端活过窗口关闭。
+# 单独一个二进制而不是 `deepterm __daemon` 的理由见 src/bin/deepcore.rs 顶部。
+[[bin]]
+name = "deepcore"
+path = "src/bin/deepcore.rs"
 
 [[bench]]
 name = "terminal_render"
