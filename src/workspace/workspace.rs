@@ -1650,6 +1650,7 @@ impl Workspace {
                     ref cwd,
                     ref command,
                     ref args,
+                    ..
                 }) => match (command, args.len()) {
                     (Some(command), _) => Panel::with_terminal_command(
                         args_id.clone(),
@@ -2697,7 +2698,9 @@ impl Workspace {
                 let label = Self::terminal_label_from_panel(&panel, cx);
                 self.add_terminal_tab(label, panel, None, window, cx);
             }
-            TerminalSessionState::Local { cwd, command, args } => {
+            TerminalSessionState::Local {
+                cwd, command, args, ..
+            } => {
                 if let Some(cmd) = command {
                     // 起点继承：命令型本地标签（picker 里的 PowerShell/CMD/WSL）
                     // 此前丢掉了 cwd，复制出来固定在家目录启动。WSL 的 Linux
@@ -3349,6 +3352,7 @@ mod tests {
             cwd: Some("/tmp".into()),
             command: None,
             args: Vec::new(),
+            daemon_address: None,
         };
         let ssh = TerminalSessionState::Ssh {
             config: SshConnectionConfig::new(

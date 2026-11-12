@@ -177,36 +177,58 @@ impl Client {
         }
         let bytes = serde_json::to_vec(&request)?;
         self.send(Frame::json(bytes))?;
+        self.await_reply(id, timeout)
+    }
 
-        let deadline = Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "守护进程没有回复",
-                ));
-            }
-            match self.replies.recv_blocking() {
-                Ok(frame) => {
-                    if frame.channel != CONTROL || frame.kind != Kind::Json {
-                        // 不是控制回复（可能是终端输出），丢弃。
-                        // 真正的分发由调用方自己的循环负责。
-                        continue;
-                    }
-                    let reply: Value =
-                        serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                    if reply.get("id").and_then(Value::as_u64) == Some(id) {
-                        return Ok(reply);
+    /// 等一条指定 id 的控制回复。
+    ///
+    /// # 为什么不能直接用 `recv_blocking`
+    ///
+    /// 它会一直阻塞到有消息为止，于是"超时"这条分支永远走不到——守护
+    /// 进程一旦不回，调用方（常常是 UI 线程）就永久卡死。而这里又必须
+    /// 用阻塞式的收，因为 `call_timeout` 是同步接口（GPUI 的很多初始化
+    /// 路径拿不到 async 上下文）。
+    ///
+    /// 折中办法：另起一条线程做阻塞收，主线程带超时地等它。多一条线程
+    /// 的代价可以接受——只有 `call` 期间才存在，且控制面调用是低频的
+    /// （开终端、挂接、列终端）。
+    fn await_reply(&self, id: u64, timeout: Duration) -> std::io::Result<Value> {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Value>>();
+        let replies = self.replies.clone();
+        std::thread::Builder::new()
+            .name("daemon-call".into())
+            .spawn(move || {
+                loop {
+                    match replies.recv_blocking() {
+                        Ok(frame) => {
+                            if frame.channel != CONTROL || frame.kind != Kind::Json {
+                                continue;
+                            }
+                            let reply: Value =
+                                serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
+                            if reply.get("id").and_then(Value::as_u64) == Some(id) {
+                                let _ = tx.send(Some(reply));
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            let _ = tx.send(None);
+                            return;
+                        }
                     }
                 }
-                Err(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "守护进程连接已断开",
-                    ));
-                }
-            }
+            })?;
+
+        match rx.recv_timeout(timeout) {
+            Ok(Some(reply)) => Ok(reply),
+            Ok(None) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "守护进程连接已断开",
+            )),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "守护进程没有回复",
+            )),
         }
     }
 

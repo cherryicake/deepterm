@@ -1811,10 +1811,14 @@ impl TerminalView {
         }
 
         let cwd = self.current_local_working_directory(cx);
+        // 挂接式终端要记住它在守护进程里的地址：重开 deepterm 时靠它
+        // 接回**同一个进程**，而不是新建一个 shell 把原来的丢掉。
+        let daemon_address = self.terminal.read(cx).attached_address().map(str::to_owned);
         TerminalSessionState::Local {
             cwd: cwd.map(|path| path.to_string_lossy().to_string()),
             command: self.command.clone(),
             args: self.command_args.clone(),
+            daemon_address,
         }
     }
 

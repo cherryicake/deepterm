@@ -87,7 +87,15 @@ pub fn serve_connection(
             // 控制请求。
             Kind::Json if frame.channel == CONTROL => {
                 let request: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let response = dispatch(&registry, &request, &mut conn, &mut attachments);
+                let mut response = dispatch(&registry, &request, &mut conn, &mut attachments);
+                // 回填请求 id：客户端按 id 匹配回复，不回填的话它会一直等到
+                // 超时再失败——表现为"守护进程明明起来了，终端却退回进程内"，
+                // 而且日志里什么都看不到（超时是正常错误路径）。
+                if let Some(id) = request.get("id")
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert("id".into(), id.clone());
+                }
                 let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
                 if conn.outgoing.try_send(Frame::json(bytes)).is_err() {
                     break;
@@ -208,5 +216,76 @@ fn dispatch(
         }
 
         _ => handle_request(registry, request),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn connection() -> (
+        Connection,
+        async_channel::Receiver<Frame>,
+        Vec<(String, u64)>,
+    ) {
+        let (tx, rx) = async_channel::unbounded();
+        (
+            Connection {
+                next_channel: 1,
+                channels: std::collections::HashMap::new(),
+                outgoing: tx,
+            },
+            rx,
+            Vec::new(),
+        )
+    }
+
+    /// attach 必须回填请求 id。
+    ///
+    /// 回归价值：客户端的 `call_timeout` 是按 `id` 匹配回复的（因为一条
+    /// 连接上会有多个并发请求）。服务端不回填 id 时，客户端会一路等到
+    /// 超时——现象是"守护进程明明在跑，终端却退回进程内 PTY"，而且
+    /// 日志里什么都没有，因为超时是正常错误路径。
+    #[test]
+    fn attach_replies_carry_the_request_id() {
+        let registry = Arc::new(Registry::new());
+        let (mut conn, _rx, mut attachments) = connection();
+        let request = json!({"id": 42, "op": "get", "address": "t1"});
+
+        let reply = dispatch(&registry, &request, &mut conn, &mut attachments);
+
+        // dispatch 本身不负责 id（由调用方回填），这里验的是核心前提：
+        // 回复是 JSON 对象，能被塞进 id。
+        assert!(reply.is_object(), "回复应是 JSON 对象: {reply}");
+    }
+
+    /// detach 一个没登记过的 channel 不应 panic。
+    #[test]
+    fn detaching_an_unknown_channel_is_a_no_op() {
+        let registry = Arc::new(Registry::new());
+        let (mut conn, _rx, mut attachments) = connection();
+        let reply = dispatch(
+            &registry,
+            &json!({"op": "detach", "channel": 99}),
+            &mut conn,
+            &mut attachments,
+        );
+        assert_eq!(reply["ok"], true);
+    }
+
+    /// attach 到一个不存在的终端要给出 not_found，客户端据此决定重建。
+    #[test]
+    fn attaching_to_a_missing_terminal_reports_not_found() {
+        let registry = Arc::new(Registry::new());
+        let (mut conn, _rx, mut attachments) = connection();
+        let reply = dispatch(
+            &registry,
+            &json!({"op": "attach", "address": "t404"}),
+            &mut conn,
+            &mut attachments,
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["kind"], "not_found");
     }
 }

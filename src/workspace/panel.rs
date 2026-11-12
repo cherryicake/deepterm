@@ -500,7 +500,7 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = TerminalView::new_with_command(cx, command, args, working_directory);
+        let terminal_view = Self::create_terminal_view(cx, working_directory, Some(command), args);
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self::new_common(
             panel_id,
@@ -575,7 +575,9 @@ impl Panel {
                 );
                 TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone())
             }
-            TerminalSessionState::Local { cwd, command, args } => {
+            TerminalSessionState::Local {
+                cwd, command, args, ..
+            } => {
                 log::info!("重新启动面板 {} 的本地会话", self.panel_id);
                 if let Some(cmd) = command {
                     // 命令型标签（picker 选的 PowerShell/CMD/WSL）也要回到当前
@@ -635,8 +637,40 @@ impl Panel {
                 cwd,
                 command,
                 args,
+                daemon_address,
             }) => {
                 let working_directory = cwd.as_ref().map(PathBuf::from);
+
+                // 先试着接回守护进程里的**同一个终端**。
+                //
+                // 这是"重启 deepterm 后立刻恢复退出前状态"的关键一步：接回
+                // 意味着屏幕上还是断开前那一屏、程序还在原来那一步，用户
+                // 不需要重新 `cd`、不会丢掉正在跑的任务。接不上（终端已退出、
+                // 守护进程重启过）才退回下面的重建路径。
+                if let Some(address) = daemon_address.as_deref()
+                    && let Some(terminal_view) = TerminalView::attach_existing(
+                        cx,
+                        address,
+                        working_directory.clone(),
+                        command.as_deref(),
+                        args,
+                    )
+                {
+                    log::info!("已接回守护进程中的终端 {address}");
+                    Self::subscribe_terminal_events(&state.id, &terminal_view, cx);
+                    return Self::new_common(
+                        state.id.clone(),
+                        workspace_id,
+                        active_tab_id,
+                        active_tab_label,
+                        PanelContent::Terminal(terminal_view),
+                        cx,
+                    );
+                }
+                if daemon_address.is_some() {
+                    log::info!("终端已不在守护进程中，按会话重建面板 {}", state.id);
+                }
+
                 match command {
                     // 命令型标签（picker 里的 PowerShell / CMD / WSL）：恢复时
                     // 保持原命令与起点，丢掉它会把 CMD/WSL 标签换成默认 shell；

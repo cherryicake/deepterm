@@ -127,6 +127,15 @@ pub enum TerminalSessionState {
         cwd: Option<String>,
         command: Option<String>,
         args: Vec<String>,
+        /// 守护进程里这个终端的地址（`t1`、`t2`…）。
+        ///
+        /// `Some` 表示"上次这个终端是在守护进程里跑的"：恢复时先拿它去
+        /// 挂接，**接回同一个进程**；接不上（终端已退出、守护进程重启过）
+        /// 才退回按 `cwd`/`command` 重建。
+        ///
+        /// 旧会话文件没有这个字段，缺省 `None` = 老行为按需重建。
+        #[serde(default)]
+        daemon_address: Option<String>,
     },
     Ssh {
         config: SshConnectionConfig,
@@ -202,6 +211,24 @@ impl TerminalSessionState {
         matches!(self, Self::Local { .. })
     }
 
+    /// 守护进程里的终端地址（不是挂接式终端时为 `None`）。
+    pub fn daemon_address(&self) -> Option<&str> {
+        match self {
+            Self::Local { daemon_address, .. } => daemon_address.as_deref(),
+            Self::Ssh { .. } => None,
+        }
+    }
+
+    /// 构造一个挂在守护进程上的本地会话。
+    pub fn attached(address: String, cwd: Option<String>) -> Self {
+        Self::Local {
+            cwd,
+            command: None,
+            args: Vec::new(),
+            daemon_address: Some(address),
+        }
+    }
+
     pub fn ssh_config(&self) -> Option<&SshConnectionConfig> {
         match self {
             Self::Ssh { config, .. } => Some(config),
@@ -243,7 +270,9 @@ impl TerminalSessionState {
             Self::Ssh { .. } => "远程文件树",
         };
         let (path, label_path) = match self {
-            Self::Local { cwd, command, args } => {
+            Self::Local {
+                cwd, command, args, ..
+            } => {
                 let raw = cwd.as_ref().map(PathBuf::from);
                 if Self::is_wsl_session(command.as_deref(), args) {
                     // 发行版没在参数里显式给时，就是默认发行版。
@@ -336,6 +365,7 @@ mod tests {
             cwd: Some("/tmp".to_string()),
             command: None,
             args: Vec::new(),
+            daemon_address: None,
         };
         assert!(!state.use_system_proxy());
         assert!(state.ssh_config_with_proxy().is_none());
@@ -356,6 +386,7 @@ mod tests {
             cwd: Some("/home/you/project".to_string()),
             command: Some("wsl.exe".to_string()),
             args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
+            daemon_address: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(
@@ -380,6 +411,7 @@ mod tests {
             cwd: Some("/home/you/project".to_string()),
             command: Some("/usr/local/bin/wsl".to_string()),
             args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
+            daemon_address: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(
@@ -405,6 +437,7 @@ mod tests {
             cwd: Some(cwd.to_string()),
             command: Some("powershell.exe".to_string()),
             args: vec![],
+            daemon_address: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(path.as_deref(), Some(std::path::Path::new(cwd)));
