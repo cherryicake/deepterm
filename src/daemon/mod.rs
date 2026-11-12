@@ -51,12 +51,18 @@ pub fn runtime_dir() -> PathBuf {
     let config = crate::workspace::persistence::PersistenceManager::get_config_dir();
 
     // Unix 上先算一下 socket 路径会不会超限；超了就退到临时目录下按 uid
-    // 隔离的短路径（`/tmp` 在 macOS 是个指向 `/private/tmp` 的软链，
-    // 用 `$TMPDIR` 更稳，但它本身也可能很长，所以取较短的那个）。
+    // 隔离的短路径。
+    //
+    // 注意**必须按解析软链之后的路径算**：macOS 上 `/tmp` 是指向
+    // `/private/tmp` 的软链，`bind` 时内核看到的是解析后的路径，比用户写的
+    // 多 8 个字节。只按字面量长度检查会在边界上放行、然后在小核那里失败。
     #[cfg(unix)]
     {
         let would_be = config.join(SOCKET_FILE_NAME);
-        if would_be.to_string_lossy().len() > MAX_SOCKET_PATH {
+        let resolved_len = std::fs::canonicalize(&config)
+            .map(|dir| dir.join(SOCKET_FILE_NAME).to_string_lossy().len())
+            .unwrap_or_else(|_| would_be.to_string_lossy().len());
+        if resolved_len > MAX_SOCKET_PATH {
             let uid = unsafe { libc::getuid() };
             let short = PathBuf::from(format!("/tmp/deepterm-{uid}"));
             log::warn!(

@@ -60,13 +60,28 @@ fn listener_accept(listener: &Listener) -> std::io::Result<Stream> {
 /// 启动守护进程的监听循环（阻塞）。
 pub fn run() -> std::io::Result<()> {
     let dir = super::runtime_dir();
-    std::fs::create_dir_all(&dir)?;
 
-    // 权限收紧：socket 拿到就等于拿到用户的所有终端。
+    // 权限：socket 拿到就等于拿到用户的所有终端，所以目录必须 0700。
+    //
+    // **创建时就用 0700**，不能"先按 umask 建、再 chmod"：那样在多用户
+    // 机器上留了一个窗口，别的用户可以在 chmod 之前把 socket 抢过来或
+    // 塞一个假的进去（`/tmp` 下尤其现实——兜底路径就在那里）。
+    //
+    // `create_dir_all` 没有"指定权限"的参数，所以逐级建：已存在的目录
+    // 不再碰（可能属于父级，动它会破坏别的东西）。
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        if !dir.exists() {
+            std::fs::create_dir_all(&dir)?;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+        // 已存在也校验一次：目录可能被别的进程按更宽的权限建过。
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir)?;
     }
 
     let path = super::socket_path();

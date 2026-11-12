@@ -16,12 +16,6 @@ use serde_json::{Value, json};
 use super::registry::{Registry, SpawnRequest};
 use super::terminal::State;
 
-/// 一个连接上某终端的挂接信息。
-struct Attachment {
-    address: String,
-    subscriber_id: u64,
-}
-
 /// 服务端状态：注册表 + 关停标志。
 pub struct Server {
     pub registry: Arc<Registry>,

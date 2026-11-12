@@ -175,6 +175,15 @@ impl SshPtyTerminal {
             env.insert("SSHPASS".to_string(), password.to_string());
         }
 
+        // 记一条脱敏后的命令行：排查 SSH 连不上时，`ssh` 到底带了哪些参数
+        // 是最关键的线索（StrictHostKeyChecking、超时、证书、转发规则）。
+        // 口令经环境变量传递、不在 argv 里，这里再脱敏一次做兜底。
+        log::info!(
+            "SSH 命令: {} {:?}",
+            ssh_program,
+            redact_sensitive_args(&ssh_args)
+        );
+
         Ok((ssh_program.to_string(), ssh_args, env, proxy_outcome))
     }
 
@@ -193,10 +202,6 @@ impl SshPtyTerminal {
         let (program, args, env, proxy_outcome) =
             Self::build_ssh_command(config, initial_cwd.as_deref())?;
         let shell = alacritty_terminal::tty::Shell::new(program, args);
-
-        // 口令经环境变量传递，不进 argv；这里只记程序名，避免把主机/用户
-        // 之外的东西写进日志。
-        log::info!("SSH 命令已构造（口令经环境变量传递）");
 
         let pty_options = Options {
             shell: Some(shell),
@@ -261,7 +266,7 @@ impl SshPtyTerminal {
 /// 日志脱敏：把 argv 中紧随敏感选项（-p/-P/--password）之后的参数替换为掩码。
 /// 兜底防御——当前密码经 SSHPASS 环境变量传递，argv 中不应再出现密码，
 /// 但若未来有人把密码重新放回 argv，日志也不会泄漏。
-fn redact_sensitive_args(args: &[String]) -> Vec<String> {
+pub(crate) fn redact_sensitive_args(args: &[String]) -> Vec<String> {
     const SENSITIVE_FLAGS: &[&str] = &["-p", "-P", "--password", "--pass", "-p="];
     let mut redacted = Vec::with_capacity(args.len());
     let mut mask_next = false;
