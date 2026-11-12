@@ -3680,13 +3680,13 @@ mod tests {
                 ("悬停", tray.hover),
                 ("选中", tray.selected),
             ] {
-                if let Some(drift) = TabBar::hue_drift(base, TabBar::hue_of(color)) {
-                    if drift > 3.0 {
-                        failures.push(format!(
-                            "{}: {name}相对应用背景色相漂移 {drift:.1}°",
-                            app.id
-                        ));
-                    }
+                if let Some(drift) = TabBar::hue_drift(base, TabBar::hue_of(color))
+                    && drift > 3.0
+                {
+                    failures.push(format!(
+                        "{}: {name}相对应用背景色相漂移 {drift:.1}°",
+                        app.id
+                    ));
                 }
             }
             // 选中标签上的文字。
@@ -3938,34 +3938,46 @@ mod tests {
     /// 二是错位太大 → 叠得又宽又散。这条把几何与「只有顶层描边」钉住。
     #[test]
     fn stacked_tiles_stay_flat_and_compact() {
+        // 用「实际渲染出来的尺寸」断言，而不是对常量本身下结论——
+        // 后者编译期就恒真，改坏了也拦不住。
+        let layers: Vec<f32> = (0..TILE_STACK_MAX)
+            .map(|i| TILE_SIZE_PX * (TILE_STACK_SCALE + TILE_STACK_SCALE_STEP * i as f32))
+            .collect();
+
         // 每层都比单方块小，否则叠起来比单个还大，"折叠"感就没了。
-        assert!(TILE_STACK_SCALE < 1.0, "叠放层必须缩小，不能与单方块同尺寸");
-        // 缩得不能太狠：18px 以下图形就糊了。
-        let layer = TILE_SIZE_PX * TILE_STACK_SCALE;
-        assert!(layer >= 18.0, "叠放层 {layer}px 太小，图形会糊成一团");
-        // 最上层必须比下层大，层次才看得出来——叠放层一律不描边，
-        // 缩放递进是唯一的层次线索。
+        let biggest = layers.iter().copied().fold(0.0_f32, f32::max);
         assert!(
-            TILE_STACK_SCALE_STEP > 0.0,
-            "逐层缩放必须有递进，否则叠起来像一块"
+            biggest <= TILE_SIZE_PX + 0.5,
+            "叠放层 {biggest}px 不应超过单个方块 {TILE_SIZE_PX}px"
         );
-        let top = TILE_SIZE_PX
-            * (TILE_STACK_SCALE + TILE_STACK_SCALE_STEP * (TILE_STACK_MAX as f32 - 1.0));
-        assert!(top <= TILE_SIZE_PX + 0.5, "最上层 {top}px 不应超过单个方块");
-        // 错位要明显小于层宽，否则叠出来是一串而不是一叠。
+        // 缩得不能太狠：18px 以下图形就糊了。
+        let smallest = layers.iter().copied().fold(f32::MAX, f32::min);
         assert!(
-            TILE_STACK_STEP_PX < layer / 2.0,
-            "错位 {}px 相对 {layer}px 的层宽太大，会显得又宽又散",
+            smallest >= 18.0,
+            "最小的叠放层 {smallest}px 太小，图形会糊成一团"
+        );
+        // 后一层必须比前一层大：层次全靠缩放递进（叠放层一律不描边）。
+        for pair in layers.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "叠放层必须逐层放大，{:?} 没有递增",
+                layers
+            );
+        }
+        // 错位要明显小于最小层宽，否则叠出来是一串而不是一叠。
+        assert!(
+            TILE_STACK_STEP_PX < smallest / 2.0,
+            "错位 {}px 相对 {smallest}px 的层宽太大，会显得又宽又散",
             TILE_STACK_STEP_PX
         );
         // 整叠宽度仍要明显窄于两个并排方块，才值得用"叠"。
-        let width = layer + TILE_STACK_STEP_PX * (TILE_STACK_MAX as f32 - 1.0);
+        let width = biggest + TILE_STACK_STEP_PX * (TILE_STACK_MAX as f32 - 1.0);
         assert!(
             width < TILE_SIZE_PX * 2.0,
             "{width}px 的整叠已超过两个方块宽，叠放失去意义"
         );
         // 层数上限不能是 1：那就等于没做叠放。
-        assert!(TILE_STACK_MAX >= 2);
+        assert!(layers.len() >= 2, "叠放至少要能容纳两层");
     }
 
     /// 新建的终端标签**第一帧**就该有程序方块，不能等终端吐出标题/PWD。

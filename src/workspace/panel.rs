@@ -1415,18 +1415,25 @@ impl Render for Panel {
                 move |menu: PopupMenu, _window, _cx| {
                     use crate::components::button::Icon as MenuIcon;
                     use crate::workspace::workspace as ws;
+                    // 快捷键提示必须与实际绑定一致（见 workspace.rs 的 bind）。
+                    let mac = cfg!(target_os = "macos");
+                    let (k_right, k_down, k_zoom, k_close) = if mac {
+                        ("⌘D", "⇧⌘D", "⇧⌘↩", "⌘W")
+                    } else {
+                        ("Ctrl⇧D", "Ctrl⇧E", "Ctrl⇧↩", "⌘W")
+                    };
                     // 只有终端面板能分屏（新面板要继承目录）。
                     let menu = if can_split {
                         menu.menu_with_shortcut(
                             "Split right",
                             MenuIcon::new("icons/panel-right.svg"),
-                            "⌘D",
+                            k_right,
                             Box::new(ws::SplitRight),
                         )
                         .menu_with_shortcut(
                             "Split down",
                             MenuIcon::new("icons/panel-right.svg"),
-                            "⇧⌘D",
+                            k_down,
                             Box::new(ws::SplitDown),
                         )
                     } else {
@@ -1437,7 +1444,7 @@ impl Render for Panel {
                         menu.separator().menu_with_shortcut(
                             if is_zoomed { "Unzoom" } else { "Zoom" },
                             MenuIcon::new("icons/square.svg"),
-                            "⇧⌘↩",
+                            k_zoom,
                             Box::new(ws::TogglePaneZoom),
                         )
                     } else {
@@ -1446,7 +1453,7 @@ impl Render for Panel {
                     menu.separator().menu_with_shortcut(
                         "Close pane",
                         MenuIcon::new("icons/search-xmark.svg"),
-                        "⌘W",
+                        k_close,
                         Box::new(ws::CloseSelectedPanel),
                     )
                 }

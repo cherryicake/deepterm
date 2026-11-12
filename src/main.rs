@@ -3,13 +3,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use deepterm::{
-    AppWindow, NewWindow, Quit,
-    builtin_commands::executor::init_global_executor,
-    ssh_view::picker::ShowSshPicker,
-    workspace::{
-        window_manager::WindowManager,
-        workspace::{CloseSelectedPanel, SplitDown, SplitRight, TogglePaneZoom},
-    },
+    AppWindow, NewWindow, Quit, builtin_commands::executor::init_global_executor,
+    ssh_view::picker::ShowSshPicker, workspace::window_manager::WindowManager,
 };
 use gpui::{App, KeyBinding};
 use std::io::{Seek as _, Write as _};
@@ -243,12 +238,6 @@ fn main() {
                     #[cfg(not(target_os = "windows"))]
                     KeyBinding::new("cmd-k", ShowSshPicker, None),
                     KeyBinding::new("cmd-n", NewWindow, None),
-                    // 面板分屏 / 缩放 / 关闭。面板标题栏只在分屏后出现，
-                    // 这几个键让单面板时也能用键盘操作，菜单里的提示即取自此处。
-                    KeyBinding::new("cmd-d", SplitRight, None),
-                    KeyBinding::new("cmd-shift-d", SplitDown, None),
-                    KeyBinding::new("cmd-shift-enter", TogglePaneZoom, None),
-                    KeyBinding::new("cmd-w", CloseSelectedPanel, None),
                 ],
             );
             cx.on_action(|_: &Quit, cx| {

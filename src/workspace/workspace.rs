@@ -121,6 +121,20 @@ pub fn init(cx: &mut App) {
             #[cfg(not(target_os = "windows"))]
             KeyBinding::new("cmd-l", NewLocalTerminal, None),
             KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+            // 面板分屏 / 缩放。面板标题栏只在分屏后出现，这几个键让单面板时
+            // 也能用键盘操作；右键菜单里的快捷键提示即取自这里。
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-d", SplitRight, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-d", SplitRight, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-d", SplitDown, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-e", SplitDown, None),
+            #[cfg(target_os = "macos")]
+            KeyBinding::new("cmd-shift-enter", TogglePaneZoom, None),
+            #[cfg(not(target_os = "macos"))]
+            KeyBinding::new("ctrl-shift-enter", TogglePaneZoom, None),
             // 新 tab：cmd-t（win/linux 用 ctrl-shift-t，ctrl-t 是 shell 的输出重定向切换）
             #[cfg(target_os = "macos")]
             KeyBinding::new("cmd-t", NewTerminalTab, None),
@@ -1363,8 +1377,23 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 关闭当前选中的 panel
-    /// 如果当前 Tab 下只有一个 Panel，则关闭整个 Tab
+    /// `cmd-w` 在「当前标签有 `panel_count` 个面板」时该关标签而不是关面板吗？
+    ///
+    /// 抽成纯函数是为了能断言这条语义：它依赖容器结构，而 `Workspace`
+    /// 本身要真实窗口与 PTY 才能构造。单面板时「标签」就是「这一格」，
+    /// 关它即关标签；多面板时才有「只关一格」的余地。
+    fn cmd_w_closes_tab(panel_count: usize) -> bool {
+        panel_count <= 1
+    }
+
+    /// `cmd-w` 的落点：关面板还是关标签，按「当前标签里有几个面板」分派。
+    ///
+    /// - 多面板：只关**选中的那个**面板，标签与其它面板留着。
+    /// - 单面板：这个标签没有可单独关闭的「一部分」，关掉这个标签本身；
+    ///   若它已经是最后一个标签，`do_tab_close` 会随之关窗口。
+    ///
+    /// 也就是说 `cmd-w` 永远只吃掉「当前这一格」，不会一按就带走整个窗口
+    /// 里的其它标签——与 iTerm / VS Code 的习惯一致。
     pub fn close_selected_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 获取当前活动tab
         let Some(tab_info) = self.tabs.get(&self.active_tab_id) else {
@@ -1373,8 +1402,9 @@ impl Workspace {
 
         let panel_count = tab_info.container.panel_count();
 
-        // 如果当前 Tab 下只有一个 Panel，关闭整个 Tab
-        if panel_count <= 1 {
+        // 只有一个面板：没有「一部分」可关，交给标签关闭流程。
+        // 最后一个标签时它会进一步关窗口（见 `do_tab_close`）。
+        if Self::cmd_w_closes_tab(panel_count) {
             let active_tab_id = self.active_tab_id.clone();
             self.handle_tab_close(&active_tab_id, window, cx);
             return;
@@ -3198,6 +3228,21 @@ pub(crate) fn should_mark_unread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cmd-w` 只吃掉「当前这一格」：多面板关面板，单面板关标签
+    /// （最后一个标签时由 `do_tab_close` 进一步关窗口）。
+    ///
+    /// 这条守的是「一按 cmd-w 别把整个窗口带走」——若把单面板也当成
+    /// 「关窗口」，多标签窗口里按一下就会连带关掉其它标签。
+    #[test]
+    fn cmd_w_targets_one_pane_before_the_window() {
+        // 单面板：没有「一部分」可关，交给标签关闭流程。
+        assert!(Workspace::cmd_w_closes_tab(1));
+        assert!(Workspace::cmd_w_closes_tab(0), "空容器也走标签流程");
+        // 多面板：只关选中的那一格。
+        assert!(!Workspace::cmd_w_closes_tab(2));
+        assert!(!Workspace::cmd_w_closes_tab(5));
+    }
 
     /// 红点只在「后台 tab 跑完一个回合」时点亮。
     #[test]
