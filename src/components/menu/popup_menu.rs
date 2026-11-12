@@ -44,6 +44,11 @@ pub enum PopupMenuItem {
         checked: bool,
         action: Option<Box<dyn Action>>,
         handler: OptionalClickCallback,
+        /// 右对齐的快捷键提示（herdr 菜单的 `shortcut()`）。
+        ///
+        /// 只用于显示：真正的按键绑定在 action 系统里，这里不参与分发。
+        /// 没有绑定时留空，渲染时那一列不占位。
+        shortcut: Option<SharedString>,
     },
 }
 
@@ -59,6 +64,7 @@ impl PopupMenuItem {
             checked: false,
             action: None,
             handler: None,
+            shortcut: None,
         }
     }
 
@@ -100,6 +106,16 @@ impl PopupMenuItem {
     pub fn action(mut self, action: Box<dyn Action>) -> Self {
         if let PopupMenuItem::Item { action: a, .. } = &mut self {
             *a = Some(action);
+        }
+        self
+    }
+
+    /// 设置右对齐的快捷键提示（如 `"⌘D"`）。
+    ///
+    /// 纯展示：按下的键由 action 系统分发，菜单不拦截。
+    pub fn shortcut(mut self, shortcut: impl Into<SharedString>) -> Self {
+        if let PopupMenuItem::Item { shortcut: s, .. } = &mut self {
+            *s = Some(shortcut.into());
         }
         self
     }
@@ -172,6 +188,23 @@ impl PopupMenu {
     /// Add Menu Item
     pub fn menu(mut self, label: impl Into<SharedString>, action: Box<dyn Action>) -> Self {
         self.add_menu_item(label, None, action, false, false);
+        self
+    }
+
+    /// 带图标与快捷键提示的菜单项（herdr 菜单的行样式：图标 + 标签 + 右对齐键位）。
+    pub fn menu_with_shortcut(
+        mut self,
+        label: impl Into<SharedString>,
+        icon: impl Into<Icon>,
+        shortcut: impl Into<SharedString>,
+        action: Box<dyn Action>,
+    ) -> Self {
+        self.menu_items.push(
+            PopupMenuItem::new(label)
+                .icon(icon)
+                .shortcut(shortcut)
+                .action(action),
+        );
         self
     }
 
@@ -372,6 +405,7 @@ impl PopupMenu {
                 disabled,
                 icon,
                 checked,
+                shortcut,
                 ..
             } => {
                 let this = this
@@ -417,7 +451,25 @@ impl PopupMenu {
                     content = content.gap(px(6.)).child(div().w(px(18.)).h(px(18.)));
                 }
 
-                this.child(content.child(div().child(label.clone())))
+                // 标签扩展、快捷键提示右对齐（herdr 菜单的
+                // `justify_between` + 尾部 dim 色小字）。
+                let label_el = div().flex_1().min_w_0().truncate().child(label.clone());
+                let this = this.child(content.child(label_el));
+                match shortcut {
+                    Some(shortcut) => this.child(
+                        div()
+                            .flex_none()
+                            .pl(px(18.))
+                            .text_size(px(11.))
+                            .text_color(if *disabled {
+                                theme.text_subtle
+                            } else {
+                                theme.text_muted
+                            })
+                            .child(shortcut.clone()),
+                    ),
+                    None => this,
+                }
             }
         }
     }

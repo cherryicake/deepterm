@@ -861,6 +861,7 @@ impl Panel {
         theme: crate::theme::UiTheme,
         on_click: impl Fn(&gpui::ClickEvent, &mut gpui::Window, &mut gpui::App) + 'static,
     ) -> gpui::Stateful<gpui::Div> {
+        let group = format!("{}-grp", id);
         div()
             .id(id)
             .flex_none()
@@ -868,9 +869,22 @@ impl Panel {
             .rounded(px(4.0))
             .cursor_pointer()
             .text_color(theme.icon_muted)
-            .hover(move |style| style.bg(theme.title_bar_hover).text_color(theme.text))
+            // group：hover 时**图标本身**也要变亮。`text_color` 不会传给 svg，
+            // 所以 svg 那侧用 `group_hover` 自己取色。
+            .group(group.clone())
+            .hover(move |style| style.bg(theme.title_bar_hover))
             .on_click(on_click)
-            .child(svg().size(px(14.0)).path(icon.path()))
+            // `text_color` 必须**直接设在 svg 上**：gpui 的 svg 按 alpha mask
+            // 渲染、用自身的前景色着色，不继承父容器的文字色。父层那句
+            // `.text_color()` 只影响文字节点，svh 会沿用默认色——在被挤成
+            // 14px 的图标上就是「看不见」。
+            .child(
+                svg()
+                    .size(px(14.0))
+                    .text_color(theme.icon_muted)
+                    .group_hover(group, move |style| style.text_color(theme.text))
+                    .path(icon.path()),
+            )
     }
 
     /// 渲染标题栏
@@ -1383,39 +1397,57 @@ impl Render for Panel {
             )
             // 右键菜单：分屏 / 放大 / 关闭。
             //
-            // 面板标题栏只在分屏（多面板）时才显示，所以单面板时这三个操作
-            // 在界面上无处可点——菜单补上这个入口。菜单项里挂的是
-            // **Workspace 级** action（`SplitRight` / `SplitDown` /
-            // `TogglePaneZoom` / `ClosePanel`）：菜单浮层是独立 entity，
-            // 点选项走 `window.dispatch_action` 沿焦点链分发，挂在 Panel
-            // 上的 handler 收不到，只有 Workspace 接得住。
+            // 文案、图标、快捷键都照 herdr 的 pane 菜单（`mods/menu/main.js`
+            // 的 `items()` + `menuIcon()`）：
+            //   Split right / Split down / Zoom / Close pane
+            // 图标分别是 panel-right / panel-right / square / x。
+            //
+            // 面板标题栏只在分屏（多面板）时才显示，所以单面板时这几个操作
+            // 在界面上无处可点，菜单补上这个入口。
+            //
+            // 菜单项挂 **Workspace 级** action：菜单浮层是独立 entity，
+            // 点选项走 `window.dispatch_action` 沿焦点链分发，挂在 Panel 上的
+            // handler 收不到，只有 Workspace 接得住。
             .context_menu(format!("panel-menu-{}", self.panel_id), {
                 let can_split = self.can_split;
                 let can_zoom = self.can_zoom;
                 let is_zoomed = self.is_zoomed;
                 move |menu: PopupMenu, _window, _cx| {
+                    use crate::components::button::Icon as MenuIcon;
+                    use crate::workspace::workspace as ws;
                     // 只有终端面板能分屏（新面板要继承目录）。
                     let menu = if can_split {
-                        menu.menu(
-                            "向右分割",
-                            Box::new(crate::workspace::workspace::SplitRight),
+                        menu.menu_with_shortcut(
+                            "Split right",
+                            MenuIcon::new("icons/panel-right.svg"),
+                            "⌘D",
+                            Box::new(ws::SplitRight),
                         )
-                        .menu("向下分割", Box::new(crate::workspace::workspace::SplitDown))
+                        .menu_with_shortcut(
+                            "Split down",
+                            MenuIcon::new("icons/panel-right.svg"),
+                            "⇧⌘D",
+                            Box::new(ws::SplitDown),
+                        )
                     } else {
                         menu
                     };
                     // 放大只在多面板时有意义。
                     let menu = if can_zoom {
-                        menu.separator().menu(
-                            if is_zoomed { "缩回" } else { "放大" },
-                            Box::new(crate::workspace::workspace::TogglePaneZoom),
+                        menu.separator().menu_with_shortcut(
+                            if is_zoomed { "Unzoom" } else { "Zoom" },
+                            MenuIcon::new("icons/square.svg"),
+                            "⇧⌘↩",
+                            Box::new(ws::TogglePaneZoom),
                         )
                     } else {
                         menu
                     };
-                    menu.separator().menu(
-                        "关闭面板",
-                        Box::new(crate::workspace::workspace::CloseSelectedPanel),
+                    menu.separator().menu_with_shortcut(
+                        "Close pane",
+                        MenuIcon::new("icons/search-xmark.svg"),
+                        "⌘W",
+                        Box::new(ws::CloseSelectedPanel),
                     )
                 }
             })

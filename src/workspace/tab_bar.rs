@@ -4092,6 +4092,32 @@ mod tests {
         }
     }
 
+    /// 面板标题栏与右键菜单用到的图标必须真的在资源里。
+    ///
+    /// 这类失效很隐蔽：路径写错时 gpui 只是画不出东西，不报错、不 panic，
+    /// 表现得就是「按钮在、图标没了」。所以直接查 `Assets`，而不是只断言
+    /// 路径字符串长得对。
+    #[test]
+    fn pane_and_menu_icons_resolve_to_embedded_assets() {
+        for path in [
+            Icon::SplitRight.path(),
+            Icon::SplitDown.path(),
+            Icon::Zoom.path(),
+            Icon::Unzoom.path(),
+            Icon::PanelRight.path(),
+            Icon::Square.path(),
+            // 菜单里直接用的字面量路径（`MenuIcon::new` 要 `&'static str`）。
+            SharedString::new_static("icons/panel-right.svg"),
+            SharedString::new_static("icons/square.svg"),
+            SharedString::new_static("icons/search-xmark.svg"),
+        ] {
+            assert!(
+                crate::assets::Assets::get(path.as_ref()).is_some(),
+                "{path} 不在嵌入资源里"
+            );
+        }
+    }
+
     /// 每个 `CLIAgent` 的图标都必须在嵌入资源里真实存在。
     ///
     /// 这是最容易悄无声息失效的一环：`icon_path()` 返回一个不存在的路径时

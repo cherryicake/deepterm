@@ -84,6 +84,9 @@ pub enum Icon {
     SplitDown,
     Zoom,
     Unzoom,
+    /// 菜单项图标（herdr 的 `menuIcon()` 映射）：分屏、放大、关闭。
+    PanelRight,
+    Square,
     Bell,
     Reveal,
     Sidebar,
@@ -168,6 +171,8 @@ impl Icon {
             Icon::SplitDown => SharedString::new_static("icons/split-down.svg"),
             Icon::Zoom => SharedString::new_static("icons/zoom.svg"),
             Icon::Unzoom => SharedString::new_static("icons/unzoom.svg"),
+            Icon::PanelRight => SharedString::new_static("icons/panel-right.svg"),
+            Icon::Square => SharedString::new_static("icons/square.svg"),
             Icon::Bell => SharedString::new_static("icons/bell.svg"),
             Icon::Reveal => SharedString::new_static("icons/reveal.svg"),
             Icon::Sidebar => SharedString::new_static("icons/sidebar.svg"),
