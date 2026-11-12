@@ -2827,6 +2827,29 @@ impl Terminal {
     ///
     /// 混为一谈的后果：网线一抖，用户所有终端都被判成"已退出"并关掉面板，
     /// 而实际上程序全都还活着。
+    /// 与守护进程的连接彻底断了，且挂接不回去。
+    ///
+    /// 与 [`Self::handle_program_exit`] 是**相反**的语义：程序可能还在
+    /// 守护进程里活着，只是我们看不到了。所以这里**不关面板、不报
+    /// "已退出"**——那会让用户以为任务死了从而重启一遍，而实际上原来的
+    /// 还在后面跑。
+    ///
+    /// 做法：往屏幕上写一行说明，并把状态标成"连接丢失"。用户能看到
+    /// 发生了什么，也能自己决定要不要重连。
+    pub fn handle_connection_lost(&mut self, cx: &mut Context<Self>) {
+        log::warn!(
+            "与守护进程的连接丢失，终端 {:?} 无法挂接回去",
+            self.attached_address()
+        );
+        // 用一行可见的提示代替静默冻结：终端停在最后一屏且不再更新，
+        // 用户最先怀疑的是"程序卡住了"，而不是"连接断了"。
+        let notice = "\r\n\x1b[33m[deepterm] 与终端守护进程的连接已断开。\r\n\
+                      程序可能仍在运行；重新打开 deepterm 可尝试接回。\x1b[0m\r\n";
+        self.process_ssh_data(notice.as_bytes(), cx);
+        self.note_output();
+        cx.emit(Event::Wakeup);
+    }
+
     pub fn handle_program_exit(&mut self, cx: &mut Context<Self>) {
         log::info!("挂接式终端的程序已退出: {:?}", self.attached_address());
         // 先把最后一点输出刷上屏，再报退出——否则用户永远看不到

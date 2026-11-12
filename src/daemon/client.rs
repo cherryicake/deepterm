@@ -126,6 +126,13 @@ impl Client {
                         }
                     }
                 }
+                // 关键：把各 channel 的发送端清掉，让挂接方的 `recv()`
+                // 返回 `Err` 而不是永远阻塞。
+                //
+                // 只置 `closed` 标志是不够的：泵任务阻塞在 `recv()` 上，
+                // 它不会被那个标志唤醒，于是终端静默冻结在最后一屏——
+                // 用户看到的是"程序卡住了"，而实际是连接早就断了。
+                reader_routes.lock().expect("client routes").clear();
                 closed_flag.store(true, Ordering::SeqCst);
             })?;
 

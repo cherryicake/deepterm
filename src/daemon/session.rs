@@ -14,7 +14,7 @@
 //! "重连失败"。herdr 用 `Stream::Closed` / `Stream::Lost` 区分这两件事，
 //! 这里照做。
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use gpui::{App, Entity};
 
@@ -26,25 +26,45 @@ use crate::terminal::Terminal;
 ///
 /// `OnceLock` 而不是每次新建：守护进程侧每条连接要占两个线程，几十个
 /// 终端各连一次就是上百个线程。
-static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+///
+/// 用 `Mutex<Option<Arc<Client>>>` 而不是 `OnceLock`：连接会**断**（守护
+/// 进程崩溃、被更新、被用户结束），断了必须能换一条新的。`OnceLock`
+/// 只写一次，第一次的连接一旦关闭，后面所有调用都会拿到那条死连接，
+/// 表现为"守护进程明明重启了，终端却再也接不回来"。
+static CLIENT: std::sync::Mutex<Option<Arc<Client>>> = std::sync::Mutex::new(None);
 
 /// 取（必要时建立）全局连接。失败时返回 `None` 并记日志——终端不该因为
 /// 守护进程起不来就打不开，调用方应退回普通本地终端。
 pub fn client() -> Option<Arc<Client>> {
-    if let Some(client) = CLIENT.get() {
-        // 连接断过就重建：守护进程可能重启过（更新、崩溃）。
-        if !client.is_closed() {
-            return Some(client.clone());
-        }
-        log::warn!("与守护进程的连接已断开，重新建立");
+    let guard = || {
+        CLIENT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+
+    // 已有一条活着的连接就复用（守护进程侧每条连接要占两个线程）。
+    if let Some(client) = guard().as_ref()
+        && !client.is_closed()
+    {
+        return Some(client.clone());
     }
+
+    // 连接断了（或从没连过）：重建。`connect_or_start` 会顺带把守护进程
+    // 拉起来——它可能刚崩溃或被更新。
     match Client::connect_or_start() {
         Ok(client) => {
             let client = Arc::new(client);
-            // 竞态：另一个线程可能先塞进去了。`OnceLock` 不支持替换，
-            // 所以两个都能用——多出来的那条连接在被 drop 时自然关闭。
-            let stored = CLIENT.get_or_init(|| client.clone());
-            Some(stored.clone())
+            // 竞态下另一线程可能已经先建好了一条：用它的，我们这条随
+            // `Arc` 的最后一个引用一起关闭，不会泄漏。
+            let mut slot = guard();
+            match slot.as_ref().filter(|existing| !existing.is_closed()) {
+                Some(existing) => Some(existing.clone()),
+                None => {
+                    *slot = Some(client.clone());
+                    log::info!("已（重新）建立与终端守护进程的连接");
+                    Some(client)
+                }
+            }
         }
         Err(e) => {
             log::error!("无法连接终端守护进程: {e}");
@@ -212,50 +232,95 @@ pub fn attach(address: &str) -> Result<Session, String> {
 /// 销毁时 `detach`**，否则守护进程会一直往一个没人读的 channel 发数据
 /// （虽然它会因发送失败自行清理，但那要等下一次输出）。
 pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
-    let channel = session.channel;
-    let incoming = session.client.attach_channel(channel);
     let address = session.address.clone();
     let terminal = terminal.downgrade();
 
     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
-        while let Ok(frame) = incoming.recv().await {
-            let alive = match frame.kind {
-                Kind::Data => {
-                    let data = frame.payload;
-                    terminal
-                        .update(cx, |terminal, cx| {
-                            terminal.handle_remote_data(&data, cx);
-                        })
-                        .is_ok()
+        // 当前挂接的 channel 与它的输出流，每轮重连后更新。
+        let mut incoming = session.client.attach_channel(session.channel);
+        let mut current = session;
+
+        'outer: loop {
+            while let Ok(frame) = incoming.recv().await {
+                match frame.kind {
+                    Kind::Data => {
+                        let data = frame.payload;
+                        if terminal
+                            .update(cx, |terminal, cx| {
+                                terminal.handle_remote_data(&data, cx);
+                            })
+                            .is_err()
+                        {
+                            // 视图没了：停止观看，但**不要**结束终端。
+                            log::debug!("终端 {address} 的视图已销毁，停止挂接");
+                            break 'outer;
+                        }
+                    }
+                    Kind::Close => {
+                        // 程序真的退出了（不是我们看不到）。
+                        log::info!("终端 {address} 的程序已退出");
+                        let _ = terminal.update(cx, |terminal, cx| {
+                            terminal.handle_program_exit(cx);
+                        });
+                        break 'outer;
+                    }
+                    _ => {}
                 }
-                Kind::Close => {
-                    // 程序真的退出了（不是我们看不到）。
-                    log::info!("终端 {address} 的程序已退出");
+            }
+
+            // 走到这里说明流断了——通常是与守护进程的连接没了。
+            //
+            // **不能**就这样静默停下：终端会永远冻结在最后一屏，用户以为
+            // 程序卡死了。要试着挂接回去；守护进程重启过的话原来的地址
+            // 已经不存在，`attach` 会返回 not_found，那时才真的放弃。
+            log::warn!("终端 {address} 的挂接流断开，尝试重新挂接");
+
+            // 给守护进程一点时间起来（它可能正在被重新拉起）。
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(300))
+                .await;
+
+            match attach(&address) {
+                Ok(fresh) => {
+                    log::info!("已重新挂接终端 {address}");
+                    incoming = fresh.client.attach_channel(fresh.channel);
+                    current = fresh;
+                }
+                Err(e) => {
+                    log::warn!("终端 {address} 无法重新挂接: {e}");
+                    // 真接不回来了：告诉用户，别让画面静默冻住。
                     let _ = terminal.update(cx, |terminal, cx| {
-                        terminal.handle_program_exit(cx);
+                        terminal.handle_connection_lost(cx);
                     });
-                    break;
+                    break 'outer;
                 }
-                _ => true,
-            };
-            if !alive {
-                // 终端实体已经没了：停止观看，但**不要**结束终端。
-                log::debug!("终端 {address} 的视图已销毁，停止挂接");
-                break;
             }
         }
-        log::debug!("终端 {address} 的挂接流已结束");
+
+        // 只 detach 最后一次握着的那个 channel；之前的都随连接一起没了。
+        current.detach();
+        log::debug!("终端 {address} 的挂接任务结束");
     })
     .detach();
-
-    // 会话本身不参与后续流程，挂接已由上面的任务接管；显式丢弃即可，
-    // `Session` 没有 `Drop`，不会去 detach 掉刚建立的挂接。
-    drop(session);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 挂接不存在的终端必须返回错误，而不是给一个空会话。
+    ///
+    /// 这条保护重连路径：守护进程重启后所有地址都不存在了，`attach`
+    /// 若在这里"成功"返回，泵任务就会挂在一个永远没有数据的 channel 上，
+    /// 终端静默冻住——比明确报"接不回来"糟糕得多。
+    #[test]
+    fn attaching_to_an_unknown_terminal_fails() {
+        // SAFETY：本用例独占该变量，指向一个不存在的运行时目录。
+        unsafe { std::env::set_var(super::super::RUNTIME_DIR_ENV, "/tmp/deepterm-none-2") };
+        let result = attach("t404");
+        assert!(result.is_err(), "没有守护进程时应报错");
+        unsafe { std::env::remove_var(super::super::RUNTIME_DIR_ENV) };
+    }
 
     /// 拿不到守护进程时必须返回错误而不是 panic。
     ///
