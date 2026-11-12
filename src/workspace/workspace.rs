@@ -79,6 +79,16 @@ const FONT_SIZE_MIN: f32 = 6.0;
 const FONT_SIZE_MAX: f32 = 40.0;
 const FONT_SIZE_STEP: f32 = 1.0;
 
+/// 分屏分隔条的厚度（像素）。
+///
+/// 这里必须显式 `flex_none()`（见 `render_split_container`）并固定厚度：
+/// 分割子项用 `flex_basis(Fraction(size))`，历史代码新建分屏时写的是
+/// `[1.0, 1.0]`，子项 basis 总和 200%，溢出时会把同样参与 flex 收缩的
+/// 12px 分隔条压到约 6px。会话恢复时 `normalize_sizes` 又把比例归一到
+/// 总和 1，分隔条不再被压，于是「重启后面板间距突然变大」。
+/// 固定为 6px 既保持用户当前看到的间距，也让新建/恢复完全一致。
+const SPLIT_HANDLE_THICKNESS: f32 = 6.0;
+
 /// 最后一个 tab 关闭时的回调（不需要跨线程，故无 `Send + Sync`）。
 ///
 /// 回调接收**已经算好的** `WorkspaceSessionState`：调用发生在
@@ -2736,11 +2746,19 @@ impl Workspace {
                         let sizes_sum: f32 = sizes.iter().sum();
 
                         let resize_div = div()
+                            // 分隔条是固定尺寸的「实体」，不参与 flex 收缩：
+                            // 否则子项 basis 总和 > 1 时它会被压窄，导致
+                            // 同一布局在新建与恢复后宽度不同。
+                            .flex_none()
                             .when(is_horizontal, |this| {
-                                this.w(px(12.0)).h_full().cursor_col_resize()
+                                this.w(px(SPLIT_HANDLE_THICKNESS))
+                                    .h_full()
+                                    .cursor_col_resize()
                             })
                             .when(!is_horizontal, |this| {
-                                this.h(px(12.0)).w_full().cursor_row_resize()
+                                this.h(px(SPLIT_HANDLE_THICKNESS))
+                                    .w_full()
+                                    .cursor_row_resize()
                             })
                             .flex()
                             .items_center()
