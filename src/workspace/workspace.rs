@@ -56,7 +56,9 @@ actions!(
         /// 把当前面板向右分屏（herdr 的 `pane.split direction=right`）。
         SplitRight,
         /// 把当前面板向下分屏（herdr 的 `pane.split direction=down`）。
-        SplitDown
+        SplitDown,
+        /// 放大 / 缩回当前面板（herdr 的 `pane.zoom`）。
+        TogglePaneZoom
     ]
 );
 
@@ -2909,6 +2911,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SplitDown, window, cx| {
                 this.split_selected_panel(PanelPlacement::Bottom, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &TogglePaneZoom, _window, cx| {
+                this.toggle_selected_panel_zoom(cx);
             }))
             // 新 tab：cmd-t / ctrl-shift-t（直接新建本地终端 tab，同 tab 栏 + 按钮行为）
             .on_action(cx.listener(|this, _: &NewTerminalTab, window, cx| {

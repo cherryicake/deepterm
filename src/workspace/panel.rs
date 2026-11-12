@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use crate::agent::{AgentStatus, CLIAgent};
 use crate::assets::Icon;
+use crate::components::menu::{ContextMenuExt, PopupMenu};
 use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
 use crate::terminal_view::terminal_view::{Event as TerminalViewEvent, TerminalView};
@@ -19,6 +20,11 @@ use crate::workspace::tab_bar::{DragPreview, DraggedTab};
 // Re-export for convenience
 pub use crate::ssh::SshConnectionConfig;
 
+// 面板右键菜单的动作。
+//
+// 用 Action 而不是直接闭包：`PopupMenu::menu` 的签名要求 `Box<dyn Action>`，
+// 点击后统一走 `cx.dispatch_action`，与 deepterm 其它菜单（标签栏右键等）
+// 的机制一致。
 /// 拖拽的 Panel 数据
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraggedPanel {
@@ -1360,5 +1366,58 @@ impl Render for Panel {
             .on_drop(cx.listener(move |_this, _dragged: &(), _window, _cx| {
                 // Generic drop handler
             }))
+            // 右键即选中本面板。
+            //
+            // 菜单里的「关闭面板」走 `CloseSelectedPanel`（关的是**选中**
+            // 那个），而右键完全可能落在非选中面板上。不先选中，就会出现
+            // 「右键 A、关掉 B」。菜单打开前选中，语义才对得上。
+            .on_mouse_down(
+                gpui::MouseButton::Right,
+                cx.listener(|this, _event, _window, cx| {
+                    if !this.is_selected {
+                        cx.emit(PanelEvent::Selected {
+                            panel_id: this.panel_id.clone(),
+                        });
+                    }
+                }),
+            )
+            // 右键菜单：分屏 / 放大 / 关闭。
+            //
+            // 面板标题栏只在分屏（多面板）时才显示，所以单面板时这三个操作
+            // 在界面上无处可点——菜单补上这个入口。菜单项里挂的是
+            // **Workspace 级** action（`SplitRight` / `SplitDown` /
+            // `TogglePaneZoom` / `ClosePanel`）：菜单浮层是独立 entity，
+            // 点选项走 `window.dispatch_action` 沿焦点链分发，挂在 Panel
+            // 上的 handler 收不到，只有 Workspace 接得住。
+            .context_menu(format!("panel-menu-{}", self.panel_id), {
+                let can_split = self.can_split;
+                let can_zoom = self.can_zoom;
+                let is_zoomed = self.is_zoomed;
+                move |menu: PopupMenu, _window, _cx| {
+                    // 只有终端面板能分屏（新面板要继承目录）。
+                    let menu = if can_split {
+                        menu.menu(
+                            "向右分割",
+                            Box::new(crate::workspace::workspace::SplitRight),
+                        )
+                        .menu("向下分割", Box::new(crate::workspace::workspace::SplitDown))
+                    } else {
+                        menu
+                    };
+                    // 放大只在多面板时有意义。
+                    let menu = if can_zoom {
+                        menu.separator().menu(
+                            if is_zoomed { "缩回" } else { "放大" },
+                            Box::new(crate::workspace::workspace::TogglePaneZoom),
+                        )
+                    } else {
+                        menu
+                    };
+                    menu.separator().menu(
+                        "关闭面板",
+                        Box::new(crate::workspace::workspace::CloseSelectedPanel),
+                    )
+                }
+            })
     }
 }
