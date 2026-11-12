@@ -175,6 +175,37 @@ mod log_tests {
     }
 }
 
+/// 安装 panic hook：把 panic 的线程、位置、消息和强制捕获的栈写进日志文件。
+///
+/// 为什么必须有：GUI 进程从 Finder 启动时 stderr 指向 `/dev/null`，Rust
+/// 默认 hook 打印的 panic 消息直接丢失；而 `extern "C"` 回调里的 panic 在
+/// `.ips` 崩溃报告里只剩 `panic_cannot_unwind`，没有消息也没有调用方。
+/// 之前几次崩溃因此完全无法定位。hook 返回后运行时照常 abort，不改变行为。
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("unnamed");
+        let thread_id = thread.id();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        // `force_capture` 不受 RUST_BACKTRACE 影响：release 版默认不打印栈，
+        // 这里必须无条件抓取。
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        log::error!(
+            "=== PANIC === thread={thread_name} ({thread_id:?}) at {location}: {message}\n{backtrace}"
+        );
+        log::logger().flush();
+    }));
+}
+
 fn main() {
     // release 默认 Info：之前 debug/release 都硬编码 Debug，单次会话能写出
     // 几十 MB 日志，真正的问题反而被 DEBUG 淹没。需要排查时用 RUST_LOG 覆盖。
@@ -212,6 +243,9 @@ fn main() {
         }
     }
     builder.init();
+
+    // 尽早安装：此后任何线程的 panic 都会连同位置和栈写入日志。
+    install_panic_hook();
 
     log::info!("=== DeepTerm 启动 ===");
     if let Some(path) = log_file_path() {
