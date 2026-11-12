@@ -108,6 +108,17 @@ pub fn handle_request(registry: &Registry, request: &Value) -> Value {
             }
         }
 
+        "close" => {
+            let Some(address) = request.get("address").and_then(Value::as_str) else {
+                return json!({"ok": false, "error": "缺少 address"});
+            };
+            if registry.close(address) {
+                json!({"ok": true})
+            } else {
+                json!({"ok": false, "error": "没有这个终端", "kind": "not_found"})
+            }
+        }
+
         "reap" => json!({"ok": true, "removed": registry.reap()}),
 
         "snapshot" => {
@@ -293,6 +304,40 @@ mod tests {
     fn a_request_without_an_op_is_an_error_not_a_panic() {
         let response = handle_request(&registry(), &json!({}));
         assert_eq!(response["ok"], false);
+    }
+
+    /// `close` 与 `remove` 是两种语义，不能合并。
+    ///
+    /// - `remove` 只清掉**已经结束**的记录（打扫）；拿它去关一个还活着的
+    ///   终端会失败，这是刻意的保护：一次误调用就把用户的编译任务干掉。
+    /// - `close` 是用户明确说"我不要这个终端了"，**主动结束**还在跑的
+    ///   程序。
+    ///
+    /// 回归价值：若把 `remove` 改成也能杀活终端，任何一次清理调用都会
+    /// 变成"静默杀掉用户正在跑的东西"。
+    #[test]
+    fn remove_refuses_live_terminals_while_close_accepts_them() {
+        let registry = Registry::new();
+        // 没有终端时两者都报 not_found —— 语义差别在"活着"这一侧。
+        let removed = handle_request(&registry, &json!({"op": "remove", "address": "t1"}));
+        assert_eq!(removed["ok"], false);
+        assert_eq!(removed["kind"], "not_removable");
+
+        let closed = handle_request(&registry, &json!({"op": "close", "address": "t1"}));
+        assert_eq!(closed["ok"], false);
+        assert_eq!(closed["kind"], "not_found");
+    }
+
+    /// `close` 缺 address 时要报错而不是关掉别的东西。
+    #[test]
+    fn close_without_an_address_is_rejected() {
+        let response = handle_request(&Registry::new(), &json!({"op": "close"}));
+        assert_eq!(response["ok"], false);
+        assert!(
+            response["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("address"))
+        );
     }
 
     /// 凭据只能进子进程环境，**不能**留在这个终端的记录里。

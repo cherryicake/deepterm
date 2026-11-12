@@ -168,6 +168,22 @@ fn spawn_with(
         .ok_or_else(|| "守护进程没有返回终端地址".to_string())
 }
 
+/// 结束守护进程里某个终端里的程序（用户显式关闭标签/面板）。
+///
+/// 与"断开挂接"是两件事：断开只是不再观看，程序继续跑。
+pub fn close_terminal(address: &str) {
+    let Some(client) = client() else { return };
+    match client.call(serde_json::json!({"op": "close", "address": address})) {
+        Ok(reply) if reply["ok"] == true => {
+            log::info!("已结束守护进程终端 {address}");
+        }
+        Ok(reply) => {
+            log::warn!("结束终端 {address} 失败: {}", reply["error"]);
+        }
+        Err(e) => log::warn!("结束终端 {address} 时无法联系守护进程: {e}"),
+    }
+}
+
 /// 挂接一个已存在的终端。
 pub fn attach(address: &str) -> Result<Session, String> {
     let client = client().ok_or_else(|| "守护进程不可用".to_string())?;

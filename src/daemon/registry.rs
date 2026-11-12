@@ -135,6 +135,22 @@ impl Registry {
         }
     }
 
+    /// 结束一个终端里的程序（不管它是否还活着）。
+    ///
+    /// 与 [`Self::remove`] 的差别：`remove` 只清掉**已经结束**的记录，
+    /// 相当于"打扫"；这个是**主动结束**一个还在跑的程序，是用户点了
+    /// "关掉这个标签"的意思。两者不能合并——把 `remove` 改成能杀活终端，
+    /// 一次误调用就会把用户的编译任务干掉。
+    pub fn close(&self, address: &str) -> bool {
+        match self.get(address) {
+            Some(handle) => {
+                handle.request_close();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 回收所有已结束的终端，返回被移除的地址。
     pub fn reap(&self) -> Vec<Address> {
         let mut map = self.terminals.lock().expect("registry");

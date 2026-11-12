@@ -32,6 +32,16 @@ const IDLE_EXIT: Duration = Duration::from_secs(300);
 /// 50ms 的响应延迟对"连上守护进程"这件事完全够用，又不至于忙等。
 const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
+/// 多久清扫一次已结束的终端记录。
+///
+/// 用户关标签后终端会变成 `finished`，但记录不会自己消失——不清的话，
+/// 一个跑了几天的守护进程会攒下成百上千条死记录，`list` 越来越慢，
+/// 客户端每次也要多解一遍没人用的 JSON。
+///
+/// 取 30 秒：足够让客户端在这段时间里读到 `finished` 状态并给出提示
+/// （"程序已退出"），又不至于让记录长期滞留。
+const REAP_INTERVAL: Duration = Duration::from_secs(30);
+
 /// 跨平台的 `accept`。
 ///
 /// Unix 的 `accept` 返回 `(stream, addr)`，Windows 的命名管道只返回
@@ -89,6 +99,7 @@ pub fn run() -> std::io::Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(AtomicUsize::new(0));
     let idle_since = std::sync::Mutex::new(std::time::Instant::now());
+    let mut last_reap = std::time::Instant::now();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -129,6 +140,15 @@ pub fn run() -> std::io::Result<()> {
             // Windows 的命名管道是**阻塞** accept，这条分支在那里不会命中；
             // 它的空闲退出由下面 `Err(e)` 之前的平台分支处理。
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // 周期性清扫已结束的终端记录（见 `REAP_INTERVAL`）。
+                if last_reap.elapsed() >= REAP_INTERVAL {
+                    let removed = registry.reap();
+                    if !removed.is_empty() {
+                        log::info!("清扫了 {} 个已结束的终端: {:?}", removed.len(), removed);
+                    }
+                    last_reap = std::time::Instant::now();
+                }
+
                 // 空闲退出：没有连接，也没有终端。
                 let idle = *idle_since.lock().expect("idle");
                 if connections.load(Ordering::SeqCst) == 0

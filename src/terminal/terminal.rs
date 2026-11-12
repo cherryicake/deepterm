@@ -4806,17 +4806,18 @@ impl Terminal {
     /// - PTY 模式远程：显式 `close()` 发 `Shutdown`；只靠 drop 回调闭包会让
     ///   alacritty 事件循环在 channel 断开时 panic，且 ssh 子进程可能挂着。
     pub fn kill(&mut self) {
-        // 挂接式终端：程序不归本进程所有，**不能**在这里结束它。
+        // 挂接式终端：程序在守护进程里，本进程只是观看者。
         //
-        // 这条分支是"关掉 deepterm 终端不死"的最后一环：面板关闭 / 标签
-        // 关闭 / 换会话时都会走 `kill`，如果照本地终端那样把 PTY 关掉，
-        // 用户的程序就被我们自己杀了。真正的终止要走守护进程的
-        // `remove` / `spawn` 生命周期，那是显式动作。
-        if self.is_attached() {
-            log::debug!(
-                "挂接式终端不随视图销毁而终止: {:?}",
-                self.attached_address()
-            );
+        // `kill` 的语义是"用户不要这个终端了"（关标签、关面板、换会话），
+        // 所以要**通知守护进程结束程序**，而不是像本地终端那样关 PTY——
+        // 那条路在这里根本不存在，PTY 不在本进程。
+        //
+        // 只在 `Drop` 里不这么做（见 `Drop` 的实现）：视图销毁 ≠ 用户要
+        // 结束它，退出应用时所有视图都会销毁，那时杀程序就等于把
+        // "关掉 deepterm 终端不死"这个功能整个抹掉。
+        if let Some(address) = self.attached_address().map(str::to_owned) {
+            log::info!("结束挂接式终端 {address}（用户关闭了它）");
+            crate::daemon::session::close_terminal(&address);
             return;
         }
         // 本地终端：通知读线程退出，释放 PTY / 回收 shell 子进程。
@@ -5772,7 +5773,23 @@ impl EventEmitter<Event> for Terminal {}
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // 终端被丢弃时显式回收底层资源：
+        // 挂接式终端：**什么都不做**。
+        //
+        // 这是整个持久化功能的关键一环。退出应用时每个视图都会被 drop：
+        // 若在这里调用 `kill`（而 `kill` 会通知守护进程结束程序），
+        // 那"关掉 deepterm 终端不死"就永远不可能成立——用户每次退出都在
+        // 杀掉自己的所有终端。
+        //
+        // 视图销毁只是"不再观看"，守护进程里的程序该继续跑。
+        if self.is_attached() {
+            log::debug!(
+                "挂接式终端随视图销毁，程序留在守护进程里: {:?}",
+                self.attached_address()
+            );
+            return;
+        }
+
+        // 进程内终端：丢弃时必须显式回收资源。
         // - 本地 PTY：仅 drop `local_sender` 只关闭通道，读线程还阻塞在
         //   `Poller::wait` 上；必须显式发 `Shutdown` 让它退出并释放 `Pty`
         //   （触发 SIGHUP / `ClosePseudoConsole`，回收 shell 子进程）。

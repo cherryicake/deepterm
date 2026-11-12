@@ -179,6 +179,15 @@ impl TerminalHandle {
         let _ = self.input_tx.try_send(Input::Bytes(bytes));
     }
 
+    /// 结束这个终端里的程序（用户显式关闭标签/面板时用）。
+    ///
+    /// 与"视图销毁"是两件事：视图销毁只是不再观看，程序该继续跑；
+    /// 这个是用户明确说"我不要它了"。两者混在一起会导致要么关标签杀不掉
+    /// 程序（泄漏），要么关窗口把用户的活全杀了。
+    pub fn request_close(&self) {
+        let _ = self.input_tx.try_send(Input::Shutdown);
+    }
+
     /// 请求改尺寸。
     pub fn resize(&self, size: WindowSize) {
         let _ = self.input_tx.try_send(Input::Resize(size));
