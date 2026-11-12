@@ -1307,8 +1307,22 @@ impl AppWindow {
         if let Some(state) = file_tree_state
             && !state.open_files_info.is_empty()
         {
+            // 这里仍在 `AppWindow::update` 内。恢复过程会重建 md 图片上下文，
+            // 需要文件树根；必须在进入 editor 更新之前直接读 sidebar 算好，
+            // 不能留给 Editor 在恢复途中回头 read AppWindow——那会触发
+            // “cannot read AppWindow while it is already being updated”。
+            let new_tree = self.sidebar.read(cx).file_tree_view();
+            let workspace_root = new_tree.and_then(|tree| {
+                let tree = tree.read(cx);
+                tree.is_local().then(|| tree.root_path().to_path_buf())
+            });
             self.editor.update(cx, |editor, cx| {
-                editor.restore_from_file_tree_state(state, window, cx);
+                editor.restore_from_file_tree_state_with_workspace_root(
+                    state,
+                    workspace_root,
+                    window,
+                    cx,
+                );
             });
         }
     }
