@@ -523,11 +523,21 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Self {
         let panel_id = panel_id.into();
-        let terminal_view = if let Some(cwd) = remote_cwd {
-            TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
-        } else {
-            TerminalView::new_ssh(cx, ssh_config)
-        };
+        // 先试着放进守护进程：这样关掉 deepterm 时 SSH 连接不会断，远端的
+        // 长任务继续跑。失败（守护进程不可用）退回进程内 SSH——持久化是
+        // 增强，不能变成"连不上服务器"的新故障点。
+        let terminal_view =
+            match TerminalView::new_persistent_ssh(cx, ssh_config, remote_cwd.clone(), 80, 24) {
+                Ok(view) => view,
+                Err(e) => {
+                    log::warn!("远程终端未交给守护进程（{e}），使用进程内 SSH");
+                    if let Some(cwd) = remote_cwd {
+                        TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
+                    } else {
+                        TerminalView::new_ssh(cx, ssh_config)
+                    }
+                }
+            };
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
@@ -697,9 +707,44 @@ impl Panel {
                 }
             }
             PanelContentSessionState::Terminal(TerminalSessionState::Ssh {
-                remote_cwd, ..
+                remote_cwd,
+                daemon_address,
+                ..
             }) => {
                 let panel_id = state.id.clone();
+
+                // 先试着接回同一个 SSH 会话：远端的长任务还在跑，重连会让你
+                // 丢掉它（`htop` 退出、编译中断）。
+                if let Some(address) = daemon_address.as_deref()
+                    && let Some(config) = state.content.ssh_config_with_proxy()
+                    && let Some(terminal_view) =
+                        TerminalView::attach_existing(cx, address, None, None, &[])
+                {
+                    log::info!("已接回守护进程中的远程终端 {address}");
+                    terminal_view.update(cx, |this, _cx| {
+                        this.adopt_ssh_session(config, remote_cwd.clone());
+                    });
+                    Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
+                    let mut panel = Self::new_common(
+                        panel_id,
+                        workspace_id,
+                        active_tab_id,
+                        active_tab_label,
+                        PanelContent::Terminal(terminal_view),
+                        cx,
+                    );
+                    panel.ssh_config_id = Some(
+                        state
+                            .content
+                            .ssh_config_with_proxy()
+                            .map(|c| c.id())
+                            .unwrap_or_default(),
+                    );
+                    return panel;
+                }
+                if daemon_address.is_some() {
+                    log::info!("远程终端已不在守护进程中，重新连接 {}", state.id);
+                }
                 // 经 `ssh_config_with_proxy` 还原代理标记：`config` 上的
                 // `use_system_proxy` 是 `serde(skip)` 的，标记存在会话状态的同级
                 // 字段里，不合回去的话恢复出来的海外主机是直连。

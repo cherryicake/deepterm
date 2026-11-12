@@ -1630,6 +1630,7 @@ impl Workspace {
                     ref config,
                     ref remote_cwd,
                     use_system_proxy,
+                    ..
                 }) => {
                     // 代理标记跟着分屏走：海外主机靠它才连得上，
                     // 丢了就得回退成直连（通常直接超时）。
@@ -3355,6 +3356,7 @@ mod tests {
             daemon_address: None,
         };
         let ssh = TerminalSessionState::Ssh {
+            daemon_address: None,
             config: SshConnectionConfig::new(
                 "example.com",
                 "root",

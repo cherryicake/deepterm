@@ -1600,6 +1600,48 @@ impl TerminalView {
         })
     }
 
+    /// 把一个已挂接的终端视图标记成 SSH 会话。
+    ///
+    /// 用于"接回守护进程里的远程终端"：socket 那边只有字节，视图本身
+    /// 不知道它连的是哪台主机。接回后把会话信息补回去，重连、状态栏、
+    /// 会话保存才拿得到主机信息。
+    pub fn adopt_ssh_session(&mut self, config: SshConnectionConfig, remote_cwd: Option<String>) {
+        self.ssh_config = Some(config);
+        self.pending_remote_cwd_restore = remote_cwd;
+    }
+
+    /// 在守护进程里起一个 SSH 终端。
+    ///
+    /// 与 [`Self::new_ssh_with_remote_cwd`] 的区别：`ssh` 进程跑在 `deepcore`
+    /// 里而不是本进程。关掉 deepterm 时 SSH 连接不会断，远端的 `htop`、编译
+    /// 任务继续跑；重开时挂接回同一个连接。
+    ///
+    /// 失败返回 `Err`，调用方应退回进程内 SSH。
+    pub fn new_persistent_ssh(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Entity<Self>, String> {
+        let (program, args, env, _proxy) = crate::ssh::ssh_pty::SshPtyTerminal::build_ssh_command(
+            ssh_config,
+            remote_cwd.as_deref(),
+        )
+        .map_err(|e| format!("构造 SSH 命令失败: {e}"))?;
+
+        let env_pairs: Vec<(String, String)> = env.into_iter().collect();
+
+        let address =
+            crate::daemon::session::spawn_remote_terminal(&program, &args, &env_pairs, cols, rows)?;
+        let view = Self::attach_existing(cx, &address, None, None, &[])
+            .ok_or_else(|| "无法挂接刚创建的远程终端".to_string())?;
+        view.update(cx, |this, _cx| {
+            this.adopt_ssh_session(ssh_config.clone(), remote_cwd);
+        });
+        Ok(view)
+    }
+
     pub fn new_ssh_with_remote_cwd(
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
@@ -1807,7 +1849,14 @@ impl TerminalView {
 
     pub fn session_state(&self, cx: &App) -> TerminalSessionState {
         if let Some(config) = self.ssh_config.clone() {
-            return TerminalSessionState::ssh(config, self.current_remote_working_directory(cx));
+            // 远程终端同样要记住守护进程地址：否则重开只能重连，远端
+            // 正在跑的任务就断了。
+            let mut state =
+                TerminalSessionState::ssh(config, self.current_remote_working_directory(cx));
+            if let TerminalSessionState::Ssh { daemon_address, .. } = &mut state {
+                *daemon_address = self.terminal.read(cx).attached_address().map(str::to_owned);
+            }
+            return state;
         }
 
         let cwd = self.current_local_working_directory(cx);

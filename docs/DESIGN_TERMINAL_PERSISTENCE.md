@@ -189,15 +189,35 @@ deepterm (GUI)                    deepcore (守护进程)
 标签/面板的布局照旧从 `session_state.json` 读；与 herdr 把布局放进 core
 不同，deepterm 单机使用，本地文件已经够了，且能省掉 CAS 那一套。
 
-### 4.5 SSH 远程终端
+### 4.5 SSH 远程终端（已实施）
 
-SSH 会话的字节来源本来就是网络，放进守护进程同样可行：
+远程终端本质就是"PTY 里跑 `ssh`"，所以**不需要新机制**：守护进程照常
+起一条 PTY，只不过里面跑的是 `ssh` 而不是 shell。
 
-- 守护进程持有 SSH 连接（`russh`），客户端挂接在守护进程的输出上；
-- 好处与本地一致：关掉窗口 SSH 连接不断，远的 `htop` 继续跑；
-- 断线重连（`russh` 重连后）由守护进程负责，客户端无感。
+- `SshPtyTerminal::build_ssh_command` 被抽成独立函数，进程内路径与守护
+  进程路径共用同一份参数构造（StrictHostKeyChecking 策略、超时、保活、
+  代理、端口转发）。两边各写一份迟早会漂移，表现成"同一台主机在持久化
+  模式下连法不一样"。
+- spawn 请求新增 `env` 与 `remote` 两个字段：
+  - `env` 传 `SSHPASS` 等**凭据**。这些值只随这一次请求发出，守护进程
+    交给子进程环境后就不再保留，**绝不写进终端记录**（`terminals.json`
+    是同机可读的）。
+  - `remote: true` 表示"别套本地 shell integration"——远程主机上没有
+    deepterm 的集成脚本，注入 `ZDOTDIR`/`ENV` 只会把对方 shell 弄坏。
+- 会话状态里 `Ssh` 分支也带 `daemon_address`，恢复时优先挂接；接不上
+  才重连（重连会让远端的 `htop` 退出、编译中断）。
 
-这一层要复用 `src/ssh/` 里已有的驱动，不能重写。
+**没有做的事：向远端部署 `deepcore`。** herdr 的做法是远端跑它自己的
+core（`hc machine add` 会用 `curl | sh` 装一个），那样终端进程才真正在
+远端机器上。deepterm 现阶段不这么做，理由：
+
+1. 没有发布站，`curl | sh` 这条路不通；
+2. 传自编译二进制要面对 glibc 兼容（本机 2.39 vs 远端 2.35 起不来），
+   得先做 musl 静态构建；
+3. 收益只在"本机断网后远端进程仍要活着"时才体现。
+
+本方案下关闭 deepterm 不中断 SSH 连接，远端的 `htop`、长编译照常跑——
+"关掉 GUI 终端不死"这条需求已经满足。
 
 ### 4.6 Windows
 

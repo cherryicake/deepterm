@@ -149,6 +149,12 @@ pub enum TerminalSessionState {
         /// 缺省 `false`：旧会话文件没有这个字段，按直连处理。
         #[serde(default)]
         use_system_proxy: bool,
+        /// 守护进程里这个远程终端的地址。
+        ///
+        /// 与本地分支同名同义：`Some` 时优先挂接回同一个 SSH 会话，接不上
+        /// 才重连。旧会话文件缺省 `None` = 老行为。
+        #[serde(default)]
+        daemon_address: Option<String>,
     },
 }
 
@@ -164,6 +170,7 @@ impl TerminalSessionState {
             config,
             remote_cwd,
             use_system_proxy,
+            daemon_address: None,
         }
     }
 
@@ -214,8 +221,9 @@ impl TerminalSessionState {
     /// 守护进程里的终端地址（不是挂接式终端时为 `None`）。
     pub fn daemon_address(&self) -> Option<&str> {
         match self {
-            Self::Local { daemon_address, .. } => daemon_address.as_deref(),
-            Self::Ssh { .. } => None,
+            Self::Local { daemon_address, .. } | Self::Ssh { daemon_address, .. } => {
+                daemon_address.as_deref()
+            }
         }
     }
 

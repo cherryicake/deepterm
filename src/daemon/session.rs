@@ -100,6 +100,36 @@ pub fn spawn_terminal(
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
+    spawn_with(cwd, command, args, &[], false, cols, rows)
+}
+
+/// 起一个远程（SSH）终端。
+///
+/// `env` 里可能带 `SSHPASS` 之类的**凭据**：它只随这一次 spawn 请求发出，
+/// 守护进程把它交给子进程环境后就不再保留，也不会写进终端记录。
+pub fn spawn_remote_terminal(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    spawn_with(None, Some(command), args, env, true, cols, rows)
+}
+
+/// 起终端请求的统一实现。
+///
+/// `remote` 为 true 时守护进程**不套**本地 shell integration：远程主机上没有
+/// deepterm 的集成脚本，注入 `ZDOTDIR`/`ENV` 只会把对方的 shell 弄坏。
+fn spawn_with(
+    cwd: Option<&std::path::Path>,
+    command: Option<&str>,
+    args: &[String],
+    env: &[(String, String)],
+    remote: bool,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
     let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
     let mut request = serde_json::json!({
         "op": "spawn",
@@ -112,6 +142,16 @@ pub fn spawn_terminal(
     if let Some(command) = command {
         request["shell"] = serde_json::json!(command);
         request["args"] = serde_json::json!(args);
+    }
+    if !env.is_empty() {
+        let map: serde_json::Map<String, serde_json::Value> = env
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::json!(v)))
+            .collect();
+        request["env"] = serde_json::Value::Object(map);
+    }
+    if remote {
+        request["remote"] = serde_json::json!(true);
     }
     let reply = client
         .call(request)

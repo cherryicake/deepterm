@@ -157,11 +157,33 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
         .and_then(Value::as_u64)
         .unwrap_or(super::registry::DEFAULT_ROWS as u64) as u16;
 
-    // shell integration 必须与本地终端走**同一套**准备逻辑：否则守护进程
-    // 起出来的 shell 拿不到 OSC 7 上报，`cd` 之后文件树不跟随、提示符标记
-    // 收不到，用户会觉得"开了持久化之后功能少了一半"。
+    // 请求方可以自带环境变量（远程 SSH 终端需要 `SSHPASS` 之类的凭据，
+    // 那些值只能由 UI 侧提供——守护进程不持有用户的密钥链）。
+    //
+    // **绝不把它们写进终端记录**：`SSHPASS` 是明文口令，落盘等于把它
+    // 写进 `terminals.json`。
     let mut env = crate::terminal::mappings::default_terminal_env();
+    if let Some(extra) = request.get("env").and_then(Value::as_object) {
+        for (key, value) in extra {
+            if let Some(value) = value.as_str() {
+                env.insert(key.clone(), value.to_string());
+            }
+        }
+    }
+
+    // `remote: true` 表示"这是 SSH 连接，别套本地 shell integration"。
+    // 远程主机上不存在 deepterm 的集成脚本，注入 ZDOTDIR/ENV 只会把
+    // 远程 shell 弄坏。
+    let is_remote = request
+        .get("remote")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let shell = match shell_program {
+        Some(program) if is_remote => {
+            // 远程：原样执行调用方给的命令，不做任何 shell 改写。
+            alacritty_terminal::tty::Shell::new(program, args)
+        }
         Some(program) => {
             crate::terminal::terminal::configure_local_shell_integration(program, args, &mut env)
         }
@@ -271,6 +293,24 @@ mod tests {
     fn a_request_without_an_op_is_an_error_not_a_panic() {
         let response = handle_request(&registry(), &json!({}));
         assert_eq!(response["ok"], false);
+    }
+
+    /// 凭据只能进子进程环境，**不能**留在这个终端的记录里。
+    ///
+    /// 远程 SSH 终端用 `SSHPASS` 传明文口令。守护进程会把它交给 PTY 子进程，
+    /// 但一旦它进了 `TerminalHandle` 或落盘文件，等于把用户口令写进
+    /// `terminals.json`——同机任何进程都能读到。
+    ///
+    /// 这条钉住的是"记录里没有环境变量"这个结构性事实：`list`/`get` 返回的
+    /// JSON 里不该出现任何 env 内容。
+    #[test]
+    fn credentials_never_appear_in_terminal_records() {
+        let registry = Registry::new();
+        let response = handle_request(&registry, &json!({"op": "list"}));
+        let text = response.to_string();
+        for key in ["SSHPASS", "password", "env"] {
+            assert!(!text.contains(key), "终端记录不该含 {key}: {text}");
+        }
     }
 
     /// 默认 shell 必须能解析出来，否则守护进程起不了任何终端。
