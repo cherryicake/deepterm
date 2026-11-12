@@ -31,6 +31,15 @@ pub const RUNTIME_DIR_ENV: &str = "DEEPTERM_RUNTIME_DIR";
 /// 最后退到配置目录。选 `XDG_RUNTIME_DIR` 的理由：它在 Linux 上是
 /// tmpfs 且权限为 0700，socket 天然不会被别的用户拿到；配置目录在
 /// 某些发行版上是 0755，把 socket 放那里等于把终端交给同机所有用户。
+/// Unix socket 的路径上限（`sun_path`），macOS 与 Linux 都是 104 字节。
+///
+/// 超了这个长度 `bind` 直接失败，而且错误信息是 "path too long"，很容易
+/// 被当成权限问题查半天。macOS 没有 `XDG_RUNTIME_DIR`，默认会落到
+/// `~/Library/Application Support/deepterm/`——用户名或目录名长一点就可能
+/// 越界，所以要主动兜底。
+#[cfg(unix)]
+const MAX_SOCKET_PATH: usize = 100;
+
 pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(RUNTIME_DIR_ENV).filter(|v| !v.is_empty()) {
         return PathBuf::from(dir);
@@ -38,7 +47,28 @@ pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(dir).join("deepterm");
     }
-    crate::workspace::persistence::PersistenceManager::get_config_dir()
+
+    let config = crate::workspace::persistence::PersistenceManager::get_config_dir();
+
+    // Unix 上先算一下 socket 路径会不会超限；超了就退到临时目录下按 uid
+    // 隔离的短路径（`/tmp` 在 macOS 是个指向 `/private/tmp` 的软链，
+    // 用 `$TMPDIR` 更稳，但它本身也可能很长，所以取较短的那个）。
+    #[cfg(unix)]
+    {
+        let would_be = config.join(SOCKET_FILE_NAME);
+        if would_be.to_string_lossy().len() > MAX_SOCKET_PATH {
+            let uid = unsafe { libc::getuid() };
+            let short = PathBuf::from(format!("/tmp/deepterm-{uid}"));
+            log::warn!(
+                "配置目录下的 socket 路径过长（{}），改用 {}",
+                would_be.display(),
+                short.display()
+            );
+            return short;
+        }
+    }
+
+    config
 }
 
 /// socket（或 Named Pipe）的完整路径。
@@ -131,6 +161,24 @@ pub use transport::{Listener, Stream};
 #[cfg(test)]
 mod path_tests {
     use super::*;
+
+    /// socket 路径必须落在 `sun_path` 的长度上限内。
+    ///
+    /// 回归价值：macOS 没有 `XDG_RUNTIME_DIR`，默认路径是
+    /// `~/Library/Application Support/deepterm/daemon.sock`。用户名或目录名
+    /// 长一点就越过 104 字节，`bind` 报 "path too long"——那个错误看起来像
+    /// 权限问题，很容易查错方向。这条把上限钉住，改路径拼接时会立刻发现。
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_path_fits_in_sun_path() {
+        let path = socket_path();
+        let len = path.to_string_lossy().len();
+        assert!(
+            len <= MAX_SOCKET_PATH,
+            "socket 路径 {len} 字节，超过上限 {MAX_SOCKET_PATH}: {}",
+            path.display()
+        );
+    }
 
     /// 环境变量覆盖必须生效，且要拼上固定的文件名。
     ///
