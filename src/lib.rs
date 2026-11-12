@@ -6,6 +6,7 @@ pub mod agent;
 pub mod assets;
 pub mod builtin_commands;
 pub mod components;
+pub mod daemon;
 pub mod editor;
 pub mod file_manager;
 pub mod keymap;

@@ -213,6 +213,25 @@ fn main() {
     }
     builder.init();
 
+    // 隐藏子命令：守护进程。
+    //
+    // 必须在日志初始化**之后**（守护进程也要写日志）、GPUI 启动**之前**
+    // 拦下来——它是个纯后台进程，绝不能初始化图形栈。
+    //
+    // 选"同一个可执行文件的隐藏子命令"而不是独立二进制：打包形态不变，
+    // 版本天然一致，不会出现"新客户端配旧守护进程"的错配。
+    if std::env::args().nth(1).as_deref() == Some("__daemon") {
+        log::info!("=== DeepTerm 守护进程启动 ===");
+        match deepterm::daemon::listen::run() {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                log::error!("守护进程启动失败: {e}");
+                eprintln!("deepterm __daemon: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     log::info!("=== DeepTerm 启动 ===");
     if let Some(path) = log_file_path() {
         log::info!("日志文件: {}", path.display());

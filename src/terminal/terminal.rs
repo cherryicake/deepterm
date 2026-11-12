@@ -137,6 +137,19 @@ pub const AGENT_STREAM_WINDOW: Duration = Duration::from_millis(800);
 pub enum TerminalType {
     /// 本地终端（通过PTY）
     Local,
+    /// 挂在守护进程上的本地终端。
+    ///
+    /// 与 [`Self::Local`] 的区别只在"谁持有 PTY"：这个变体的 PTY 在
+    /// `deepterm __daemon` 进程里，本进程只是一个挂接者。因此关掉窗口
+    /// 不会杀掉程序，重开时挂接回去即可（见 `docs/DESIGN_TERMINAL_PERSISTENCE.md`）。
+    ///
+    /// 之所以单列一个变体而不是复用 `Local`：`is_remote()`、`remote_info()`、
+    /// 会话恢复、以及"前台进程组"这类判断对三者的答案不同，用类型区分
+    /// 比到处写 `if attached { .. }` 更难写错。
+    Attached {
+        /// 守护进程里的终端地址（`t1`、`t2`…）。
+        address: String,
+    },
     /// 远程SSH终端
     Remote {
         /// 主机地址
@@ -1946,6 +1959,71 @@ impl Terminal {
         }
     }
 
+    /// 构造一个挂在守护进程上的终端。
+    ///
+    /// `address` 是守护进程里的终端地址。返回的实体与本地终端在使用上
+    /// 没有区别；区别只在生命周期：**它不会因为本进程退出而结束**。
+    ///
+    /// 调用方负责：
+    /// 1. 已经通过 `/attach` 拿到 `channel` 并建立了推送循环；
+    /// 2. 把收到的字节喂给 [`Self::handle_remote_data`]；
+    /// 3. 断开时不要调 `shutdown`——那不是"关闭终端"，只是"停止观看"。
+    ///
+    /// `input` / `resize` 是回写通道，由调用方接到守护进程客户端上。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_attached(
+        cx: &mut App,
+        address: String,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        input: impl Fn(&[u8]) + Send + Sync + 'static,
+        resize: impl Fn(u16, u16, f32) + Send + Sync + 'static,
+    ) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        // 挂接式终端没有独立的"驱动事件"来源：断线由调用方直接调用
+        // `handle_remote_data` / 事件通知，这条通道留空即可（保持
+        // `build_attachable` 的签名统一）。
+        let (_driver_tx, driver_rx) = async_channel::bounded::<DriverEvent>(1);
+        let listener = ZedListener(events_tx.clone());
+
+        // 初始几何按守护进程给的 cols/rows 与默认单元格尺寸换算。
+        //
+        // **不能**把 cell_width / line_height 写成 0：`TerminalBounds` 的
+        // `num_columns()` / `num_lines()` 是除法，0 会让 `Term::new` 拿到
+        // 一个溢出的列数，直接 `capacity overflow` panic。
+        let template = TerminalBounds::default();
+        let initial = TerminalBounds::new(
+            template.line_height,
+            template.cell_width,
+            Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: template.cell_width * cols as f32,
+                    height: template.line_height * rows as f32,
+                },
+            },
+        );
+        let term = Arc::new(FairMutex::new(Term::new(
+            Self::terminal_config_with_scrollback(scrollback_lines),
+            &initial,
+            listener.clone(),
+        )));
+
+        Self::build_attachable(
+            cx,
+            TerminalType::Attached { address },
+            term,
+            listener,
+            events_rx,
+            driver_rx,
+            input,
+            resize,
+            scrollback_lines,
+            None,
+        )
+    }
+
     fn new_ssh_russh(
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
@@ -2136,8 +2214,48 @@ impl Terminal {
         scrollback_requested: usize,
         russh_handle: Option<RusshTerminal>,
     ) -> Entity<Self> {
+        let terminal_type = TerminalType::Remote {
+            host: ssh_config.host.clone(),
+            username: ssh_config.username.clone(),
+            port: ssh_config.port,
+        };
+        Self::build_attachable(
+            cx,
+            terminal_type,
+            term,
+            listener,
+            events_rx,
+            driver_rx,
+            input_handler,
+            resize_handler,
+            scrollback_requested,
+            russh_handle,
+        )
+    }
+
+    /// 构造一个"字节来自外部"的终端：远程 SSH 与守护进程挂接共用这一条。
+    ///
+    /// 两者的差别只有 [`TerminalType`]（以及谁在喂字节），其余管线完全一致：
+    /// 字节进 `handle_remote_data` → `process_pty_data` → vte，输入走
+    /// `remote_input_callback`，尺寸走 `remote_resize_callback`。
+    ///
+    /// 抽出来的价值：挂接式终端不必复制一遍 200 行的字段初始化——那份
+    /// 初始化里有一堆必须成对出现的 `Arc`（kitty 图像、应答队列、脏标记），
+    /// 复制粘贴迟早漏一个，表现为"图片渲染不出来"这种很难查的故障。
+    #[allow(clippy::too_many_arguments)]
+    fn build_attachable(
+        cx: &mut App,
+        terminal_type: TerminalType,
+        term: Arc<FairMutex<Term<ZedListener>>>,
+        listener: ZedListener,
+        events_rx: UnboundedReceiver<AlacTermEvent>,
+        driver_rx: async_channel::Receiver<DriverEvent>,
+        input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
+        resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
+        scrollback_requested: usize,
+        russh_handle: Option<RusshTerminal>,
+    ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
-        let ssh_config_clone = ssh_config.clone();
 
         // 远程路径的字节在 UI 线程解析，因此扫描器/共享状态都在这里建立。
         let images = KittyImages::default();
@@ -2260,11 +2378,7 @@ impl Terminal {
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
                 scrollback_requested,
-                terminal_type: TerminalType::Remote {
-                    host: ssh_config_clone.host.clone(),
-                    username: ssh_config_clone.username.clone(),
-                    port: ssh_config_clone.port,
-                },
+                terminal_type,
                 remote_input_callback: Some(Box::new(input_handler)),
                 remote_resize_callback: Some(Box::new(resize_handler)),
                 russh_handle,
@@ -2283,6 +2397,19 @@ impl Terminal {
     /// 检查是否是远程终端
     pub fn is_remote(&self) -> bool {
         matches!(self.terminal_type, TerminalType::Remote { .. })
+    }
+
+    /// 是否挂在守护进程上（终端不归本进程所有）。
+    pub fn is_attached(&self) -> bool {
+        matches!(self.terminal_type, TerminalType::Attached { .. })
+    }
+
+    /// 守护进程里的终端地址。
+    pub fn attached_address(&self) -> Option<&str> {
+        match &self.terminal_type {
+            TerminalType::Attached { address } => Some(address),
+            _ => None,
+        }
     }
 
     /// 获取远程连接信息（如果是远程终端）
@@ -5841,6 +5968,73 @@ mod tests {
             // 锁释放后的下一轮检查应清掉 pending，并正常应用模式。
             terminal.check_focus_mode_enabled();
             assert!(!terminal.focus_check_pending);
+        });
+    }
+
+    /// 挂接式终端必须能把外部灌进来的字节解析成内容。
+    ///
+    /// 这条保护 `new_attached` 与 `handle_remote_data` 之间的接线：
+    /// 挂接式终端没有本地读线程，字节**只**能从 `handle_remote_data` 进，
+    /// 一旦那条路断了，界面上永远是空屏——而所有本地终端的测试都不会发现。
+    #[gpui::test]
+    fn attached_terminal_parses_bytes_from_its_byte_source(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t1".to_string(), 80, 24, 1_000, |_| {}, |_, _, _| {})
+        });
+
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"attached-hello", cx);
+            // 直接读 `Term` 而不是 `last_content()`：后者是渲染快照，
+            // 要等一次 `update_last_content` 才刷新，与"字节有没有进网格"
+            // 是两件事。这条测的是后者。
+            let text: String = {
+                let term = t.term.lock();
+                let grid = term.grid();
+                let mut out = String::new();
+                let rows = alacritty_terminal::grid::Dimensions::screen_lines(grid);
+                let cols = alacritty_terminal::grid::Dimensions::columns(grid);
+                for row in 0..rows {
+                    let line = &grid[alacritty_terminal::index::Line(row as i32)];
+                    for col in 0..cols {
+                        out.push(line[alacritty_terminal::index::Column(col)].c);
+                    }
+                }
+                out
+            };
+            assert!(
+                text.contains("attached-hello"),
+                "挂接式终端应解析外部字节，实际内容: {text:?}"
+            );
+        });
+    }
+
+    /// 挂接式终端的类型标识必须能被认出来。
+    ///
+    /// 这条钉住的是"关窗不杀程序"的前提：界面上要能区分"这是挂在守护
+    /// 进程上的终端"，否则 `cmd-w` / 退出流程会照本地终端的方式去
+    /// shutdown，把用户的程序杀掉。
+    #[gpui::test]
+    fn attached_terminals_identify_themselves(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t7".to_string(), 80, 24, 1_000, |_| {}, |_, _, _| {})
+        });
+        terminal.read_with(cx, |t, _| {
+            assert!(t.is_attached(), "应被识别为挂接式终端");
+            assert!(!t.is_remote(), "挂接式终端不是 SSH 远程终端");
+            assert_eq!(t.attached_address(), Some("t7"));
+        });
+    }
+
+    /// 普通本地终端不能被误判成挂接式。
+    ///
+    /// 反向保护：若 `is_attached` 写错（比如 `matches!` 用反了），
+    /// 所有本地终端都会走"关窗不清理"的路径，泄漏 PTY 与子进程。
+    #[gpui::test]
+    fn a_headless_terminal_is_not_attached(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.read_with(cx, |t, _| {
+            assert!(!t.is_attached());
+            assert_eq!(t.attached_address(), None);
         });
     }
 
