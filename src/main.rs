@@ -232,12 +232,11 @@ fn main() {
             deepterm::keymap::bind(
                 cx,
                 [
-                    KeyBinding::new("cmd-q", Quit, None),
-                    #[cfg(target_os = "windows")]
-                    KeyBinding::new("ctrl-k", ShowSshPicker, None),
-                    #[cfg(not(target_os = "windows"))]
-                    KeyBinding::new("cmd-k", ShowSshPicker, None),
-                    KeyBinding::new("cmd-n", NewWindow, None),
+                    // `secondary-` = macOS 的 ⌘ / 其他平台的 Ctrl。
+                    // 写死 `cmd-` 在 Linux/Windows 上会映射到 Super 键，按 Ctrl 无效。
+                    KeyBinding::new("secondary-q", Quit, None),
+                    KeyBinding::new("secondary-k", ShowSshPicker, None),
+                    KeyBinding::new("secondary-n", NewWindow, None),
                 ],
             );
             cx.on_action(|_: &Quit, cx| {

@@ -182,19 +182,16 @@ pub fn init(cx: &mut App) {
     crate::keymap::bind(
         cx,
         [
-            KeyBinding::new("cmd-c", crate::editor::markdown::Copy, Some("LiveMarkdown")),
+            // 复制/全选：`secondary-` 覆盖 macOS 的 ⌘ 与其他平台的 Ctrl，
+            // 一行即可；原先 cmd/ctrl 各绑一次，在 Windows/Linux 上
+            // cmd 那行会变成 Super 键，等于多注册了一个用不到的绑定。
             KeyBinding::new(
-                "ctrl-c",
+                "secondary-c",
                 crate::editor::markdown::Copy,
                 Some("LiveMarkdown"),
             ),
             KeyBinding::new(
-                "cmd-a",
-                crate::editor::markdown::SelectAll,
-                Some("LiveMarkdown"),
-            ),
-            KeyBinding::new(
-                "ctrl-a",
+                "secondary-a",
                 crate::editor::markdown::SelectAll,
                 Some("LiveMarkdown"),
             ),
@@ -203,34 +200,34 @@ pub fn init(cx: &mut App) {
     crate::keymap::bind(
         cx,
         [
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-w", CloseActiveEditorTab, Some("EditorPanel")),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-s", SaveActiveEditorTab, Some("EditorPanel")),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-s", SaveActiveEditorTab, Some("EditorPanel")),
-            // 跳转到行：ctrl-g 全平台；cmd-l 仅 macOS（覆盖工作区的新建终端）
+            // 编辑器面板内：`secondary-` = macOS ⌘ / 其他平台 Ctrl。
+            // 原先 `CloseActiveEditorTab` 只在 macOS 绑了 cmd-w，
+            // Linux/Windows 上根本没有关闭编辑器标签的键。
+            KeyBinding::new("secondary-w", CloseActiveEditorTab, Some("EditorPanel")),
+            KeyBinding::new("secondary-s", SaveActiveEditorTab, Some("EditorPanel")),
+            // 跳转到行：ctrl-g 全平台；macOS 额外保留 ⌘L
             KeyBinding::new("ctrl-g", GotoLine, Some("EditorPanel")),
             #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-l", GotoLine, Some("EditorPanel")),
-            KeyBinding::new("cmd-+", ZoomIn, Some("ImageViewer")),
-            KeyBinding::new("cmd-=", ZoomIn, Some("ImageViewer")),
-            KeyBinding::new("cmd--", ZoomOut, Some("ImageViewer")),
-            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
+            KeyBinding::new("secondary-l", GotoLine, Some("EditorPanel")),
+            // 图片查看器
+            KeyBinding::new("secondary-+", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("secondary-=", ZoomIn, Some("ImageViewer")),
+            KeyBinding::new("secondary--", ZoomOut, Some("ImageViewer")),
+            KeyBinding::new("secondary-0", ActualSize, Some("ImageViewer")),
+            KeyBinding::new("secondary-9", FitToView, Some("ImageViewer")),
+            KeyBinding::new("secondary-1", ResetZoom, Some("ImageViewer")),
             // LSP：跳转定义 / 查找引用 / 重命名 / 格式化，全平台同键。
             KeyBinding::new("f12", GotoDefinition, Some("EditorPanel")),
             KeyBinding::new("ctrl-f12", GotoDeclaration, Some("EditorPanel")),
             KeyBinding::new("ctrl-shift-f12", GotoTypeDefinition, Some("EditorPanel")),
-            KeyBinding::new("cmd-f12", GotoImplementation, Some("EditorPanel")),
+            KeyBinding::new("secondary-f12", GotoImplementation, Some("EditorPanel")),
             // 跳转返回：与 VSCode/Zed 一致用 ctrl--（macOS 上也常见 cmd--）。
             KeyBinding::new("ctrl--", NavigateBack, Some("EditorPanel")),
             KeyBinding::new("shift-f12", FindReferences, Some("EditorPanel")),
             KeyBinding::new("f2", RenameSymbol, Some("EditorPanel")),
             KeyBinding::new("alt-shift-f", FormatDocument, Some("EditorPanel")),
-            KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("EditorPanel")),
-            KeyBinding::new("cmd-.", CodeAction, Some("EditorPanel")),
+            KeyBinding::new("secondary-shift-o", DocumentSymbols, Some("EditorPanel")),
+            KeyBinding::new("secondary-.", CodeAction, Some("EditorPanel")),
             // 键盘触发 hover（vim normal 下的 `K`）：第一次显示浮层，第二次把
             // 焦点移进浮层，此后 hjkl 滚动内容。
             //
@@ -245,9 +242,6 @@ pub fn init(cx: &mut App) {
             //
             // **不能**绑在 `EditorPanel`：`Input` 上已有 enter/escape/up/down，
             // 同深度下更深（Input）的绑定先派发并消费事件，补全动作永远收不到。
-            KeyBinding::new("cmd-0", ActualSize, Some("ImageViewer")),
-            KeyBinding::new("cmd-9", FitToView, Some("ImageViewer")),
-            KeyBinding::new("cmd-1", ResetZoom, Some("ImageViewer")),
         ],
     );
 }

@@ -1415,12 +1415,13 @@ impl Render for Panel {
                 move |menu: PopupMenu, _window, _cx| {
                     use crate::components::button::Icon as MenuIcon;
                     use crate::workspace::workspace as ws;
-                    // 快捷键提示必须与实际绑定一致（见 workspace.rs 的 bind）。
+                    // 快捷键提示必须与实际绑定一致：workspace.rs 里用的是
+                    // `secondary-*`（macOS = ⌘，Linux/Windows = Ctrl）。
                     let mac = cfg!(target_os = "macos");
                     let (k_right, k_down, k_zoom, k_close) = if mac {
                         ("⌘D", "⇧⌘D", "⇧⌘↩", "⌘W")
                     } else {
-                        ("Ctrl⇧D", "Ctrl⇧E", "Ctrl⇧↩", "⌘W")
+                        ("Ctrl+D", "Ctrl+Shift+D", "Ctrl+Shift+Enter", "Ctrl+W")
                     };
                     // 只有终端面板能分屏（新面板要继承目录）。
                     let menu = if can_split {

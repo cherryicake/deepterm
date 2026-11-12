@@ -62,7 +62,9 @@ actions!(
     ]
 );
 
-/// 跳转到第 N 个 tab（0 基）：cmd-1..9 为前 9 个，cmd-0 为第 10 个。
+/// 跳转到第 N 个 tab（0 基）：1..9 键为前 9 个，0 键为第 10 个。
+///
+/// 绑定写作 `secondary-N`：macOS 是 ⌘N，Linux/Windows 是 Ctrl+N。
 #[derive(Clone, PartialEq, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
 #[action(namespace = workspace, no_json)]
 pub struct GotoTab(pub usize);
@@ -116,87 +118,58 @@ pub fn init(cx: &mut App) {
     crate::keymap::bind(
         cx,
         [
-            #[cfg(target_os = "windows")]
-            KeyBinding::new("ctrl-l", NewLocalTerminal, None),
-            #[cfg(not(target_os = "windows"))]
-            KeyBinding::new("cmd-l", NewLocalTerminal, None),
-            KeyBinding::new("cmd-w", CloseSelectedPanel, None),
+            // 新建本地终端：mac ⌘L、Linux/Windows Ctrl+L
+            KeyBinding::new("secondary-l", NewLocalTerminal, None),
+            // `secondary-` 是 gpui 的跨平台写法：macOS 映射 Command、
+            // 其他平台映射 Control。写死 `cmd-` 在 Linux/Windows 上会被解析成
+            // **Super/Win** 键，用户按 Ctrl 毫无反应。
+            KeyBinding::new("secondary-w", CloseSelectedPanel, None),
             // 面板分屏 / 缩放。面板标题栏只在分屏后出现，这几个键让单面板时
-            // 也能用键盘操作；右键菜单里的快捷键提示即取自这里。
+            // 也能用键盘操作；右键菜单里的快捷键提示取自这里。
+            KeyBinding::new("secondary-d", SplitRight, None),
+            KeyBinding::new("secondary-shift-d", SplitDown, None),
+            KeyBinding::new("secondary-shift-enter", TogglePaneZoom, None),
+            // 新 tab。非 macOS 用 shift 是有意为之：那里 ctrl-t 是 shell 的
+            // 输出重定向切换，不抢它。
             #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-d", SplitRight, None),
+            KeyBinding::new("secondary-t", NewTerminalTab, None),
             #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-d", SplitRight, None),
+            KeyBinding::new("secondary-shift-t", NewTerminalTab, None),
+            // 重开最近关闭的 tab：mac 用 ⇧⌘T，其他平台用 Ctrl+Alt+T
             #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-d", SplitDown, None),
+            KeyBinding::new("secondary-shift-t", ReopenClosedTab, None),
             #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-e", SplitDown, None),
+            KeyBinding::new("secondary-alt-t", ReopenClosedTab, None),
+            // Tab 轮换：mac 用 ⇧⌘] / ⇧⌘[，其他平台用 Ctrl+PageUp/PageDown
             #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-enter", TogglePaneZoom, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-enter", TogglePaneZoom, None),
-            // 新 tab：cmd-t（win/linux 用 ctrl-shift-t，ctrl-t 是 shell 的输出重定向切换）
+            KeyBinding::new("secondary-shift-]", NextTab, None),
             #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-t", NewTerminalTab, None),
+            KeyBinding::new("secondary-shift-[", PreviousTab, None),
             #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-t", NewTerminalTab, None),
-            // 重开最近关闭的 tab：cmd-shift-t（mac）/ ctrl-alt-t（其他）
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+            KeyBinding::new("secondary-pageup", PreviousTab, None),
             #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-alt-t", ReopenClosedTab, None),
-            // Tab 轮换：cmd-shift-] / cmd-shift-[（win/linux 用 ctrl-pageup/down）
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-]", NextTab, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-[", PreviousTab, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-pageup", PreviousTab, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-pagedown", NextTab, None),
-            // cmd+1..9 直接切到第 N 个 tab（0 = 第 10 个）
-            KeyBinding::new("cmd-1", GotoTab(0), None),
-            KeyBinding::new("cmd-2", GotoTab(1), None),
-            KeyBinding::new("cmd-3", GotoTab(2), None),
-            KeyBinding::new("cmd-4", GotoTab(3), None),
-            KeyBinding::new("cmd-5", GotoTab(4), None),
-            KeyBinding::new("cmd-6", GotoTab(5), None),
-            KeyBinding::new("cmd-7", GotoTab(6), None),
-            KeyBinding::new("cmd-8", GotoTab(7), None),
-            KeyBinding::new("cmd-9", GotoTab(8), None),
-            // cmd-0 是第 10 个 tab（与 cmd-1..9 同源），字号复位让位给 cmd-shift-0
-            KeyBinding::new("cmd-0", GotoTab(9), None),
-            // 分屏导航：cmd+alt+方向键（win/linux 用 ctrl+alt+方向键）
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-alt-left", FocusSplitLeft, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-alt-right", FocusSplitRight, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-alt-up", FocusSplitUp, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-alt-down", FocusSplitDown, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-alt-left", FocusSplitLeft, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-alt-right", FocusSplitRight, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-alt-up", FocusSplitUp, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-alt-down", FocusSplitDown, None),
-            // 字号：cmd +/-/0（win/linux 用 ctrl +/-/0）。
-            // 注意 win/linux 下 ctrl+0 / ctrl+plus 不会与浏览器风格冲突。
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-+", IncreaseFontSize, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-", DecreaseFontSize, None),
-            #[cfg(target_os = "macos")]
-            KeyBinding::new("cmd-shift-0", ResetFontSize, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-+", IncreaseFontSize, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-", DecreaseFontSize, None),
-            #[cfg(not(target_os = "macos"))]
-            KeyBinding::new("ctrl-shift-0", ResetFontSize, None),
+            KeyBinding::new("secondary-pagedown", NextTab, None),
+            // 1..9 直接切到第 N 个 tab（0 基索引），0 键是第 10 个
+            KeyBinding::new("secondary-1", GotoTab(0), None),
+            KeyBinding::new("secondary-2", GotoTab(1), None),
+            KeyBinding::new("secondary-3", GotoTab(2), None),
+            KeyBinding::new("secondary-4", GotoTab(3), None),
+            KeyBinding::new("secondary-5", GotoTab(4), None),
+            KeyBinding::new("secondary-6", GotoTab(5), None),
+            KeyBinding::new("secondary-7", GotoTab(6), None),
+            KeyBinding::new("secondary-8", GotoTab(7), None),
+            KeyBinding::new("secondary-9", GotoTab(8), None),
+            // 0 键是第 10 个 tab（与上面同源），字号复位让位给 secondary-shift-0
+            KeyBinding::new("secondary-0", GotoTab(9), None),
+            // 分屏导航：secondary+alt+方向键（全平台同一写法）
+            KeyBinding::new("secondary-alt-left", FocusSplitLeft, None),
+            KeyBinding::new("secondary-alt-right", FocusSplitRight, None),
+            KeyBinding::new("secondary-alt-up", FocusSplitUp, None),
+            KeyBinding::new("secondary-alt-down", FocusSplitDown, None),
+            // 字号：secondary +/-/0（mac 是 ⌘，其他平台是 Ctrl）。
+            KeyBinding::new("secondary-+", IncreaseFontSize, None),
+            KeyBinding::new("secondary--", DecreaseFontSize, None),
+            KeyBinding::new("secondary-shift-0", ResetFontSize, None),
         ],
     );
 }
@@ -3228,6 +3201,61 @@ pub(crate) fn should_mark_unread(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 代码里注册的键位优先用 `secondary-`，别写死 `cmd-`。
+    ///
+    /// gpui 把 `cmd` 解析成 **Super/Win** 键，不是「平台主修饰键」：写死
+    /// `cmd-w` 在 Linux/Windows 上要按 Win+W 才有反应，用户按 Ctrl 毫无反应。
+    /// `secondary-` 才是「macOS 用 ⌘、其他平台用 Ctrl」。
+    ///
+    /// 例外：终端视图刻意保留 `cmd-*` + 在下方追加 `ctrl-*`（Ctrl+C 有选区
+    /// 才复制、否则要能中断进程，语义与普通复制不同）。所以这里只在
+    /// **没有对应 ctrl 绑定**时才视为错误——那正是「用户按 Ctrl 没反应」的情形。
+    #[test]
+    fn code_bindings_use_secondary_not_bare_cmd() {
+        for (name, src) in source_files_with_key_bindings() {
+            let mut cmd_keys = Vec::new();
+            let mut ctrl_keys = Vec::new();
+            for (start, _) in src.match_indices("KeyBinding::new(\"") {
+                let rest = &src[start + "KeyBinding::new(\"".len()..];
+                let Some(end) = rest.find('"') else { continue };
+                let keys = &rest[..end];
+                if let Some(stripped) = keys.strip_prefix("cmd-") {
+                    cmd_keys.push(stripped.to_string());
+                } else if let Some(stripped) = keys.strip_prefix("ctrl-") {
+                    ctrl_keys.push(stripped.to_string());
+                }
+            }
+            for keys in cmd_keys {
+                // 非 macOS 的兜底键不必逐字相同：
+                // - 全选用 `ctrl-shift-a`（`ctrl-a` 是 shell 的行首键）；
+                // - 搜索用 `ctrl-shift-f`（`ctrl-f` 是 shell 的 forward-char）。
+                // 只要存在一个以该键结尾的 `ctrl-*` 变体，就说明平台语义被考虑过。
+                let has_fallback = ctrl_keys
+                    .iter()
+                    .any(|ctrl| ctrl == &keys || ctrl.ends_with(&format!("-{keys}")));
+                assert!(
+                    has_fallback,
+                    "{name} 里注册了 cmd-{keys} 却没有任何 ctrl-*{keys} 兜底：\
+                     cmd- 在 Linux/Windows 上是 Super 键，用户按 Ctrl 无效。\
+                     应改用 secondary-{keys}（或补一个 ctrl- 变体）"
+                );
+            }
+        }
+    }
+
+    /// 参与键位检查的源码：(文件名, 内容)。
+    fn source_files_with_key_bindings() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("workspace.rs", include_str!("workspace.rs")),
+            ("main.rs", include_str!("../main.rs")),
+            ("editor.rs", include_str!("../editor/editor.rs")),
+            (
+                "terminal_view.rs",
+                include_str!("../terminal_view/terminal_view.rs"),
+            ),
+        ]
+    }
 
     /// `cmd-w` 只吃掉「当前这一格」：多面板关面板，单面板关标签
     /// （最后一个标签时由 `do_tab_close` 进一步关窗口）。
