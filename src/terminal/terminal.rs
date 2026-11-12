@@ -40,7 +40,7 @@ use gpui::{
     SharedString, Size, Task, Window, px,
 };
 
-use crate::agent::{AgentEvent, AgentSessionState, CLIAgent};
+use crate::agent::{AgentEvent, AgentSessionState, AgentStatus, CLIAgent};
 use crate::ssh::{RusshTerminal, SshConnectionConfig, SshPtyTerminal, platform::detect_local_os};
 use crate::ssh::{
     keychain::{PreferredSshTransport, preferred_ssh_transport},
@@ -2854,6 +2854,23 @@ impl Terminal {
     ///   这是**事件驱动**、结论明确，所以直接调这里。
     ///
     /// 值不变时不发事件（检测按 TTL 周期性跑，重复结果很多）。
+    /// 测试用：把「最近一次输出时刻」置为现在。
+    ///
+    /// 真实路径是 PTY 读到字节时更新；headless 终端没有 PTY，测试需要
+    /// 直接伪造这个事实来验证「输出驱动的状态推断」。
+    #[doc(hidden)]
+    pub fn mark_output_for_tests(&mut self) {
+        self.last_output_at = Some(std::time::Instant::now());
+    }
+
+    /// 测试用：写 agent 的回合状态（模拟 agent 上报）。
+    #[doc(hidden)]
+    pub fn set_session_status_for_tests(&mut self, status: AgentStatus) {
+        self.agent_session
+            .get_or_insert_with(AgentSessionState::default)
+            .status = status;
+    }
+
     pub fn set_foreground_agent(&mut self, agent: Option<CLIAgent>, cx: &mut Context<Self>) {
         if self.foreground_agent == agent {
             return;

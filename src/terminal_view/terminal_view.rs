@@ -2622,10 +2622,26 @@ impl TerminalView {
     pub fn agent_tab_state(&self, cx: &App) -> (Option<CLIAgent>, AgentStatus) {
         let term = self.terminal.read(cx);
         let agent = term.foreground_agent();
-        let status = term
-            .agent_session()
-            .map(|session| session.status)
-            .unwrap_or_default();
+        let status = match term.agent_session() {
+            // 有 session：以 agent 上报的回合状态为准。
+            Some(session) if session.status != AgentStatus::Idle => session.status,
+            // 没有 session、或 session 还停在默认的 `Idle`：说明这个 agent
+            // 没有上报回合事件（没装 hook、或钩子没映射）。
+            //
+            // 此时若屏幕正在滚字，就按 `Working` 处理——**这正是用户直觉**：
+            // agent 在跑就该有个点。不这么做的话状态点永远不出现（`Idle`
+            // 按设计不画点），用户会以为整个功能是坏的。
+            //
+            // herdr 那边同一件事由 `model.rs::status()` 兜底：agent 存在但
+            // 没有 `word` 时，仍按 `turn`/`seen` 推断出 working/done。
+            _ => {
+                if agent.is_some() && term.output_streaming(crate::terminal::AGENT_STREAM_WINDOW) {
+                    AgentStatus::Working
+                } else {
+                    AgentStatus::Idle
+                }
+            }
+        };
         (agent, status)
     }
 
@@ -6127,6 +6143,57 @@ mod tests {
         let (args, cwd) = plan_local_session_startup("wsl.exe", &wsl_args, None);
         assert_eq!(args, wsl_args);
         assert!(cwd.is_none());
+    }
+
+    /// agent 在跑但**没有上报回合事件**时，标签仍要显示"正在工作"的状态点。
+    ///
+    /// 这是用户直接反馈的问题：agent 明显在干活，右上角却什么都没有。
+    /// 根因是 `AgentSessionState::default()` 的 status 是 `Idle`，而 `Idle`
+    /// 按设计不画点——没装 hook（或钩子没映射回合事件）的 agent 就永远
+    /// 停在 `Idle`。这里改为「有 agent 且屏幕在滚字」即视为 `Working`。
+    #[gpui::test]
+    fn agent_without_turn_events_still_reports_working_while_outputting(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        // 没有 agent：哪怕在输出也不该报 Working（没有点可挂）。
+        view.update(cx, |v, cx| {
+            v.terminal
+                .update(cx, |term, _| term.mark_output_for_tests());
+        });
+        let (agent, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
+        assert!(agent.is_none());
+        assert_eq!(status, AgentStatus::Idle, "没有 agent 时不该有状态");
+
+        // 有 agent + 正在输出 → 推断为 Working。
+        view.update(cx, |v, cx| {
+            v.terminal.update(cx, |term, cx| {
+                term.set_foreground_agent(Some(CLIAgent::Claude), cx);
+                term.mark_output_for_tests();
+            });
+        });
+        let (agent, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
+        assert_eq!(agent, Some(CLIAgent::Claude));
+        assert_eq!(
+            status,
+            AgentStatus::Working,
+            "agent 在输出却没上报回合事件时，应推断为 Working（否则永远不画点）"
+        );
+
+        // agent 上报了真实状态时，以上报值为准（不被输出推断覆盖）。
+        view.update(cx, |v, cx| {
+            v.terminal.update(cx, |term, _| {
+                term.set_session_status_for_tests(AgentStatus::Waiting);
+            });
+        });
+        let (_, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
+        assert_eq!(status, AgentStatus::Waiting, "上报状态优先于输出推断");
     }
 
     /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。
