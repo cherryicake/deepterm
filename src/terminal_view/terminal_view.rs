@@ -2622,26 +2622,20 @@ impl TerminalView {
     pub fn agent_tab_state(&self, cx: &App) -> (Option<CLIAgent>, AgentStatus) {
         let term = self.terminal.read(cx);
         let agent = term.foreground_agent();
-        let status = match term.agent_session() {
-            // 有 session：以 agent 上报的回合状态为准。
-            Some(session) if session.status != AgentStatus::Idle => session.status,
-            // 没有 session、或 session 还停在默认的 `Idle`：说明这个 agent
-            // 没有上报回合事件（没装 hook、或钩子没映射）。
-            //
-            // 此时若屏幕正在滚字，就按 `Working` 处理——**这正是用户直觉**：
-            // agent 在跑就该有个点。不这么做的话状态点永远不出现（`Idle`
-            // 按设计不画点），用户会以为整个功能是坏的。
-            //
-            // herdr 那边同一件事由 `model.rs::status()` 兜底：agent 存在但
-            // 没有 `word` 时，仍按 `turn`/`seen` 推断出 working/done。
-            _ => {
-                if agent.is_some() && term.output_streaming(crate::terminal::AGENT_STREAM_WINDOW) {
-                    AgentStatus::Working
-                } else {
-                    AgentStatus::Idle
-                }
-            }
-        };
+        // 状态**只认 agent 上报**（hook 事件驱动的 `agent_session`）。
+        //
+        // 没有 session 时返回 `Idle`（不画点），而不是拿"屏幕在滚字"去猜：
+        // - herdr 的 `model.rs::status()` 也是这个语义——`a.word.as_deref()?`
+        //   在 agent 没上报 `word` 时直接返回 `None`，不画任何点；
+        // - 猜出来的点会在「只是普通命令输出」时误亮，反而比没有点更糟。
+        //
+        // 曾经的"输出推断"兜底是错的：`AGENT_STREAM_WINDOW` 是 800ms 的
+        // **屏幕滚动**判据（给扫光动画用的），拿它当回合状态必然抖动——
+        // agent 思考/等工具时整秒没有字节，点就会闪断。
+        let status = term
+            .agent_session()
+            .map(|session| session.status)
+            .unwrap_or_default();
         (agent, status)
     }
 
@@ -6145,14 +6139,15 @@ mod tests {
         assert!(cwd.is_none());
     }
 
-    /// agent 在跑但**没有上报回合事件**时，标签仍要显示"正在工作"的状态点。
+    /// 状态点只认 agent 上报，不拿「屏幕在滚字」去猜。
     ///
-    /// 这是用户直接反馈的问题：agent 明显在干活，右上角却什么都没有。
-    /// 根因是 `AgentSessionState::default()` 的 status 是 `Idle`，而 `Idle`
-    /// 按设计不画点——没装 hook（或钩子没映射回合事件）的 agent 就永远
-    /// 停在 `Idle`。这里改为「有 agent 且屏幕在滚字」即视为 `Working`。
+    /// 这条钉的是与 herdr 一致的语义：`model.rs::status()` 在 agent 没上报
+    /// `word` 时直接返回 `None`（不画点）。曾经的"输出推断"兜底是错的——
+    /// `AGENT_STREAM_WINDOW` 是 800ms 的**屏幕滚动**判据（给扫光动画用的），
+    /// 拿它当回合状态必然抖动：agent 思考/等工具时整秒没有字节，点会闪断，
+    /// 普通命令输出时又会误亮。
     #[gpui::test]
-    fn agent_without_turn_events_still_reports_working_while_outputting(cx: &mut TestAppContext) {
+    fn agent_status_follows_reports_not_raw_output(cx: &mut TestAppContext) {
         cx.update(|cx| {
             crate::theme::init(cx);
             crate::sidebar_view::font_settings::FontState::init(cx);
@@ -6162,16 +6157,7 @@ mod tests {
             TerminalView::build_headless(cx, terminal)
         });
 
-        // 没有 agent：哪怕在输出也不该报 Working（没有点可挂）。
-        view.update(cx, |v, cx| {
-            v.terminal
-                .update(cx, |term, _| term.mark_output_for_tests());
-        });
-        let (agent, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
-        assert!(agent.is_none());
-        assert_eq!(status, AgentStatus::Idle, "没有 agent 时不该有状态");
-
-        // 有 agent + 正在输出 → 推断为 Working。
+        // 有 agent、屏幕在滚字，但没有任何上报 → Idle（不画点）。
         view.update(cx, |v, cx| {
             v.terminal.update(cx, |term, cx| {
                 term.set_foreground_agent(Some(CLIAgent::Claude), cx);
@@ -6182,21 +6168,34 @@ mod tests {
         assert_eq!(agent, Some(CLIAgent::Claude));
         assert_eq!(
             status,
-            AgentStatus::Working,
-            "agent 在输出却没上报回合事件时，应推断为 Working（否则永远不画点）"
+            AgentStatus::Idle,
+            "没有上报时不该凭输出猜测（否则普通命令输出也会点亮状态点）"
         );
 
-        // agent 上报了真实状态时，以上报值为准（不被输出推断覆盖）。
+        // agent 上报 Working → 立刻反映。
         view.update(cx, |v, cx| {
             v.terminal.update(cx, |term, _| {
-                term.set_session_status_for_tests(AgentStatus::Waiting);
+                term.set_session_status_for_tests(AgentStatus::Working);
             });
         });
         let (_, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
-        assert_eq!(status, AgentStatus::Waiting, "上报状态优先于输出推断");
+        assert_eq!(status, AgentStatus::Working, "上报的回合状态必须被采信");
+
+        // 上报 Done → 立刻反映（不需要等输出窗口过期）。
+        view.update(cx, |v, cx| {
+            v.terminal.update(cx, |term, _| {
+                term.set_session_status_for_tests(AgentStatus::Done);
+            });
+        });
+        let (_, status) = view.read_with(cx, |v, cx| v.agent_tab_state(cx));
+        assert_eq!(
+            status,
+            AgentStatus::Done,
+            "回合结束后状态点应立即改成「完成」，不必等 800ms 输出窗口"
+        );
     }
 
-    /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。
+    /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。    /// 文件树的目标目录取自**进程 cwd 缓存**（无 OSC 7 时的唯一来源）。
     ///
     /// 这条不需要真 PTY：`build_headless` 出的视图没有后台线程，gpui 的测试
     /// 调度器才允许断言（真起 conpty 会被判为「测试不确定」——PTY 读线程会在

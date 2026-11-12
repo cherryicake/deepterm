@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gpui::{
     App, Context, CursorStyle, Element, Entity, FocusHandle, GlobalElementId, InteractiveElement,
-    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render, Style,
-    Styled, Subscription, Window, div, px, relative,
+    IntoElement, LayoutId, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Render,
+    SharedString, Style, Styled, Subscription, Window, div, px, relative,
 };
 use gpui::{EventEmitter, KeyBinding, actions, prelude::*};
 
@@ -1360,6 +1360,15 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 分屏出来的新面板该用哪种会话：**跟随源面板**。
+    ///
+    /// 抽成纯函数以便断言规则本身——构造真实 `Workspace` 需要窗口与 PTY，
+    /// 而这条规则错了的表现很具体：在远程面板上分屏弹出一个本地 shell。
+    #[cfg(test)]
+    fn split_inherits_ssh(session: Option<&TerminalSessionState>) -> bool {
+        matches!(session, Some(TerminalSessionState::Ssh { .. }))
+    }
+
     /// `cmd-w` 在「当前标签有 `panel_count` 个面板」时该关标签而不是关面板吗？
     ///
     /// 抽成纯函数是为了能断言这条语义：它依赖容器结构，而 `Workspace`
@@ -1600,25 +1609,77 @@ impl Workspace {
         };
         let target_id = target.read(cx).panel_id.to_string();
 
-        // 新面板的工作目录跟源面板走。
-        let cwd = target.read(cx).content().terminal_view().and_then(|view| {
-            match view.read(cx).session_state(cx) {
-                TerminalSessionState::Local { cwd, .. } => cwd.map(std::path::PathBuf::from),
-                _ => None,
-            }
-        });
-
+        // 新面板**继承源面板的会话类型**：本地终端分屏出新本地终端，
+        // SSH 终端分屏出连同一台主机的新终端。
+        //
+        // 曾经这里一律建本地终端，于是在远程面板上按分屏，弹出的是一个
+        // 本地 shell——用户还得再 ssh 一次，等于把「分屏」变成了「重连」。
+        let session = target
+            .read(cx)
+            .content()
+            .terminal_view()
+            .map(|view| view.read(cx).session_state(cx));
         let workspace_id = self.workspace_id.clone();
         let panel_id = format!("panel-{}", self.next_panel_id);
+        let active_tab_id: SharedString = format!("tab-{}", self.next_tab_id).into();
         let new_panel = cx.new(|cx| {
-            Panel::with_terminal_working_directory(
-                panel_id.clone(),
-                workspace_id,
-                Some(format!("tab-{}", self.next_tab_id).into()),
-                None,
-                cwd,
-                cx,
-            )
+            let (args_id, ws_id) = (panel_id.clone(), workspace_id.clone());
+            match session {
+                // SSH：连同一台主机，落在同一个远端目录。
+                Some(TerminalSessionState::Ssh {
+                    ref config,
+                    ref remote_cwd,
+                    use_system_proxy,
+                }) => {
+                    // 代理标记跟着分屏走：海外主机靠它才连得上，
+                    // 丢了就得回退成直连（通常直接超时）。
+                    let mut config = config.clone();
+                    config.use_system_proxy = use_system_proxy;
+                    Panel::with_ssh_terminal(
+                        args_id.clone(),
+                        ws_id.clone(),
+                        Some(active_tab_id.clone()),
+                        None,
+                        &config,
+                        remote_cwd.clone(),
+                        cx,
+                    )
+                }
+                // 本地：沿用源面板的工作目录（含「用指定命令启动」的重放）。
+                Some(TerminalSessionState::Local {
+                    ref cwd,
+                    ref command,
+                    ref args,
+                }) => match (command, args.len()) {
+                    (Some(command), _) => Panel::with_terminal_command(
+                        args_id.clone(),
+                        ws_id.clone(),
+                        Some(active_tab_id.clone()),
+                        None,
+                        command,
+                        args,
+                        cwd.as_ref().map(std::path::PathBuf::from),
+                        cx,
+                    ),
+                    (None, _) => Panel::with_terminal_working_directory(
+                        args_id.clone(),
+                        ws_id.clone(),
+                        Some(active_tab_id.clone()),
+                        None,
+                        cwd.as_ref().map(std::path::PathBuf::from),
+                        cx,
+                    ),
+                },
+                // 非终端面板（纯文本占位）：给个本地终端兜底。
+                None => Panel::with_terminal_working_directory(
+                    args_id.clone(),
+                    ws_id.clone(),
+                    Some(active_tab_id.clone()),
+                    None,
+                    None,
+                    cx,
+                ),
+            }
         });
         self.next_panel_id += 1;
 
@@ -3273,6 +3334,44 @@ mod tests {
                 include_str!("../terminal_view/terminal_view.rs"),
             ),
         ]
+    }
+
+    /// 分屏必须继承源面板的会话类型：远程面板分屏出远程终端。
+    ///
+    /// 这条守的是一个具体回归：`split_selected_panel` 曾一律建本地终端，
+    /// 于是在 SSH 面板上按分屏弹出一个本地 shell，用户还得再 ssh 一次。
+    #[test]
+    fn split_inherits_the_source_session_kind() {
+        use crate::ssh::SshConnectionConfig;
+        use crate::workspace::session_state::TerminalSessionState;
+
+        let local = TerminalSessionState::Local {
+            cwd: Some("/tmp".into()),
+            command: None,
+            args: Vec::new(),
+        };
+        let ssh = TerminalSessionState::Ssh {
+            config: SshConnectionConfig::new(
+                "example.com",
+                "root",
+                crate::ssh::config::AuthMethod::Password {
+                    password: String::new(),
+                },
+            ),
+            remote_cwd: Some("/srv".into()),
+            use_system_proxy: false,
+        };
+
+        assert!(
+            !Workspace::split_inherits_ssh(Some(&local)),
+            "本地终端分屏应保持本地"
+        );
+        assert!(
+            Workspace::split_inherits_ssh(Some(&ssh)),
+            "SSH 终端分屏必须继续走 SSH，不能退化成本地 shell"
+        );
+        // 非终端面板（没有会话）：按本地终端兜底。
+        assert!(!Workspace::split_inherits_ssh(None));
     }
 
     /// `cmd-w` 只吃掉「当前这一格」：多面板关面板，单面板关标签
