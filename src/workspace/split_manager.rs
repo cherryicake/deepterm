@@ -78,10 +78,15 @@ impl SplitContainer {
                     return None;
                 }
 
+                // 落盘前归一化：老会话里可能还留着 `[1.0, 1.0]` 这种
+                // 总和为 2 的比例。恢复侧虽然也会归一化，但写回一份
+                // 规范的 sizes 能让会话文件自洽，避免下次读取时再修。
+                let sizes = normalize_sizes(sizes, children.len());
+
                 Some(SplitSessionState::Split {
                     direction: (*direction).into(),
                     children,
-                    sizes: sizes.clone(),
+                    sizes,
                 })
             }
         }
@@ -294,10 +299,15 @@ impl SplitContainer {
                 if new_children.len() == 1 {
                     Some(new_children[0].clone())
                 } else {
+                    let child_count = new_children.len();
                     Some(SplitContainer::Split {
                         direction: *direction,
                         children: new_children,
-                        sizes: new_sizes,
+                        // 删掉一格后剩余 sizes 的总和会小于 1。若不归一化，
+                        // 剩下的面板按原比例只占容器的一部分，末尾留出空白，
+                        // 重启后 `from_session_state` 又会归一化，间距/宽度
+                        // 前后不一致。这里当场归一，保证运行时与恢复一致。
+                        sizes: normalize_sizes(&new_sizes, child_count),
                     })
                 }
             }
@@ -331,7 +341,12 @@ impl SplitContainer {
                     SplitContainer::Split {
                         direction,
                         children,
-                        sizes: vec![1.0, 1.0],
+                        // 用归一化后的比例（总和 1）。写 [1.0, 1.0] 时子项
+                        // flex-basis 总和是 200%，溢出会把中间的分隔条一起
+                        // 压窄；会话恢复时 sizes 又被归一化成 1.0，分隔条
+                        // 不再被压，于是「重启后间距变大」。统一用
+                        // [0.5, 0.5] 让新建与恢复走同一套布局。
+                        sizes: vec![0.5, 0.5],
                     }
                 } else {
                     self.clone()
@@ -556,7 +571,9 @@ impl From<SplitSessionDirection> for SplitDirection {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_sizes;
+    use super::{SplitContainer, SplitDirection, normalize_sizes};
+    use crate::workspace::panel::{Panel, PanelPlacement};
+    use gpui::AppContext;
 
     #[test]
     fn keeps_valid_sizes() {
@@ -585,5 +602,71 @@ mod tests {
     #[test]
     fn empty_children_yields_empty_sizes() {
         assert!(normalize_sizes(&[0.5], 0).is_empty());
+    }
+
+    /// 新建分屏的比例必须总和为 1。
+    ///
+    /// 回归用例：`split_at` 曾写 `[1.0, 1.0]`（总和 2）。子项 flex-basis
+    /// 总和 200% 时，固定厚度的分隔条也会被 flex-shrink 压窄（12px → 约 6px）；
+    /// 而重启恢复时 `normalize_sizes` 把比例归一到总和 1，分隔条不再被压，
+    /// 表现为「重启后面板间距变大」。新建与恢复必须用同一种规范。
+    #[gpui::test]
+    fn split_at_uses_canonical_sizes(cx: &mut gpui::TestAppContext) {
+        let first = cx.new(|cx| Panel::new("panel-0", "ws", None, cx));
+        let second = cx.new(|cx| Panel::new("panel-1", "ws", None, cx));
+
+        let container = cx.update(|cx| {
+            SplitContainer::Panel(first).split_at(
+                "panel-0",
+                PanelPlacement::Right,
+                SplitContainer::Panel(second),
+                cx,
+            )
+        });
+
+        let SplitContainer::Split {
+            children, sizes, ..
+        } = container
+        else {
+            panic!("split_at 应产生 Split 容器");
+        };
+        assert_eq!(children.len(), 2);
+        assert_eq!(sizes, vec![0.5, 0.5]);
+        let sum: f32 = sizes.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "sizes 必须归一到总和 1，实际 {sizes:?}"
+        );
+    }
+
+    /// 删掉一格后，剩余比例要重新归一化，否则剩余面板只占容器的一部分，
+    /// 末尾留白；重启恢复又会归一化，前后布局不一致。
+    #[gpui::test]
+    fn removing_a_panel_renormalizes_sizes(cx: &mut gpui::TestAppContext) {
+        let p0 = cx.new(|cx| Panel::new("panel-0", "ws", None, cx));
+        let p1 = cx.new(|cx| Panel::new("panel-1", "ws", None, cx));
+        let p2 = cx.new(|cx| Panel::new("panel-2", "ws", None, cx));
+        let container = SplitContainer::Split {
+            direction: SplitDirection::Horizontal,
+            children: vec![
+                SplitContainer::Panel(p0),
+                SplitContainer::Panel(p1),
+                SplitContainer::Panel(p2),
+            ],
+            sizes: vec![1.0 / 3.0; 3],
+        };
+
+        let after = cx
+            .update(|cx| container.remove_panel("panel-1", cx))
+            .expect("还剩两个面板");
+        let SplitContainer::Split { sizes, .. } = after else {
+            panic!("剩两个面板时应保持 Split 容器");
+        };
+        assert_eq!(sizes.len(), 2);
+        let sum: f32 = sizes.iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "删除后剩余 sizes 必须归一化，实际 {sizes:?}"
+        );
     }
 }
