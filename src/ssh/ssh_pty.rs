@@ -295,6 +295,23 @@ mod tests {
     use super::*;
     use crate::ssh::config::AuthMethod;
 
+    /// 让测试读起来短一些，同时把"这是被测的构造函数"点出来。
+    struct SshCommandBuilder;
+
+    impl SshCommandBuilder {
+        fn build(
+            config: &SshConnectionConfig,
+            cwd: Option<&str>,
+        ) -> anyhow::Result<(
+            String,
+            Vec<String>,
+            std::collections::HashMap<String, String>,
+            ProxyCommandOutcome,
+        )> {
+            SshPtyTerminal::build_ssh_command(config, cwd)
+        }
+    }
+
     #[test]
     fn redact_masks_value_after_sensitive_flag() {
         let args = vec![
@@ -371,5 +388,86 @@ mod tests {
                 panic!("选了代理却报 NotRequested 等于静默直连");
             }
         }
+    }
+
+    /// `build_ssh_command` 必须产出能直接交给 PTY 的 ssh 调用。
+    ///
+    /// 这条函数是两个路径共用的（进程内 SSH 与守护进程持久化），所以它
+    /// 本身值得单独验：一旦它漏了 `-t -t`，远端不会分配 TTY，`htop` 之类
+    /// 直接把终端弄成全屏乱码；漏了端口就是连到 22 而不是用户配的端口。
+    #[test]
+    fn the_ssh_command_allocates_a_tty_and_honours_the_port() {
+        let config = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+        let mut config = config;
+        config.port = 2222;
+
+        let (program, args, _env, _proxy) =
+            SshCommandBuilder::build(&config, None).expect("命令应能构造");
+
+        assert_eq!(program, "ssh", "Agent 认证直接用 ssh");
+        // `-t -t` 是"强制分配 TTY"，两次才强制（OpenSSH 的约定）。
+        let t_count = args.iter().filter(|a| *a == "-t").count();
+        assert_eq!(t_count, 2, "必须带两遍 -t 才会强制分配 TTY: {args:?}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"),
+            "端口要如实带上: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "root@example.com"),
+            "目标主机要在参数里: {args:?}"
+        );
+    }
+
+    /// 密码认证必须走 `sshpass -e` + 环境变量，口令**不能**出现在 argv。
+    ///
+    /// `ps` 对这些参数全局可见。这条钉住的是"口令不进 argv"这个安全属性，
+    /// 不是实现细节——一旦有人图省事改成 `sshpass -p <密码>`，同机任何
+    /// 用户都能读到用户的口令。
+    #[test]
+    fn passwords_go_through_the_environment_never_argv() {
+        let secret = "hunter2-must-not-leak";
+        let config = SshConnectionConfig::new(
+            "example.com",
+            "root",
+            AuthMethod::Password {
+                password: secret.to_string(),
+            },
+        );
+
+        let (program, args, env, _proxy) =
+            SshCommandBuilder::build(&config, None).expect("命令应能构造");
+
+        assert_eq!(program, "sshpass", "密码认证要走 sshpass");
+        assert!(
+            !args.iter().any(|a| a.contains(secret)),
+            "口令绝不能出现在 argv 里（ps 可见）: {args:?}"
+        );
+        assert!(
+            args.contains(&"-e".to_string()),
+            "要用 -e 让 sshpass 从环境变量取口令: {args:?}"
+        );
+        assert_eq!(
+            env.get("SSHPASS").map(String::as_str),
+            Some(secret),
+            "口令应经环境变量传给子进程"
+        );
+    }
+
+    /// 远程 shell integration 的引导命令要带上初始 cwd。
+    ///
+    /// 恢复会话时用户期望回到断开前那个目录；丢了它，重开就落在远端家目录。
+    #[test]
+    fn the_tracking_bootstrap_carries_the_initial_directory() {
+        let config = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+
+        let (_p, args, _e, _proxy) =
+            SshCommandBuilder::build(&config, Some("/srv/app")).expect("命令应能构造");
+
+        // 最后一个是发往远端执行的引导命令。
+        let bootstrap = args.last().expect("应有引导命令");
+        assert!(
+            bootstrap.contains("/srv/app"),
+            "引导命令应带初始目录: {bootstrap}"
+        );
     }
 }

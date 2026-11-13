@@ -57,6 +57,36 @@ fn listener_accept(listener: &Listener) -> std::io::Result<Stream> {
     }
 }
 
+/// 收到 SIGTERM / SIGINT 时置位，让监听循环走正常的退出路径。
+///
+/// 为什么需要：不处理信号时进程被直接杀掉，socket 与 pid 文件留在原地。
+/// 下次启动虽然能清理（`bind` 前会删残留），但用户 `kill` 掉一个守护进程
+/// 后发现 `daemon.sock` 还在，会以为它没死透。
+///
+/// 用 `libc::signal` 而不是引一个信号库：这里只需要"收到就置个标志"，
+/// 处理函数里只做一次原子写，是 async-signal-safe 的。
+#[cfg(unix)]
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// 装好退出信号的处理器。
+#[cfg(unix)]
+fn install_signal_handlers() {
+    // SAFETY：处理函数只做一次原子写，是 async-signal-safe 的；
+    // `signal` 的旧值不需要保存。
+    unsafe {
+        libc::signal(libc::SIGTERM, request_shutdown as libc::sighandler_t);
+        libc::signal(libc::SIGINT, request_shutdown as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {}
+
 /// 启动守护进程的监听循环（阻塞）。
 pub fn run() -> std::io::Result<()> {
     let dir = super::runtime_dir();
@@ -110,6 +140,8 @@ pub fn run() -> std::io::Result<()> {
 
     log::info!("守护进程已启动，socket: {}", path.display());
 
+    install_signal_handlers();
+
     let registry = Arc::new(Registry::new());
     let shutdown = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(AtomicUsize::new(0));
@@ -118,6 +150,12 @@ pub fn run() -> std::io::Result<()> {
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        // 收到 SIGTERM/SIGINT：走正常退出路径，把 socket 与 pid 文件清掉。
+        #[cfg(unix)]
+        if SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
+            log::info!("收到退出信号，守护进程准备退出");
             break;
         }
 
