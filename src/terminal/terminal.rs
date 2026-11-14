@@ -4881,6 +4881,15 @@ impl Terminal {
         let scale_changed = scale != self.display_scale;
         self.display_scale = scale;
 
+        // 记下网格尺寸，供 `attach` 向守护进程报出真实大小。
+        //
+        // 恢复会话时拿不到 `window`（调用链一路把它丢了），只能靠这里
+        // 在布局时留下的提示。见 `TerminalView::remember_grid_size`。
+        crate::terminal_view::terminal_view::TerminalView::remember_grid_size(
+            cols as u16,
+            rows as u16,
+        );
+
         // 对应 ghostty `Terminal.resize` 的 cols/rows 未变早退。
         let applied_cols = self.terminal_bounds.num_columns();
         let applied_rows = self.terminal_bounds.num_lines();
@@ -5527,21 +5536,43 @@ impl Terminal {
                         self.write(&scroll);
                     }
                 };
-            } else if self
-                .last_content
-                .mode
-                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-                && !e.shift
-            {
+            } else if !e.shift && self.in_alternate_screen() {
+                // 备用屏上滚轮一律转成方向键交给程序。
+                //
+                // 这与 herdr 一致（`terminal.rs` 的 `scroll`：先判
+                // `alt_screen()` 就发方向键）。不用 `ALTERNATE_SCROLL`
+                // 作条件：它默认就开着，靠它判断等于没判断；真正该区分
+                // 的是"在不在备用屏"。
+                //
+                // 备用屏没有回滚区，本地滚动只会把 TUI 画面平移出去。
                 self.write(&alt_scroll(scroll_lines));
             } else {
-                let scroll = AlacScroll::Delta(scroll_lines);
-                let mut term = self.term.lock();
-                term.scroll_display(scroll);
-                self.content_dirty = true;
-                self.last_scroll_time.set(Instant::now());
+                self.scroll_by(AlacScroll::Delta(scroll_lines));
             }
         }
+    }
+
+    /// 当前是否该把滚轮当作"全屏程序内的滚动"处理。
+    ///
+    /// # 为什么读实时状态而不是 `last_content.mode`
+    ///
+    /// `last_content` 是**渲染快照**，只在 `update_last_content` 里刷新，
+    /// 而那个函数为了不阻塞渲染，拿不到网格锁时**整轮跳过**（见
+    /// `MAX_SNAPSHOT_LOCK_SKIPS`）。nvim / htop 这类程序会持续重绘光标与
+    /// 状态行，读线程频繁持锁，快照因此可能停在几帧之前。
+    ///
+    /// 用滞后的快照判分支的后果很具体：程序刚切到全屏、快照还没更新时，
+    /// 这里读到的是"普通终端"，于是滚轮走进 `scroll_display`，把整个 TUI
+    /// 界面平移出去——用户看到的就是"在 nvim 里滚一下，界面滚没了"。
+    /// 而且它**时有时无**（取决于那一刻锁的争用），最难排查的那一类。
+    ///
+    /// 判断条件本身沿用 alacritty 的语义：`ALT_SCREEN` 表示程序在备用屏，
+    /// `ALTERNATE_SCROLL`（DECSET 1007，**默认开启**）表示把滚轮转成方向键。
+    fn full_screen_wheel_mode(&self) -> bool {
+        self.term
+            .lock()
+            .mode()
+            .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
     }
 
     fn determine_scroll_lines(
@@ -5625,8 +5656,39 @@ impl Terminal {
     // 注意：scroll_display 只更新 term 内部的 display_offset，视口快照
     // （last_content）依赖 sync() 的 content_dirty 分支刷新。这里统一置位
     // content_dirty，否则键盘滚动后视口/选区高亮会停留在旧数据。
+    /// 滚轮事件是否由程序自己处理（而非本地滚动）。
+    ///
+    /// 两种情形都算：
+    /// - 程序开了鼠标上报（`MOUSE_MODE`）：要收到滚轮报告；
+    /// - 程序在备用屏上：滚轮要转成方向键发过去。
+    ///
+    /// 这里的意义是**关掉客户端的滚动放大**。放大的初衷是让普通终端里
+    /// "一格滚轮滚多点"，但程序接管后，每一次报告都会触发一次重绘——
+    /// 乘 3~8 倍就是一次滚轮让 nvim 重绘 8 次，输出暴涨、界面卡死。
+    pub fn program_owns_scroll(&self) -> bool {
+        let mode = *self.term.lock().mode();
+        mode.intersects(TermMode::MOUSE_MODE) || mode.contains(TermMode::ALT_SCREEN)
+    }
+
+    /// 当前是否在备用屏（全屏程序）上。
+    ///
+    /// 备用屏**没有回滚区**：它的那一片就是程序的全部画面。对它调用
+    /// `scroll_display` 只会把画面整体平移出去，露出下面的空白——用户看到
+    /// 的就是"htop / nvim 整个界面被滚走了"。
+    pub fn in_alternate_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// 所有滚动入口的公共尾部：滚动 + 置脏 + 记录时间。
+    ///
+    /// 备用屏上**直接忽略**：那里没有回滚区可滚，滚了就是把 TUI 画面
+    /// 平移出去。herdr 的做法是在 `scroll` 里先判 `alt_screen()`，走方向键
+    /// 转发而不是 `scroll_viewport`；这里守在最底层，让所有入口（滚轮、
+    /// PgUp/PgDn、Home/End、滚动条拖拽）都受同一约束。
     fn scroll_by(&mut self, scroll: AlacScroll) {
+        if self.in_alternate_screen() {
+            return;
+        }
         let mut term = self.term.lock();
         term.scroll_display(scroll);
         drop(term);
@@ -6025,6 +6087,98 @@ mod tests {
     use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// **全屏程序（备用屏）不能滚动它的“界面”。**
+    ///
+    /// 回归价值：这是"htop / nvim / opencode 整个界面被滚走"的直接原因。
+    /// 备用屏没有回滚区，`scroll_display` 只会把画面整体平移出去，露出
+    /// 底下的空白。herdr 在滚轮入口先判 `alt_screen()` 走方向键转发；
+    /// 这里把约束下沉到 `scroll_by`，让**所有**滚动入口（滚轮、PgUp/PgDn、
+    /// Home/End、滚动条拖拽）都受同一保护。
+    #[gpui::test]
+    fn alternate_screen_ignores_every_scroll_entry_point(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            // 先堆出可滚动的历史，确认普通模式下确实能滚。
+            for i in 0..80 {
+                t.handle_remote_data(format!("line {i}\r\n").as_bytes(), cx);
+            }
+            t.scroll_line_up();
+            assert!(
+                t.term.lock().grid().display_offset() > 0,
+                "普通终端里应当能滚进回滚区"
+            );
+
+            // 进备用屏——nvim / htop 启动时发的就是它。
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+            t.term
+                .lock()
+                .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+
+            // 所有入口都不该改动显示区。
+            let before = t.term.lock().grid().display_offset();
+            t.scroll_line_up();
+            t.scroll_page_up();
+            t.scroll_to_top();
+            assert_eq!(
+                t.term.lock().grid().display_offset(),
+                before,
+                "备用屏下任何滚动入口都不该移动画面（TUI 会被滚走）"
+            );
+        });
+    }
+
+    /// 备用屏里的滚轮要转成方向键发给程序，而不是本地滚动。
+    ///
+    /// 与上一条互补：不是"什么都不做"——nvim 里滚轮该能看到内容滚动，
+    /// 那是程序收到方向键后自己重绘的。本地滚动则是错的（会把整个界面
+    /// 连同边框一起平移）。
+    #[gpui::test]
+    fn wheel_in_the_alternate_screen_is_forwarded_as_arrow_keys(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+            assert!(t.in_alternate_screen());
+            // 这一层的判断：是备用屏 → 走方向键转发。
+            assert!(t.in_alternate_screen(), "备用屏下滚轮应转发方向键");
+            // 生成的字节必须是方向键，不是滚动指令。
+            let seq = crate::terminal::mappings::mouse::alt_scroll(-3);
+            assert_eq!(seq, b"\x1bOB\x1bOB\x1bOB");
+        });
+    }
+
+    /// **全屏程序的滚动判断必须用实时模式，不能用滞后的渲染快照。**
+    ///
+    /// 回归价值：`scroll_wheel` 原本读 `last_content.mode`。那是渲染快照，
+    /// 而 `update_last_content` 为了不阻塞渲染，拿不到网格锁时会整轮跳过
+    /// （`MAX_SNAPSHOT_LOCK_SKIPS`）。nvim / htop 持续重绘，锁争用频繁，
+    /// 快照常常落后几帧——于是在程序刚切到全屏时，滚轮被判成"普通终端"，
+    /// 走进 `scroll_display` 把整个 TUI 界面平移出去。
+    ///
+    /// 这条用例刻意**不刷新** `last_content`：它模拟的正是"快照还停在旧状态"
+    /// 的那一刻。判断必须仍然正确。
+    #[gpui::test]
+    fn full_screen_detection_ignores_a_stale_render_snapshot(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            // 先确认普通 shell 下不是全屏模式。
+            assert!(!t.full_screen_wheel_mode(), "普通终端不应被判成全屏程序");
+
+            // nvim 启动时发的序列：切到备用屏。
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+
+            // 此刻 `last_content` 仍是旧快照（真实场景里锁争用让更新被跳过）。
+            // 判断仍必须是"全屏"——否则滚轮会把界面滚走。
+            assert!(
+                t.full_screen_wheel_mode(),
+                "快照滞后时也必须认出全屏程序（否则 nvim 里滚轮会滚走界面）"
+            );
+
+            // 退出全屏后要回到普通模式。
+            t.handle_remote_data(b"\x1b[?1049l", cx);
+            assert!(!t.full_screen_wheel_mode(), "退出备用屏后应恢复普通滚动");
+        });
+    }
 
     #[gpui::test]
     fn focus_check_never_blocks_on_grid_lock(cx: &mut TestAppContext) {

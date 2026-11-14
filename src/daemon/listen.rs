@@ -78,9 +78,12 @@ extern "C" fn request_shutdown(_signal: libc::c_int) {
 fn install_signal_handlers() {
     // SAFETY：处理函数只做一次原子写，是 async-signal-safe 的；
     // `signal` 的旧值不需要保存。
+    // `sighandler_t` 在 unix 上是 `usize`，不能直接从函数项转——先取
+    // 函数指针再转整数，跨平台（含 macOS 的 `Option<fn>` 表示）都正确。
+    let handler = request_shutdown as extern "C" fn(libc::c_int) as usize;
     unsafe {
-        libc::signal(libc::SIGTERM, request_shutdown as libc::sighandler_t);
-        libc::signal(libc::SIGINT, request_shutdown as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGINT, handler);
     }
 }
 
@@ -89,6 +92,25 @@ fn install_signal_handlers() {}
 
 /// 启动守护进程的监听循环（阻塞）。
 pub fn run() -> std::io::Result<()> {
+    // core 不亲自持有 PTY：它随时可能被重启（升级、崩溃恢复），
+    // 亲自建 PTY 会让终端跟着一起死。转给 holder。
+    run_at(
+        super::socket_path(),
+        true,
+        super::connection::Backend::Holder,
+    )
+}
+
+/// 在指定 socket 上跑监听循环。
+///
+/// 抽出来是为了让 holder 复用同一套接受/分发逻辑（它只是换了个地址）。
+/// `idle_exit` 控制"没终端时是否自行退出"：core 该退（用户关掉 deepterm
+/// 就别留空进程），holder 在有终端时要一直活着。
+pub fn run_at(
+    socket: std::path::PathBuf,
+    idle_exit: bool,
+    backend: super::connection::Backend,
+) -> std::io::Result<()> {
     let dir = super::runtime_dir();
 
     // 权限：socket 拿到就等于拿到用户的所有终端，所以目录必须 0700。
@@ -114,7 +136,7 @@ pub fn run() -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
     }
 
-    let path = super::socket_path();
+    let path = socket;
 
     // 先探一下：已经有守护进程在跑就别抢同一个地址。
     //
@@ -136,9 +158,23 @@ pub fn run() -> std::io::Result<()> {
     transport::set_nonblocking(&listener, true)?;
 
     // pid 文件：便于排障与"这个 socket 是谁的"。
-    let _ = std::fs::write(dir.join("daemon.pid"), std::process::id().to_string());
+    //
+    // **按 socket 名区分**：core 与 holder 是两个进程，共用一个 pid 文件
+    // 时后启动的会把先启动的覆盖掉——排查时按那个文件去 kill，杀的是
+    // 另一个进程（本地实测就踩了：以为在杀 core，实际杀的是 holder）。
+    let pid_file = path.with_extension("pid");
+    let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
     log::info!("守护进程已启动，socket: {}", path.display());
+
+    // 生成并落盘鉴权 token（0600）。
+    //
+    // 每次启动换一个：它是"本次守护进程的会话凭据"，不是长期密码，
+    // 不需要也不应该持久化到用户配置里。
+    let token = super::generate_token();
+    if let Err(e) = super::write_token_for(&path, &token) {
+        log::error!("无法写入 token 文件，远端连接将不可用: {e}");
+    }
 
     install_signal_handlers();
 
@@ -173,12 +209,19 @@ pub fn run() -> std::io::Result<()> {
 
                 let registry = registry.clone();
                 let shutdown = shutdown.clone();
+                let socket_for_conn = path.clone();
                 let connections = connections.clone();
                 let counter = connections.clone();
                 std::thread::Builder::new()
                     .name("daemon-conn".into())
                     .spawn(move || {
-                        serve_connection(stream, registry, shutdown);
+                        serve_connection(
+                            stream,
+                            registry,
+                            shutdown,
+                            backend,
+                            socket_for_conn.clone(),
+                        );
                         counter.fetch_sub(1, Ordering::SeqCst);
                     })
                     .map_err(|e| {
@@ -204,7 +247,8 @@ pub fn run() -> std::io::Result<()> {
 
                 // 空闲退出：没有连接，也没有终端。
                 let idle = *idle_since.lock().expect("idle");
-                if connections.load(Ordering::SeqCst) == 0
+                if idle_exit
+                    && connections.load(Ordering::SeqCst) == 0
                     && registry.is_empty()
                     && idle.elapsed() >= IDLE_EXIT
                 {
@@ -222,7 +266,8 @@ pub fn run() -> std::io::Result<()> {
 
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(dir.join("daemon.pid"));
+    let _ = std::fs::remove_file(path.with_extension("pid"));
+    let _ = std::fs::remove_file(super::token_path_for(&path));
     log::info!("守护进程已退出");
     Ok(())
 }

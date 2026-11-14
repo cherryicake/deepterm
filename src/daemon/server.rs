@@ -74,19 +74,25 @@ pub fn handle_request(registry: &Registry, request: &Value) -> Value {
                 return json!({"ok": false, "error": "缺少 address"});
             };
             match registry.get(address) {
-                Some(handle) => json!({
-                    "ok": true,
-                    "terminal": {
-                        "address": handle.address,
-                        "state": match handle.state() {
-                            State::Live => "live",
-                            State::Finished => "finished",
-                        },
-                        "exit_code": handle.exit_code(),
-                        "cwd": handle.cwd,
-                        "created_ms": handle.created_ms,
-                    }
-                }),
+                Some(handle) => {
+                    let (cols, rows) = handle.size();
+                    json!({
+                        "ok": true,
+                        "terminal": {
+                            "address": handle.address,
+                            "state": match handle.state() {
+                                State::Live => "live",
+                                State::Finished => "finished",
+                            },
+                            "exit_code": handle.exit_code(),
+                            "cwd": handle.cwd,
+                            "created_ms": handle.created_ms,
+                            // 客户端据此建本地 VT：尺寸不一致时重放会折行错位。
+                            "cols": cols,
+                            "rows": rows,
+                        }
+                    })
+                }
                 None => json!({"ok": false, "error": "没有这个终端", "kind": "not_found"}),
             }
         }

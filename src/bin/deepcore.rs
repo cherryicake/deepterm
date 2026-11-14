@@ -26,11 +26,29 @@
 use deepterm::utils::logging::{self, CappedLog};
 
 fn main() {
+    // 版本查询走最短路径：远端部署探针会在别的机器上跑 `--version`，
+    // 那里可能没有可写的 HOME、没有图形环境，任何多余的初始化都可能
+    // 让它失败——而探针失败会被判成"这个二进制不兼容"，把用户引到
+    // 错误的方向上。
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("deepcore {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // 守护进程的日志单独一份：和 GUI 混写会互相裁尾，
     // 而排查"终端为什么没恢复"正需要两边的时间线各自完整。
     let mut builder = logging::base_log_builder(logging::default_level());
+    // holder 单独一个日志文件：它和 core 是两个进程，混写会让时间线
+    // 互相穿插，而排查"终端为什么死了"最需要两者各自完整。
+    let is_holder_arg =
+        deepterm::daemon::holder::is_holder_invocation(&std::env::args().collect::<Vec<_>>());
     let mut log_path = None;
-    if let Some(path) = logging::core_log_path() {
+    let configured = if is_holder_arg {
+        logging::holder_log_path()
+    } else {
+        logging::core_log_path()
+    };
+    if let Some(path) = configured {
         match CappedLog::open(path.clone()) {
             Ok(file) => {
                 builder.target(env_logger::Target::Pipe(Box::new(file)));
@@ -50,7 +68,20 @@ fn main() {
         log::info!("日志文件: {}", path.display());
     }
 
-    match deepterm::daemon::listen::run() {
+    // 以 holder 身份运行？它不是"另一个程序"，只是同一份代码的另一种
+    // 职责：持 PTY 而不是做协调。见 `daemon::holder` 的模块文档。
+    let args: Vec<String> = std::env::args().collect();
+    let is_holder = deepterm::daemon::holder::is_holder_invocation(&args);
+
+    let result = if is_holder {
+        log::info!("=== deepcore 以 holder 身份启动 ===");
+        deepterm::daemon::holder::run()
+    } else {
+        log::info!("=== deepcore 以 core 身份启动 ===");
+        deepterm::daemon::listen::run()
+    };
+
+    match result {
         Ok(()) => log::info!("=== deepcore 正常退出 ==="),
         Err(e) => {
             log::error!("守护进程启动失败: {e}");

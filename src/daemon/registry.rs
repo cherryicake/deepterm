@@ -298,6 +298,37 @@ fn run_terminal(
                 }
                 Input::Resize(size) => {
                     pty.on_resize(size);
+                    // **必须同时 resize 本进程里的 VT**。
+                    //
+                    // 只做 `pty.on_resize` 的话：子进程看到的窗口变了、会按新
+                    // 尺寸重绘，但守护进程这份 `Term` 仍是旧网格。后果分两种，
+                    // 都很难查：
+                    // - 新尺寸更小时，程序画的内容被旧网格裁掉；
+                    // - 重连时 `snapshot` 按旧网格重放，客户端按新尺寸渲染，
+                    //   于是 nvim / htop 的边框、状态栏全部错位。
+                    //
+                    // 这正是"重启 deepterm 后 TUI 布局全乱"的根因。
+                    if size.num_cols > 0 && size.num_lines > 0 {
+                        {
+                            let mut t = term.lock();
+                            t.resize(alacritty_terminal::term::test::TermSize::new(
+                                size.num_cols as usize,
+                                size.num_lines as usize,
+                            ));
+                        }
+                        // resize 之后必须整屏重画推给挂接者。
+                        //
+                        // reflow 会把每一行的折行位置都改掉；客户端虽然也
+                        // 自己 resize 了本地 VT，但两边对"内容落在哪一行"的
+                        // 推断不可能完全一致——不重画，屏幕上就留着按旧列数
+                        // 折行的残影，也就是"改窗口大小后 TUI 布局乱掉"。
+                        // herdr 用 `repaint_pending` + `queue_resize_paints`
+                        // 做同一件事。
+                        // 只标记，不立刻生成快照：拖动窗口时 resize 是连续
+                        // 的，逐次整屏序列化会让 UI 明显发卡。这一批事件读
+                        // 完之后由 `flush_repaint` 合并成一次。
+                        handle.mark_repaint();
+                    }
                 }
                 Input::Shutdown => break 'outer,
             }
@@ -351,6 +382,13 @@ fn run_terminal(
                 _ => {}
             }
         }
+
+        // 这一批事件处理完，把攒下的 resize 重绘合并成一次发出去。
+        //
+        // 放在这里而不是 resize 处直接发：拖动窗口时读线程一批能收到好几条
+        // `Input::Resize`，每条都整屏序列化（遍历全部单元格 + 拼 SGR）就是
+        // 卡顿的来源。合并之后一批只发一帧，画面照样跟上，CPU 也不再空转。
+        handle.flush_repaint();
     }
 
     let _ = pty.deregister(&poller);

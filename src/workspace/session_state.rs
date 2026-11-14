@@ -11,6 +11,21 @@ pub struct AppSessionState {
     pub version: u32,
     pub active_group_id: String,
     pub groups: Vec<WorkspaceGroupSessionState>,
+    /// 上次关掉窗口时的外框尺寸 `(宽, 高)`，单位为逻辑像素。
+    ///
+    /// # 为什么必须存
+    ///
+    /// 不存的话每次启动都按硬编码的 1400×900 居中开窗。而守护进程里的
+    /// 终端（可能正在跑 nvim / htop）还停在关掉前那个更大的尺寸上——
+    /// 窗口一变，全屏程序就得按新列数重新布局，界面于是错位。
+    ///
+    /// 用户看到的"重启 deepterm 后 TUI 布局乱了"，最直接的一环就是
+    /// 窗口尺寸没恢复。
+    ///
+    /// `Option` + `#[serde(default)]`：旧会话文件没有这个字段，反序列化
+    /// 不能因此失败——那会让所有老用户升级后丢失整个会话。
+    #[serde(default)]
+    pub window_size: Option<(f32, f32)>,
 }
 
 impl Default for AppSessionState {
@@ -19,6 +34,7 @@ impl Default for AppSessionState {
             version: SESSION_STATE_VERSION,
             active_group_id: crate::workspace::sidebar::DEFAULT_TAB_GROUP_ID.to_string(),
             groups: Vec::new(),
+            window_size: None,
         }
     }
 }
@@ -136,6 +152,16 @@ pub enum TerminalSessionState {
         /// 旧会话文件没有这个字段，缺省 `None` = 老行为按需重建。
         #[serde(default)]
         daemon_address: Option<String>,
+        /// 上次关掉时这个终端在守护进程里的**真实网格尺寸** `(cols, rows)`。
+        ///
+        /// 恢复时用它向守护进程 attach：守护进程会先按这个尺寸 resize、
+        /// 再生产快照。没有它就只能靠窗口尺寸估算，而估算必然偏——偏了
+        /// 的后果是全屏程序重开到错误的列数上，也就是"重开就乱、动一下
+        /// 窗口才好"。
+        ///
+        /// 非活动标签尤其需要它：那些终端从未布局过，拿不到任何真实尺寸。
+        #[serde(default)]
+        daemon_grid: Option<(u16, u16)>,
     },
     Ssh {
         config: SshConnectionConfig,
@@ -146,6 +172,9 @@ pub enum TerminalSessionState {
         /// `serde(skip)` 的（它是「本次连接」的选择，不是主机属性），因此
         /// 会话文件必须自己记住它，否则重启后海外服务器又变回直连。
         ///
+        /// 同上：上次关掉时的真实网格尺寸。
+        #[serde(default)]
+        daemon_grid: Option<(u16, u16)>,
         /// 缺省 `false`：旧会话文件没有这个字段，按直连处理。
         #[serde(default)]
         use_system_proxy: bool,
@@ -171,6 +200,7 @@ impl TerminalSessionState {
             remote_cwd,
             use_system_proxy,
             daemon_address: None,
+            daemon_grid: None,
         }
     }
 
@@ -234,6 +264,14 @@ impl TerminalSessionState {
             command: None,
             args: Vec::new(),
             daemon_address: Some(address),
+            daemon_grid: None,
+        }
+    }
+
+    /// 上次关掉时这个终端在守护进程里的真实网格尺寸。
+    pub fn daemon_grid(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::Local { daemon_grid, .. } | Self::Ssh { daemon_grid, .. } => *daemon_grid,
         }
     }
 
@@ -374,6 +412,7 @@ mod tests {
             command: None,
             args: Vec::new(),
             daemon_address: None,
+            daemon_grid: None,
         };
         assert!(!state.use_system_proxy());
         assert!(state.ssh_config_with_proxy().is_none());
@@ -395,6 +434,7 @@ mod tests {
             command: Some("wsl.exe".to_string()),
             args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
             daemon_address: None,
+            daemon_grid: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(
@@ -420,6 +460,7 @@ mod tests {
             command: Some("/usr/local/bin/wsl".to_string()),
             args: vec!["-d".to_string(), "Ubuntu-24.04".to_string()],
             daemon_address: None,
+            daemon_grid: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(
@@ -446,6 +487,7 @@ mod tests {
             command: Some("powershell.exe".to_string()),
             args: vec![],
             daemon_address: None,
+            daemon_grid: None,
         };
         let (path, label) = state.file_tree_target();
         assert_eq!(path.as_deref(), Some(std::path::Path::new(cwd)));

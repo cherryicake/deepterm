@@ -95,7 +95,7 @@ const SPLIT_HANDLE_THICKNESS: f32 = 6.0;
 /// `Workspace::do_tab_close` 的 `&mut self` 更新过程中，若回调里再去
 /// `AppWindow::default_workspace.read(cx)` 会触发 GPUI 的
 /// "cannot read ... while it is already being updated" panic。
-type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App, WorkspaceSessionState)>;
+type LastTabCloseCallback = Box<dyn Fn(&mut gpui::App, WorkspaceSessionState, Option<(f32, f32)>)>;
 /// 可选 [`LastTabCloseCallback`]。
 type OptionalLastTabCloseCallback = Option<LastTabCloseCallback>;
 
@@ -252,6 +252,11 @@ pub struct Workspace {
     /// 最后一个 tab 关闭、窗口即将移除前的回调（由 AppWindow 注入，
     /// 用于同步落盘会话——防抖任务会随窗口销毁而丢失）。
     on_last_tab_close: OptionalLastTabCloseCallback,
+    /// 窗口外框尺寸（逻辑像素），由渲染循环每帧写入。
+    ///
+    /// 关窗回调拿不到 `&Window`（那时窗口已在销毁），所以趁渲染时先记下来，
+    /// 关窗时直接读。用 `Cell` 因为渲染拿的是 `&self`。
+    window_size: std::cell::Cell<Option<(f32, f32)>>,
     /// 下一个传输任务序号
     pub(crate) next_transfer_id: usize,
     /// 文件传输任务状态
@@ -489,6 +494,7 @@ impl Workspace {
                 resize_drag: None,
                 ssh_picker: None,
                 on_last_tab_close: None,
+                window_size: std::cell::Cell::new(None),
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
                 close_confirm: crate::components::modal::ModalState::entity(cx),
@@ -538,6 +544,19 @@ impl Workspace {
             return None;
         }
 
+        // 从窗口尺寸估一个网格提示，一路传给终端的 `attach`。
+        //
+        // 恢复会话发生在**第一次布局之前**，那时还没有 `TerminalBounds`；
+        // 能拿到的最准的东西就是窗口尺寸。按默认字体度量换算后作为 attach
+        // 的初值，守护进程据此先 resize 再生产快照——否则快照会按旧列数
+        // 折行，TUI 布局当场错位。首帧布局后 `Terminal::resize` 会用精确
+        // 值再校正一次。
+        let window_size = window.bounds().size;
+        let hint = super::panel::TerminalGridHint::from_window_size(
+            window_size.width.into(),
+            window_size.height.into(),
+        );
+
         let focus_handle = cx.focus_handle();
         let workspace_id = if state.workspace_id.is_empty() {
             format!("workspace-{}", uuid::Uuid::new_v4())
@@ -572,6 +591,7 @@ impl Workspace {
                     &workspace_id,
                     &tab.id,
                     &label,
+                    hint,
                     cx,
                 );
                 let tab_info = TabInfo {
@@ -628,6 +648,7 @@ impl Workspace {
                 resize_drag: None,
                 ssh_picker: None,
                 on_last_tab_close: None,
+                window_size: std::cell::Cell::new(None),
                 next_transfer_id: 1,
                 transfer_tasks: Vec::new(),
                 close_confirm: crate::components::modal::ModalState::entity(cx),
@@ -671,11 +692,24 @@ impl Workspace {
     }
 
     /// 注入「最后一个 tab 关闭、窗口即将移除」回调（AppWindow 用它同步落盘会话）。
-    pub fn set_on_last_tab_close(
-        &mut self,
-        callback: Box<dyn Fn(&mut gpui::App, WorkspaceSessionState)>,
-    ) {
+    pub fn set_on_last_tab_close(&mut self, callback: LastTabCloseCallback) {
         self.on_last_tab_close = Some(callback);
+    }
+
+    /// 记录当前窗口尺寸。由渲染循环每帧调用。
+    ///
+    /// 关窗时窗口已在销毁，回调拿不到 `&Window`；趁渲染时把尺寸存进
+    /// `Cell`，关窗时直接读。这是"重启后窗口尺寸能恢复"的数据来源。
+    /// 读出上次记住的窗口尺寸。
+    pub fn remembered_window_size(&self) -> Option<(f32, f32)> {
+        self.window_size.get()
+    }
+
+    pub fn remember_window_size(&self, size: gpui::Size<gpui::Pixels>) {
+        let (w, h) = (f32::from(size.width), f32::from(size.height));
+        if w > 0.0 && h > 0.0 {
+            self.window_size.set(Some((w, h)));
+        }
     }
 
     /// 注入后调用此辅助：关窗前同步落盘。
@@ -689,9 +723,14 @@ impl Workspace {
             return;
         }
         let default_state = self.session_state(cx);
+        // 窗口尺寸要跟着会话一起存：不存的话每次启动都按硬编码的
+        // 1400×900 开窗，而守护进程里的终端（可能正在跑 nvim）还停在
+        // 关掉前那个更大的尺寸上——窗口一变，全屏程序就得重新布局，
+        // 界面于是错位。这是"重启后 TUI 布局乱"最直接的一环。
+        let window_size = self.window_size.get();
         if let Some(callback) = self.on_last_tab_close.take() {
             // &mut Context 经 DerefMut 强转为 &mut App
-            callback(cx, default_state);
+            callback(cx, default_state, window_size);
         }
     }
 
@@ -3354,9 +3393,11 @@ mod tests {
             command: None,
             args: Vec::new(),
             daemon_address: None,
+            daemon_grid: None,
         };
         let ssh = TerminalSessionState::Ssh {
             daemon_address: None,
+            daemon_grid: None,
             config: SshConnectionConfig::new(
                 "example.com",
                 "root",

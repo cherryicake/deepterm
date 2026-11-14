@@ -3,7 +3,7 @@
 //! UI 进程只通过这里与守护进程打交道。所有"发现没连上 → 拉起 → 重试"
 //! 的逻辑都收在这一个文件里，调用方拿到的永远是"连上了"或一个明确的错误。
 
-use std::io::BufWriter;
+use std::io::{BufWriter, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,7 +27,16 @@ const CONNECT_RETRY: Duration = Duration::from_millis(50);
 /// 分发给各自的接收端。
 pub struct Client {
     /// 往守护进程写帧。
-    writer: std::sync::Mutex<BufWriter<super::transport::Stream>>,
+    /// 待写帧的队列。
+    ///
+    /// **不直接在调用方线程写 socket**：`send` 会在 UI 线程上被调用
+    /// （按键、滚轮、resize），而 socket 写是阻塞的。守护进程一旦读得慢
+    /// （它那边可能在给一堆客户端推输出），send 就卡在内核缓冲区上，
+    /// UI 线程跟着冻住——表现为"滚动一下就卡死"，而且完全看不出跟网络
+    /// 有关。
+    ///
+    /// 改成投递到队列，由专门的写线程负责真正的 write。
+    outbox: async_channel::Sender<Frame>,
     /// 控制面的 JSON 回复。
     replies: async_channel::Receiver<Frame>,
     /// 各终端 channel 的输出接收端。
@@ -38,6 +47,8 @@ pub struct Client {
     routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>>,
     /// reader 线程是否已退出（守护进程没了）。
     closed: Arc<AtomicBool>,
+    /// 路由尚未登记时提前到达的帧（见 `attach_channel`）。
+    pending: Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
     next_id: AtomicU64,
 }
 
@@ -83,6 +94,9 @@ impl Client {
         let closed = Arc::new(AtomicBool::new(false));
         let closed_flag = closed.clone();
         let reader_routes = routes.clone();
+        let pending: Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>> =
+            Arc::default();
+        let pending_for_client = pending.clone();
 
         std::thread::Builder::new()
             .name("daemon-client-read".into())
@@ -114,9 +128,23 @@ impl Client {
                                             .remove(&channel);
                                     }
                                 }
-                                // 没有登记的 channel：这是已经 detach 的终端
-                                // 残留的输出，丢掉即可。
-                                None => {}
+                                None => {
+                                    // 路由还没登记：**不能丢**。
+                                    //
+                                    // `attach` 的回复和数据帧走同一条连接，
+                                    // 服务端会先把整屏快照推出来、再回 JSON。
+                                    // 客户端要等回复解析出 channel 号才调
+                                    // `attach_channel` 登记路由，中间这段窗口
+                                    // 里的帧（正是那份快照）到这里时查不到。
+                                    //
+                                    // 与 `core_holder` 侧是同一个问题、同一个
+                                    // 修法：先攒着，登记时补发。
+                                    let mut p = pending.lock().expect("client pending");
+                                    let buf = p.entry(channel).or_default();
+                                    if buf.len() + frame.payload.len() <= MAX_PENDING {
+                                        buf.extend_from_slice(&frame.payload);
+                                    }
+                                }
                             }
                         }
                         Ok(None) => break,
@@ -136,13 +164,72 @@ impl Client {
                 closed_flag.store(true, Ordering::SeqCst);
             })?;
 
-        Ok(Self {
-            writer: std::sync::Mutex::new(BufWriter::new(stream)),
+        // 写线程：独占 socket 的写端，负责把队列里的帧真正发出去。
+        //
+        // 队列无界：调用方（UI 线程）绝不能因为守护进程慢而被阻塞。真正的
+        // 背压由流控（credit）承担——终端数据本来就是按信用发的。
+        let (out_tx, out_rx) = async_channel::unbounded::<Frame>();
+        {
+            let mut buf = BufWriter::new(stream);
+            std::thread::Builder::new()
+                .name("daemon-client-w".into())
+                .spawn(move || {
+                    while let Ok(frame) = out_rx.recv_blocking() {
+                        if frame.write_to(&mut buf).is_err() {
+                            break;
+                        }
+                        // 立刻刷出去：这些是按键/滚轮，延迟会直接影响手感。
+                        if buf.flush().is_err() {
+                            break;
+                        }
+                    }
+                    let _ = buf.flush();
+                })
+                .ok();
+        }
+        let client = Self {
+            pending: pending_for_client,
+            outbox: out_tx,
             replies: reply_rx,
             routes,
             closed,
             next_id: AtomicU64::new(1),
-        })
+        };
+        client.handshake()?;
+        Ok(client)
+    }
+
+    /// 建立连接后的鉴权握手。
+    ///
+    /// 服务端要求第一条帧是带正确 token 的 `hello`，否则直接关连接。
+    /// token 读不到时给出明确错误——比"连上了但所有请求都超时"好查得多。
+    fn handshake(&self) -> std::io::Result<()> {
+        let token = super::read_token().map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("读不到守护进程 token: {e}"),
+            )
+        })?;
+        let request = json!({"id": 0, "op": "hello", "token": token});
+        self.send(Frame::json(serde_json::to_vec(&request)?))?;
+
+        match self.replies.recv_blocking() {
+            Ok(frame) => {
+                let reply: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
+                if reply["ok"] == true {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "守护进程拒绝了鉴权",
+                    ))
+                }
+            }
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "鉴权时连接断开",
+            )),
+        }
     }
 
     /// 连接是否已经断了。
@@ -159,7 +246,21 @@ impl Client {
         self.routes
             .lock()
             .expect("client routes")
-            .insert(channel, tx);
+            .insert(channel, tx.clone());
+
+        // 补发登记之前就到的数据（attach 的整屏快照通常在这时到达）。
+        // 必须在返回接收端之前：晚了这些字节会被排到新输出后面，顺序反掉。
+        let buffered = self
+            .pending
+            .lock()
+            .expect("client pending")
+            .remove(&channel);
+        if let Some(bytes) = buffered
+            && !bytes.is_empty()
+        {
+            log::debug!("补发 {channel} 的 {} 字节（登记前到达）", bytes.len());
+            let _ = tx.try_send(Frame::data(channel, bytes));
+        }
         rx
     }
 
@@ -241,8 +342,10 @@ impl Client {
 
     /// 发一帧。
     pub fn send(&self, frame: Frame) -> std::io::Result<()> {
-        let mut writer = self.writer.lock().expect("client writer");
-        frame.write_to(&mut *writer)
+        // 投递即可，不等写线程。写线程没了说明连接已断。
+        self.outbox
+            .try_send(frame)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "写线程已退出"))
     }
 
     /// 向某个终端的 channel 写输入。
@@ -360,6 +463,9 @@ pub fn daemon_binary_path() -> Option<std::path::PathBuf> {
 
 /// 指定 `deepcore` 路径的环境变量（测试与自定义安装）。
 pub const DAEMON_ENV: &str = "DEEPTERM_DEEPCORE";
+
+/// 单个 channel 最多先攒多少字节（登记路由之前到达的数据）。
+const MAX_PENDING: usize = 8 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {

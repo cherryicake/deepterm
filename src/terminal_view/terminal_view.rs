@@ -153,6 +153,12 @@ const SCROLL_VELOCITY_SCALE: f32 = 2000.0;
 // Scrollbar thumb animation duration (seconds)
 const SCROLLBAR_ANIMATION_DURATION: f32 = 0.15;
 
+/// 输出驱动的重绘合并间隔。
+///
+/// 16ms ≈ 60fps：一帧最多画一次，再快也看不出来，但每帧都重绘会让渲染
+/// 线程被请求淹没（实测 nvim 滚动时 CPU 冲到 400%+，界面反而卡死）。
+const OUTPUT_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
 /// BEL 视觉闪烁总时长（毫秒）：视区边缘呼吸式高亮，随后自然衰减。
 const BELL_FLASH_MS: u64 = 350;
 
@@ -639,6 +645,10 @@ pub struct TerminalView {
     scrollbar_anim_start: Instant,
     /// Whether a thumb-position animation is currently running.
     scrollbar_animating: bool,
+    /// 上一次因输出而请求重绘的时刻（见 `OUTPUT_REPAINT_INTERVAL`）。
+    pending_output_repaint_at: Option<Instant>,
+    /// 为"被合并掉的那一帧"排的补帧任务。
+    output_repaint_task: Option<gpui::Task<()>>,
     // ── Scroll velocity tracking ────────────────────────────────────────────
     /// Instant of the last scroll-wheel event (for velocity calculation).
     last_scroll_instant: Instant,
@@ -876,6 +886,102 @@ fn plan_local_session_startup(
         (args.to_vec(), working_directory.or_else(dirs::home_dir))
     }
 }
+
+/// 把一个"普通字符"按键转成要写入 PTY 的字节。
+///
+/// 只处理 `to_esc_str` 明确不管的情形：无 Ctrl / Alt / Cmd 修饰、且确实
+/// 产出了可打印文本的按键。其余一律返回 `None`，交回原有路径。
+///
+/// # 为什么需要这层兜底
+///
+/// 未修饰字符按 kitty 协议不该编成 CSI u，`to_esc_str` 因此返回 `None`，
+/// 由框架的文本输入分发（`EntityInputHandler`）发送。但那次转换要求窗口
+/// 的焦点与字符坐标都处于就绪状态：刚重连、或输入法有残留状态时，事件会
+/// 被静默丢弃——表现为"nvim 里 j/k 失灵、shell 里又看着正常"。
+///
+/// herdr 直接用 `key_char` 兜底，不依赖框架；这里做同样的事。
+/// 是否是"命名键"（方向键、功能键、Home/End 之类）而非字面字符。
+///
+/// 这些键的 `key` 字段是名字（"up"、"f1"、"pageup"），不是要输入的字符。
+/// 把它们当正文发出去会把方向键变成字母。
+fn is_named_key(key: &str) -> bool {
+    matches!(
+        key,
+        "up" | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+            | "insert"
+            | "delete"
+            | "backspace"
+            | "tab"
+            | "return"
+            | "enter"
+            | "escape"
+            | "space"
+            | "capslock"
+            | "shift"
+            | "control"
+            | "alt"
+            | "platform"
+            | "function"
+    ) || key
+        .strip_prefix('f')
+        .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty())
+}
+
+fn plain_text_bytes(event: &KeyDownEvent) -> Option<Vec<u8>> {
+    let keystroke = &event.keystroke;
+    let m = keystroke.modifiers;
+    // 带修饰的组合键由 `to_esc_str` 负责；这里只补纯字符。
+    if m.control || m.alt || m.platform || m.function {
+        return None;
+    }
+    // Windows 的原生组字预览要继续交给输入法，否则拼音候选会被当正文发出。
+    #[cfg(windows)]
+    if event.prefer_character_input {
+        return None;
+    }
+
+    // 命名键（方向键、功能键、Home/End…）一律不走这条路径：它们的 `key`
+    // 是名字不是字符，`key_char` 即便有值也是平台塞进来的噪声。编码交给
+    // `to_esc_str`（它对功能键有完整映射表）。
+    if is_named_key(keystroke.key.as_str()) {
+        return None;
+    }
+
+    if let Some(text) = keystroke.key_char.as_deref() {
+        // 空串没有可发的内容；控制字符（含 IME 的中间态）也一样跳过。
+        if !text.is_empty() && !text.chars().any(|c| (c as u32) < 0x20) {
+            return Some(text.as_bytes().to_vec());
+        }
+        return None;
+    }
+
+    // 少数平台/输入法不给 `key_char`：单字符的 `key` 本身就是要发的文本。
+    //
+    // 但要排除命名键——`shift-up` 的 `key` 是 "up"，`f1` 的 `key` 是 "f1"，
+    // 它们不是"一个字面字符"，当正文发出去会把方向键变成字母 u/p。
+    // 命名键一律交给 `to_esc_str`（它对功能键有完整的编码表）。
+    let key = keystroke.key.as_str();
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) if !ch.is_control() => {
+            let mut buf = [0u8; 4];
+            Some(ch.encode_utf8(&mut buf).as_bytes().to_vec())
+        }
+        _ => None,
+    }
+}
+
+/// 最近一次布局算出的网格尺寸（打包成 `cols << 16 | rows`，0 表示未知）。
+///
+/// 见 [`TerminalView::remember_grid_size`]：恢复会话时拿不到 `window`，
+/// 只能靠渲染时留下的这个提示让 `attach` 报出正确尺寸。
+static GRID_SIZE_HINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 impl TerminalView {
     /// 处理 SSH 连接异常断开事件
@@ -1258,6 +1364,8 @@ impl TerminalView {
             scrollbar_anim_from_y: px(0.0),
             scrollbar_anim_start: Instant::now(),
             scrollbar_animating: false,
+            pending_output_repaint_at: None,
+            output_repaint_task: None,
             last_scroll_instant: Instant::now(),
             recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
             last_scroll_direction: 0,
@@ -1362,21 +1470,86 @@ impl TerminalView {
             cols,
             rows,
         )?;
-        Self::attach_existing(cx, &address, working_directory, command, args)
+        // 尺寸是现成的（spawn 时就是这么建的），直接传给 attach：
+        // 守护进程据此确认网格，不必再按别的尺寸重排一次。
+        let hint = Some(crate::workspace::panel::TerminalGridHint { cols, rows });
+        Self::attach_existing(cx, &address, working_directory, command, args, hint)
             .ok_or_else(|| "无法挂接刚创建的终端".to_string())
     }
 
     /// 挂接一个已经存在于守护进程里的终端。
     ///
     /// 返回 `None` 表示挂接失败（终端已经退出，或守护进程不可用）。
+    /// 窗口尺寸提示：`(网格列数, 行数)`，由最近一次布局写入。
+    ///
+    /// # 为什么要有这个东西
+    ///
+    /// `attach` 必须带上**客户端的真实尺寸**，否则守护进程只能按它自己
+    /// 记录的旧尺寸生成快照，客户端再用新尺寸渲染——两者错位，TUI 布局
+    /// 就乱了（herdr-core 在 `viewers::attach` 里正是先 `apply_size()`
+    /// 再 `first_paint()`，herdr-app 还有两条测试钉这个顺序）。
+    ///
+    /// 麻烦在于恢复会话的调用链（`Workspace::from_session_state` →
+    /// `SplitContainer` → `Panel`）一路把 `window` 丢掉了，到面板创建时
+    /// 已经拿不到窗口。所以在渲染时把**最近一次**布局算出的网格存进这个
+    /// 全局量，attach 时直接取。
+    ///
+    /// 取不到（首次启动、还没渲染过）时返回 `None`，attach 退回守护进程
+    /// 的尺寸——那是次优但不会出错的路径。
+    pub fn remember_grid_size(cols: u16, rows: u16) {
+        if cols > 0 && rows > 0 {
+            GRID_SIZE_HINT.store(
+                u32::from(cols) << 16 | u32::from(rows),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// 读回 [`Self::remember_grid_size`] 记下的网格尺寸。
+    pub fn grid_size_hint() -> Option<(u16, u16)> {
+        let packed = GRID_SIZE_HINT.load(std::sync::atomic::Ordering::Relaxed);
+        if packed == 0 {
+            return None;
+        }
+        Some(((packed >> 16) as u16, (packed & 0xffff) as u16))
+    }
+
+    /// 当前活动窗口换算出的网格尺寸。
+    ///
+    /// 用于**新建**终端：那时还没有任何布局记录（`grid_size_hint` 是
+    /// `None`），但窗口已经存在，可以按它估一个。
+    ///
+    /// 取不到（没有活动窗口、处于测试环境）返回 `None`，调用方退回默认值。
+    pub fn grid_size_from_active_window(cx: &mut gpui::App) -> Option<(u16, u16)> {
+        let handle = cx.active_window()?;
+        let bounds = handle.update(cx, |_, window, _| window.bounds()).ok()?;
+        crate::workspace::panel::TerminalGridHint::from_window_size(
+            bounds.size.width.into(),
+            bounds.size.height.into(),
+        )
+        .map(|hint| (hint.cols, hint.rows))
+    }
+
     pub fn attach_existing(
         cx: &mut App,
         address: &str,
         working_directory: Option<PathBuf>,
         command: Option<&str>,
         args: &[String],
+        hint: Option<crate::workspace::panel::TerminalGridHint>,
     ) -> Option<Entity<Self>> {
-        let session = match crate::daemon::session::attach(address) {
+        // 报给守护进程的尺寸必须准：它会先按这个尺寸 resize、再生产快照，
+        // 报错了快照就按错误列数折行——全屏程序重开时布局当场错位。
+        //
+        // 优先级（越靠前越准）：
+        // 1. 调用方给的 hint：恢复会话时传的是**上次关掉前这个终端真实的
+        //    网格尺寸**（存在 `daemon_grid` 里）。非活动标签也能拿到，
+        //    这是最可靠的一项；
+        // 2. 全局网格提示：由 `prepaint` 的真实布局写入，但它是**单一
+        //    静态量**，多面板时会互相覆盖，只能当兜底；
+        // 3. 都没有 → `None`，守护进程保持现状。
+        let size = hint.map(|h| (h.cols, h.rows)).or_else(Self::grid_size_hint);
+        let session = match crate::daemon::session::attach(address, size) {
             Ok(session) => session,
             Err(e) => {
                 log::warn!("挂接终端 {address} 失败: {e}");
@@ -1387,11 +1560,16 @@ impl TerminalView {
         // 不查表——查表在 detach 之后会静默写到别的终端上。
         let input_session = session.clone();
         let resize_session = session.clone();
+        // 用守护进程报的真实尺寸建本地 VT。
+        //
+        // 这里以前硬编码 80×24，而守护进程里的终端可能是 174×66：重放的
+        // 整屏画面按 80 列折行，nvim / htop 的边框与状态栏于是全部错位。
+        // 这是"重连后 TUI 布局全乱"的直接原因。
         let terminal = Terminal::new_attached(
             cx,
             address.to_string(),
-            80,
-            24,
+            session.cols,
+            session.rows,
             Self::persistent_scrollback_lines(cx),
             move |bytes| input_session.write(bytes),
             move |cols, rows, _scale| resize_session.resize(cols, rows, 0, 0),
@@ -1568,6 +1746,8 @@ impl TerminalView {
                 scrollbar_anim_from_y: px(0.0),
                 scrollbar_anim_start: Instant::now(),
                 scrollbar_animating: false,
+                pending_output_repaint_at: None,
+                output_repaint_task: None,
                 last_scroll_instant: Instant::now(),
                 recent_scroll_velocities: VecDeque::with_capacity(SCROLL_VELOCITY_WINDOW_SIZE),
                 last_scroll_direction: 0,
@@ -1634,7 +1814,8 @@ impl TerminalView {
 
         let address =
             crate::daemon::session::spawn_remote_terminal(&program, &args, &env_pairs, cols, rows)?;
-        let view = Self::attach_existing(cx, &address, None, None, &[])
+        let hint = Some(crate::workspace::panel::TerminalGridHint { cols, rows });
+        let view = Self::attach_existing(cx, &address, None, None, &[], hint)
             .ok_or_else(|| "无法挂接刚创建的远程终端".to_string())?;
         view.update(cx, |this, _cx| {
             this.adopt_ssh_session(ssh_config.clone(), remote_cwd);
@@ -1700,7 +1881,40 @@ impl TerminalView {
                     self.poll_wsl_cwd(cx);
                 }
                 self.check_tab_label_changed(cx);
-                cx.notify();
+                // 输出驱动的重绘要合并，不能每帧数据来一发。
+                //
+                // `handle_remote_data` 每收一帧就 `emit(Wakeup)`，一条大输出
+                // 会被切成几十上百帧。每帧都 `cx.notify()` 就是每帧一次
+                // 整屏重绘：nvim 滚动/重绘时 CPU 能冲到 400% 以上，界面反而
+                // 卡住（渲染线程被重绘请求淹没）。
+                //
+                // 合并策略与 herdr 的输出时间片同源：一个时间片内只排一次
+                // 重绘，把这一片攒下的所有内容一次性画出来。
+                let now = Instant::now();
+                let due = self
+                    .pending_output_repaint_at
+                    .is_none_or(|at| now.duration_since(at) >= OUTPUT_REPAINT_INTERVAL);
+                if due {
+                    self.pending_output_repaint_at = Some(now);
+                    cx.notify();
+                } else {
+                    // 被合并掉的那一帧必须补回来。
+                    //
+                    // 只做"限流"而不补最后一帧，输出停下时画面会停在合并
+                    // 之前的状态——用户看到"最后几行没出来"。这里排一个
+                    // 定时器，到点再请求一次；已在排队就不重复排。
+                    if self.output_repaint_task.is_none() {
+                        let wait = OUTPUT_REPAINT_INTERVAL;
+                        self.output_repaint_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(wait).await;
+                            let _ = this.update(cx, |this, cx| {
+                                this.output_repaint_task = None;
+                                this.pending_output_repaint_at = Some(Instant::now());
+                                cx.notify();
+                            });
+                        }));
+                    }
+                }
                 // 输出边沿要把「正在滚字」同步给 tab（扫光动画用），
                 // 并保证输出停下时有一个计时器把状态翻回去。
                 if self.sync_agent_streaming(cx) {
@@ -1853,8 +2067,20 @@ impl TerminalView {
             // 正在跑的任务就断了。
             let mut state =
                 TerminalSessionState::ssh(config, self.current_remote_working_directory(cx));
-            if let TerminalSessionState::Ssh { daemon_address, .. } = &mut state {
-                *daemon_address = self.terminal.read(cx).attached_address().map(str::to_owned);
+            let address = self.terminal.read(cx).attached_address().map(str::to_owned);
+            // 与本地终端同理：尺寸要问守护进程。非活动标签的本地 VT
+            // 尺寸是构造默认值，存下来只会让重开时排错。
+            let grid = address
+                .as_deref()
+                .and_then(crate::daemon::session::terminal_grid);
+            if let TerminalSessionState::Ssh {
+                daemon_address,
+                daemon_grid,
+                ..
+            } = &mut state
+            {
+                *daemon_address = address;
+                *daemon_grid = grid;
             }
             return state;
         }
@@ -1863,11 +2089,21 @@ impl TerminalView {
         // 挂接式终端要记住它在守护进程里的地址：重开 deepterm 时靠它
         // 接回**同一个进程**，而不是新建一个 shell 把原来的丢掉。
         let daemon_address = self.terminal.read(cx).attached_address().map(str::to_owned);
+        // 记下真实网格尺寸：重开时靠它向守护进程 attach，守护进程据此
+        // 先 resize 再生产快照。
+        //
+        // **必须问守护进程**，不能用本地 VT 的 `terminal_bounds`：
+        // 非活动标签从未布局过，那个值还停在构造时的默认 55×18，存下来
+        // 等于存了个错的——重开时照它 resize，全屏程序就排到错误的列数上。
+        let daemon_grid = daemon_address
+            .as_deref()
+            .and_then(crate::daemon::session::terminal_grid);
         TerminalSessionState::Local {
             cwd: cwd.map(|path| path.to_string_lossy().to_string()),
             command: self.command.clone(),
             args: self.command_args.clone(),
             daemon_address,
+            daemon_grid,
         }
     }
 
@@ -3419,6 +3655,19 @@ impl TerminalView {
     /// 3. Less than 2 seconds have passed since the last scroll
     pub fn should_show_scrollbar(&self, cx: &App) -> bool {
         let term = self.terminal.read(cx);
+
+        // 全屏程序（备用屏）**没有回滚区**，不该有滚动条。
+        //
+        // 这不仅是"画蛇添足"的问题。滚动条一旦显示，可见性判断就依赖
+        // `last_scroll_time`（滚动后 2 秒内可见），而全屏程序持续输出会
+        // 不断刷新那个时间戳；于是"滚动条动画推进 → cx.notify() → 整屏
+        // 重绘"这条链永远收敛不了，60fps 空转把 CPU 顶到 140%。
+        //
+        // 用户感受到的就是"在 nvim 里来回滚动，界面卡住"。
+        if term.in_alternate_screen() {
+            return false;
+        }
+
         let content = term.last_content();
         let total_lines = content.total_lines;
         let viewport_lines = content.viewport_lines;
@@ -5479,6 +5728,22 @@ impl TerminalView {
                 terminal.write(&bytes);
                 input_bytes = Some(bytes);
                 true
+            } else if let Some(bytes) = plain_text_bytes(event) {
+                // 编码器不负责的普通字符（`j` / `k` / 字母 / 数字……）。
+                //
+                // `to_esc_str` 对这类键返回 `None` 是**有意的**：kitty 协议
+                // 规定未修饰字符走文本路径，不该编成 CSI u。问题在于那条
+                // 文本路径要靠框架把 KeyDownEvent 转成一次文本提交，而这条
+                // 转换**并不可靠**——窗口刚重连、焦点/坐标状态未就绪，或
+                // 输入法处于某种状态时，事件就被吞掉了。表现出来就是
+                // "nvim 里 j/k 按了没反应"，而 shell 里看起来又正常。
+                //
+                // herdr 的 `key_down` 对所有按键都产生字节（`key_char` 兜底），
+                // 从不依赖这条转换。这里对齐同一策略：只在这一层兜底，
+                // `to_esc_str` 的协议语义保持不变。
+                terminal.write(&bytes);
+                input_bytes = Some(bytes);
+                true
             } else {
                 false
             }
@@ -6013,10 +6278,22 @@ impl Render for TerminalView {
                 let avg_velocity: f32 = this.recent_scroll_velocities.iter().sum::<f32>()
                     / this.recent_scroll_velocities.len().max(1) as f32;
 
-                // Dynamic multiplier: base + velocity bonus (capped at max).
-                let dynamic_multiplier = (SCROLL_MULTIPLIER_BASE
-                    + avg_velocity / SCROLL_VELOCITY_SCALE)
-                    .min(SCROLL_MULTIPLIER_MAX);
+                // 倍率只对"本地滚动"有意义，对转发给程序的滚轮必须关掉。
+                //
+                // 全屏程序（nvim / htop / less）会把每一次滚轮报告变成一次
+                // 重绘：`scroll_report` 是按 `scroll_lines` 逐条生成的，
+                // 乘 3~8 倍就是一次滚轮打出 3~8 条报告 → 程序重绘 3~8 次
+                // → 输出暴涨。用户滚动时的感受就是"卡死"。
+                //
+                // herdr 完全不乘（`terminal.rs::scroll`：严格按像素折算行数），
+                // 这里对齐：程序接管滚轮时倍率恒为 1。
+                let program_owns_wheel = this.terminal.read(cx).program_owns_scroll();
+                let dynamic_multiplier = if program_owns_wheel {
+                    1.0
+                } else {
+                    (SCROLL_MULTIPLIER_BASE + avg_velocity / SCROLL_VELOCITY_SCALE)
+                        .min(SCROLL_MULTIPLIER_MAX)
+                };
 
                 // Detect direction change and tell Terminal to reset accumulator.
                 let current_direction = event.delta.pixel_delta(line_height).y.signum() as i32;
@@ -6232,6 +6509,79 @@ mod tests {
     use crate::terminal::Terminal;
     use crate::terminal::terminal::TerminalBounds;
     use gpui::{TestAppContext, size};
+
+    /// 网格尺寸提示必须能存能取，且拒绝无效值。
+    ///
+    /// 回归价值：这是 `attach` 报对尺寸的唯一来源。恢复会话的调用链
+    /// （`Workspace::from_session_state` → `SplitContainer` → `Panel`）
+    /// 一路把 `window` 丢掉了，拿不到窗口就只能靠这个提示。取错了会让
+    /// attach 报错尺寸，守护进程按错的尺寸 resize，TUI 布局照样乱。
+    #[test]
+    fn the_grid_size_hint_round_trips() {
+        TerminalView::remember_grid_size(174, 66);
+        assert_eq!(TerminalView::grid_size_hint(), Some((174, 66)));
+
+        // 0 是"未知"的哨兵，不能被当成有效尺寸写进去。
+        TerminalView::remember_grid_size(0, 40);
+        assert_eq!(
+            TerminalView::grid_size_hint(),
+            Some((174, 66)),
+            "无效尺寸不该覆盖已有的有效提示"
+        );
+    }
+
+    fn key_event(spec: &str) -> KeyDownEvent {
+        KeyDownEvent {
+            keystroke: gpui::Keystroke::parse(spec).expect("击键应可解析"),
+            is_held: false,
+            prefer_character_input: false,
+        }
+    }
+
+    /// **`j` / `k` 这类普通字符必须能直接变成字节。**
+    ///
+    /// 回归价值：nvim 里"按键失灵"的根因就在这里。`to_esc_str` 对未修饰
+    /// 字符返回 `None`（kitty 协议要求走文本路径），而那条文本路径依赖
+    /// 框架把 KeyDownEvent 转成一次文本提交——重连后焦点/坐标状态未就绪
+    /// 时会被静默丢弃。这条用例钉住 `key_down` 里的兜底：只要有
+    /// `key_char`，就一定能拿到要写入的字节。
+    #[test]
+    fn plain_letters_produce_bytes_without_the_text_input_path() {
+        for key in ["j", "k", "h", "l", "0", "9", "/", ":"] {
+            let mut ev = key_event(key);
+            ev.keystroke.key_char = Some(key.to_string());
+            assert_eq!(
+                plain_text_bytes(&ev).as_deref(),
+                Some(key.as_bytes()),
+                "{key} 必须能直接编码（否则 nvim 里按键会失灵）"
+            );
+        }
+    }
+
+    /// 带修饰键的组合不能走这条兜底，否则会把 Ctrl-C 之类当成字符发出去。
+    ///
+    /// 这正是这条兜底最危险的地方：它必须在"编码器不管、且确实是纯字符"
+    /// 的狭窄区间里生效。越界就会把快捷键变成正文输入。
+    #[test]
+    fn modified_keys_never_take_the_plain_text_path() {
+        for spec in ["ctrl-c", "alt-x", "ctrl-a", "shift-up"] {
+            let mut ev = key_event(spec);
+            ev.keystroke.key_char = Some("x".to_string());
+            assert_eq!(
+                plain_text_bytes(&ev),
+                None,
+                "{spec} 不该走纯字符兜底（会被当成正文发进终端）"
+            );
+        }
+    }
+
+    /// 控制字符（IME 中间态、退格等）不能被当成正文发出去。
+    #[test]
+    fn control_characters_are_rejected() {
+        let mut ev = key_event("a");
+        ev.keystroke.key_char = Some("\u{1}".to_string());
+        assert_eq!(plain_text_bytes(&ev), None, "控制字符不该被当正文发送");
+    }
 
     /// 复制 / 重连本地标签时，新会话的起点跟着源标签走（见
     /// [`plan_local_session_startup`]）。

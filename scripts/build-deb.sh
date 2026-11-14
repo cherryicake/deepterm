@@ -63,7 +63,9 @@ command -v dpkg-deb > /dev/null || { echo -e "${RED}缺少 dpkg-deb${NC}" >&2; e
 if [ "$DO_BUILD" = "1" ]; then
     echo -e "${GREEN}=== 1/4 构建 release 二进制 ===${NC}"
     cd "$PROJECT_DIR"
-    cargo build --release --bin "${PKG_NAME}"
+    # 两个二进制都要：`deepcore` 是终端守护进程，缺了它装出来的包
+    # 虽然能开窗，但"关掉窗口终端继续跑"会静默失效。
+    cargo build --release --bins
 fi
 
 [ -f "$BIN_SRC" ] || {

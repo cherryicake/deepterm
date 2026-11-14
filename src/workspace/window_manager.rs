@@ -69,9 +69,52 @@ impl WindowManager {
     ///
     /// `open_paths`, when given, are opened in the editor once the window is
     /// ready (supports `deepterm <file>...` from the command line).
+    /// 从上次会话里读回窗口尺寸。
+    ///
+    /// 读不到（首次启动、文件损坏、字段缺失）就返回 `None`，由调用方用
+    /// 默认尺寸。这里**不能**因为读失败就中断启动——窗口尺寸是锦上添花，
+    /// 不是启动前置条件。
+    ///
+    /// 尺寸还会被夹在合理区间内：会话文件可能被手工改过，或者上一次是
+    /// 在一块已经拔掉的外接屏上留下的巨型尺寸。直接用会让窗口开到屏幕外。
+    fn restored_window_size() -> Option<(f32, f32)> {
+        /// 低于这个尺寸窗口会挤成一团（连标题栏都放不下）。
+        const MIN: f32 = 400.0;
+        /// 高于这个尺寸基本不可能是一块真实屏幕，更可能是坏数据。
+        const MAX: f32 = 10_000.0;
+
+        let manager = crate::workspace::persistence::PersistenceManager::new();
+        let session = match manager.load_session() {
+            Ok(Some(session)) => session,
+            Ok(None) => return None,
+            Err(e) => {
+                log::warn!("读取窗口尺寸失败（{e}），用默认尺寸");
+                return None;
+            }
+        };
+        let (w, h) = session.window_size?;
+        if !w.is_finite() || !h.is_finite() {
+            return None;
+        }
+        // 存的是 `Window::bounds().size`（内容区），而这里建窗用的是
+        // `WindowBounds::Windowed`，尺寸按**外框**理解。两者差一圈边框
+        // （本机实测 20×20），不补偿的话每重启一次窗口就长一点，几次后
+        // 终端列数变了，TUI 又要重新布局——正是我们要避免的。
+        const BORDER: f32 = 20.0;
+        Some(((w - BORDER).clamp(MIN, MAX), (h - BORDER).clamp(MIN, MAX)))
+    }
+
     pub fn open_window(cx: &mut App, open_paths: Vec<std::path::PathBuf>) {
-        let bounds =
-            gpui::Bounds::centered(None, gpui::size(gpui::px(1400.0), gpui::px(900.0)), cx);
+        // 恢复上次关窗时的尺寸；没有记录就用默认的 1400×900 居中。
+        //
+        // 这一步直接关系到"重启后 TUI 布局乱"：窗口尺寸不变，守护进程里的
+        // 全屏程序（nvim / htop）就不必按新列数重新布局，接回来的画面能原样
+        // 对上。以前每次都用 1400×900，关掉前若是最大化，重开后窗口骤变，
+        // 界面自然错位。
+        let size = Self::restored_window_size()
+            .map(|(w, h)| gpui::size(gpui::px(w), gpui::px(h)))
+            .unwrap_or_else(|| gpui::size(gpui::px(1400.0), gpui::px(900.0)));
+        let bounds = gpui::Bounds::centered(None, size, cx);
 
         if let Err(e) = cx.open_window(
             WindowOptions {

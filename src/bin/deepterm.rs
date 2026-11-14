@@ -62,6 +62,30 @@ fn main() {
         log::info!("日志文件: {}", path.display());
     }
 
+    // 单实例：同一个用户只跑一个 GUI。
+    //
+    // 没有这一步时，用户多点几次桌面图标就起好几个进程，每个都开一个窗口；
+    // 而 gpui 在 Linux 上 `activate()` 是空实现（源码里就写着
+    // `activate is not implemented on Linux`），新窗口既不置前也不抢焦点，
+    // 用户看到的是"点了没反应，过一会儿又突然能开了"。
+    //
+    // 拿不到锁说明已有实例在跑：直接退出，不再开窗。锁在进程退出时由内核
+    // 释放，不会留下"文件在、进程没了"的假阳性。
+    let _instance_lock = match deepterm::single_instance::InstanceLock::acquire() {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => {
+            log::info!("已有 DeepTerm 实例在运行，本次启动退出");
+            // 给终端用户的反馈：从命令行启动时能立刻明白发生了什么。
+            eprintln!("deepterm: 已有一个 DeepTerm 实例在运行。");
+            return;
+        }
+        Err(e) => {
+            // 锁机制坏了不能变成"应用打不开"：记一条日志，照常启动。
+            log::warn!("无法建立实例锁（{e}），本次启动不做单实例检查");
+            None
+        }
+    };
+
     use deepterm::assets::Assets;
 
     gpui::Application::with_platform(gpui_platform::current_platform(false))

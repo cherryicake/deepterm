@@ -97,6 +97,7 @@ impl SplitContainer {
         workspace_id: &str,
         tab_id: &str,
         tab_label: &str,
+        hint: Option<super::panel::TerminalGridHint>,
         cx: &mut App,
     ) -> Self {
         match state {
@@ -107,6 +108,7 @@ impl SplitContainer {
                         workspace_id.to_string(),
                         Some(SharedString::from(tab_id.to_string())),
                         Some(SharedString::from(tab_label.to_string())),
+                        hint,
                         cx,
                     )
                 });
@@ -120,7 +122,7 @@ impl SplitContainer {
                 let children: Vec<SplitContainer> = children
                     .iter()
                     .map(|child| {
-                        Self::from_session_state(child, workspace_id, tab_id, tab_label, cx)
+                        Self::from_session_state(child, workspace_id, tab_id, tab_label, hint, cx)
                     })
                     .collect();
                 // sizes 来自会话 JSON，长度可能与 children 不一致（损坏/旧版本

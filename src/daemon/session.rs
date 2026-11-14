@@ -81,6 +81,12 @@ pub fn client() -> Option<Arc<Client>> {
 pub struct Session {
     pub address: String,
     pub channel: u32,
+    /// 终端在守护进程里的网格尺寸 `(cols, rows)`。
+    ///
+    /// 客户端**必须**用它建本地 VT。尺寸不一致时，重放的整屏画面会按
+    /// 错误的列数折行——nvim / htop 这类全屏程序重连后布局全乱就是这个。
+    pub cols: u16,
+    pub rows: u16,
     client: Arc<Client>,
 }
 
@@ -205,11 +211,22 @@ pub fn close_terminal(address: &str) {
 }
 
 /// 挂接一个已存在的终端。
-pub fn attach(address: &str) -> Result<Session, String> {
+/// 挂接一个终端。
+///
+/// `size` 是**客户端当前的网格尺寸**。它必须随 attach 一起发出去：守护
+/// 进程会先按这个尺寸 resize 终端，**再**生成快照。反过来（先按旧尺寸
+/// 快照、客户端再 resize）会直接导致 TUI 布局错乱——见 herdr-core
+/// `viewers.rs::apply_size` 与 `first_paint` 的先后关系。
+///
+/// 传 `None` 时退回守护进程当前尺寸（用于测试/无窗口场景）。
+pub fn attach(address: &str, size: Option<(u16, u16)>) -> Result<Session, String> {
     let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
-    let reply = client
-        .call(serde_json::json!({"op": "attach", "address": address}))
-        .map_err(|e| format!("挂接失败: {e}"))?;
+    let mut request = serde_json::json!({"op": "attach", "address": address});
+    if let Some((cols, rows)) = size {
+        request["cols"] = serde_json::json!(cols);
+        request["rows"] = serde_json::json!(rows);
+    }
+    let reply = client.call(request).map_err(|e| format!("挂接失败: {e}"))?;
     if reply["ok"] != true {
         return Err(reply["error"]
             .as_str()
@@ -219,11 +236,48 @@ pub fn attach(address: &str) -> Result<Session, String> {
     let channel = reply["channel"]
         .as_u64()
         .ok_or_else(|| "挂接回复缺少 channel".to_string())? as u32;
+    // 尺寸缺失时退回一个保守值而不是报错：老版本守护进程不会带这两个字段，
+    // 直接失败会让"升级 GUI 但没升级 core"变成打不开终端。
+    let cols = reply["cols"].as_u64().unwrap_or(80) as u16;
+    let rows = reply["rows"].as_u64().unwrap_or(24) as u16;
     Ok(Session {
         address: address.to_string(),
         channel,
+        cols,
+        rows,
         client,
     })
+}
+
+/// 每轮输出处理的时间片预算。
+///
+/// 与 herdr 的 `OUTPUT_TIME_PER_TURN`（6ms）同量级：足够把一批 16~64 KiB
+/// 的帧吞下，又不会让渲染等太久。
+const OUTPUT_TURN_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
+
+/// 查询某个终端在守护进程里的真实网格尺寸。
+///
+/// 供会话持久化用：客户端本地 VT 的尺寸对**非活动标签**毫无意义（那些
+/// 终端从未布局，`terminal_bounds` 还是构造时的默认值 55×18）。要记住
+/// "上次关掉时它是多大"，只能问真正持有它的守护进程。
+///
+/// 用最短超时：这是保存路径上的一次附加查询，绝不能因为守护进程慢就
+/// 把 UI 卡住。查不到就返回 `None`——保存一个缺失值，比存一个错的强。
+pub fn terminal_grid(address: &str) -> Option<(u16, u16)> {
+    let client = client()?;
+    let reply = client
+        .call_timeout(
+            serde_json::json!({"op": "get", "address": address}),
+            std::time::Duration::from_millis(150),
+        )
+        .ok()?;
+    let term = reply.get("terminal")?;
+    let cols = term.get("cols")?.as_u64()? as u16;
+    let rows = term.get("rows")?.as_u64()? as u16;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    Some((cols, rows))
 }
 
 /// 把一个已挂接的会话接到终端实体上：开一条泵任务，把字节喂给 `Terminal`。
@@ -241,10 +295,44 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
         let mut current = session;
 
         'outer: loop {
-            while let Ok(frame) = incoming.recv().await {
+            // 等第一帧（真正阻塞，没数据时任务睡眠，不占 CPU）。
+            // 真正阻塞：没数据时任务睡眠，不占 CPU。
+            let Ok(first) = incoming.recv().await else {
+                break 'outer;
+            };
+
+            // **每轮只吃一个时间片**，然后让出一次事件循环。
+            //
+            // 这条是防"UI 被输出饿死"的关键。原来写的是
+            // `while let Ok(frame) = incoming.recv().await { ... }` —— 只要
+            // 还有数据就一路转下去，中间**从不 yield**。nvim 滚动/重绘时
+            // 输出是连续的，这个循环于是永不返回：同一条任务链上的重绘、
+            // 光标动画、滚动条推进全都拿不到执行机会，用户看到的就是
+            // "界面卡住不动"。
+            //
+            // herdr 用 `output_turn`（`terminal.rs:24`）做同一件事：攒够
+            // 一个 6ms 的时间片就把控制权交还出去。
+            let deadline = std::time::Instant::now() + OUTPUT_TURN_BUDGET;
+            let mut pending = Some(first);
+            loop {
+                let frame = match pending.take() {
+                    Some(frame) => frame,
+                    None => {
+                        // 时间片用完就停手，剩下的留给下一轮。
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        match incoming.try_recv() {
+                            Ok(frame) => frame,
+                            Err(_) => break,
+                        }
+                    }
+                };
+
                 match frame.kind {
                     Kind::Data => {
                         let data = frame.payload;
+                        let len = data.len();
                         if terminal
                             .update(cx, |terminal, cx| {
                                 terminal.handle_remote_data(&data, cx);
@@ -255,6 +343,16 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
                             log::debug!("终端 {address} 的视图已销毁，停止挂接");
                             break 'outer;
                         }
+                        // 归还流控信用。
+                        //
+                        // 守护进程侧每个挂接者初始只有 1 MiB 额度，用尽之后
+                        // 新的输出会被**丢弃**（它不能让内存无限增长）。不发
+                        // 这条回执，额度只减不增——打开 nvim 加载文件这种
+                        // 输出量大的场景几秒就把额度耗光，之后界面再也不
+                        // 刷新，看起来就是"卡死"。
+                        let _ = current
+                            .client
+                            .credit(current.channel, len.min(u32::MAX as usize) as u32);
                     }
                     Kind::Close => {
                         // 程序真的退出了（不是我们看不到）。
@@ -268,6 +366,17 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
                 }
             }
 
+            // 时间片用完 / 队列已空：交还控制权，然后回到外层继续等数据。
+            //
+            // **必须 `continue`**。这里的 `break` 是内层 loop 的退出，若
+            // 直接往下走，就会落进"挂接流断开 → 重新挂接"那条分支——正常
+            // 的时间片结束被当成断线，于是每隔 300ms 无谓重连一次，三个
+            // 终端把 CPU 空转到 120%。这个 bug 是加时间片时引入的。
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(0))
+                .await;
+            continue 'outer;
+
             // 走到这里说明流断了——通常是与守护进程的连接没了。
             //
             // **不能**就这样静默停下：终端会永远冻结在最后一屏，用户以为
@@ -280,10 +389,22 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
                 .timer(std::time::Duration::from_millis(300))
                 .await;
 
-            match attach(&address) {
+            match attach(&address, None) {
                 Ok(fresh) => {
                     log::info!("已重新挂接终端 {address}");
-                    incoming = fresh.client.attach_channel(fresh.channel);
+                    // 先登记新 channel，**再**替换 `incoming`。
+                    //
+                    // 顺序反了会形成重连风暴：`attach_channel` 往 routes 里
+                    // 插入同名 channel 会**替换**掉旧的发送端，旧接收端的
+                    // 所有 sender 随即被丢弃，它的 `recv()` 立刻返回 `Err`
+                    // ——正好落回本循环的重连分支，于是 300ms 一次无限重连，
+                    // 每个终端每秒烧掉几十次重连请求，CPU 空转到 120%+。
+                    let next = fresh.client.attach_channel(fresh.channel);
+                    // 旧 channel 一并注销，避免 routes 里留下没人读的条目。
+                    if fresh.channel != current.channel {
+                        current.client.detach_channel(current.channel);
+                    }
+                    incoming = next;
                     current = fresh;
                 }
                 Err(e) => {
@@ -317,7 +438,7 @@ mod tests {
     fn attaching_to_an_unknown_terminal_fails() {
         // SAFETY：本用例独占该变量，指向一个不存在的运行时目录。
         unsafe { std::env::set_var(super::super::RUNTIME_DIR_ENV, "/tmp/deepterm-none-2") };
-        let result = attach("t404");
+        let result = attach("t404", None);
         assert!(result.is_err(), "没有守护进程时应报错");
         unsafe { std::env::remove_var(super::super::RUNTIME_DIR_ENV) };
     }

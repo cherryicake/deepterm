@@ -14,6 +14,7 @@ pub mod lsp;
 pub mod programs;
 pub mod settings;
 pub mod sidebar_view;
+pub mod single_instance;
 pub mod ssh;
 pub mod ssh_view;
 pub mod terminal;
@@ -168,6 +169,12 @@ pub struct AppWindow {
     is_main_window: bool,
     workspace_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_save_task: Option<gpui::Task<()>>,
+    /// 关窗时要落盘的窗口尺寸（由 `before_window_remove` 传入）。
+    ///
+    /// 用一次性中转而不是直接字段传递：`save_session_with_default` 还有
+    /// 其他调用方（普通自动保存），它们没有窗口上下文，这里留 `None`
+    /// 表示"这次不更新尺寸"，而不是"把尺寸清空"。
+    pending_window_size: Option<(f32, f32)>,
     _sidebar_subscription: Option<Subscription>,
     /// 标题栏 padding 动画状态：侧边栏 + 编辑器共同驱动（render_main_area 内检测翻转后更新）
     title_pad_epoch: u32,
@@ -242,6 +249,7 @@ impl AppWindow {
             is_main_window: bundle.is_main_window,
             workspace_subscriptions: HashMap::new(),
             pending_save_task: None,
+            pending_window_size: None,
             _sidebar_subscription: Some(wired.subscription),
             title_pad_epoch: 0,
             title_pad_start: 0.0,
@@ -759,10 +767,10 @@ impl AppWindow {
         // 关窗会销毁本窗口的 AppWindow，防抖任务随之丢失，必须同步落盘。
         let app_window_weak = cx.entity().downgrade();
         workspace.update(cx, |ws, _cx| {
-            ws.set_on_last_tab_close(Box::new(move |cx, default_state| {
+            ws.set_on_last_tab_close(Box::new(move |cx, default_state, window_size| {
                 if let Some(app) = app_window_weak.upgrade() {
                     app.update(cx, |app, cx| {
-                        app.flush_pending_save_with_default(default_state, cx)
+                        app.flush_pending_save_with_default(default_state, window_size, cx)
                     });
                 }
             }));
@@ -878,11 +886,16 @@ impl AppWindow {
             version: crate::workspace::session_state::SESSION_STATE_VERSION,
             active_group_id,
             groups,
+            // 由调用方（能拿到窗口的地方）填；这里留 None，写盘时会补上。
+            window_size: None,
         }
     }
 
     fn save_session(&mut self, cx: &mut Context<Self>) {
         let default_state = self.default_workspace.read(cx).session_state(cx);
+        // 自动保存是**唯一稳定会跑的保存路径**（关窗回调在 SIGTERM / 崩溃
+        // 时根本不会触发）。窗口尺寸必须在这里带走，否则它永远存不下来。
+        self.pending_window_size = self.default_workspace.read(cx).remembered_window_size();
         self.save_session_with_default(default_state, cx);
     }
 
@@ -893,13 +906,17 @@ impl AppWindow {
         default_state: WorkspaceSessionState,
         cx: &mut Context<Self>,
     ) {
+        let window_size = self.pending_window_size.take();
         // 只有主窗口写盘：多窗口共用 session_state.json，
         // 若各窗口都写，后写者会整体覆盖其他窗口的标签页与 SSH 会话。
         if !self.ensure_session_ownership(cx) {
             log::debug!("跳过会话落盘：本窗口不是主窗口");
             return;
         }
-        let session = self.session_state_with_default(default_state, cx);
+        let mut session = self.session_state_with_default(default_state, cx);
+        // 窗口尺寸跟着会话一起存：重开时用它恢复窗口，避免守护进程里的
+        // 全屏程序因为窗口变小而重新布局（那是"重启后 TUI 乱掉"的一环）。
+        session.window_size = window_size;
         if let Err(error) = self.persistence.save_session(&session) {
             log::warn!("Failed to save session state: {error}");
         }
@@ -996,7 +1013,9 @@ impl AppWindow {
     /// 避免防抖窗口内的最后变更丢失。
     pub fn flush_pending_save(&mut self, cx: &mut Context<Self>) {
         let default_state = self.default_workspace.read(cx).session_state(cx);
-        self.flush_pending_save_with_default(default_state, cx);
+        // `None` = 本次不更新窗口尺寸（这条路径拿不到窗口，且已有尺寸
+        // 不该被覆盖）。传 `Some` 的只有关窗那条路。
+        self.flush_pending_save_with_default(default_state, None, cx);
     }
 
     /// 与 [`Self::flush_pending_save`] 相同，但默认标签页组状态由
@@ -1005,9 +1024,11 @@ impl AppWindow {
     pub fn flush_pending_save_with_default(
         &mut self,
         default_state: WorkspaceSessionState,
+        window_size: Option<(f32, f32)>,
         cx: &mut Context<Self>,
     ) {
         self.pending_save_task.take();
+        self.pending_window_size = window_size;
         self.save_session_with_default(default_state, cx);
     }
 
@@ -1699,6 +1720,16 @@ impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().ui;
         self.flush_tab_group_select_request(window, cx);
+
+        // 记住窗口尺寸：关窗回调拿不到 `&Window`（那时窗口已在销毁），
+        // 所以趁每帧渲染先存进 Workspace 的 `Cell`，关窗时由
+        // `before_window_remove` 读走写进会话。
+        //
+        // 这一步直接关系到"重启后 TUI 布局乱"：尺寸没存，重开就退回
+        // 1400×900，守护进程里的 nvim 被迫按新列数重新布局。
+        let win_size = window.bounds().size;
+        self.default_workspace
+            .update(cx, |ws, _cx| ws.remember_window_size(win_size));
 
         let editor_is_empty = self.editor.read(cx).is_empty();
 

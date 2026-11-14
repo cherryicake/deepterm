@@ -206,6 +206,58 @@ impl PanelContent {
 /// the workspace layout.
 ///
 /// Note: The tab bar is managed by the Workspace, not individual panels.
+/// 恢复会话时给终端用的**网格尺寸提示**。
+///
+/// # 为什么需要这个类型
+///
+/// `attach` 必须报出客户端的真实网格尺寸，守护进程才能先 resize 再生产
+/// 快照（herdr-core `viewers::attach` 里 `apply_size()` 在 `first_paint()`
+/// 之前，就是这个道理）。报错了，快照会按旧列数折行，TUI 布局跟着乱。
+///
+/// 但恢复会话的路径（`Workspace::from_session_state` → `SplitContainer`
+/// → `Panel`）发生在**第一次布局之前**，那时还没有 `TerminalBounds`。
+/// 能拿到的最准的东西是窗口尺寸，于是这里按默认字体度量把窗口换算成网格，
+/// 作为 attach 时的初值；首帧布局后 `Terminal::resize` 会立刻用精确值
+/// 校正并再通知一次守护进程。
+///
+/// 这比"读一个全局的最近尺寸"可靠：那个值可能是另一个窗口、或上一个
+/// 会话留下的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TerminalGridHint {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl TerminalGridHint {
+    /// 默认字体度量（与 [`crate::terminal::terminal::TerminalBounds::default`]
+    /// 一致：单元格 9×16 逻辑像素）。
+    const CELL_WIDTH: f32 = 9.0;
+    const LINE_HEIGHT: f32 = 16.0;
+    /// 侧边栏 + 标签栏占掉的宽度/高度估算，见 [`Self::from_window_size`]。
+    const CHROME_WIDTH: f32 = 260.0;
+    const CHROME_HEIGHT: f32 = 90.0;
+
+    /// 由窗口尺寸估算终端区域能放下多少格。
+    ///
+    /// 保守取值：宁可报小一点。报大了守护进程会按过宽的快照折行，客户端
+    /// 首帧再缩窄——那一帧就是错位的；报小了只是首帧拉伸一下，内容不会
+    /// 重组。
+    pub fn from_window_size(width: f32, height: f32) -> Option<Self> {
+        if !(width.is_finite() && height.is_finite()) || width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+        let cols = ((width - Self::CHROME_WIDTH) / Self::CELL_WIDTH).floor();
+        let rows = ((height - Self::CHROME_HEIGHT) / Self::LINE_HEIGHT).floor();
+        if cols < 2.0 || rows < 2.0 {
+            return None;
+        }
+        Some(Self {
+            cols: cols.min(f32::from(u16::MAX)) as u16,
+            rows: rows.min(f32::from(u16::MAX)) as u16,
+        })
+    }
+}
+
 pub struct Panel {
     /// Unique identifier for this panel
     pub panel_id: String,
@@ -429,7 +481,19 @@ impl Panel {
         command: Option<&str>,
         args: &[String],
     ) -> Entity<TerminalView> {
-        match TerminalView::new_persistent(cx, working_directory.clone(), command, args, 80, 24) {
+        // 新建终端时的初始网格。
+        //
+        // 这里以前硬编码 80×24，于是守护进程按 80 列建 PTY；首帧布局发现
+        // 实际是 175 列，再 resize——全屏程序（nvim / htop）会先按 80 列
+        // 画一遍、再按 175 列重排，用户看到的就是"刚打开时布局是乱的"。
+        //
+        // 优先用最近一次布局记下的真实网格；没有（首次启动、还没渲染过）
+        // 才退回 80×24。
+        let (cols, rows) = TerminalView::grid_size_hint()
+            .or_else(|| TerminalView::grid_size_from_active_window(cx))
+            .unwrap_or((80, 24));
+        match TerminalView::new_persistent(cx, working_directory.clone(), command, args, cols, rows)
+        {
             Ok(view) => view,
             Err(e) => {
                 log::warn!("守护进程不可用（{e}），退回进程内终端");
@@ -526,18 +590,28 @@ impl Panel {
         // 先试着放进守护进程：这样关掉 deepterm 时 SSH 连接不会断，远端的
         // 长任务继续跑。失败（守护进程不可用）退回进程内 SSH——持久化是
         // 增强，不能变成"连不上服务器"的新故障点。
-        let terminal_view =
-            match TerminalView::new_persistent_ssh(cx, ssh_config, remote_cwd.clone(), 80, 24) {
-                Ok(view) => view,
-                Err(e) => {
-                    log::warn!("远程终端未交给守护进程（{e}），使用进程内 SSH");
-                    if let Some(cwd) = remote_cwd {
-                        TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
-                    } else {
-                        TerminalView::new_ssh(cx, ssh_config)
-                    }
+        // 与本地终端同理：用最近一次布局的真实网格，避免先按 80 列建
+        // 再重排。见 `create_terminal_view` 的说明。
+        let (ssh_cols, ssh_rows) = TerminalView::grid_size_hint()
+            .or_else(|| TerminalView::grid_size_from_active_window(cx))
+            .unwrap_or((80, 24));
+        let terminal_view = match TerminalView::new_persistent_ssh(
+            cx,
+            ssh_config,
+            remote_cwd.clone(),
+            ssh_cols,
+            ssh_rows,
+        ) {
+            Ok(view) => view,
+            Err(e) => {
+                log::warn!("远程终端未交给守护进程（{e}），使用进程内 SSH");
+                if let Some(cwd) = remote_cwd {
+                    TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
+                } else {
+                    TerminalView::new_ssh(cx, ssh_config)
                 }
-            };
+            }
+        };
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
             panel_id,
@@ -640,6 +714,7 @@ impl Panel {
         workspace_id: impl Into<String>,
         active_tab_id: Option<SharedString>,
         active_tab_label: Option<SharedString>,
+        hint: Option<TerminalGridHint>,
         cx: &mut Context<Self>,
     ) -> Self {
         match &state.content {
@@ -648,6 +723,7 @@ impl Panel {
                 command,
                 args,
                 daemon_address,
+                daemon_grid,
             }) => {
                 let working_directory = cwd.as_ref().map(PathBuf::from);
 
@@ -664,6 +740,9 @@ impl Panel {
                         working_directory.clone(),
                         command.as_deref(),
                         args,
+                        daemon_grid
+                            .map(|(c, r)| TerminalGridHint { cols: c, rows: r })
+                            .or(hint),
                     )
                 {
                     log::info!("已接回守护进程中的终端 {address}");
@@ -718,7 +797,7 @@ impl Panel {
                 if let Some(address) = daemon_address.as_deref()
                     && let Some(config) = state.content.ssh_config_with_proxy()
                     && let Some(terminal_view) =
-                        TerminalView::attach_existing(cx, address, None, None, &[])
+                        TerminalView::attach_existing(cx, address, None, None, &[], hint)
                 {
                     log::info!("已接回守护进程中的远程终端 {address}");
                     terminal_view.update(cx, |this, _cx| {
@@ -1563,5 +1642,68 @@ impl Render for Panel {
                     )
                 }
             })
+    }
+}
+
+#[cfg(test)]
+mod grid_hint_tests {
+    use super::TerminalGridHint;
+
+    /// 窗口尺寸必须能换算成合理的网格。
+    ///
+    /// 回归价值：这个值会被 `attach` 报给守护进程，用来**先 resize 再生产
+    /// 快照**。报错就会让快照按错列数折行，TUI 布局当场错位。所以至少
+    /// 要保证：常见窗口尺寸下结果落在"合理的终端大小"区间里。
+    #[test]
+    fn a_typical_window_maps_to_a_sane_grid() {
+        // 1400×900 是默认开窗尺寸。
+        let hint = TerminalGridHint::from_window_size(1400.0, 900.0).expect("默认尺寸应能换算");
+        assert!(
+            (100..=130).contains(&hint.cols),
+            "1400 宽应该约 120 列，实际 {}",
+            hint.cols
+        );
+        assert!(
+            (40..=60).contains(&hint.rows),
+            "900 高应该约 50 行，实际 {}",
+            hint.rows
+        );
+    }
+
+    /// 全屏窗口要换算出一个明显更大的网格。
+    ///
+    /// 与上一条互补：固定的常量偏移（侧边栏/标签栏）不该吃掉大窗口的
+    /// 比例——1920 与 1400 之间必须有可见差异，否则拖大窗口后 attach
+    /// 报的尺寸还是旧的，快照仍然错位。
+    #[test]
+    fn a_bigger_window_maps_to_more_cells() {
+        let small = TerminalGridHint::from_window_size(1400.0, 900.0).unwrap();
+        let large = TerminalGridHint::from_window_size(1920.0, 1080.0).unwrap();
+        assert!(
+            large.cols > small.cols,
+            "{} 应大于 {}",
+            large.cols,
+            small.cols
+        );
+        assert!(
+            large.rows > small.rows,
+            "{} 应大于 {}",
+            large.rows,
+            small.rows
+        );
+    }
+
+    /// 退化输入不能产出 0 行列（那会让守护进程拒绝 resize 或算出空网格）。
+    #[test]
+    fn degenerate_sizes_are_rejected() {
+        assert_eq!(TerminalGridHint::from_window_size(0.0, 900.0), None);
+        assert_eq!(TerminalGridHint::from_window_size(1400.0, 0.0), None);
+        assert_eq!(TerminalGridHint::from_window_size(f32::NAN, 900.0), None);
+        assert_eq!(
+            TerminalGridHint::from_window_size(f32::INFINITY, 900.0),
+            None
+        );
+        // 比侧边栏还窄的窗口。
+        assert_eq!(TerminalGridHint::from_window_size(200.0, 900.0), None);
     }
 }

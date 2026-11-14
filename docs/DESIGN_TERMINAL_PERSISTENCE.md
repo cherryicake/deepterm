@@ -275,6 +275,7 @@ PTY 侧不用做任何事：`alacritty_terminal` 的 `Pty` 抽象已覆盖 ConPT
 | 关掉 GUI 后本地终端存活 | ✅ 实测 | ⬜ 代码同源，未跑 | ⬜ 未编译 |
 | 重启后接回同一终端、屏幕保留 | ✅ 实测 | ⬜ | ⬜ |
 | 关标签真正结束程序 | ✅ 实测 | ⬜ | ⬜ |
+| **core 重启（含 kill -9）后终端存活** | ✅ 实测 | ⬜ | ⬜ |
 | 守护进程崩溃后自动重连 | ✅ 实测（kill -9） | ⬜ | ⬜ |
 | SSH 远程终端持久化 | ⚠️ 机制实测通过，未连真机 | ⬜ | ⬜ |
 | 命名管道 IPC | — | — | ⬜ 未编译过 |
@@ -336,6 +337,58 @@ daemon: ppid=2  pgrp=5   session=5
 
 要在沙箱里验证"守护进程被 SIGKILL 后终端仍在"，需要把守护进程与测试
 放进**同一次**工具调用里跑。
+
+## 7.5 core / holder 两进程（对齐 herdr）
+
+最初的实现让 core 亲自建 PTY，于是**core 就是终端进程的父进程**——core
+一重启（升级、崩溃恢复），终端跟着死。实测 `ppid` 指向 core，core 退出
+后程序立刻消失，这与 herdr 的 "programs keep running" 正好相反。
+
+herdr 的解法是两个进程：
+
+```
+deepcore                  core：协调、跑 UI 协议、转发
+  └─ deepcore --holder    holder：PTY 的父进程，只负责"别死"
+       └─ 终端程序
+```
+
+core 把 `spawn`/`attach`/`close` 转给 holder，输入、尺寸、输出原样双向
+转发。**core 在这里只是一根管子**：不做缓冲、不改内容——终端字节本来就
+该端到端保持原样（任何"顺手处理"都可能破坏转义序列）。
+
+holder 用 `pre_exec(setsid)` 脱离 core 的会话。只脱离会话还不够，父子
+关系还在；实测 `kill -9` core 后 holder 与终端都活着，这正是要的性质。
+
+两个进程各用各的 socket 与日志：
+
+| | core | holder |
+| --- | --- | --- |
+| socket | `daemon.sock` | `holder.sock` |
+| pid | `daemon.pid` | `holder.pid` |
+| token | `daemon.token` | `holder.token` |
+| 日志 | `deepcore.log` | `holder.log` |
+
+这三个"按 socket 名区分"的文件都曾经是共用的，每一个都造成过真实故障：
+
+- **pid** 共用：后启动的覆盖先启动的，按那个文件去 kill 杀的是另一个
+  进程（实测中招：以为在杀 core，实际杀的是 holder）。
+- **token** 共用：holder 启动时写入自己的 token 覆盖 core 的，core 拿被
+  覆盖前的旧值去连 holder 必然被拒。
+- 连带 **holder 客户端漏了鉴权握手**：连接建立后直接发 `spawn`，服务端
+  要求第一帧是带 token 的 `hello`，于是每条请求都被拒——而连接本身是
+  "成功"的。
+
+第三个问题的表现最阴险：`spawn` 返回成功、`list` 也能看到终端，但
+**holder 里是空的**——终端其实还是 core 自己建的，core 一重启照样死。
+"对齐 herdr"只是看起来像。要发现它，必须直接问 holder "你有几个终端"。
+
+Linux 实测：
+
+```
+core=5  holder=10  prog=14 (ppid=10)
+kill -9 core  → holder 存活 YES，程序存活 YES
+新 core 启动  → 看到 t1 (live) → 旧屏幕在 → 仍可交互
+```
 
 ## 8. 生命周期语义（重要）
 

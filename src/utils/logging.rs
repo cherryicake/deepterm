@@ -102,6 +102,14 @@ pub fn core_log_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("deepterm").join("deepcore.log"))
 }
 
+/// holder 的日志文件路径（`<config>/deepterm/holder.log`）。
+///
+/// 三个进程各写各的：混在一起时时间线互相穿插，而排查"终端为什么死了"
+/// 恰恰要对照 core 与 holder 两边各自的完整记录。
+pub fn holder_log_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("deepterm").join("holder.log"))
+}
+
 /// 装上 `env_logger` 的基础过滤规则（两个进程共用）。
 ///
 /// 只设级别与噪音模块，不碰输出目标——由调用方决定写文件还是 stderr。
