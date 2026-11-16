@@ -277,11 +277,24 @@ mod tests {
 
     #[test]
     fn test_complete_with_prefix() {
-        // 测试带前缀的补全
+        // 测试带前缀的补全：`src/` 下必须能列出**目录里真实存在**的条目。
+        //
+        // 断言具体文件名会随代码组织变动而失效（曾经钉的是 `main.rs`，
+        // 后来入口搬到 `src/bin/` 就假失败了）。这里改钉"前缀补全确实
+        // 返回了 src 下的东西"，并额外要求结果的名字与该目录下的实际
+        // 文件名对得上——这才是这条用例本来要保护的行为。
         let items = PathCompletionEngine::complete("src/", Some(Path::new(".")));
+        assert!(!items.is_empty(), "src/ 前缀补全不应为空");
+
+        let expected: Vec<String> = std::fs::read_dir("src")
+            .expect("读 src 目录")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            items.iter().any(|i| i.name == "main.rs"),
-            "Should find src/main.rs"
+            items.iter().any(|item| expected.contains(&item.name)),
+            "补全结果应来自 src/ 下的真实条目；得到 {:?}，目录里有 {expected:?}",
+            items.iter().map(|i| &i.name).collect::<Vec<_>>()
         );
     }
 }

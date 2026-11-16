@@ -188,6 +188,15 @@ windows = { version = "0.52", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Kernel",
     "Wdk_System_Threading",
+    # 守护进程的 IPC 在 Windows 上走命名管道（`daemon::windows`）：
+    # CreateNamedPipeW / ConnectNamedPipe 在 Pipes，CreateFileW / ReadFile /
+    # WriteFile 在 Storage::FileSystem。
+    "Win32_System_Pipes",
+    "Win32_Storage_FileSystem",
+    # 命名管道的读写要用 OVERLAPPED 参数（这里传 None），CreateFileW 与
+    # CreateNamedPipeW 的安全描述符指针在 Security 下。
+    "Win32_System_IO",
+    "Win32_Security",
 ] }
 russh = { version = "0.61.1", default-features = false, features = [
     "flate2",
@@ -235,7 +244,16 @@ gpui_platform = { git = "https://github.com/zed-industries/zed.git", rev = "d25f
     "font-kit",
 ] }
 
-[package.metadata.bundle]
+# 注意：必须写在 `bin.deepterm` 下。
+#
+# 本包有两个二进制（GUI 与守护进程）。`cargo bundle --bin deepterm` 在
+# cargo-bundle 0.9 里**只读** `[package.metadata.bundle.bin.deepterm]`，
+# 找不到就套默认值（名字变成 deepterm、identifier 变成 deepterm.deepterm、
+# 图标与资源全部丢失，Finder/Dock 里就是一个空白图标）。顶层
+# `[package.metadata.bundle]` 只对不带 `--bin` 的调用生效，而那种调用会
+# 选中另一个二进制 deepcore 当主程序——同样不可用。因此元数据只放这里，
+# 打包必须显式 `cargo bundle --release --bin deepterm`（见 build-dmg.sh）。
+[package.metadata.bundle.bin.deepterm]
 name = "DeepTerm"
 identifier = "com.deepterm.app"
 icon = ["assets/icon.png"]
@@ -257,9 +275,16 @@ embed-resource = "2"
 # bench target 需要独立启用：dev-dependencies 的 cfg(test) 不作用于其代码。
 alloc-probe = []
 
+# GUI 客户端。
 [[bin]]
 name = "deepterm"
-path = "src/main.rs"
+path = "src/bin/deepterm.rs"
+
+# 终端守护进程：独立进程，持有所有 PTY，让终端活过窗口关闭。
+# 单独一个二进制而不是 `deepterm __daemon` 的理由见 src/bin/deepcore.rs 顶部。
+[[bin]]
+name = "deepcore"
+path = "src/bin/deepcore.rs"
 
 [[bench]]
 name = "terminal_render"

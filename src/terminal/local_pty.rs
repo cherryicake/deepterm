@@ -675,10 +675,36 @@ fn parse_loop(
 ) {
     let mut processor = Processor::<StdSyncHandler>::new();
     let mut pending: Vec<u8> = Vec::new();
+    // 从什么时候起解析器停在同步更新（`?2026h`）里。
+    // 见 `Terminal::release_stuck_sync` 的说明：vte 的超时不会自己到期，
+    // 必须有外部兜底，否则界面会永久冻在最后一帧。
+    let mut sync_held_since: Option<std::time::Instant> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+        // 每轮（含 50ms 超时）检查一次是否卡在同步更新里。
+        //
+        // 不需要单独计时器：`recv_timeout(50ms)` 本来就是心跳，而 50ms 的
+        // 检查粒度相对 `MAX_SYNC_HOLD`（1s）绰绰有余。
+        if processor.sync_bytes_count() > 0 {
+            let since = *sync_held_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= crate::terminal::terminal::MAX_SYNC_HOLD {
+                log::warn!(
+                    "本地终端停在同步更新（?2026h）里已超过 {:?}，强制解冻",
+                    crate::terminal::terminal::MAX_SYNC_HOLD
+                );
+                {
+                    let mut t = term.lock();
+                    processor.stop_sync(&mut *t);
+                }
+                sync_held_since = None;
+                // 积压的内容已经解析进网格了，必须通知 UI 重绘。
+                let _ = notice.try_send(LocalNotice::Wakeup);
+            }
+        } else {
+            sync_held_since = None;
         }
         match msg_rx.recv_timeout(std::time::Duration::from_millis(50)) {
             Ok(ParseMsg::Data(mut buf)) => {

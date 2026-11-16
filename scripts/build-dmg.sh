@@ -33,7 +33,10 @@ rm -rf "${PROJECT_DIR}/${APP_BUNDLE}"
 # Build release binary with bundle
 echo -e "${GREEN}Building release bundle...${NC}"
 cd "$PROJECT_DIR"
-cargo bundle --release
+# **必须显式指定 --bin deepterm**：cargo-bundle 在有多个二进制时会自己
+# 挑一个（这里挑成了 deepcore），导致 bundle 的 CFBundleExecutable 指向
+# 守护进程、GUI 二进制根本没进包——应用在 Dock 里点不开。
+cargo bundle --release --bin deepterm
 
 # Check if bundle was created
 if [ ! -d "${BUNDLE_DIR}/${APP_BUNDLE}" ]; then
@@ -44,6 +47,22 @@ fi
 # Copy bundle to project root for DMG creation
 echo "Preparing app bundle..."
 cp -R "${BUNDLE_DIR}/${APP_BUNDLE}" "${PROJECT_DIR}/${APP_BUNDLE}"
+
+# 终端守护进程要进 Contents/MacOS/（与主可执行文件同目录）。
+#
+# cargo-bundle 只打包 `package.metadata.bundle` 里那一个二进制，不会带上
+# 别的。缺了它，应用能开窗，但"关掉窗口终端继续跑"会静默失效——
+# 客户端找不到 deepcore 就退回进程内 PTY（这是有意的降级），
+# 用户只会觉得功能没做。
+CORE_BIN="${PROJECT_DIR}/target/release/deepcore"
+if [ ! -f "${CORE_BIN}" ]; then
+    echo -e "${RED}Error: deepcore not found at ${CORE_BIN}${NC}"
+    echo "Run: cargo build --release --bins"
+    exit 1
+fi
+cp "${CORE_BIN}" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/deepcore"
+chmod +x "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/deepcore"
+echo -e "${GREEN}deepcore bundled.${NC}"
 
 # Compile terminfo into app bundle (matching Alacritty's build process)
 echo "Compiling terminfo..."

@@ -123,6 +123,48 @@ impl BlockingSftpSession {
         })
     }
 
+    /// 在远端执行一条命令，返回 `(退出码, stdout, stderr)`。
+    ///
+    /// 与终端会话分开的一条临时 channel：用于部署探针、版本检测这类
+    /// "跑一下看看"的小命令，不占用用户的终端。
+    ///
+    /// 退出码为 `None` 表示远端没给（被信号打断，或对方实现不规范）。
+    pub fn exec_capture(&self, command: &str) -> anyhow::Result<(Option<u32>, String, String)> {
+        let rt = crate::ssh::shared_runtime::shared_ssh_runtime();
+        let handle = &self.handle;
+        let command = command.to_string();
+        rt.block_on(async move {
+            let mut channel = handle.channel_open_session().await?;
+            channel.exec(true, command).await?;
+
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let mut code = None;
+            // russh 的 channel 是一条消息流：数据、扩展数据（stderr）、
+            // 退出状态混在一起，必须读完才知道结果。
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    russh::ChannelMsg::Data { ref data } => {
+                        stdout.extend_from_slice(data);
+                    }
+                    russh::ChannelMsg::ExtendedData { ref data, ext } => {
+                        if ext == 1 {
+                            stderr.extend_from_slice(data);
+                        }
+                    }
+                    russh::ChannelMsg::ExitStatus { exit_status } => {
+                        code = Some(exit_status);
+                    }
+                    _ => {}
+                }
+            }
+            anyhow::Ok((
+                code,
+                String::from_utf8_lossy(&stdout).into_owned(),
+                String::from_utf8_lossy(&stderr).into_owned(),
+            ))
+        })
+    }
+
     /// 返回当前 session 的 bulk `RawSftpSession`，首次调用时惰性建立独立 channel。
     ///
     /// 该通道与 `self.sftp` 使用不同的 SSH channel，因此可以在 bulk 传输

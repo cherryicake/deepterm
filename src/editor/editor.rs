@@ -609,6 +609,13 @@ pub struct Editor {
     panel_anim_ms: u64,
     /// 恢复文件树/会话状态期间为 true：禁止播放展开动画（避免切换标签页组/文件树时闪动）
     suppress_open_animation: bool,
+    /// 恢复文件树状态期间的工作区根覆盖值。
+    ///
+    /// 恢复通常由 `AppWindow::update` 发起（见 `on_file_tree_switched`），
+    /// 此时 AppWindow 正被租借；编辑器若再从 `app_window.read(cx)` 取文件树，
+    /// 会触发 gpui 的 double-lease panic。外层 `Some` 表示「正在恢复」，
+    /// 内层是恢复后的工作区根（远端树没有本机路径，就是 `None`）。
+    restore_workspace_root: Option<Option<std::path::PathBuf>>,
     /// 恢复（切标签页组/文件树）后请求 AppWindow 静态对齐 tab 栏 pad。
     ///
     /// 恢复期间编辑器内容被整体替换，pad 的目标值（随「编辑器空满 × 侧边栏
@@ -873,6 +880,7 @@ impl Editor {
             panel_anim_end: 0.0,
             panel_anim_ms: EDITOR_OPEN_ANIMATION_MS,
             suppress_open_animation: false,
+            restore_workspace_root: None,
             tab_bar_pad_snap_request: false,
             content_left_padding: 0.0,
             content_bottom_padding: 0.0,
@@ -1139,7 +1147,7 @@ impl Editor {
         }
     }
 
-    /// 从文件树状态恢复编辑器
+    /// 从文件树状态恢复编辑器。
     pub fn restore_from_file_tree_state(
         &mut self,
         state: FileTreeEditorState,
@@ -1164,6 +1172,25 @@ impl Editor {
             window,
             cx,
         );
+    }
+
+    /// 从文件树状态恢复编辑器，并显式指定恢复后的工作区根。
+    ///
+    /// 生产路径必须走这个版本：调用方 `AppWindow::on_file_tree_switched`
+    /// 本身处于 `AppWindow::update` 内，恢复期间不能再 `read` AppWindow
+    /// （否则 gpui 报 “cannot read AppWindow while it is already being
+    /// updated” 并 abort）。调用方在更新栈外先算好根路径，这里临时覆盖
+    /// [`Self::sidebar_workspace_root`] 的返回值。
+    pub(crate) fn restore_from_file_tree_state_with_workspace_root(
+        &mut self,
+        state: FileTreeEditorState,
+        workspace_root: Option<std::path::PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.restore_workspace_root = Some(workspace_root);
+        self.restore_from_file_tree_state(state, window, cx);
+        self.restore_workspace_root = None;
     }
 
     /// 从缓存恢复文件列表。
@@ -5252,6 +5279,11 @@ impl Editor {
     /// 只用于给相对图片引用兜底（见 [`Self::md_image_roots`]）：拿不到
     /// （未绑定窗口 / 没有文件树 / 远端树）就返回 `None`，行为与以前一致。
     fn sidebar_workspace_root(&self, cx: &mut App) -> Option<std::path::PathBuf> {
+        // 恢复文件树状态时 AppWindow 正被更新，不能反向 read 它；
+        // 根路径由调用方在更新栈外算好并通过 `restore_workspace_root` 传入。
+        if let Some(root) = &self.restore_workspace_root {
+            return root.clone();
+        }
         let app_window = self.app_window.as_ref()?.upgrade()?;
         let tree = app_window.read(cx).sidebar.read(cx).file_tree_view()?;
         let tree = tree.read(cx);

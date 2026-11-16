@@ -86,21 +86,28 @@ impl SshPtyTerminal {
     /// `ws_xpixel` 需要物理像素（ghostty 也是按 DPI 换算后下发）。
     ///
     /// 返回终端句柄与代理落点：后者由调用方报到 UI（见 [`ProxyCommandOutcome`]）。
-    pub fn new(
+    /// 构造一条可以直接交给 PTY 执行的 SSH 启动命令。
+    ///
+    /// 抽出来是为了让**守护进程**也能起 SSH 终端：持久化把 PTY 搬到了
+    /// `deepcore`，而 `ssh` 只是那条 PTY 里跑的程序。两边必须共用同一套
+    /// 参数构造（StrictHostKeyChecking 策略、超时、保活、代理、端口转发），
+    /// 否则同一主机在"进程内"和"持久化"下表现会不一样。
+    ///
+    /// 返回的 `env` 里可能带 `SSHPASS`（密码认证走 `sshpass -e`）。调用方
+    /// 要清楚这是**凭据**：只交给子进程环境，不落盘、不写日志、不回报给 UI。
+    pub fn build_ssh_command(
         config: &SshConnectionConfig,
-        bounds: TerminalBounds,
-        scale: f32,
-        term: Arc<FairMutex<Term<ZedListener>>>,
-        listener: ZedListener,
-        initial_cwd: Option<String>,
-    ) -> anyhow::Result<(Self, ProxyCommandOutcome)> {
-        log::info!("=== 创建 SSH PTY 终端 ===");
-        log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
-
+        initial_cwd: Option<&str>,
+    ) -> anyhow::Result<(
+        String,
+        Vec<String>,
+        std::collections::HashMap<String, String>,
+        ProxyCommandOutcome,
+    )> {
         let resolved_auth = resolve_auth_method(&config.auth_method)?;
 
-        // 构建 SSH 命令。StrictHostKeyChecking 与 russh 路径共用同一策略，
-        // 避免同一开关在两条传输路径上行为不一致。
+        // StrictHostKeyChecking 与 russh 路径共用同一策略，避免同一开关在
+        // 两条传输路径上行为不一致。
         let host_key_policy = crate::ssh::host_key::policy_from_global_config();
         let mut ssh_program = "ssh";
         let mut ssh_args = vec![
@@ -110,7 +117,6 @@ impl SshPtyTerminal {
             "ServerAliveInterval=60".to_string(),
             "-o".to_string(),
             "ServerAliveCountMax=3".to_string(),
-            // config.timeout 在系统 ssh 路径同样生效（与 russh 路径一致），
             // 避免不可达主机等 OS 级 SYN 重试（约 75-130s）。
             "-o".to_string(),
             format!("ConnectTimeout={}", config.timeout.max(1)),
@@ -122,17 +128,8 @@ impl SshPtyTerminal {
             "-t".to_string(), // 强制分配 TTY
         ];
 
-        // 系统代理：OpenSSH 不读系统代理设置，只能经 `ProxyCommand` 表达。
-        // 路由判定与 russh 路径共用（`system_proxy::route`），两条传输对
-        // 「这个目标走不走代理」的结论一致。
-        //
-        // 结果由调用方报到 UI（见 [`ProxyCommandOutcome`]）：用户点了「使用系统
-        // 代理连接」却没走成代理时，必须说出来——只写日志等于静默直连。
         let proxy_outcome = apply_proxy_command(config, &mut ssh_args);
 
-        // 添加认证方式
-        // 密码认证使用 sshpass -e：密码通过 SSHPASS 环境变量传递，
-        // 避免明文密码出现在命令行 argv 中（会被 ps 等工具全局可见）。
         let mut use_sshpass_env = false;
         match &resolved_auth {
             ResolvedAuthMethod::PrivateKey {
@@ -140,7 +137,6 @@ impl SshPtyTerminal {
                 certificate_path,
                 ..
             } => {
-                log::info!("使用密钥: {:?}", path);
                 ssh_args.push("-i".to_string());
                 ssh_args.push(path.to_string_lossy().to_string());
                 if let Some(certificate_path) = certificate_path {
@@ -152,8 +148,7 @@ impl SshPtyTerminal {
                 }
             }
             ResolvedAuthMethod::Password { .. } => {
-                log::info!("使用密码认证 (通过 sshpass -e)");
-                // 命令格式: SSHPASS=<password> sshpass -e ssh [options] user@host
+                // 密码经 `SSHPASS` 环境变量传递，不出现在 argv（`ps` 可见）。
                 let mut sshpass_args = vec!["-e".to_string(), "ssh".to_string()];
                 sshpass_args.append(&mut ssh_args);
                 ssh_args = sshpass_args;
@@ -163,51 +158,53 @@ impl SshPtyTerminal {
             ResolvedAuthMethod::Agent | ResolvedAuthMethod::Auto => {}
         }
 
-        // 端口转发：系统 ssh 路径没有 russh handle，反向隧道用 `-R` 表达，
-        // 隧道由 ssh 进程自己维护；「请求了什么」由 terminal.rs 直接按 config 报给 UI。
-        //
-        // 但若该主机已有活着的**共享隧道**（另一个 russh 标签建的，见
-        // `crate::ssh::tunnel`），这些规则已经装在上面了：再加 `-R` 只会让 ssh
-        // 拿到「端口被占用」的警告——占住端口的正是本进程自己。此时省掉。
+        // 系统 ssh 路径没有 russh handle，反向隧道用 `-R` 表达。
         let pending_forwards = crate::ssh::tunnel::rules_for_openssh(config, &config.port_forwards);
         let forward_args = crate::ssh::port_forward::openssh_args(&pending_forwards);
         if !forward_args.is_empty() {
-            log::info!("SSH: 端口转发参数 {:?}", forward_args);
             ssh_args.extend(forward_args);
-        } else if !config.port_forwards.is_empty() {
-            log::info!("SSH: 端口转发已由共享隧道覆盖，本次连接不再重复请求监听");
         }
 
-        // 目标主机
         ssh_args.push(format!("{}@{}", config.username, config.host));
-        // 和 russh 路径保持一致：远程 shell integration 在远程 shell 启动前
-        // 通过 ssh command bootstrap 完成，不再登录后向远程 PTY 输入脚本。
-        ssh_args.push(remote_shell_tracking_command(initial_cwd.as_deref()));
+        ssh_args.push(remote_shell_tracking_command(initial_cwd));
 
-        // 日志脱敏：密码等敏感参数不得写入日志（SSHPASS 经环境变量传递，
-        // argv 中不再包含密码，此处仍做兜底过滤以防未来引入含密码的参数）。
+        let mut env = crate::terminal::mappings::default_terminal_env();
+        // SSH 远程主机可能没有 deepterm terminfo，回退 xterm-256color
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        if use_sshpass_env && let ResolvedAuthMethod::Password { password } = &resolved_auth {
+            env.insert("SSHPASS".to_string(), password.to_string());
+        }
+
+        // 记一条脱敏后的命令行：排查 SSH 连不上时，`ssh` 到底带了哪些参数
+        // 是最关键的线索（StrictHostKeyChecking、超时、证书、转发规则）。
+        // 口令经环境变量传递、不在 argv 里，这里再脱敏一次做兜底。
         log::info!(
             "SSH 命令: {} {:?}",
             ssh_program,
             redact_sensitive_args(&ssh_args)
         );
 
-        // 创建 PTY 选项 - 使用共享的环境变量设置
-        let mut env = crate::terminal::mappings::default_terminal_env();
-        // SSH 远程主机可能没有 deepterm terminfo，回退 xterm-256color
-        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        Ok((ssh_program.to_string(), ssh_args, env, proxy_outcome))
+    }
 
-        // sshpass -e 从 SSHPASS 环境变量读取密码（仅子进程环境可见，
-        // 不会出现在 ps 输出中）
-        if use_sshpass_env && let ResolvedAuthMethod::Password { password } = &resolved_auth {
-            env.insert("SSHPASS".to_string(), password.to_string());
-        }
+    pub fn new(
+        config: &SshConnectionConfig,
+        bounds: TerminalBounds,
+        scale: f32,
+        term: Arc<FairMutex<Term<ZedListener>>>,
+        listener: ZedListener,
+        initial_cwd: Option<String>,
+    ) -> anyhow::Result<(Self, ProxyCommandOutcome)> {
+        log::info!("=== 创建 SSH PTY 终端 ===");
+        log::info!("目标: {}@{}:{}", config.username, config.host, config.port);
+
+        // 命令构造与守护进程路径共用同一份实现。
+        let (program, args, env, proxy_outcome) =
+            Self::build_ssh_command(config, initial_cwd.as_deref())?;
+        let shell = alacritty_terminal::tty::Shell::new(program, args);
 
         let pty_options = Options {
-            shell: Some(alacritty_terminal::tty::Shell::new(
-                ssh_program.to_string(),
-                ssh_args,
-            )),
+            shell: Some(shell),
             working_directory: None,
             drain_on_exit: true,
             env,
@@ -269,7 +266,7 @@ impl SshPtyTerminal {
 /// 日志脱敏：把 argv 中紧随敏感选项（-p/-P/--password）之后的参数替换为掩码。
 /// 兜底防御——当前密码经 SSHPASS 环境变量传递，argv 中不应再出现密码，
 /// 但若未来有人把密码重新放回 argv，日志也不会泄漏。
-fn redact_sensitive_args(args: &[String]) -> Vec<String> {
+pub(crate) fn redact_sensitive_args(args: &[String]) -> Vec<String> {
     const SENSITIVE_FLAGS: &[&str] = &["-p", "-P", "--password", "--pass", "-p="];
     let mut redacted = Vec::with_capacity(args.len());
     let mut mask_next = false;
@@ -297,6 +294,23 @@ fn redact_sensitive_args(args: &[String]) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::ssh::config::AuthMethod;
+
+    /// 让测试读起来短一些，同时把"这是被测的构造函数"点出来。
+    struct SshCommandBuilder;
+
+    impl SshCommandBuilder {
+        fn build(
+            config: &SshConnectionConfig,
+            cwd: Option<&str>,
+        ) -> anyhow::Result<(
+            String,
+            Vec<String>,
+            std::collections::HashMap<String, String>,
+            ProxyCommandOutcome,
+        )> {
+            SshPtyTerminal::build_ssh_command(config, cwd)
+        }
+    }
 
     #[test]
     fn redact_masks_value_after_sensitive_flag() {
@@ -374,5 +388,86 @@ mod tests {
                 panic!("选了代理却报 NotRequested 等于静默直连");
             }
         }
+    }
+
+    /// `build_ssh_command` 必须产出能直接交给 PTY 的 ssh 调用。
+    ///
+    /// 这条函数是两个路径共用的（进程内 SSH 与守护进程持久化），所以它
+    /// 本身值得单独验：一旦它漏了 `-t -t`，远端不会分配 TTY，`htop` 之类
+    /// 直接把终端弄成全屏乱码；漏了端口就是连到 22 而不是用户配的端口。
+    #[test]
+    fn the_ssh_command_allocates_a_tty_and_honours_the_port() {
+        let config = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+        let mut config = config;
+        config.port = 2222;
+
+        let (program, args, _env, _proxy) =
+            SshCommandBuilder::build(&config, None).expect("命令应能构造");
+
+        assert_eq!(program, "ssh", "Agent 认证直接用 ssh");
+        // `-t -t` 是"强制分配 TTY"，两次才强制（OpenSSH 的约定）。
+        let t_count = args.iter().filter(|a| *a == "-t").count();
+        assert_eq!(t_count, 2, "必须带两遍 -t 才会强制分配 TTY: {args:?}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "-p" && w[1] == "2222"),
+            "端口要如实带上: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "root@example.com"),
+            "目标主机要在参数里: {args:?}"
+        );
+    }
+
+    /// 密码认证必须走 `sshpass -e` + 环境变量，口令**不能**出现在 argv。
+    ///
+    /// `ps` 对这些参数全局可见。这条钉住的是"口令不进 argv"这个安全属性，
+    /// 不是实现细节——一旦有人图省事改成 `sshpass -p <密码>`，同机任何
+    /// 用户都能读到用户的口令。
+    #[test]
+    fn passwords_go_through_the_environment_never_argv() {
+        let secret = "hunter2-must-not-leak";
+        let config = SshConnectionConfig::new(
+            "example.com",
+            "root",
+            AuthMethod::Password {
+                password: secret.to_string(),
+            },
+        );
+
+        let (program, args, env, _proxy) =
+            SshCommandBuilder::build(&config, None).expect("命令应能构造");
+
+        assert_eq!(program, "sshpass", "密码认证要走 sshpass");
+        assert!(
+            !args.iter().any(|a| a.contains(secret)),
+            "口令绝不能出现在 argv 里（ps 可见）: {args:?}"
+        );
+        assert!(
+            args.contains(&"-e".to_string()),
+            "要用 -e 让 sshpass 从环境变量取口令: {args:?}"
+        );
+        assert_eq!(
+            env.get("SSHPASS").map(String::as_str),
+            Some(secret),
+            "口令应经环境变量传给子进程"
+        );
+    }
+
+    /// 远程 shell integration 的引导命令要带上初始 cwd。
+    ///
+    /// 恢复会话时用户期望回到断开前那个目录；丢了它，重开就落在远端家目录。
+    #[test]
+    fn the_tracking_bootstrap_carries_the_initial_directory() {
+        let config = SshConnectionConfig::new("example.com", "root", AuthMethod::Agent);
+
+        let (_p, args, _e, _proxy) =
+            SshCommandBuilder::build(&config, Some("/srv/app")).expect("命令应能构造");
+
+        // 最后一个是发往远端执行的引导命令。
+        let bootstrap = args.last().expect("应有引导命令");
+        assert!(
+            bootstrap.contains("/srv/app"),
+            "引导命令应带初始目录: {bootstrap}"
+        );
     }
 }

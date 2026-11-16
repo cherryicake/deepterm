@@ -31,6 +31,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; 终端守护进程：持有所有 PTY，让终端活过窗口关闭。必须与 deepterm.exe
+; **同目录**——客户端按"与自身同目录"去找它（见 daemon::client）。
+Source: "..\target\release\deepcore.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs
 ; Windows Terminal ConPTY（MIT）：系统 conhost 会丢 APC，TUI 的 Kitty 图形
 ; 协议必须靠它透传。alacritty 从 exe 目录加载 conpty.dll，必须与 exe 同目录；

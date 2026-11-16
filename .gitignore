@@ -13,3 +13,5 @@
 .workbuddy/
 .zcode/
 .qoder/
+/nvim.log
+.openidea/

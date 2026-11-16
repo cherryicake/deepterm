@@ -121,6 +121,24 @@ pub const AGENT_INTERRUPT_SETTLE: Duration = Duration::from_millis(1000);
 /// 「`Stop` 丢了」——否则状态点会永远停在蓝色。
 pub const AGENT_STALE_AFTER: Duration = Duration::from_secs(30 * 60);
 
+/// 同步更新（`CSI ?2026h`）最多允许冻住画面的时长。
+///
+/// # 为什么必须有这个上限
+///
+/// 同步更新是 TUI 的常规手法：程序发 `?2026h`、整屏重绘、最后发 `?2026l`，
+/// 让终端只在完整的帧之间刷新。opencode 一次滚轮重绘会发 **51 对**
+/// `?2026h/?2026l`（实测）。
+///
+/// 问题在于 vte 收到 `?2026h` 后**停止解析**，把后续字节全囤进 sync 缓冲，
+/// 直到看见 `?2026l`——而 `StdSyncHandler` 的"超时"判的是"是否被设置"，
+/// **不会自己到期**。于是只要有一帧的收尾 `?2026l` 被丢掉（流控丢帧、程序
+/// 崩溃、写了一半），画面就永久冻住，后续输出也全看不见。
+///
+/// herdr 为此设了 `MAX_HOLD = 1s`：到点就把 `SYNC_OUTPUT` 模式强制关掉并
+/// 清掉"held"标记，再安排一次重绘（`herdr-app/src/vt.rs:1674` 的
+/// `render_hold_deadline` 与 `frame()` 里的强制复位）。这里对齐同一策略。
+pub const MAX_SYNC_HOLD: Duration = Duration::from_millis(1000);
+
 /// 连续这么久没有 PTY 输出，就不再算「正在输出」。
 ///
 /// 它与 [`crate::agent::AgentStatus::Working`] **不是一回事**：`Working` 是
@@ -137,6 +155,19 @@ pub const AGENT_STREAM_WINDOW: Duration = Duration::from_millis(800);
 pub enum TerminalType {
     /// 本地终端（通过PTY）
     Local,
+    /// 挂在守护进程上的本地终端。
+    ///
+    /// 与 [`Self::Local`] 的区别只在"谁持有 PTY"：这个变体的 PTY 在
+    /// `deepterm __daemon` 进程里，本进程只是一个挂接者。因此关掉窗口
+    /// 不会杀掉程序，重开时挂接回去即可（见 `docs/DESIGN_TERMINAL_PERSISTENCE.md`）。
+    ///
+    /// 之所以单列一个变体而不是复用 `Local`：`is_remote()`、`remote_info()`、
+    /// 会话恢复、以及"前台进程组"这类判断对三者的答案不同，用类型区分
+    /// 比到处写 `if attached { .. }` 更难写错。
+    Attached {
+        /// 守护进程里的终端地址（`t1`、`t2`…）。
+        address: String,
+    },
     /// 远程SSH终端
     Remote {
         /// 主机地址
@@ -273,6 +304,10 @@ pub struct DriverListener(pub async_channel::Sender<DriverEvent>);
 /// 优先级淘汰。
 const KITTY_IMAGE_LIMIT: usize = 128 * 1000 * 1000;
 
+/// 守护进程侧的图像预算。与客户端同一上限：两边淘汰的结果不一致时，
+/// 重连会丢图（守护进程已经淘汰、客户端还在等它）。
+pub const KITTY_IMAGE_BUDGET: usize = KITTY_IMAGE_LIMIT;
+
 /// Kitty 协议应答的投递通道。
 ///
 /// 有两个消费者，靠 `mem::take` 保证应答只被回写一次：
@@ -380,7 +415,13 @@ fn powershell_cwd_sync_args(program: &str, args: &[String]) -> Option<Vec<String
     Some(args)
 }
 
-fn configure_local_shell_integration(
+/// 给一个本地 shell 套上 deepterm 的 shell integration（OSC 7 cwd 上报、
+/// 提示符标记等），并把需要的环境变量写进 `env`。
+///
+/// `pub(crate)` 而非私有：守护进程起 shell 时必须走**同一套**准备逻辑，
+/// 否则同一个 shell 在守护进程模式下拿不到 integration，`cd` 后文件树
+/// 不跟随、agent 提示符标记收不到——表现成"开了持久化之后功能少了一半"。
+pub(crate) fn configure_local_shell_integration(
     program: String,
     mut args: Vec<String>,
     env: &mut HashMap<String, String>,
@@ -1268,6 +1309,16 @@ pub struct Terminal {
     /// 与 `content_generation` 同步更新：两者都是「输出发生了」的证据，只是
     /// 一个用于缓存失效，一个用于时间窗判定（扫光动画 / agent 计时器）。
     last_output_at: Option<std::time::Instant>,
+    /// 同步更新卡住时的解冻计时器（见 [`Self::watch_sync_hold`]）。
+    ///
+    /// `Task` 被 drop 即取消；正常收到 `?2026l` 时清掉它，不留空转的定时器。
+    sync_hold_task: Option<Task<()>>,
+    /// 从什么时候起画面被同步更新（`CSI ?2026h`）冻住。
+    ///
+    /// `Some(t)` 表示解析器停在同步块里、且已经停了多久。超过
+    /// [`MAX_SYNC_HOLD`] 就强制解冻一次（见 [`Self::release_stuck_sync`]）——
+    /// 否则一帧丢掉收尾 `?2026l` 就会让界面永久冻死。
+    sync_held_since: Option<std::time::Instant>,
     /// 连续多少次因为拿不到网格锁而跳过了快照刷新（见 `update_last_content`）。
     /// 超过 [`MAX_SNAPSHOT_LOCK_SKIPS`] 后退回公平锁，保证画面一定跟得上。
     snapshot_lock_skips: u32,
@@ -1398,6 +1449,21 @@ pub struct Terminal {
     focus_check_pending: bool,
 }
 
+/// 把一个 argv[0] 变成标签上能显示的程序名。
+///
+/// 去掉目录、去掉 Windows 的 `.exe`、去掉登录 shell 的前导 `-`
+/// （`-zsh` → `zsh`）：`argv[0]` 是程序自己填的，形状并不统一。
+fn program_display_name(argv0: &str) -> String {
+    let base = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
+    let base = base.trim_start_matches('-');
+    match base.len().checked_sub(4) {
+        Some(i) if base.is_char_boundary(i) && base[i..].eq_ignore_ascii_case(".exe") => {
+            base[..i].to_string()
+        }
+        _ => base.to_string(),
+    }
+}
+
 impl Terminal {
     fn terminal_config_with_scrollback(scrollback_lines: usize) -> Config {
         Config {
@@ -1468,6 +1534,8 @@ impl Terminal {
             content_generation: 0,
             content_dirty: false,
             last_output_at: None,
+            sync_held_since: None,
+            sync_hold_task: None,
             snapshot_lock_skips: 0,
             #[cfg(test)]
             incremental_snapshot_count: 0,
@@ -1691,6 +1759,8 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 last_output_at: None,
+                sync_held_since: None,
+                sync_hold_task: None,
                 snapshot_lock_skips: 0,
                 #[cfg(test)]
                 incremental_snapshot_count: 0,
@@ -1875,6 +1945,8 @@ impl Terminal {
             content_generation: 0,
             content_dirty: false,
             last_output_at: None,
+            sync_held_since: None,
+            sync_hold_task: None,
             snapshot_lock_skips: 0,
             #[cfg(test)]
             incremental_snapshot_count: 0,
@@ -1944,6 +2016,71 @@ impl Terminal {
                 Self::new_ssh_russh(cx, ssh_config, remote_cwd)
             }
         }
+    }
+
+    /// 构造一个挂在守护进程上的终端。
+    ///
+    /// `address` 是守护进程里的终端地址。返回的实体与本地终端在使用上
+    /// 没有区别；区别只在生命周期：**它不会因为本进程退出而结束**。
+    ///
+    /// 调用方负责：
+    /// 1. 已经通过 `/attach` 拿到 `channel` 并建立了推送循环；
+    /// 2. 把收到的字节喂给 [`Self::handle_remote_data`]；
+    /// 3. 断开时不要调 `shutdown`——那不是"关闭终端"，只是"停止观看"。
+    ///
+    /// `input` / `resize` 是回写通道，由调用方接到守护进程客户端上。
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_attached(
+        cx: &mut App,
+        address: String,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        input: impl Fn(&[u8]) + Send + Sync + 'static,
+        resize: impl Fn(u16, u16, f32) + Send + Sync + 'static,
+    ) -> Entity<Self> {
+        let (events_tx, events_rx) = unbounded();
+        // 挂接式终端没有独立的"驱动事件"来源：断线由调用方直接调用
+        // `handle_remote_data` / 事件通知，这条通道留空即可（保持
+        // `build_attachable` 的签名统一）。
+        let (_driver_tx, driver_rx) = async_channel::bounded::<DriverEvent>(1);
+        let listener = ZedListener(events_tx.clone());
+
+        // 初始几何按守护进程给的 cols/rows 与默认单元格尺寸换算。
+        //
+        // **不能**把 cell_width / line_height 写成 0：`TerminalBounds` 的
+        // `num_columns()` / `num_lines()` 是除法，0 会让 `Term::new` 拿到
+        // 一个溢出的列数，直接 `capacity overflow` panic。
+        let template = TerminalBounds::default();
+        let initial = TerminalBounds::new(
+            template.line_height,
+            template.cell_width,
+            Bounds {
+                origin: Point::default(),
+                size: Size {
+                    width: template.cell_width * cols as f32,
+                    height: template.line_height * rows as f32,
+                },
+            },
+        );
+        let term = Arc::new(FairMutex::new(Term::new(
+            Self::terminal_config_with_scrollback(scrollback_lines),
+            &initial,
+            listener.clone(),
+        )));
+
+        Self::build_attachable(
+            cx,
+            TerminalType::Attached { address },
+            term,
+            listener,
+            events_rx,
+            driver_rx,
+            input,
+            resize,
+            scrollback_lines,
+            None,
+        )
     }
 
     fn new_ssh_russh(
@@ -2136,8 +2273,48 @@ impl Terminal {
         scrollback_requested: usize,
         russh_handle: Option<RusshTerminal>,
     ) -> Entity<Self> {
+        let terminal_type = TerminalType::Remote {
+            host: ssh_config.host.clone(),
+            username: ssh_config.username.clone(),
+            port: ssh_config.port,
+        };
+        Self::build_attachable(
+            cx,
+            terminal_type,
+            term,
+            listener,
+            events_rx,
+            driver_rx,
+            input_handler,
+            resize_handler,
+            scrollback_requested,
+            russh_handle,
+        )
+    }
+
+    /// 构造一个"字节来自外部"的终端：远程 SSH 与守护进程挂接共用这一条。
+    ///
+    /// 两者的差别只有 [`TerminalType`]（以及谁在喂字节），其余管线完全一致：
+    /// 字节进 `handle_remote_data` → `process_pty_data` → vte，输入走
+    /// `remote_input_callback`，尺寸走 `remote_resize_callback`。
+    ///
+    /// 抽出来的价值：挂接式终端不必复制一遍 200 行的字段初始化——那份
+    /// 初始化里有一堆必须成对出现的 `Arc`（kitty 图像、应答队列、脏标记），
+    /// 复制粘贴迟早漏一个，表现为"图片渲染不出来"这种很难查的故障。
+    #[allow(clippy::too_many_arguments)]
+    fn build_attachable(
+        cx: &mut App,
+        terminal_type: TerminalType,
+        term: Arc<FairMutex<Term<ZedListener>>>,
+        listener: ZedListener,
+        events_rx: UnboundedReceiver<AlacTermEvent>,
+        driver_rx: async_channel::Receiver<DriverEvent>,
+        input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
+        resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
+        scrollback_requested: usize,
+        russh_handle: Option<RusshTerminal>,
+    ) -> Entity<Self> {
         let default_bounds = TerminalBounds::default();
-        let ssh_config_clone = ssh_config.clone();
 
         // 远程路径的字节在 UI 线程解析，因此扫描器/共享状态都在这里建立。
         let images = KittyImages::default();
@@ -2226,6 +2403,8 @@ impl Terminal {
                 content_generation: 0,
                 content_dirty: false,
                 last_output_at: None,
+                sync_held_since: None,
+                sync_hold_task: None,
                 snapshot_lock_skips: 0,
                 #[cfg(test)]
                 incremental_snapshot_count: 0,
@@ -2260,11 +2439,7 @@ impl Terminal {
                 scrollbar_drag_offset: Rc::new(Cell::new(None)),
                 last_scroll_time: Cell::new(Instant::now()),
                 scrollback_requested,
-                terminal_type: TerminalType::Remote {
-                    host: ssh_config_clone.host.clone(),
-                    username: ssh_config_clone.username.clone(),
-                    port: ssh_config_clone.port,
-                },
+                terminal_type,
                 remote_input_callback: Some(Box::new(input_handler)),
                 remote_resize_callback: Some(Box::new(resize_handler)),
                 russh_handle,
@@ -2283,6 +2458,19 @@ impl Terminal {
     /// 检查是否是远程终端
     pub fn is_remote(&self) -> bool {
         matches!(self.terminal_type, TerminalType::Remote { .. })
+    }
+
+    /// 是否挂在守护进程上（终端不归本进程所有）。
+    pub fn is_attached(&self) -> bool {
+        matches!(self.terminal_type, TerminalType::Attached { .. })
+    }
+
+    /// 守护进程里的终端地址。
+    pub fn attached_address(&self) -> Option<&str> {
+        match &self.terminal_type {
+            TerminalType::Attached { address } => Some(address),
+            _ => None,
+        }
     }
 
     /// 获取远程连接信息（如果是远程终端）
@@ -2356,73 +2544,57 @@ impl Terminal {
         self.agent_session.as_ref()
     }
 
-    /// 获取当前 TTY 前台进程的名称（本地终端）。
-    /// 如果前台仍然是 shell 或无法获取，返回 None。
+    /// 当前 TTY 前台进程的名称（本地与挂接式终端都支持）。
+    ///
+    /// 返回 `None` 表示「前台就是 shell 自己」或「拿不到结论」，调用方据此
+    /// 回落到 [`Self::shell_name`]。
+    ///
+    /// # 为什么有两套数据源
+    ///
+    /// | 终端类型 | 有没有 master fd | 来源 |
+    /// | --- | --- | --- |
+    /// | 本地 PTY | 有 | `tcgetpgrp` 实时查（能跟上「刚敲下 vim」） |
+    /// | 挂接式 | **没有**（PTY 在守护进程里） | 守护进程推来的 [`Self::foreground_argv`] 快照 |
+    ///
+    /// 挂接式终端没有 fd 就没有「前台进程组」这个概念，`tcgetpgrp` 无从
+    /// 谈起——过去这里直接 `?` 掉 fd 返回 `None`，于是重启后所有标签一律
+    /// 显示 `bash`，哪怕前台正在跑 opencode。结论只能由持有 PTY 的守护进程
+    /// 探、再经 `Kind::Meta` 推过来（见 [`Self::apply_daemon_meta`]）。
+    ///
+    /// # 不 fork
+    ///
+    /// 两处都走 [`crate::terminal::foreground_argv`]（macOS 走
+    /// `KERN_PROCARGS2`，Linux 读 `/proc`），**不起 `/bin/ps`**。这条路径在
+    /// 标签渲染里，macOS 上 fork 一次是几毫秒到几十毫秒，滚动时每帧都调
+    /// 就是肉眼可见的掉帧。
     pub fn foreground_process_name(&self) -> Option<String> {
         if self.is_remote() {
             return None;
         }
 
         #[cfg(unix)]
-        {
-            let fd = self.pty_master_fd?;
-            // SAFETY（中文）：同上，`tcgetpgrp` 只读查询，失败判 `<0` 后返回 None。
+        if let Some(fd) = self.pty_master_fd {
+            // SAFETY（中文）：`tcgetpgrp` 只读查询，失败（`<0`）就退回快照。
             let pgid = unsafe { libc::tcgetpgrp(fd) };
-            if pgid < 0 {
-                return None;
+            if pgid > 0 {
+                // 前台进程组就是 shell 自己：没有前台应用，这是结论。
+                if self.shell_process_group_id == Some(pgid) {
+                    return None;
+                }
+                if let Some(argv) = crate::terminal::foreground_argv::foreground_argv(pgid as u32)
+                    && let Some(name) = argv.first()
+                {
+                    return Some(program_display_name(name));
+                }
             }
-            // 前台进程组就是 shell 自己，说明没有前台应用
-            if self.shell_process_group_id == Some(pgid) {
-                return None;
-            }
-            // 获取前台进程组的 leader 进程名
-            Self::process_name_by_pid(pgid as u32)
         }
-        #[cfg(not(unix))]
-        {
-            None
-        }
-    }
 
-    #[cfg(unix)]
-    fn process_name_by_pid(pid: u32) -> Option<String> {
-        // 各平台分支显式 `return`：这样即使分析器没有应用 `cfg`（把三个块
-        // 都当普通语句看），也不会把非尾块判成「应为 ()」。编译器的 cfg
-        // 结果与原来完全一致。
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_to_string(format!("/proc/{}/comm", pid))
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            return std::process::Command::new("/bin/ps")
-                .args(["-p", &pid.to_string(), "-o", "comm="])
-                .output()
-                .ok()
-                .and_then(|out| {
-                    if out.status.success() {
-                        String::from_utf8(out.stdout)
-                            .ok()
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| {
-                                std::path::Path::new(&s)
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or(s)
-                            })
-                    } else {
-                        None
-                    }
-                });
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            None
-        }
+        // 没有 fd（挂接式终端）：快照就是唯一来源。`None` 表示守护进程报的
+        // 是「前台就是 shell」，与本地那条 `Some(pgid)` 分支同一个语义。
+        self.foreground_argv
+            .as_deref()
+            .and_then(|argv| argv.first())
+            .map(|name| program_display_name(name))
     }
 
     pub fn reported_working_directory(&self) -> Option<&str> {
@@ -2611,6 +2783,73 @@ impl Terminal {
         }
     }
 
+    /// 检查解析器是否停在同步更新里；卡住就起定时器，到点强制解冻。
+    ///
+    /// # 为什么 vte 自己不会解冻
+    ///
+    /// vte 的 `Processor` 在 `?2026h` 之后走 `advance_sync`：**不解析**，只把
+    /// 字节追加进 `sync_state.buffer`。它有一个 `Timeout` trait，但
+    /// `StdSyncHandler::pending_timeout()` 判的是"超时是否被**设置**"而
+    /// 不是"是否已到期"——`set_timeout` 之后它恒为 true，**永远不会自己
+    /// 结束**。唯一的内建出口是缓冲涨到 2 MiB（`SYNC_BUFFER_SIZE`）被动溢出。
+    ///
+    /// 所以必须由我们在时间维度上兜底。取 [`MAX_SYNC_HOLD`] = 1s：
+    /// - 正常 TUI 一帧是毫秒级，1s 足够宽松，不会打断任何合法帧；
+    /// - 真卡住时用户最多等 1 秒，而不是永久。
+    fn watch_sync_hold(&mut self, cx: &mut Context<Self>) {
+        let stuck = self.vte_processor.sync_bytes_count() > 0;
+        if !stuck {
+            self.sync_held_since = None;
+            self.sync_hold_task = None;
+            return;
+        }
+        let since = *self.sync_held_since.get_or_insert_with(Instant::now);
+        let elapsed = since.elapsed();
+        if elapsed >= MAX_SYNC_HOLD {
+            self.release_stuck_sync(cx);
+            return;
+        }
+        // 已有一个在途计时器就不重复起。
+        if self.sync_hold_task.is_some() {
+            return;
+        }
+        let wait = MAX_SYNC_HOLD.saturating_sub(elapsed);
+        self.sync_hold_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update(cx, |this, cx| {
+                this.sync_hold_task = None;
+                // 到点了再确认一次：期间可能已经正常收到 `?2026l`。
+                if this.vte_processor.sync_bytes_count() > 0 {
+                    this.release_stuck_sync(cx);
+                }
+            });
+        }));
+    }
+
+    /// 强制结束卡住的同步更新并重绘。
+    ///
+    /// `stop_sync` 会把 sync 缓冲里的字节真正解析掉（它们本来就是程序画出来
+    /// 的内容，只是被 `?2026h` 拦住了），然后我们标记内容脏，让下一帧把
+    /// 画面画出来。
+    fn release_stuck_sync(&mut self, cx: &mut Context<Self>) {
+        let pending = self.vte_processor.sync_bytes_count();
+        if pending == 0 {
+            self.sync_held_since = None;
+            return;
+        }
+        log::warn!(
+            "终端停在同步更新（?2026h）里已超过 {MAX_SYNC_HOLD:?}，强制解冻（{pending} 字节待解析）"
+        );
+        {
+            let mut term = self.term.lock();
+            self.vte_processor.stop_sync(&mut *term);
+        }
+        self.sync_held_since = None;
+        self.sync_hold_task = None;
+        self.note_output();
+        cx.emit(Event::Wakeup);
+    }
+
     /// 处理 PTY/SSH 原始输出。
     ///
     /// 所有原始 bytes 都先经过这里旁路识别 OSC 7，再继续喂给 alacritty 的 VTE
@@ -2627,6 +2866,14 @@ impl Terminal {
         // 序列（如 133;B、cwd 更新）在此被拦截，OSC 52 等则透传给 vte；
         // Kitty 图形 APC 同样在此被摘出交给扫描器。
         self.process_pty_data(data, require_local_osc7_host, cx);
+
+        // 同步更新卡住了吗？卡住就起一个定时器，到点强制解冻。
+        //
+        // 这一条对齐 herdr 的 `MAX_HOLD`（`herdr-app/src/vt.rs:1674`）：
+        // 程序发了 `?2026h` 却没能发出收尾的 `?2026l`（丢帧、崩溃、写一半）
+        // 时，vte 会**永久停止解析**并把后续字节囤起来。没有这个兜底，
+        // 界面就冻结在最后一帧——用户看到的就是"TUI 直接卡死"。
+        self.watch_sync_hold(cx);
 
         // 扫描器刚产生的协议应答（如 `OK`、隐式 id 回报）回写给远端。
         self.flush_kitty_replies();
@@ -2682,6 +2929,49 @@ impl Terminal {
     pub fn handle_remote_data(&mut self, data: &[u8], cx: &mut Context<Self>) {
         self.process_ssh_data(data, cx);
         cx.emit(Event::Wakeup);
+    }
+
+    /// 守护进程报告：这个终端里的**程序退出了**。
+    ///
+    /// 与"连接断了"是两件事，必须分开处理：
+    /// - 程序退出 → 和本地终端的 `ChildExit` 一样，走 `CloseTerminal` /
+    ///   `ProcessExited`，界面该关面板就关面板；
+    /// - 连接断了 → 什么都不做，程序还在守护进程里跑，等重连
+    ///   （见 `daemon::session` 的说明）。
+    ///
+    /// 混为一谈的后果：网线一抖，用户所有终端都被判成"已退出"并关掉面板，
+    /// 而实际上程序全都还活着。
+    /// 与守护进程的连接彻底断了，且挂接不回去。
+    ///
+    /// 与 [`Self::handle_program_exit`] 是**相反**的语义：程序可能还在
+    /// 守护进程里活着，只是我们看不到了。所以这里**不关面板、不报
+    /// "已退出"**——那会让用户以为任务死了从而重启一遍，而实际上原来的
+    /// 还在后面跑。
+    ///
+    /// 做法：往屏幕上写一行说明，并把状态标成"连接丢失"。用户能看到
+    /// 发生了什么，也能自己决定要不要重连。
+    pub fn handle_connection_lost(&mut self, cx: &mut Context<Self>) {
+        log::warn!(
+            "与守护进程的连接丢失，终端 {:?} 无法挂接回去",
+            self.attached_address()
+        );
+        // 用一行可见的提示代替静默冻结：终端停在最后一屏且不再更新，
+        // 用户最先怀疑的是"程序卡住了"，而不是"连接断了"。
+        let notice = "\r\n\x1b[33m[deepterm] 与终端守护进程的连接已断开。\r\n\
+                      程序可能仍在运行；重新打开 deepterm 可尝试接回。\x1b[0m\r\n";
+        self.process_ssh_data(notice.as_bytes(), cx);
+        self.note_output();
+        cx.emit(Event::Wakeup);
+    }
+
+    pub fn handle_program_exit(&mut self, cx: &mut Context<Self>) {
+        log::info!("挂接式终端的程序已退出: {:?}", self.attached_address());
+        // 先把最后一点输出刷上屏，再报退出——否则用户永远看不到
+        // 那条 "command not found" 之后的提示。
+        self.flush_kitty_replies();
+        self.sync_kitty_state();
+        self.note_output();
+        cx.emit(Event::CloseTerminal);
     }
 
     /// 记录一次「输出进网格」：快照失效 + 输出时刻 + 代际自增。
@@ -2924,6 +3214,50 @@ impl Terminal {
         self.set_foreground_agent(agent, cx);
         // 身份没变但程序变了（`vim` → `nvim`、shell → `htop`）也要让上层
         // 重画，否则标签会一直举着旧图标。
+        if argv_changed && !agent_changed {
+            cx.emit(Event::TitleChanged);
+        }
+    }
+
+    /// 应用守护进程报来的前台进程信息。
+    ///
+    /// # 为什么需要从守护进程拿
+    ///
+    /// 挂接式终端的 PTY 在守护进程里，客户端**没有 master fd**，于是
+    /// `tcgetpgrp` 查不了、`foreground_process_name()` 永远返回 `None` ——
+    /// Tab 标签只能退回 `shell_name()`，重启后一律显示 `bash`，且程序图标
+    /// 也跟着错。
+    ///
+    /// 这个入口把守护进程的结论写进与本地探测**同一组字段**
+    /// （`foreground_argv` / `foreground_agent`），于是标签、图标、agent
+    /// 状态点等所有下游消费者都无需区分终端类型。
+    pub fn apply_daemon_meta(
+        &mut self,
+        foreground: Option<String>,
+        argv: Option<Vec<String>>,
+        cx: &mut Context<Self>,
+    ) {
+        // 守护进程说"前台就是 shell"：这是一条**有效结论**，要清空而不是保持。
+        //
+        // 与本地探测的 `LocalAgentOutcome::Unavailable` 相反：那里是"查不了"，
+        // 必须保留旧值；这里是"查了，确实没有程序"。
+        let argv_changed = argv.as_ref() != self.foreground_argv.as_ref();
+        self.foreground_argv = argv.clone().or_else(|| {
+            foreground.as_ref().map(|name| vec![name.clone()])
+        });
+
+        // 复用同一套 agent 识别，保证本地/挂接两条路径的结论一致。
+        //
+        // 空的自定义映射是有意的：它是**用户配置**（包装器名 → agent slug），
+        // 由 `TerminalView` 那一层持有；这里拿不到 `App`，而认错一个自定义
+        // 包装器的代价（标签晚 500ms 才更新）远小于把它写成另一套识别逻辑。
+        // 内置 agent 的识别不依赖它。
+        let agent = self.foreground_argv.as_deref().and_then(|argv| {
+            CLIAgent::detect_from_argv_with(argv, &std::collections::HashMap::new())
+        });
+
+        let agent_changed = self.foreground_agent != agent;
+        self.set_foreground_agent(agent, cx);
         if argv_changed && !agent_changed {
             cx.emit(Event::TitleChanged);
         }
@@ -4220,6 +4554,25 @@ impl Terminal {
         self.term.clone()
     }
 
+    /// 测试专用：把整屏文字拼出来（用于断言"内容真的画出来了"）。
+    #[cfg(test)]
+    pub fn screen_text_for_test(&self) -> String {
+        let term = self.term.lock();
+        let grid = term.grid();
+        let mut out = String::new();
+        for row in 0..grid.screen_lines() {
+            for col in 0..grid.columns() {
+                out.push(
+                    grid[alacritty_terminal::index::Line(row as i32)]
+                        [alacritty_terminal::index::Column(col)]
+                    .c,
+                );
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// 测试专用：置位内容脏标记，模拟「读线程送来了新输出」。
     #[cfg(test)]
     pub fn mark_content_dirty_for_test(&mut self) {
@@ -4653,6 +5006,20 @@ impl Terminal {
     /// - PTY 模式远程：显式 `close()` 发 `Shutdown`；只靠 drop 回调闭包会让
     ///   alacritty 事件循环在 channel 断开时 panic，且 ssh 子进程可能挂着。
     pub fn kill(&mut self) {
+        // 挂接式终端：程序在守护进程里，本进程只是观看者。
+        //
+        // `kill` 的语义是"用户不要这个终端了"（关标签、关面板、换会话），
+        // 所以要**通知守护进程结束程序**，而不是像本地终端那样关 PTY——
+        // 那条路在这里根本不存在，PTY 不在本进程。
+        //
+        // 只在 `Drop` 里不这么做（见 `Drop` 的实现）：视图销毁 ≠ 用户要
+        // 结束它，退出应用时所有视图都会销毁，那时杀程序就等于把
+        // "关掉 deepterm 终端不死"这个功能整个抹掉。
+        if let Some(address) = self.attached_address().map(str::to_owned) {
+            log::info!("结束挂接式终端 {address}（用户关闭了它）");
+            crate::daemon::session::close_terminal(&address);
+            return;
+        }
         // 本地终端：通知读线程退出，释放 PTY / 回收 shell 子进程。
         if let Some(sender) = &self.local_sender {
             sender.shutdown();
@@ -4690,6 +5057,15 @@ impl Terminal {
         let scale = normalize_scale(scale);
         let scale_changed = scale != self.display_scale;
         self.display_scale = scale;
+
+        // 记下网格尺寸，供 `attach` 向守护进程报出真实大小。
+        //
+        // 恢复会话时拿不到 `window`（调用链一路把它丢了），只能靠这里
+        // 在布局时留下的提示。见 `TerminalView::remember_grid_size`。
+        crate::terminal_view::terminal_view::TerminalView::remember_grid_size(
+            cols as u16,
+            rows as u16,
+        );
 
         // 对应 ghostty `Terminal.resize` 的 cols/rows 未变早退。
         let applied_cols = self.terminal_bounds.num_columns();
@@ -5337,19 +5713,18 @@ impl Terminal {
                         self.write(&scroll);
                     }
                 };
-            } else if self
-                .last_content
-                .mode
-                .contains(TermMode::ALT_SCREEN | TermMode::ALTERNATE_SCROLL)
-                && !e.shift
-            {
+            } else if !e.shift && self.in_alternate_screen() {
+                // 备用屏上滚轮一律转成方向键交给程序。
+                //
+                // 这与 herdr 一致（`terminal.rs` 的 `scroll`：先判
+                // `alt_screen()` 就发方向键）。不用 `ALTERNATE_SCROLL`
+                // 作条件：它默认就开着，靠它判断等于没判断；真正该区分
+                // 的是"在不在备用屏"。
+                //
+                // 备用屏没有回滚区，本地滚动只会把 TUI 画面平移出去。
                 self.write(&alt_scroll(scroll_lines));
             } else {
-                let scroll = AlacScroll::Delta(scroll_lines);
-                let mut term = self.term.lock();
-                term.scroll_display(scroll);
-                self.content_dirty = true;
-                self.last_scroll_time.set(Instant::now());
+                self.scroll_by(AlacScroll::Delta(scroll_lines));
             }
         }
     }
@@ -5435,8 +5810,48 @@ impl Terminal {
     // 注意：scroll_display 只更新 term 内部的 display_offset，视口快照
     // （last_content）依赖 sync() 的 content_dirty 分支刷新。这里统一置位
     // content_dirty，否则键盘滚动后视口/选区高亮会停留在旧数据。
+    /// 滚轮事件是否由程序自己处理（而非本地滚动）。
+    ///
+    /// 两种情形都算：
+    /// - 程序开了鼠标上报（`MOUSE_MODE`）：要收到滚轮报告；
+    /// - 程序在备用屏上：滚轮要转成方向键发过去。
+    ///
+    /// 这里的意义是**关掉客户端的滚动放大**。放大的初衷是让普通终端里
+    /// "一格滚轮滚多点"，但程序接管后，每一次报告都会触发一次重绘——
+    /// 乘 3~8 倍就是一次滚轮让 nvim 重绘 8 次，输出暴涨、界面卡死。
+    pub fn program_owns_scroll(&self) -> bool {
+        // 必须用**实时** mode，不能读 `last_content` 快照。
+        //
+        // 快照在拿不到网格锁时会整轮跳过（`MAX_SNAPSHOT_LOCK_SKIPS`），
+        // 于是程序刚切到备用屏、快照还没更新时读到的是"普通终端"——滚轮
+        // 于是走进本地 `scroll_display`，把整个 TUI 画面平移出去。这条约定
+        // 由 `full_screen_detection_ignores_a_stale_render_snapshot` 钉着。
+        //
+        // 代价是一次 `term.lock()`；它只在滚轮事件上发生（不是每帧），
+        // 可以接受。
+        let mode = *self.term.lock().mode();
+        mode.intersects(TermMode::MOUSE_MODE) || mode.contains(TermMode::ALT_SCREEN)
+    }
+
+    /// 当前是否在备用屏（全屏程序）上。
+    ///
+    /// 备用屏**没有回滚区**：它的那一片就是程序的全部画面。对它调用
+    /// `scroll_display` 只会把画面整体平移出去，露出下面的空白——用户看到
+    /// 的就是"htop / nvim 整个界面被滚走了"。
+    pub fn in_alternate_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// 所有滚动入口的公共尾部：滚动 + 置脏 + 记录时间。
+    ///
+    /// 备用屏上**直接忽略**：那里没有回滚区可滚，滚了就是把 TUI 画面
+    /// 平移出去。herdr 的做法是在 `scroll` 里先判 `alt_screen()`，走方向键
+    /// 转发而不是 `scroll_viewport`；这里守在最底层，让所有入口（滚轮、
+    /// PgUp/PgDn、Home/End、滚动条拖拽）都受同一约束。
     fn scroll_by(&mut self, scroll: AlacScroll) {
+        if self.in_alternate_screen() {
+            return;
+        }
         let mut term = self.term.lock();
         term.scroll_display(scroll);
         drop(term);
@@ -5606,7 +6021,23 @@ impl EventEmitter<Event> for Terminal {}
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // 终端被丢弃时显式回收底层资源：
+        // 挂接式终端：**什么都不做**。
+        //
+        // 这是整个持久化功能的关键一环。退出应用时每个视图都会被 drop：
+        // 若在这里调用 `kill`（而 `kill` 会通知守护进程结束程序），
+        // 那"关掉 deepterm 终端不死"就永远不可能成立——用户每次退出都在
+        // 杀掉自己的所有终端。
+        //
+        // 视图销毁只是"不再观看"，守护进程里的程序该继续跑。
+        if self.is_attached() {
+            log::debug!(
+                "挂接式终端随视图销毁，程序留在守护进程里: {:?}",
+                self.attached_address()
+            );
+            return;
+        }
+
+        // 进程内终端：丢弃时必须显式回收资源。
         // - 本地 PTY：仅 drop `local_sender` 只关闭通道，读线程还阻塞在
         //   `Poller::wait` 上；必须显式发 `Shutdown` 让它退出并释放 `Pty`
         //   （触发 SIGHUP / `ClosePseudoConsole`，回收 shell 子进程）。
@@ -5808,6 +6239,7 @@ pub fn scroll_offset_to_center(viewport_rows: usize, history_size: usize, line: 
 
 #[cfg(test)]
 mod tests {
+    use super::MAX_SYNC_HOLD;
     use super::{
         IndexedCell, PackedCell, RESIZE_COALESCE_DELAY, Terminal, TerminalBounds, TerminalContent,
         TerminalType, packed_zerowidth,
@@ -5819,6 +6251,182 @@ mod tests {
     use gpui::{AppContext as _, Bounds, Entity, TestAppContext, point, px, size};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    /// **停在同步更新里必须能被强制解冻。**
+    ///
+    /// 回归价值：这是"opencode TUI 直接卡死界面"的根因之一。
+    ///
+    /// 程序发 `?2026h` 后 vte **停止解析**、把后续字节全囤进 sync 缓冲；
+    /// 而它的 `Timeout` 实现判的是"是否被设置"而不是"是否到期"，
+    /// **永远不会自己结束**。opencode 一次滚轮重绘发 51 对 `?2026h/?2026l`，
+    /// 只要收尾那一对丢了，画面就永久冻住。
+    ///
+    /// herdr 对此有 `MAX_HOLD = 1s` 的兜底（`herdr-app/src/vt.rs:1674`）。
+    /// 这条用例钉住同样的行为：卡住超过 `MAX_SYNC_HOLD` 后，积压的字节必须
+    /// 被真正解析进网格，并且发出重绘事件。
+    #[gpui::test]
+    fn a_stuck_synchronized_update_is_released_after_the_hold_limit(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            // 半帧：只有 `?2026h`，收尾的 `?2026l` 丢了。
+            t.handle_remote_data(b"\x1b[?2026hSTUCK-FRAME", cx);
+
+            // 此刻解析器确实停在同步块里，屏幕上看不到这行。
+            assert!(
+                t.vte_processor.sync_bytes_count() > 0,
+                "构造失败：应停在同步更新里"
+            );
+            let text_before = t.screen_text_for_test();
+            assert!(
+                !text_before.contains("STUCK-FRAME"),
+                "同步块里的内容不该已经显示: {text_before:?}"
+            );
+
+            // 把"卡住起点"往前拨到超过上限，再喂一帧触发检查。
+            //
+            // 真实路径上这由 `watch_sync_hold` 里的计时器完成；这里直接操纵
+            // 时间戳，避免测试真的 sleep 1 秒（那会让整批测试变慢）。
+            t.sync_held_since = Some(std::time::Instant::now() - MAX_SYNC_HOLD * 2);
+            t.handle_remote_data(b"", cx);
+
+            assert_eq!(
+                t.vte_processor.sync_bytes_count(),
+                0,
+                "超过上限后必须强制解冻，否则界面永久冻住"
+            );
+            let text_after = t.screen_text_for_test();
+            assert!(
+                text_after.contains("STUCK-FRAME"),
+                "解冻后积压的字节必须真的画出来: {text_after:?}"
+            );
+        });
+    }
+
+    /// 正常收到 `?2026l` 时不该触发解冻，也不该留下计时器。
+    #[gpui::test]
+    fn a_complete_synchronized_update_is_not_disturbed(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"\x1b[?2026hOK-FRAME\x1b[?2026l", cx);
+            assert_eq!(
+                t.vte_processor.sync_bytes_count(),
+                0,
+                "成对的同步更新应当正常结束"
+            );
+            assert!(t.sync_held_since.is_none(), "没卡住就不该记起止点");
+            assert!(t.sync_hold_task.is_none(), "没卡住就不该留空转的计时器");
+            assert!(
+                t.screen_text_for_test().contains("OK-FRAME"),
+                "内容应当已经画出来"
+            );
+        });
+    }
+
+    /// **全屏程序（备用屏）不能滚动它的“界面”。**
+    ///
+    /// 回归价值：这是"htop / nvim / opencode 整个界面被滚走"的直接原因。
+    /// 备用屏没有回滚区，`scroll_display` 只会把画面整体平移出去，露出
+    /// 底下的空白。herdr 在滚轮入口先判 `alt_screen()` 走方向键转发；
+    /// 这里把约束下沉到 `scroll_by`，让**所有**滚动入口（滚轮、PgUp/PgDn、
+    /// Home/End、滚动条拖拽）都受同一保护。
+    #[gpui::test]
+    fn alternate_screen_ignores_every_scroll_entry_point(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            // 先堆出可滚动的历史，确认普通模式下确实能滚。
+            for i in 0..80 {
+                t.handle_remote_data(format!("line {i}\r\n").as_bytes(), cx);
+            }
+            t.scroll_line_up();
+            assert!(
+                t.term.lock().grid().display_offset() > 0,
+                "普通终端里应当能滚进回滚区"
+            );
+
+            // 进备用屏——nvim / htop 启动时发的就是它。
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+            t.term
+                .lock()
+                .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+
+            // 所有入口都不该改动显示区。
+            let before = t.term.lock().grid().display_offset();
+            t.scroll_line_up();
+            t.scroll_page_up();
+            t.scroll_to_top();
+            assert_eq!(
+                t.term.lock().grid().display_offset(),
+                before,
+                "备用屏下任何滚动入口都不该移动画面（TUI 会被滚走）"
+            );
+        });
+    }
+
+    /// 备用屏里的滚轮要转成方向键发给程序，而不是本地滚动。
+    ///
+    /// 与上一条互补：不是"什么都不做"——nvim 里滚轮该能看到内容滚动，
+    /// 那是程序收到方向键后自己重绘的。本地滚动则是错的（会把整个界面
+    /// 连同边框一起平移）。
+    #[gpui::test]
+    fn wheel_in_the_alternate_screen_is_forwarded_as_arrow_keys(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+            assert!(t.in_alternate_screen());
+            // 这一层的判断：是备用屏 → 走方向键转发。
+            assert!(t.in_alternate_screen(), "备用屏下滚轮应转发方向键");
+            // 生成的字节必须是方向键，不是滚动指令。
+            let seq = crate::terminal::mappings::mouse::alt_scroll(-3);
+            assert_eq!(seq, b"\x1bOB\x1bOB\x1bOB");
+        });
+    }
+
+    /// **全屏程序的滚动判断必须用实时模式，不能用滞后的渲染快照。**
+    ///
+    /// 回归价值：`scroll_wheel` 原本读 `last_content.mode`。那是渲染快照，
+    /// 而 `update_last_content` 为了不阻塞渲染，拿不到网格锁时会整轮跳过
+    /// （`MAX_SNAPSHOT_LOCK_SKIPS`）。nvim / htop 持续重绘，锁争用频繁，
+    /// 快照常常落后几帧——于是在程序刚切到全屏时，滚轮被判成"普通终端"，
+    /// 走进 `scroll_display` 把整个 TUI 界面平移出去。
+    ///
+    /// 这条用例刻意**不刷新** `last_content`：它模拟的正是"快照还停在旧状态"
+    /// 的那一刻。两个真实闸门必须仍然判对：
+    ///
+    /// - [`Terminal::program_owns_scroll`] —— 决定滚轮倍率是否归程序；
+    /// - [`Terminal::in_alternate_screen`] —— 决定滚轮走方向键还是本地滚动。
+    ///
+    /// （曾有一个 `full_screen_wheel_mode` 私有函数与这条用例对应，但它用
+    /// `ALT_SCREEN | ALTERNATE_SCROLL` 的位与判定，而 `ALTERNATE_SCROLL`
+    /// 默认开启、等于没判；生产路径从未调用它，见 `scroll_wheel` 里"不用
+    /// `ALTERNATE_SCROLL` 作条件"的说明。已删除，用例改钉真实闸门。）
+    #[gpui::test]
+    fn full_screen_detection_ignores_a_stale_render_snapshot(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.update(cx, |t, cx| {
+            // 先确认普通 shell 下两个闸门都判"不是全屏程序"。
+            assert!(!t.in_alternate_screen(), "普通终端不该在备用屏");
+            assert!(!t.program_owns_scroll(), "普通终端不该由程序接管滚轮");
+
+            // nvim 启动时发的序列：切到备用屏。
+            t.handle_remote_data(b"\x1b[?1049h", cx);
+
+            // 此刻 `last_content` 仍是旧快照（真实场景里锁争用让更新被跳过）。
+            // 判断仍必须是"全屏"——否则滚轮会把界面滚走。
+            assert!(
+                t.in_alternate_screen(),
+                "快照滞后时也必须认出备用屏（否则 nvim 里滚轮会滚走界面）"
+            );
+            assert!(
+                t.program_owns_scroll(),
+                "快照滞后时也必须判出程序接管滚轮（否则倍率会把界面滚飞）"
+            );
+
+            // 退出全屏后要回到普通模式。
+            t.handle_remote_data(b"\x1b[?1049l", cx);
+            assert!(!t.in_alternate_screen(), "退出备用屏后应恢复普通滚动");
+            assert!(!t.program_owns_scroll(), "退出备用屏后倍率应恢复本地策略");
+        });
+    }
 
     #[gpui::test]
     fn focus_check_never_blocks_on_grid_lock(cx: &mut TestAppContext) {
@@ -5841,6 +6449,73 @@ mod tests {
             // 锁释放后的下一轮检查应清掉 pending，并正常应用模式。
             terminal.check_focus_mode_enabled();
             assert!(!terminal.focus_check_pending);
+        });
+    }
+
+    /// 挂接式终端必须能把外部灌进来的字节解析成内容。
+    ///
+    /// 这条保护 `new_attached` 与 `handle_remote_data` 之间的接线：
+    /// 挂接式终端没有本地读线程，字节**只**能从 `handle_remote_data` 进，
+    /// 一旦那条路断了，界面上永远是空屏——而所有本地终端的测试都不会发现。
+    #[gpui::test]
+    fn attached_terminal_parses_bytes_from_its_byte_source(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t1".to_string(), 80, 24, 1_000, |_| {}, |_, _, _| {})
+        });
+
+        terminal.update(cx, |t, cx| {
+            t.handle_remote_data(b"attached-hello", cx);
+            // 直接读 `Term` 而不是 `last_content()`：后者是渲染快照，
+            // 要等一次 `update_last_content` 才刷新，与"字节有没有进网格"
+            // 是两件事。这条测的是后者。
+            let text: String = {
+                let term = t.term.lock();
+                let grid = term.grid();
+                let mut out = String::new();
+                let rows = alacritty_terminal::grid::Dimensions::screen_lines(grid);
+                let cols = alacritty_terminal::grid::Dimensions::columns(grid);
+                for row in 0..rows {
+                    let line = &grid[alacritty_terminal::index::Line(row as i32)];
+                    for col in 0..cols {
+                        out.push(line[alacritty_terminal::index::Column(col)].c);
+                    }
+                }
+                out
+            };
+            assert!(
+                text.contains("attached-hello"),
+                "挂接式终端应解析外部字节，实际内容: {text:?}"
+            );
+        });
+    }
+
+    /// 挂接式终端的类型标识必须能被认出来。
+    ///
+    /// 这条钉住的是"关窗不杀程序"的前提：界面上要能区分"这是挂在守护
+    /// 进程上的终端"，否则 `cmd-w` / 退出流程会照本地终端的方式去
+    /// shutdown，把用户的程序杀掉。
+    #[gpui::test]
+    fn attached_terminals_identify_themselves(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t7".to_string(), 80, 24, 1_000, |_| {}, |_, _, _| {})
+        });
+        terminal.read_with(cx, |t, _| {
+            assert!(t.is_attached(), "应被识别为挂接式终端");
+            assert!(!t.is_remote(), "挂接式终端不是 SSH 远程终端");
+            assert_eq!(t.attached_address(), Some("t7"));
+        });
+    }
+
+    /// 普通本地终端不能被误判成挂接式。
+    ///
+    /// 反向保护：若 `is_attached` 写错（比如 `matches!` 用反了），
+    /// 所有本地终端都会走"关窗不清理"的路径，泄漏 PTY 与子进程。
+    #[gpui::test]
+    fn a_headless_terminal_is_not_attached(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| Terminal::new_headless(cx, 1_000));
+        terminal.read_with(cx, |t, _| {
+            assert!(!t.is_attached());
+            assert_eq!(t.attached_address(), None);
         });
     }
 

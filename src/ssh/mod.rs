@@ -18,6 +18,7 @@ pub mod keychain;
 pub mod lsp_channel;
 pub mod platform;
 pub mod port_forward;
+pub mod remote_deploy;
 pub mod russh_terminal;
 pub mod sftp_fs;
 pub mod shared_runtime;

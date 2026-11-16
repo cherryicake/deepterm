@@ -37,6 +37,10 @@ BUILD_ROOT="${PROJECT_DIR}/target/deb"
 DEB_DIR="${PROJECT_DIR}/target/deb-out"
 DEB_FILE="${DEB_DIR}/${PKG_NAME}_${VERSION}_${ARCH}.deb"
 BIN_SRC="${PROJECT_DIR}/target/release/${PKG_NAME}"
+# 终端守护进程：持有所有 PTY，让终端活过窗口关闭。
+# 必须与 GUI 装进**同一个目录**：客户端按"与自身同目录"去找它（见
+# `daemon::client::daemon_binary_path`），分开放就得靠 PATH 兜底。
+CORE_SRC="${PROJECT_DIR}/target/release/deepcore"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -59,12 +63,22 @@ command -v dpkg-deb > /dev/null || { echo -e "${RED}缺少 dpkg-deb${NC}" >&2; e
 if [ "$DO_BUILD" = "1" ]; then
     echo -e "${GREEN}=== 1/4 构建 release 二进制 ===${NC}"
     cd "$PROJECT_DIR"
-    cargo build --release --bin "${PKG_NAME}"
+    # 两个二进制都要：`deepcore` 是终端守护进程，缺了它装出来的包
+    # 虽然能开窗，但"关掉窗口终端继续跑"会静默失效。
+    cargo build --release --bins
 fi
 
 [ -f "$BIN_SRC" ] || {
     echo -e "${RED}找不到二进制: ${BIN_SRC}${NC}" >&2
     echo "先跑一次 scripts/build-deb.sh（不带 --no-build）" >&2
+    exit 1
+}
+
+# 缺 deepcore 时不静默继续：装出来的包能开窗，但"关掉窗口终端继续跑"
+# 会静默失效，用户只会觉得功能没做。宁可构建失败。
+[ -f "$CORE_SRC" ] || {
+    echo -e "${RED}找不到守护进程: ${CORE_SRC}${NC}" >&2
+    echo "用 cargo build --release --bins 同时构建两个二进制" >&2
     exit 1
 }
 
@@ -74,6 +88,7 @@ mkdir -p "${BUILD_ROOT}"/{DEBIAN,usr/bin,usr/share/applications,usr/share/doc/"$
 
 # --- 可执行文件 ---------------------------------------------------------------
 install -m 0755 "$BIN_SRC" "${BUILD_ROOT}/usr/bin/${PKG_NAME}"
+install -m 0755 "$CORE_SRC" "${BUILD_ROOT}/usr/bin/deepcore"
 
 # --- 图标 ---------------------------------------------------------------------
 # 只安装 512x512 原图会让 128/64 的菜单位置去缩放大图，GNOME/KDE 上略显发虚；

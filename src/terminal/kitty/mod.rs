@@ -15,6 +15,7 @@ pub mod dnd;
 pub mod exec;
 pub mod image;
 pub mod render;
+pub mod replay;
 pub mod scanner;
 pub mod storage;
 pub mod unicode;
