@@ -222,7 +222,16 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n1)
           x86_sha=$(sha256sum deepcore-linux-x86_64.tar.gz | awk '{print $1}')
           arm_sha=$(sha256sum deepcore-linux-aarch64.tar.gz | awk '{print $1}')
-          base="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+
+          # 归档 URL 必须与客户端 `deploy.rs::default_releases_url` 推导出的
+          # 目录一致：`releases/download/v<version>`。客户端按**自己的内置
+          # 版本**拼这个前缀，所以这里用 Cargo.toml 的 version（上面的
+          # "Verify release version" 已保证 tag 去掉 v 前缀后等于它）。
+          #
+          # 不要改用 `releases/latest/download`：latest 只指向最新的**正式**
+          # 发布，打预发布 tag（`0.2.0-rc1`）时它仍指向旧正式版，客户端会
+          # 取回旧 manifest 然后因版本不符而永远装不上。
+          base="https://github.com/${{ github.repository }}/releases/download/v$version"
           cat > deepcore-manifest.json <<EOF
           {
             "version": "$version",
@@ -238,6 +247,19 @@ jobs:
             }
           }
           EOF
+
+          # 发布前自检：manifest 里的目录必须与客户端会请求的那一个逐字相同。
+          # 这两处分别是 shell 与 Rust 里的字符串拼接，改了一边忘了另一边
+          # 只有用户安装时才会暴露；在这里失败比发布后 404 便宜得多。
+          expected_tag="${GITHUB_REF_NAME}"
+          if [ "$expected_tag" != "v$version" ]; then
+            echo "::error::tag $expected_tag 与 manifest 目录 v$version 不一致"
+            exit 1
+          fi
+          if ! grep -q "\"url\": \"$base/" deepcore-manifest.json; then
+            echo "::error::manifest 里的归档 URL 不是预期的 $base"
+            exit 1
+          fi
 
           # manifest 本身也要进校验清单，避免发布后文件被静默替换。
           find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \

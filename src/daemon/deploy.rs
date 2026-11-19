@@ -35,7 +35,7 @@ const MANIFEST_FILE: &str = "deepcore-manifest.json";
 /// 发布 manifest 的环境变量覆盖。
 ///
 /// 值应当是包含 manifest 与各 target 归档的目录 URL。测试可以把本地 HTTP
-/// 服务指过来；正常发布不设置，走仓库的 `releases/latest/download`。
+/// 服务指过来；正常发布不设置，走仓库的 `releases/download/v{version}`。
 pub const RELEASES_URL_ENV: &str = "DEEPTERM_RELEASES_URL";
 
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
@@ -51,17 +51,38 @@ pub fn core_version() -> &'static str {
 }
 
 /// 默认发布目录。
+///
+/// # 为什么是精确版本而不是 `releases/latest/download`
+///
+/// 发布侧的 manifest 里写的是**各自 tag** 下的归档 URL（见
+/// `.github/workflows/release.yml`）。而 GitHub 的 `releases/latest` 只指向
+/// 最新的**正式**发布：打预发布 tag（`0.2.0-rc1`）时它仍指向旧的正式版，
+/// 客户端会把那个版本的 manifest 取回来，然后因为「manifest 版本 ≠ 内置
+/// 版本」而报错——安装永远走不通。
+///
+/// 用 `releases/download/v{version}` 让请求与内置版本严格对应：manifest 里
+/// 的版本、归档的版本、远端探针校验的版本三者天然一致，预发布也能按
+/// tag 直接访问。
 pub fn default_releases_url() -> String {
     format!(
-        "{}/releases/latest/download",
-        env!("CARGO_PKG_REPOSITORY").trim_end_matches('/')
+        "{}/releases/download/v{}",
+        env!("CARGO_PKG_REPOSITORY").trim_end_matches('/'),
+        core_version()
     )
 }
 
 /// 实际使用的发布目录。
 pub fn releases_url() -> String {
-    std::env::var(RELEASES_URL_ENV)
-        .ok()
+    resolve_releases_url(std::env::var(RELEASES_URL_ENV).ok())
+}
+
+/// [`releases_url`] 的纯函数形式。
+///
+/// 把环境变量读取拆出来，测试才能在不修改进程环境的情况下验证覆盖逻辑。
+/// （`std::env::set_var` 在多线程下是 unsafe 的，而 `cargo test` 默认
+/// 并行跑用例——真的去改环境会引入数据竞争。）
+fn resolve_releases_url(override_value: Option<String>) -> String {
+    override_value
         .map(|value| value.trim().trim_end_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(default_releases_url)
@@ -722,6 +743,48 @@ mod tests {
         assert_eq!(CoreManifest::parse(&bytes).unwrap(), original);
     }
 
+    /// **客户端请求的目录必须与发布侧写的 tag 对得上。**
+    ///
+    /// 回归价值：`default_releases_url` 曾经用 `releases/latest/download`，
+    /// 而 manifest 生成时写的是 `releases/download/<tag>`。两者在正式版上
+    /// 恰好等价，**打预发布 tag 时就分叉**：`latest` 仍指向旧的正式版，
+    /// 客户端取回旧 manifest，然后因为版本不符而永远装不上。
+    ///
+    /// 这里钉住协议：目录是 `releases/download/v{version}`，且版本号与
+    /// `Cargo.toml` 一致——发布工作流正是要求 tag 去掉 `v` 前缀后等于它。
+    #[test]
+    fn default_releases_url_matches_the_release_tag() {
+        let url = default_releases_url();
+        let expected = format!(
+            "{}/releases/download/v{}",
+            env!("CARGO_PKG_REPOSITORY").trim_end_matches('/'),
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(url, expected);
+        assert!(
+            !url.contains("/releases/latest/"),
+            "latest 无法定位预发布 tag，会让自动安装 404 或取到旧版本"
+        );
+    }
+
+    /// 环境变量覆盖优先于默认目录，且忽略空值与尾部斜杠。
+    ///
+    /// 走纯函数而不是 `std::env::set_var`：后者在多线程下是 unsafe 的，
+    /// 而 `cargo test` 并行跑用例，改环境会让其它用例读到中间状态。
+    #[test]
+    fn releases_url_prefers_the_override() {
+        assert_eq!(
+            resolve_releases_url(Some("http://127.0.0.1:9/custom/".into())),
+            "http://127.0.0.1:9/custom"
+        );
+        assert_eq!(
+            resolve_releases_url(Some("   ".into())),
+            default_releases_url(),
+            "空值应当回落到默认目录"
+        );
+        assert_eq!(resolve_releases_url(None), default_releases_url());
+    }
+
     #[test]
     fn version_parser_requires_the_deepcore_prefix() {
         assert_eq!(parse_core_version("deepcore 0.1.0\n"), Some("0.1.0".into()));
@@ -731,18 +794,6 @@ mod tests {
         );
         assert_eq!(parse_core_version("0.1.0"), None);
         assert_eq!(parse_core_version("deepcore bad version"), None);
-    }
-
-    #[test]
-    fn release_url_honours_the_environment_override() {
-        assert!(default_releases_url().ends_with("/releases/latest/download"));
-        assert_eq!(
-            format!(
-                "{}/x",
-                "https://example.test/releases/".trim_end_matches('/')
-            ),
-            "https://example.test/releases/x"
-        );
     }
 
     #[test]
