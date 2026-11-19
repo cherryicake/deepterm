@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleIdentifier</key><string>dev.deepterm.core</string>
+    <key>CFBundleName</key><string>DeepTerm Core</string>
+    <key>CFBundleDisplayName</key><string>DeepTerm Core</string>
+    <key>CFBundleExecutable</key><string>deepcore</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>LSUIElement</key><true/>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+    <key>NSLocalNetworkUsageDescription</key><string>DeepTerm Core 需要访问本地网络，以连接局域网中的 SSH 服务器和终端程序。</string>
+    <key>NSAppleEventsUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权控制其他应用。</string>
+    <key>NSMicrophoneUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权录制音频。</string>
+    <key>NSCameraUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权使用摄像头。</string>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权与蓝牙设备通信。</string>
+    <key>NSDesktopFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改桌面文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改“文稿”文件夹。</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改“下载”文件夹。</string>
+    <key>NSNetworkVolumesUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改网络卷。</string>
+    <key>NSRemovableVolumesUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改可移除卷。</string>
+</dict></plist>
