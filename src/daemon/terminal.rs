@@ -22,6 +22,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 
 use super::protocol::Frame;
+use crate::agent::{AgentSessionState, CLIAgent};
 
 /// 终端重连时最多回放多少行回滚。
 ///
@@ -185,11 +186,7 @@ impl TerminalHandle {
         //
         // 顺序上它是订阅之后的第一帧，早于任何增量输出——标签先有值，
         // 画面随后才到，不会出现「先看到 bash 再跳成 opencode」。
-        let meta = self
-            .meta
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let meta = self.meta.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Ok(payload) = serde_json::to_vec(&meta) {
             let _ = tx.try_send(Frame::new(channel, super::protocol::Kind::Meta, payload));
         }
@@ -407,9 +404,123 @@ impl TerminalHandle {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TerminalMeta {
     /// 前台进程名（`None` = 前台就是 shell）。
+    #[serde(default)]
     pub foreground: Option<String>,
     /// 前台进程的完整 argv，供 agent 识别与图标匹配。
+    #[serde(default)]
     pub argv: Option<Vec<String>>,
+    /// 前台 CLI agent。`argv` 能认出来时以它为准，认不出来时用 hook 的自报。
+    #[serde(default)]
+    pub agent: Option<CLIAgent>,
+    /// agent 的回合状态。这是**状态快照**而不是事件流：新窗口 attach 时
+    /// 必须连同身份一起补发，否则状态点要等下一次 hook 才会重新出现。
+    #[serde(default)]
+    pub agent_session: Option<AgentSessionState>,
+}
+
+/// holder 从 PTY 输出里看到的 agent hook 状态。
+///
+/// # 为什么在 holder 里记
+///
+/// OSC 777 是 agent 通过 hook 写进 PTY 的事件。GUI 关闭期间 PTY 还在 holder
+/// 手里，输出也仍然会经过这里；若只在 GUI 里解析，重启后这段历史就丢了。
+/// Herdr 的 `first_paint` 会把每条 OSC 7501 记录重新编码给新 viewer，这里
+/// 用同一原则：holder 保存最后一次解析结果，attach 时随 Meta 补发。
+#[derive(Debug, Default)]
+pub struct AgentHookState {
+    /// hook 自报的身份。进程探测能认出时由探测结果覆盖。
+    agent: Option<CLIAgent>,
+    /// 最近一次事件驱动出的回合状态。没有 agent 时保持 `None`。
+    session: Option<AgentSessionState>,
+    /// 状态每变一次就加一，读循环据此决定是否广播 Meta。
+    revision: u64,
+}
+
+impl AgentHookState {
+    fn observe(&mut self, content: &[u8]) {
+        let Some(event) = crate::agent::parse_agent_event(content) else {
+            return;
+        };
+        if event.agent.is_some() {
+            self.agent = event.agent;
+        }
+        if self.session.is_none() && (event.agent.is_some() || self.agent.is_some()) {
+            self.session = Some(AgentSessionState::default());
+        }
+        if let Some(session) = self.session.as_mut() {
+            session.apply_event(&event);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    /// 已观察到的状态版本。读循环只在版本变化时重新组装 Meta。
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+}
+
+/// 把终端扫描器看到的 OSC 交给 [`AgentHookState`] 的 [`OscSink`]。
+///
+/// 扫描器在终端读线程里逐字节处理输出；这个 sink 只旁路观察 OSC 777，
+/// 不改变交给 vte 的字节，也不参与 kitty 图像路径。
+struct AgentOscSink {
+    state: Arc<Mutex<AgentHookState>>,
+}
+
+impl crate::terminal::kitty::scanner::OscSink for AgentOscSink {
+    fn osc(&mut self, content: &[u8], _cursor: (i32, u32)) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .observe(content);
+    }
+}
+
+/// 为一条终端创建 hook 状态与扫描器 sink。
+pub fn agent_hook_state() -> (
+    Box<dyn crate::terminal::kitty::scanner::OscSink>,
+    Arc<Mutex<AgentHookState>>,
+) {
+    let state = Arc::new(Mutex::new(AgentHookState::default()));
+    (
+        Box::new(AgentOscSink {
+            state: state.clone(),
+        }),
+        state,
+    )
+}
+
+/// 把进程探测结果与 hook 观察结果合成给客户端的快照。
+///
+/// 进程探测是身份的主来源：hook 的 `agent` 字段只是兜底，和 GUI 侧
+/// `apply_agent_events` 的优先级一致。前台已经被确认是 shell 时，回合状态
+/// 也必须清掉——否则 agent 退出后 Tab 上会残留一个永远不会熄灭的状态点。
+pub fn compose_terminal_meta(mut probe: TerminalMeta, hook: &AgentHookState) -> TerminalMeta {
+    if probe.foreground.is_none() {
+        probe.agent = None;
+        probe.agent_session = None;
+        return probe;
+    }
+    if probe.agent.is_none() {
+        // hook 自报是兜底，但**必须确认它还没过期**。判据见
+        // [`CLIAgent::self_report_still_holds`]：`AgentHookState::observe` 只在
+        // 事件带 agent 时赋值，没有任何清空路径，所以 claude 退出后它仍是
+        // `Some(Claude)`。若照旧无条件采信，用户关掉 claude 再起 nvim 就会
+        // 得到 `foreground = Some("nvim")`（标签文字正确）配
+        // `agent = Some(Claude)`（图标画成 claude）——两者自相矛盾。
+        if let Some(agent) = hook.agent
+            && agent.self_report_still_holds(probe.argv.as_deref())
+        {
+            probe.agent = Some(agent);
+        }
+    }
+    if probe.agent.is_some() {
+        probe.agent_session = hook.session.clone();
+    } else {
+        // 身份已经换了人，回合状态必须跟着清掉，否则状态点会挂在新程序上。
+        probe.agent_session = None;
+    }
+    probe
 }
 
 /// 探测一个终端的前台进程。
@@ -454,9 +565,12 @@ pub fn probe_terminal_meta(
         let base = argv0.rsplit(['/', '\\']).next().unwrap_or(argv0);
         base.trim_start_matches('-').to_string()
     });
+    let agent = CLIAgent::detect_from_argv_with(&argv, &std::collections::HashMap::new());
     Some(TerminalMeta {
         foreground,
         argv: Some(argv),
+        agent,
+        agent_session: None,
     })
 }
 
@@ -601,17 +715,34 @@ pub fn render_screen(term: &FairMutex<Term<ZedListenerShim>>, history_rows: usiz
 /// `trailing_newline_unsafe`：调用方随后会自己补 `\r\n`（推历史时），
 /// 此时不裁行尾空白的判断要保守一点——留着空格更安全，避免把带底色的
 /// 区块裁掉。
+///
+/// # 宽字符占位格必须跳过
+///
+/// alacritty 把 CJK / emoji 这样的双宽字符存成「一个真字符 + 一个
+/// `WIDE_CHAR_SPACER` 占位格」，占位格里存的是 `' '`。逐格原样输出的话，
+/// `中文` 会变成 `中`+空格+`文`+空格；客户端 vte 重新解析时每个字符又各自
+/// 占两列，整行被迫右移，后半屏内容全部错位——而本地渲染完全相同（它读
+/// 的是同一份网格），所以只有"重启后挂接"这一条路会看到乱码，拖一下窗口
+/// 触发整屏重绘才对不齐的地方重新排版、看起来就"好了"。
+///
+/// 这与 [`crate::terminal::grid_search_snapshot`] 对占位格的处理必须一致：
+/// 那里检索要剔除，这里重绘也要剔除，否则两条路径会得出不同的屏幕。
 fn push_line_text(
     out: &mut Vec<u8>,
     line: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>,
     cols: usize,
     history: bool,
 ) {
+    let spacer_flags = alacritty_terminal::term::cell::Flags::WIDE_CHAR_SPACER
+        | alacritty_terminal::term::cell::Flags::LEADING_WIDE_CHAR_SPACER;
     let mut trailing_blank = cols;
     while trailing_blank > 0 {
         let cell = &line[alacritty_terminal::index::Column(trailing_blank - 1)];
         // 只有"默认背景的空格"才算空白；带底色的空格必须画出来，
         // 否则 `htop` 那种整行高亮会缺一块。
+        //
+        // 占位格也是空格，但它的"宽度"已经由前一个字符输出过了，不能
+        // 靠裁掉它来省字节——它本来就不该被输出。
         if cell.c == ' ' && cell.bg == DEFAULT_BG {
             trailing_blank -= 1;
         } else {
@@ -639,6 +770,10 @@ fn push_line_text(
     )> = None;
     for col in 0..trailing_blank {
         let cell = &line[alacritty_terminal::index::Column(col)];
+        // 占位格不输出：它的列宽已经由前一个宽字符占掉了。
+        if cell.flags.intersects(spacer_flags) {
+            continue;
+        }
         if current != Some((cell.fg, cell.bg, cell.flags)) {
             sgr_into(out, &cell.fg, &cell.bg, cell.flags);
             current = Some((cell.fg, cell.bg, cell.flags));
@@ -980,6 +1115,7 @@ impl TerminalHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::AgentStatus;
     use alacritty_terminal::term::Config;
 
     fn test_term() -> Arc<FairMutex<Term<ZedListenerShim>>> {
@@ -991,6 +1127,72 @@ mod tests {
             &bounds,
             listener,
         )))
+    }
+
+    /// 把网格内容读成逐行文本，用于比较"快照是否精确还原了屏幕"。
+    ///
+    /// 与下面那个单参数 `screen_text` 分开命名：电机是断言需要逐行比较
+    /// （差异定位更直观），而那条老测试要的是拼接后的整屏。
+    fn screen_rows(term: &Arc<FairMutex<Term<ZedListenerShim>>>) -> Vec<String> {
+        let term = term.lock();
+        let grid = term.grid();
+        let rows = grid.screen_lines();
+        let cols = grid.columns();
+        (0..rows)
+            .map(|row| {
+                let line = &grid[alacritty_terminal::index::Line(row as i32)];
+                (0..cols)
+                    .map(|col| line[alacritty_terminal::index::Column(col)].c)
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// **`render_screen` 必须能精确还原同一屏。**
+    ///
+    /// 这是"重启后 TUI 布局乱掉、拖一下窗口才恢复"的核心不变量。
+    ///
+    /// `attach` 把守护进程的整屏快照按字节发给客户端，客户端把它喂进自己
+    /// 的 VT。只要快照是"绝对定位 + 关闭自动折行"的逐行输出，且两边网格
+    /// 行列数一致，喂完之后客户端每一格都必须与守护进程一致；差一格就说明
+    /// 快照本身有损，用户看到的就是错位/残影，要等下一次 resize 触发整屏
+    /// 重绘才自愈——那正是 bug 的现场。
+    ///
+    /// 这里覆盖两类最容易漏的内容：
+    /// - 行尾带底色的空格（`htop` 那种整行高亮）：被当成空白裁掉就会缺一块；
+    /// - 宽字符（CJK）：占两格，宽度算错会让后续内容整体右移。
+    #[test]
+    fn attach_snapshot_reproduces_the_screen_cell_for_cell() {
+        let term = test_term(); // 20x4
+        let handle = TerminalHandle::new_for_tests("t1", term.clone());
+        // 铺满四行：中文 + 行尾底色空格 + 普通文本。
+        handle.feed_for_tests(
+            b"one\r\n\xe4\xb8\xad\xe6\x96\x87 mixed\r\n\
+              \x1b[44m    \x1b[0m tail\r\nlast line",
+        );
+
+        let expected = screen_rows(&term);
+        let snapshot = handle.attach_paint(0, false);
+
+        // 用同样的行列数建一个干净的客户端 VT，把快照喂进去。
+        let client = Arc::new(FairMutex::new(Term::new(
+            Config::default(),
+            &alacritty_terminal::term::test::TermSize::new(20, 4),
+            ZedListenerShim(std::sync::mpsc::channel().0),
+        )));
+        {
+            let mut t = client.lock();
+            let mut processor = alacritty_terminal::vte::ansi::Processor::<
+                alacritty_terminal::vte::ansi::StdSyncHandler,
+            >::new();
+            processor.advance(&mut *t, &snapshot);
+        }
+
+        assert_eq!(
+            screen_rows(&client),
+            expected,
+            "快照喂回同尺寸 VT 后必须逐格还原；不一致就说明重绘流有损"
+        );
     }
 
     /// **resize 重绘必须合并：一批事件只发一帧。**
@@ -1444,6 +1646,7 @@ mod tests {
         let meta = TerminalMeta {
             foreground: Some("opencode".into()),
             argv: Some(vec!["opencode".into()]),
+            ..Default::default()
         };
         handle.broadcast_meta(&meta);
 
@@ -1454,6 +1657,162 @@ mod tests {
         assert_eq!(frame.kind, Kind::Meta, "必须是 Meta 帧，不能混成终端数据");
         let got: TerminalMeta = serde_json::from_slice(&frame.payload).expect("meta 应是合法 JSON");
         assert_eq!(got, meta);
+    }
+
+    /// **agent 状态也必须是快照的一部分。**
+    ///
+    /// 回归价值：只补 `foreground`/`argv` 时，重开 GUI 后 Tab 能显示程序名，
+    /// 但状态点要等 agent 下一次 hook 才出现；如果 agent 正停在 Waiting/Done，
+    /// 用户会看到一个永远不亮的图标。Herdr 的 first_paint 会重放状态记录，
+    /// 这里同样把身份与回合状态一起交给新订阅者。
+    #[test]
+    fn a_late_subscriber_gets_agent_identity_and_turn_status() {
+        use super::super::protocol::Kind;
+        let term = test_term();
+        let handle = TerminalHandle::new_for_tests("t1", term);
+        let meta = TerminalMeta {
+            foreground: Some("codex".into()),
+            argv: Some(vec!["codex".into()]),
+            agent: Some(CLIAgent::Codex),
+            agent_session: Some(AgentSessionState {
+                status: AgentStatus::Waiting,
+                message: Some("approve command".into()),
+                session_id: Some("session-1".into()),
+                ..Default::default()
+            }),
+        };
+        handle.broadcast_meta(&meta);
+
+        let (tx, rx) = async_channel::bounded(4);
+        handle.subscribe(7, tx);
+        let frame = rx.try_recv().expect("新订阅者必须收到当前 meta");
+        assert_eq!(frame.kind, Kind::Meta);
+        let got: TerminalMeta = serde_json::from_slice(&frame.payload).expect("meta 应是合法 JSON");
+        assert_eq!(got, meta);
+    }
+
+    /// `TerminalMeta` 的 JSON 往返必须保留 agent 身份与回合状态。
+    ///
+    /// 这两个字段跨 core → GUI、core → SSH 桥两层 JSON 边界；漏掉
+    /// `serde` 往返会让重连后的图标与状态静默退回默认值。
+    #[test]
+    fn terminal_meta_json_round_trip_keeps_agent_fields() {
+        let meta = TerminalMeta {
+            foreground: Some("opencode".into()),
+            argv: Some(vec!["opencode".into(), "run".into()]),
+            agent: Some(CLIAgent::OpenCode),
+            agent_session: Some(AgentSessionState {
+                status: AgentStatus::Working,
+                message: None,
+                session_id: Some("ses-opencode".into()),
+                cwd: Some(std::path::PathBuf::from("/repo")),
+                inferred: false,
+            }),
+        };
+        let encoded = serde_json::to_vec(&meta).expect("meta should serialize");
+        let decoded: TerminalMeta = serde_json::from_slice(&encoded).expect("meta should parse");
+        assert_eq!(decoded, meta);
+    }
+
+    /// hook 事件在没有 GUI 连接时也要被 holder 记住。
+    ///
+    /// 这正是 GUI 关闭期间 agent 继续运行的场景：OSC 777 已经流过 PTY，
+    /// holder 必须在 attach 前把最后一次状态留成快照。
+    #[test]
+    fn hook_state_observes_prompt_submit_without_a_gui() {
+        let mut hook = AgentHookState::default();
+        hook.observe(
+            br#"777;notify;deepterm://cli-agent;{"agent":"codex","event":"prompt-submit","session_id":"s1","prompt":"fix it"}"#,
+        );
+        assert_eq!(hook.agent, Some(CLIAgent::Codex));
+        let session = hook.session.as_ref().expect("事件后应建立 session");
+        assert_eq!(session.status, AgentStatus::Working);
+        assert_eq!(session.session_id.as_deref(), Some("s1"));
+        assert_eq!(hook.revision(), 1);
+
+        hook.observe(
+            br#"777;notify;deepterm://cli-agent;{"agent":"codex","event":"stop","session_id":"s1","message":"done"}"#,
+        );
+        assert_eq!(
+            hook.session.as_ref().expect("session 仍在").status,
+            AgentStatus::Done
+        );
+        assert_eq!(hook.revision(), 2);
+    }
+
+    /// 前台确认回到 shell 时，不能把上一次 agent 的状态点继续挂着。
+    #[test]
+    fn composition_clears_agent_state_when_the_shell_is_in_front() {
+        let mut hook = AgentHookState::default();
+        hook.observe(
+            br#"777;notify;deepterm://cli-agent;{"agent":"opencode","event":"prompt-submit"}"#,
+        );
+        let meta = compose_terminal_meta(TerminalMeta::default(), &hook);
+        assert_eq!(meta, TerminalMeta::default());
+    }
+
+    /// 前台换成**另一个程序**时，hook 里残留的 agent 身份不能被沿用。
+    ///
+    /// 回归价值：`AgentHookState::observe` 只在 `event.agent.is_some()` 时给
+    /// `agent` 赋值，**没有任何清空路径**——一次 claude 上报之后它就一直是
+    /// `Some(Claude)`。而 `compose_terminal_meta` 原先只要 `probe.agent`
+    /// 为 None 就拿 `hook.agent` 兜底，于是用户关掉 claude、在前台起了 nvim：
+    /// - 进程探测如实报告 `foreground = Some("nvim")`，标签文字因此是对的；
+    /// - 身份却被兜底成 claude，图标因此一直是 claude 的。
+    ///
+    /// 这正是"标签写着 nvim、图标是 claude"的成因。
+    #[test]
+    fn composition_does_not_reuse_a_stale_agent_when_another_program_is_in_front() {
+        let mut hook = AgentHookState::default();
+        hook.observe(
+            br#"777;notify;deepterm://cli-agent;{"agent":"claude","event":"prompt-submit"}"#,
+        );
+
+        // claude 已退出，前台是 nvim：探测认不出 agent（如实为 None）。
+        let probe = TerminalMeta {
+            foreground: Some("nvim".into()),
+            argv: Some(vec!["nvim".into(), "src/main.rs".into()]),
+            agent: None,
+            agent_session: None,
+        };
+        let meta = compose_terminal_meta(probe, &hook);
+
+        assert_eq!(
+            meta.agent, None,
+            "前台不是 agent，就不该沿用 hook 里上一次的身份，否则图标会停在 claude"
+        );
+        assert_eq!(meta.agent_session, None, "身份清空时回合状态也必须清空");
+        assert_eq!(
+            meta.foreground.as_deref(),
+            Some("nvim"),
+            "前台程序名本身要如实保留（标签文字靠它）"
+        );
+    }
+
+    /// 前台程序认不出来时，hook 的身份仍是有效兜底。
+    ///
+    /// 与上一条配对：**同一个 agent 还没退出**时（例如 claude 包在 wrapper
+    /// 里，进程名认不出来），必须继续采信 hook 自报，否则图标会乱闪。
+    #[test]
+    fn composition_keeps_the_hook_agent_when_the_process_is_unrecognizable() {
+        let mut hook = AgentHookState::default();
+        hook.observe(
+            br#"777;notify;deepterm://cli-agent;{"agent":"claude","event":"prompt-submit"}"#,
+        );
+
+        // 前台确实有程序，但探测认不出它是 agent（wrapper / 被改名的二进制）。
+        let probe = TerminalMeta {
+            foreground: Some("my-claude-wrapper".into()),
+            argv: Some(vec!["my-claude-wrapper".into()]),
+            agent: None,
+            agent_session: None,
+        };
+        let meta = compose_terminal_meta(probe, &hook);
+        assert_eq!(
+            meta.agent,
+            Some(crate::agent::CLIAgent::Claude),
+            "认不出进程时 hook 自报仍是有效依据"
+        );
     }
 
     /// **attach 一个已结束的终端时，必须立刻推 `Close`。**
@@ -1475,7 +1834,9 @@ mod tests {
 
         let (tx, rx) = async_channel::bounded(4);
         handle.subscribe(1, tx);
-        let kinds: Vec<Kind> = (0..2).filter_map(|_| rx.try_recv().ok().map(|f| f.kind)).collect();
+        let kinds: Vec<Kind> = (0..2)
+            .filter_map(|_| rx.try_recv().ok().map(|f| f.kind))
+            .collect();
         assert!(
             kinds.contains(&Kind::Close),
             "已结束的终端必须在订阅时补一帧 Close，否则客户端永远挂着它: {kinds:?}"
@@ -1490,8 +1851,13 @@ mod tests {
         let handle = TerminalHandle::new_for_tests("t1", term);
         let (tx, rx) = async_channel::bounded(4);
         handle.subscribe(1, tx);
-        let kinds: Vec<Kind> = (0..2).filter_map(|_| rx.try_recv().ok().map(|f| f.kind)).collect();
-        assert!(!kinds.contains(&Kind::Close), "活着的终端不该收到 Close: {kinds:?}");
+        let kinds: Vec<Kind> = (0..2)
+            .filter_map(|_| rx.try_recv().ok().map(|f| f.kind))
+            .collect();
+        assert!(
+            !kinds.contains(&Kind::Close),
+            "活着的终端不该收到 Close: {kinds:?}"
+        );
     }
 
     /// 从未探测过时补发的是空快照（前台是 shell），而不是空白帧。
