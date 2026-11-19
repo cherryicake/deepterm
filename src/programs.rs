@@ -97,6 +97,29 @@ pub fn of(app: Option<&str>, argv: &[String]) -> Program {
     resolve(&TABLE, app, argv)
 }
 
+/// 前台程序是否是这张表**认识**的程序（含 shell、agent 与普通程序）。
+///
+/// `false` 表示"认不出来"——调用方应把它当作"无法判断"，而不是"不是 agent"。
+///
+/// **解释器不算**：`node my-agent.js` / `python run.py` 的前台进程是解释器
+/// 本身，真正的程序在参数里。把它当成"认出来了"会让调用方据此判定 agent
+/// 身份过期，于是被解释器启动的 agent 图标整片消失——这正是
+/// [`crate::agent::CLIAgent::self_report_still_holds`] 必须依赖本函数"认不出"
+/// 语义的原因。
+pub fn is_recognized(argv: &[String]) -> bool {
+    let Some(first) = argv.first().map(|a| base(a)) else {
+        return false;
+    };
+    if TABLE.interpreters.iter().any(|s| s == first) {
+        return false;
+    }
+    TABLE.shells.iter().any(|s| s == first)
+        || find(&TABLE, first).is_some()
+        || crate::agent::CLIAgent::ALL
+            .into_iter()
+            .any(|agent| agent.matches_token(first))
+}
+
 fn base(s: &str) -> &str {
     let s = s.rsplit(['/', '\\']).next().unwrap_or(s);
     let s = s.trim_start_matches('-');

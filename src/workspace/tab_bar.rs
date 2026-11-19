@@ -17,7 +17,12 @@ use crate::workspace::panel::DraggedPanel;
 
 actions!(
     tab_context_menu,
-    [CopyTabAddress, DuplicateTab, ReconnectTab]
+    [
+        CopyTabAddress,
+        DuplicateTab,
+        ReconnectTab,
+        LegacyReconnectTab
+    ]
 );
 
 /// 以 tab id 为参数的回调（点击、关闭、复制地址、复制标签页、重连等）。
@@ -850,6 +855,8 @@ pub struct TabBar {
     on_tab_duplicate: OptionalTabCallback,
     /// 重新连接回调
     on_tab_reconnect: OptionalTabCallback,
+    /// 显式切到旧 SSH 兼容模式并重连
+    on_tab_reconnect_legacy: OptionalTabCallback,
     /// 右键菜单构建回调（由调用方设置，tab_id 为右键点击的标签 ID）
     on_context_menu: Option<ContextMenuCallback>,
     /// 顶部「空间胶囊」的文案（herdr 的 space picker）：标签页组名。
@@ -887,6 +894,7 @@ impl TabBar {
             on_tab_copy_address: None,
             on_tab_duplicate: None,
             on_tab_reconnect: None,
+            on_tab_reconnect_legacy: None,
             on_context_menu: None,
             workspace_chip_label: None,
             on_workspace_chip: None,
@@ -1005,6 +1013,14 @@ impl TabBar {
         F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
     {
         self.on_tab_reconnect = Some(Rc::new(callback));
+    }
+
+    /// 旧 SSH 兼容模式重连回调
+    pub fn on_tab_reconnect_legacy<F>(&mut self, callback: F)
+    where
+        F: Fn(SharedString, &mut Window, &mut App) + Send + Sync + 'static,
+    {
+        self.on_tab_reconnect_legacy = Some(Rc::new(callback));
     }
 
     /// 右键菜单构建回调（由调用方设置）
@@ -2110,6 +2126,10 @@ impl TabBar {
                 cx,
                 self.on_tab_reconnect.clone(),
             ))
+            .on_action(Self::context_menu_action_listener::<LegacyReconnectTab>(
+                cx,
+                self.on_tab_reconnect_legacy.clone(),
+            ))
             .child(
                 // 外层容器：横向布局滚动区 + 新建按钮
                 div()
@@ -2208,6 +2228,10 @@ impl TabBar {
             .on_action(Self::context_menu_action_listener::<ReconnectTab>(
                 cx,
                 self.on_tab_reconnect.clone(),
+            ))
+            .on_action(Self::context_menu_action_listener::<LegacyReconnectTab>(
+                cx,
+                self.on_tab_reconnect_legacy.clone(),
             ))
             // 左侧「空间胶囊」：herdr 用一个胶囊显示当前 space 并点开选择器。
             // deepterm 的对应概念是**标签页组**，胶囊显示组名、点开分组选择器。

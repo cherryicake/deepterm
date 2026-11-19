@@ -22,7 +22,18 @@ pub enum Event {
     Reconnect {
         /// 连接配置
         config: SshConnectionConfig,
+        /// 重连必须回到发起错误的传输模式，不能借 UI 分支静默降级。
+        target: ReconnectTarget,
     },
+}
+
+/// 失败页面的重连目标。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReconnectTarget {
+    /// 旧 SSH 兼容路径（本地 PTY 中运行 ssh）。
+    LegacySsh,
+    /// 默认的远端 core 路径。
+    RemoteCore,
 }
 
 /// 连接阶段总数
@@ -82,6 +93,8 @@ pub struct SshConnectView {
     pub config: SshConnectionConfig,
     /// 当前连接状态
     pub status: ConnectStatus,
+    /// 用户点击 Reconnect 后要重试的传输模式。
+    pub reconnect_target: ReconnectTarget,
     /// 动画帧计数（用于 "..." 点动画）
     frame: u32,
     /// 动画任务（持有此字段使任务保持运行，drop 时自动停止；
@@ -91,8 +104,20 @@ pub struct SshConnectView {
 
 impl SshConnectView {
     pub fn new(config: SshConnectionConfig, cx: &mut Context<Self>) -> Self {
-        // 启动动画循环：每 400ms 推进一帧
-        let animation_task = cx.spawn(async move |this, cx| {
+        Self {
+            config,
+            status: ConnectStatus::Connecting {
+                stage: ConnectStage::Handshake,
+            },
+            reconnect_target: ReconnectTarget::LegacySsh,
+            frame: 0,
+            _animation_task: Some(Self::start_animation(cx)),
+        }
+    }
+
+    /// 每 400ms 推进一帧；连接结束或失败后停止。
+    fn start_animation(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(400))
@@ -112,16 +137,24 @@ impl SshConnectView {
                 })
                 .ok();
             }
-        });
+        })
+    }
 
-        Self {
-            config,
-            status: ConnectStatus::Connecting {
-                stage: ConnectStage::Handshake,
-            },
-            frame: 0,
-            _animation_task: Some(animation_task),
+    /// 指定失败页面的重连目标。
+    pub fn set_reconnect_target(&mut self, target: ReconnectTarget) {
+        self.reconnect_target = target;
+    }
+
+    /// 重试时回到连接中状态；失败页停掉的动画也重新启动。
+    pub fn set_connecting(&mut self, cx: &mut Context<Self>) {
+        let restart = !matches!(self.status, ConnectStatus::Connecting { .. });
+        self.status = ConnectStatus::Connecting {
+            stage: ConnectStage::Handshake,
+        };
+        if restart {
+            self._animation_task = Some(Self::start_animation(cx));
         }
+        cx.notify();
     }
 
     /// 将状态更新为连接成功
@@ -150,7 +183,10 @@ impl SshConnectView {
         let config = self.config.clone();
 
         // 关闭当前视图并触发重新连接
-        cx.emit(Event::Reconnect { config });
+        cx.emit(Event::Reconnect {
+            config,
+            target: self.reconnect_target,
+        });
     }
 }
 
@@ -285,7 +321,10 @@ impl Render for SshConnectView {
                             .child(
                                 div().mt(px(16.0)).child(
                                     Button::new("reconnect-btn")
-                                        .label("Reconnect")
+                                        .label(match self.reconnect_target {
+                                            ReconnectTarget::LegacySsh => "Reconnect",
+                                            ReconnectTarget::RemoteCore => "Retry remote core",
+                                        })
                                         .primary()
                                         .on_click(cx.listener(|this, _, _window, cx| {
                                             this.handle_reconnect(_window, cx);

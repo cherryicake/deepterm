@@ -117,6 +117,20 @@ pub struct PanelSessionState {
     pub content: PanelContentSessionState,
 }
 
+/// 复制一个 SSH 会话到新面板所需的三要素。
+///
+/// 见 [`TerminalSessionState::ssh_clone_target`]：字段必须整体传递，
+/// 任何一项丢失都是静默的传输方式/连接路径变化。
+#[derive(Clone, Debug)]
+pub struct SshCloneTarget {
+    /// 已合回代理标记的配置。
+    pub config: SshConnectionConfig,
+    /// 远端工作目录。
+    pub remote_cwd: Option<String>,
+    /// 用户是否显式选了「旧 SSH 模式」。
+    pub legacy_ssh: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PanelContentSessionState {
     Terminal(TerminalSessionState),
@@ -184,6 +198,13 @@ pub enum TerminalSessionState {
         /// 才重连。旧会话文件缺省 `None` = 老行为。
         #[serde(default)]
         daemon_address: Option<String>,
+        /// 该标签是否由用户显式选择“旧 SSH 模式”。
+        ///
+        /// `false`（缺省）表示默认的远端 core：PTY 与 core 都在远端。
+        /// `true` 表示兼容路径：在本机 core 的 PTY 里运行 `ssh`，不提供
+        /// 远端 core 的断线保活保证。
+        #[serde(default)]
+        legacy_ssh: bool,
     },
 }
 
@@ -201,6 +222,51 @@ impl TerminalSessionState {
             use_system_proxy,
             daemon_address: None,
             daemon_grid: None,
+            legacy_ssh: false,
+        }
+    }
+
+    /// 把本次会话标记为显式旧 SSH 兼容模式。
+    pub fn with_legacy_ssh(mut self, legacy: bool) -> Self {
+        if let Self::Ssh { legacy_ssh, .. } = &mut self {
+            *legacy_ssh = legacy;
+        }
+        self
+    }
+
+    pub fn legacy_ssh(&self) -> bool {
+        matches!(
+            self,
+            Self::Ssh {
+                legacy_ssh: true,
+                ..
+            }
+        )
+    }
+
+    /// 复制一个 SSH 会话到新面板（分屏 / 复制标签页）所需的全部信息。
+    ///
+    /// 三个字段必须**一起**带过去，漏一个都是静默的行为变化：
+    /// - `config`：代理标记已经由 [`Self::ssh_config_with_proxy`] 合回，
+    ///   丢了海外主机就退回直连；
+    /// - `remote_cwd`：新面板要落在同一个远端目录；
+    /// - `legacy_ssh`：用户显式选的传输方式，丢了就从「旧 SSH」变成
+    ///   「远端 core」——另一种实现、另一种失败方式，还会往远端装二进制。
+    ///
+    /// 做成一个纯函数是为了能直接测：这两处调用点都在 `cx.new` 闭包里，
+    /// 端到端断言传输方式要起整个 GPUI 窗口，代价远高于它守的东西。
+    pub fn ssh_clone_target(&self) -> Option<SshCloneTarget> {
+        match self {
+            Self::Ssh {
+                remote_cwd,
+                legacy_ssh,
+                ..
+            } => Some(SshCloneTarget {
+                config: self.ssh_config_with_proxy()?,
+                remote_cwd: remote_cwd.clone(),
+                legacy_ssh: *legacy_ssh,
+            }),
+            Self::Local { .. } => None,
         }
     }
 
@@ -392,7 +458,67 @@ mod tests {
         assert!(!restored.use_system_proxy(), "缺字段时按直连处理");
         let config = restored.ssh_config_with_proxy().expect("Ssh 分支应有配置");
         assert!(!config.use_system_proxy, "旧文件恢复出的配置是直连");
+        assert!(!restored.legacy_ssh(), "缺字段时默认走远端 core");
         assert_eq!(config.host, "old.example.com");
+    }
+
+    /// 显式旧 SSH 选择必须经会话文件往返，不能重启后悄悄切回远端 core。
+    #[test]
+    fn legacy_ssh_choice_round_trips_through_the_session_file() {
+        let config = SshConnectionConfig::new("legacy.example.com", "root", AuthMethod::Agent);
+        let saved = TerminalSessionState::ssh(config, Some("/srv".into())).with_legacy_ssh(true);
+        let json = serde_json::to_string(&saved).expect("会话状态应可序列化");
+        assert!(json.contains("\"legacy_ssh\":true"), "{json}");
+
+        let restored: TerminalSessionState = serde_json::from_str(&json).expect("应可反序列化");
+        assert!(restored.legacy_ssh());
+        assert_eq!(restored.remote_cwd().as_deref(), Some("/srv"));
+    }
+
+    /// 复制/分屏必须把三要素整体带过去，尤其是传输模式。
+    ///
+    /// 回归价值：`split_selected_panel` 与 `handle_tab_duplicate` 都用
+    /// `TerminalSessionState::Ssh { .. }` 解构，`..` 把 `legacy_ssh` 丢掉了，
+    /// 于是**显式选了「旧 SSH 模式」的面板一旦分屏或复制，就静默变成远端
+    /// core**：换传输、换失败方式，还会往远端装二进制。代理标记同理。
+    ///
+    /// 这两处都在 `cx.new` 闭包里，端到端断言要起整个窗口，所以把取数逻辑
+    /// 抽成 `ssh_clone_target` 在这里直接钉住。
+    #[test]
+    fn ssh_clone_target_carries_proxy_cwd_and_transport() {
+        let mut config = SshConnectionConfig::new("overseas.example", "root", AuthMethod::Agent);
+        config.use_system_proxy = true;
+
+        let state = TerminalSessionState::ssh(config, Some("/srv".into()));
+        let target = state.ssh_clone_target().expect("Ssh 分支必有目标");
+        assert!(
+            target.config.use_system_proxy,
+            "克隆目标必须带代理标记（否则海外主机复制出来就成直连）"
+        );
+        assert_eq!(target.remote_cwd.as_deref(), Some("/srv"));
+        assert!(!target.legacy_ssh, "默认是远端 core 模式");
+
+        // 显式旧 SSH：克隆目标必须也是旧 SSH。
+        let legacy = TerminalSessionState::ssh(
+            SshConnectionConfig::new("legacy.example", "root", AuthMethod::Agent),
+            Some("/srv".into()),
+        )
+        .with_legacy_ssh(true);
+        let target = legacy.ssh_clone_target().expect("Ssh 分支必有目标");
+        assert!(
+            target.legacy_ssh,
+            "旧 SSH 会话克隆出来后仍是旧 SSH——静默切到远端 core 是不允许的"
+        );
+
+        // 本地会话没有 SSH 克隆目标。
+        let local = TerminalSessionState::Local {
+            cwd: Some("/tmp".to_string()),
+            command: None,
+            args: Vec::new(),
+            daemon_address: None,
+            daemon_grid: None,
+        };
+        assert!(local.ssh_clone_target().is_none());
     }
 
     /// 直连的会话不会凭空带上代理。

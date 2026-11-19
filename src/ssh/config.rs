@@ -146,7 +146,11 @@ pub struct SshConnectionConfig {
     /// 代价与对策：
     /// - Tab 菜单「重新连接」与「复制标签页」走内存，标记天然保留；
     /// - 退出重启走 `session_state.json`，那里的 `TerminalSessionState::Ssh`
-    ///   自己存了一份并在此合回（见 `TerminalSessionState::ssh_config_with_proxy`）。
+    ///   自己存了一份并在此合回（见 `TerminalSessionState::ssh_config_with_proxy`）；
+    /// - **跨进程**（GUI → 本地 core 的 `machine.add`）也不能靠这份序列化：
+    ///   `serde(skip)` 让线上传过去的值恒为 `false`。所以 `add_machine` 额外
+    ///   带一个 `use_system_proxy` 字段，由 `machine.add` 处理器合回。否则
+    ///   「使用系统代理连接」在远端 core 路径上会静默退化成直连。
     #[serde(skip)]
     pub use_system_proxy: bool,
 }

@@ -36,7 +36,8 @@ use crate::workspace::session_state::{
 };
 use crate::workspace::split_manager::{SplitContainer, SplitDirection, SplitNavDirection};
 use crate::workspace::tab_bar::{
-    CopyTabAddress, DraggedTab, DuplicateTab, ReconnectTab, TabAgentSnapshot, TabBar, TabItem,
+    CopyTabAddress, DraggedTab, DuplicateTab, LegacyReconnectTab, ReconnectTab, TabAgentSnapshot,
+    TabBar, TabItem,
 };
 
 // Define workspace actions
@@ -679,6 +680,15 @@ impl Workspace {
                 }
             });
 
+            // 按真实视图重算所有标签名，不要沿用会话文件里存的那份。
+            //
+            // 会话文件里的 label 是**上一次保存那一刻**的快照，可能已经过期
+            // 甚至是错的（旧版本把远端 core 面板存成了 "Local Terminal"）。
+            // 活动 tab 会因 attach 成功触发的 `TabLabelChanged` 自我刷新，但
+            // **非活动标签组里的 tab 不会被立即恢复**，也就永远等不到那个
+            // 事件——它们会一直显示旧快照。所以这里统一算一遍。
+            workspace.refresh_all_tab_visuals(cx);
+
             workspace
         });
 
@@ -902,6 +912,19 @@ impl Workspace {
                 }
             });
 
+            // 显式降级：只由右键菜单触发，不在连接失败时自动调用。
+            tab_bar.on_tab_reconnect_legacy({
+                let workspace = workspace.clone();
+                move |tab_id, window, cx| {
+                    let id = tab_id.to_string();
+                    workspace.update(cx, |_this, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.handle_tab_reconnect_legacy_ssh(&id, window, cx);
+                        });
+                    });
+                }
+            });
+
             // 右键菜单
             tab_bar.on_context_menu({
                 let workspace = workspace.clone();
@@ -918,6 +941,11 @@ impl Workspace {
                             "拷贝地址",
                             MenuIcon::new("icons/document.on.document.svg"),
                             Box::new(CopyTabAddress),
+                        )
+                        .menu_with_icon(
+                            "以旧 SSH 模式重连（不保活）",
+                            MenuIcon::new("icons/arrow.clockwise.svg"),
+                            Box::new(LegacyReconnectTab),
                         )
                     } else {
                         menu
@@ -1112,7 +1140,10 @@ impl Workspace {
                         .then(|| tab_id.clone())
                 }) {
                     self.refresh_tab_visual(&tab_id, cx);
-                    cx.emit(WorkspaceEvent::SessionChanged);
+                    // 标题/前台进程变化只影响绘制。这里曾经同时发 SessionChanged，
+                    // 而 Codex 等 TUI 的标题会持续变化，导致会话保存防抖永远被
+                    // 重置、活动 Tab 从未落盘。真正需要持久化的结构变更（切 Tab、
+                    // 新建/关闭/分屏）另有各自的 SessionChanged 事件。
                     cx.emit(WorkspaceEvent::TabBarChanged);
                 }
             }
@@ -1665,23 +1696,21 @@ impl Workspace {
             let (args_id, ws_id) = (panel_id.clone(), workspace_id.clone());
             match session {
                 // SSH：连同一台主机，落在同一个远端目录。
-                Some(TerminalSessionState::Ssh {
-                    ref config,
-                    ref remote_cwd,
-                    use_system_proxy,
-                    ..
-                }) => {
-                    // 代理标记跟着分屏走：海外主机靠它才连得上，
-                    // 丢了就得回退成直连（通常直接超时）。
-                    let mut config = config.clone();
-                    config.use_system_proxy = use_system_proxy;
-                    Panel::with_ssh_terminal(
+                Some(session @ TerminalSessionState::Ssh { .. }) => {
+                    // 代理标记与传输模式都跟着分屏走。三要素由
+                    // `ssh_clone_target` 统一取出（并已在别处被回归测试钉住）：
+                    // 海外主机靠代理才连得上；而用户显式选的「旧 SSH 模式」
+                    // 更不能在这里静默改成远端 core——那是另一种传输、
+                    // 另一种失败方式，还会往远端装二进制。
+                    let target = session.ssh_clone_target().expect("Ssh 分支必有目标");
+                    Panel::with_ssh_terminal_mode(
                         args_id.clone(),
                         ws_id.clone(),
                         Some(active_tab_id.clone()),
                         None,
-                        &config,
-                        remote_cwd.clone(),
+                        &target.config,
+                        target.remote_cwd,
+                        target.legacy_ssh,
                         cx,
                     )
                 }
@@ -2719,19 +2748,22 @@ impl Workspace {
 
         let state = terminal_view.read(cx).session_state(cx);
         match &state {
-            TerminalSessionState::Ssh { remote_cwd, .. } => {
-                // 复制标签页继承代理选择：复制出来的标签连的是同一台海外主机，
-                // 丢掉标记等于复制出一个必然不稳的直连会话。
-                let config = state.ssh_config_with_proxy().expect("Ssh 分支必有配置");
+            TerminalSessionState::Ssh { .. } => {
+                // 复制标签页继承代理选择与传输模式：复制出来的标签连的是同一台
+                // 海外主机，丢掉代理标记等于复制出一个必然不稳的直连会话；
+                // 而把「旧 SSH 模式」静默换成远端 core，则会让用户以为自己在
+                // 用不保活的那条通道，实际却在远端起了个 core。
+                let target = state.ssh_clone_target().expect("Ssh 分支必有目标");
                 let workspace_id = self.workspace_id.clone();
                 let panel = cx.new(|cx| {
-                    Panel::with_ssh_terminal(
+                    Panel::with_ssh_terminal_mode(
                         format!("panel-{}", self.next_panel_id),
                         workspace_id,
                         Some(format!("tab-{}", self.next_tab_id).into()),
-                        Some(config.display_name().into()),
-                        &config,
-                        remote_cwd.clone(),
+                        Some(target.config.display_name().into()),
+                        &target.config,
+                        target.remote_cwd.clone(),
+                        target.legacy_ssh,
                         cx,
                     )
                 });
@@ -2788,6 +2820,33 @@ impl Workspace {
 
         for panel in panels {
             panel.update(cx, |panel, cx| panel.reconnect_terminal(cx));
+        }
+    }
+
+    /// 明确把标签切成旧 SSH 兼容模式并重连。
+    ///
+    /// 这是用户可见的降级入口，不能由默认连接失败自动触发：两种模式的
+    /// 远端保活语义不同，静默切换会误导用户。
+    fn handle_tab_reconnect_legacy_ssh(
+        &mut self,
+        tab_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab_info) = self.tabs.get(tab_id) else {
+            log::warn!("未找到标签页: {}", tab_id);
+            return;
+        };
+
+        let mut panels: Vec<Entity<Panel>> = Vec::new();
+        tab_info.container.collect_panels_into(&mut panels);
+        if panels.is_empty() {
+            log::warn!("标签页 {} 没有可重新连接的 panel", tab_id);
+            return;
+        }
+
+        for panel in panels {
+            panel.update(cx, |panel, cx| panel.reconnect_terminal_legacy_ssh(cx));
         }
     }
 
@@ -3379,6 +3438,39 @@ mod tests {
         ]
     }
 
+    /// 恢复会话时，标签名必须按真实视图重算，不能沿用会话文件里的快照。
+    ///
+    /// 回归价值：`from_session_state` 曾直接用 `tab.label` 建 `TabItem`，而注释
+    /// 声称"恢复完成后由 `refresh_all_tab_visuals` 重新计算"——但那条调用根本
+    /// 不存在。活动 tab 靠 attach 成功后发出的 `TabLabelChanged` 自我纠正，
+    /// **非活动标签组里的 tab 却不会被立即恢复**（它们以 `pending_session`
+    /// 惰性等待首次切换），于是永远等不到那次事件，一直显示旧快照。
+    ///
+    /// 旧版本把远端 core 面板存成 "Local Terminal"，这些 tab 重启后就一直是
+    /// "Local Terminal"——这正是用户报的现象。这里守两道：
+    /// 1. 远端 core 视图（`Attached` 类型 + 有 ssh_config）算出的是主机名；
+    /// 2. 恢复路径确实会重算（源码中必须存在该调用）。
+    #[test]
+    fn restoring_a_session_recomputes_tab_labels() {
+        // 第 2 道：恢复路径里必须调用 `refresh_all_tab_visuals`。
+        //
+        // 用源码断言而不是跑整个 `from_session_state`：后者要 `Window` 与
+        // 整棵 panel 树，成本远高于它守的这一行；而这一行一旦被删，标签
+        // 就退回旧快照，是个很难在测试里复现的静默回归。
+        let source = include_str!("workspace.rs");
+        let restore = source
+            .split("pub fn from_session_state")
+            .nth(1)
+            .expect("from_session_state 必须存在");
+        let body = &restore[..restore
+            .find("\n    /// 设置初始焦点")
+            .unwrap_or(restore.len())];
+        assert!(
+            body.contains("refresh_all_tab_visuals"),
+            "恢复会话后必须重算所有标签名，否则非活动组的 tab 会一直显示旧快照"
+        );
+    }
+
     /// 分屏必须继承源面板的会话类型：远程面板分屏出远程终端。
     ///
     /// 这条守的是一个具体回归：`split_selected_panel` 曾一律建本地终端，
@@ -3407,6 +3499,7 @@ mod tests {
             ),
             remote_cwd: Some("/srv".into()),
             use_system_proxy: false,
+            legacy_ssh: false,
         };
 
         assert!(

@@ -405,22 +405,22 @@ impl Panel {
                     });
                 }
                 TerminalViewEvent::SshReconnect { config } => {
-                    // SSH 连接断开，创建新的终端视图进行重连
-                    log::info!("Panel {}: SSH 连接断开，创建重连视图", close_panel_id);
-                    let remote_cwd = match view.read(cx).session_state(cx) {
-                        TerminalSessionState::Ssh { remote_cwd, .. } => remote_cwd,
-                        TerminalSessionState::Local { .. } => None,
-                    };
-                    // 主动终止被替换的旧终端（旧连接已断开，close 为幂等安全操作）
-                    view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
-                    let new_terminal_view =
-                        TerminalView::new_ssh_with_remote_cwd(cx, config, remote_cwd);
-                    // 重新订阅新 TerminalView 的事件
-                    Self::subscribe_terminal_events(&close_panel_id, &new_terminal_view, cx);
-                    // 更新 panel 内容
-                    this.set_content(PanelContent::Terminal(new_terminal_view), cx);
-                    // 新视图没有广播回调，若广播仍开启需要重新装配
-                    this.attach_broadcast_callback(cx);
+                    // 这条事件只由旧 SSH 传输发出；保持用户已经选择的兼容
+                    // 模式，不能借自动重连偷偷切回远端 core，反之亦然。
+                    log::info!(
+                        "Panel {}: 旧 SSH 连接断开，按原模式重连 {}",
+                        close_panel_id,
+                        config.host_label()
+                    );
+                    this.reconnect_terminal_legacy_ssh(cx);
+                }
+                TerminalViewEvent::RetryRemoteCore => {
+                    log::info!(
+                        "Panel {}: 重试远端 core 会话 {}",
+                        close_panel_id,
+                        this.ssh_config_id.as_deref().unwrap_or("unknown")
+                    );
+                    this.reconnect_terminal(cx);
                 }
                 TerminalViewEvent::RemoteOsDetected { os } => {
                     this.remote_os = Some(*os);
@@ -586,31 +586,69 @@ impl Panel {
         remote_cwd: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_ssh_terminal_mode(
+            panel_id,
+            workspace_id,
+            active_tab_id,
+            active_tab_label,
+            ssh_config,
+            remote_cwd,
+            false,
+            cx,
+        )
+    }
+
+    /// 同 [`Self::with_ssh_terminal`]，但可以指定**旧 SSH 模式**。
+    ///
+    /// 复制标签页/分屏必须把源面板的传输方式一起带过来：用户显式选了
+    /// 「旧 SSH 模式（不保活）」之后，复制出来的面板若静默变成远端 core，
+    /// 换的不只是实现，还多了一次"往远端装二进制"的动作。
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_ssh_terminal_mode(
+        panel_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        active_tab_id: Option<SharedString>,
+        active_tab_label: Option<SharedString>,
+        ssh_config: &crate::ssh::SshConnectionConfig,
+        remote_cwd: Option<String>,
+        legacy_ssh: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let panel_id = panel_id.into();
-        // 先试着放进守护进程：这样关掉 deepterm 时 SSH 连接不会断，远端的
-        // 长任务继续跑。失败（守护进程不可用）退回进程内 SSH——持久化是
-        // 增强，不能变成"连不上服务器"的新故障点。
         // 与本地终端同理：用最近一次布局的真实网格，避免先按 80 列建
         // 再重排。见 `create_terminal_view` 的说明。
         let (ssh_cols, ssh_rows) = TerminalView::grid_size_hint()
             .or_else(|| TerminalView::grid_size_from_active_window(cx))
             .unwrap_or((80, 24));
-        let terminal_view = match TerminalView::new_persistent_ssh(
-            cx,
-            ssh_config,
-            remote_cwd.clone(),
-            ssh_cols,
-            ssh_rows,
-        ) {
-            Ok(view) => view,
-            Err(e) => {
-                log::warn!("远程终端未交给守护进程（{e}），使用进程内 SSH");
-                if let Some(cwd) = remote_cwd {
-                    TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, Some(cwd))
-                } else {
-                    TerminalView::new_ssh(cx, ssh_config)
-                }
-            }
+        // 注意：这里**没有**「守护进程不可用就退回进程内 SSH」的兜底。
+        // 静默换传输方式正是本模块反复要避免的事——远端 core 起不来时
+        // 视图自己显示失败页并重试（`connect_remote_core`），由用户决定
+        // 要不要显式切到旧 SSH 模式。
+        let terminal_view = if legacy_ssh {
+            TerminalView::new_persistent_legacy_ssh(
+                cx,
+                ssh_config,
+                remote_cwd.clone(),
+                ssh_cols,
+                ssh_rows,
+            )
+            .unwrap_or_else(|e| {
+                log::warn!("旧 SSH 持久模式不可用（{e}），退回进程内 SSH");
+                let view =
+                    TerminalView::new_ssh_with_remote_cwd(cx, ssh_config, remote_cwd.clone());
+                view.update(cx, |this, _cx| {
+                    this.adopt_legacy_ssh_session(ssh_config.clone(), remote_cwd.clone());
+                });
+                view
+            })
+        } else {
+            TerminalView::new_remote_core_ssh(
+                cx,
+                ssh_config,
+                remote_cwd.clone(),
+                ssh_cols,
+                ssh_rows,
+            )
         };
         Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
         Self {
@@ -645,19 +683,59 @@ impl Panel {
         };
 
         let state = terminal_view.read(cx).session_state(cx);
-        // 主动终止被替换的旧终端，避免进程/连接泄漏（旧实体随后被 set_content 释放）
-        terminal_view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
+        if !state.legacy_ssh() && state.ssh_config().is_some() {
+            terminal_view.update(cx, |view, cx| view.retry_remote_core(cx));
+            cx.notify();
+            return;
+        }
         let new_terminal_view = match &state {
             TerminalSessionState::Ssh { remote_cwd, .. } => {
                 // 经 `ssh_config_with_proxy` 还原代理标记：重连必须与首次连接走
                 // 同一条传输路径，否则海外主机重连就退回直连。
                 let config = state.ssh_config_with_proxy().expect("Ssh 分支必有配置");
-                log::info!(
-                    "重新连接面板 {} 的 SSH 会话: {}",
-                    self.panel_id,
-                    config.host_label()
-                );
-                TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone())
+                if state.legacy_ssh() {
+                    log::info!(
+                        "以旧 SSH 模式重连面板 {} 的会话: {}",
+                        self.panel_id,
+                        config.host_label()
+                    );
+                    let (cols, rows) = TerminalView::grid_size_hint()
+                        .or_else(|| TerminalView::grid_size_from_active_window(cx))
+                        .unwrap_or((80, 24));
+                    TerminalView::new_persistent_legacy_ssh(
+                        cx,
+                        &config,
+                        remote_cwd.clone(),
+                        cols,
+                        rows,
+                    )
+                    .unwrap_or_else(|e| {
+                        log::warn!("旧 SSH 持久模式不可用（{e}），退回进程内 SSH");
+                        let view =
+                            TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone());
+                        view.update(cx, |this, _cx| {
+                            this.adopt_legacy_ssh_session(config.clone(), remote_cwd.clone());
+                        });
+                        view
+                    })
+                } else {
+                    log::info!(
+                        "重新连接面板 {} 的远端 core 会话: {}",
+                        self.panel_id,
+                        config.host_label()
+                    );
+                    let (cols, rows) = TerminalView::grid_size_hint()
+                        .or_else(|| TerminalView::grid_size_from_active_window(cx))
+                        .unwrap_or((80, 24));
+                    TerminalView::new_remote_core_ssh_resuming(
+                        cx,
+                        &config,
+                        remote_cwd.clone(),
+                        state.daemon_address().map(str::to_owned),
+                        cols,
+                        rows,
+                    )
+                }
             }
             TerminalSessionState::Local {
                 cwd, command, args, ..
@@ -676,9 +754,47 @@ impl Panel {
             }
         };
 
+        // 新视图建立后才结束旧视图：远端 core 重连失败时，旧画面至少还
+        // 能撑到错误页出现，不会先黑屏再报错。
+        terminal_view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
         Self::subscribe_terminal_events(&self.panel_id, &new_terminal_view, cx);
         self.set_content(PanelContent::Terminal(new_terminal_view), cx);
         // 新视图没有广播回调，若广播仍开启需要重新装配
+        self.attach_broadcast_callback(cx);
+        cx.notify();
+    }
+
+    /// 用户显式选择旧 SSH 兼容模式并重连。
+    pub fn reconnect_terminal_legacy_ssh(&mut self, cx: &mut Context<Self>) {
+        let Some(terminal_view) = self.content.terminal_view().cloned() else {
+            return;
+        };
+        let state = terminal_view.read(cx).session_state(cx);
+        let TerminalSessionState::Ssh { remote_cwd, .. } = &state else {
+            return;
+        };
+        let config = state.ssh_config_with_proxy().expect("Ssh 分支必有配置");
+        let (cols, rows) = TerminalView::grid_size_hint()
+            .or_else(|| TerminalView::grid_size_from_active_window(cx))
+            .unwrap_or((80, 24));
+        log::warn!(
+            "用户显式选择旧 SSH 模式: {}（该模式的远端任务不保证在关窗后继续）",
+            config.host_label()
+        );
+        let view =
+            TerminalView::new_persistent_legacy_ssh(cx, &config, remote_cwd.clone(), cols, rows)
+                .unwrap_or_else(|e| {
+                    log::warn!("旧 SSH 持久模式不可用（{e}），退回进程内 SSH");
+                    let view =
+                        TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone());
+                    view.update(cx, |this, _cx| {
+                        this.adopt_legacy_ssh_session(config.clone(), remote_cwd.clone());
+                    });
+                    view
+                });
+        terminal_view.update(cx, |tv, inner_cx| tv.kill(inner_cx));
+        Self::subscribe_terminal_events(&self.panel_id, &view, cx);
+        self.set_content(PanelContent::Terminal(view), cx);
         self.attach_broadcast_callback(cx);
         cx.notify();
     }
@@ -788,20 +904,66 @@ impl Panel {
             PanelContentSessionState::Terminal(TerminalSessionState::Ssh {
                 remote_cwd,
                 daemon_address,
+                daemon_grid,
+                legacy_ssh,
                 ..
             }) => {
                 let panel_id = state.id.clone();
 
+                // 经 `ssh_config_with_proxy` 还原代理标记：`config` 上的
+                // `use_system_proxy` 是 `serde(skip)` 的，标记存在会话状态的同级
+                // 字段里，不合回去的话恢复出来的海外主机是直连。
+                let config = state
+                    .content
+                    .ssh_config_with_proxy()
+                    .expect("Ssh 分支必有配置");
+
+                if !*legacy_ssh {
+                    // 默认远端 core 路径不能在 UI 线程做任何 attach。按 herdr
+                    // 的 pane 模型立即建视图，把保存的 `machine/tN` 交给它，
+                    // 由视图自己的后台任务接回；窗口和事件循环先保持可用。
+                    let (cols, rows) = (*daemon_grid)
+                        .or_else(|| hint.map(|hint| (hint.cols, hint.rows)))
+                        .or_else(TerminalView::grid_size_hint)
+                        .or_else(|| TerminalView::grid_size_from_active_window(cx))
+                        .unwrap_or((80, 24));
+                    let terminal_view = TerminalView::new_remote_core_ssh_resuming(
+                        cx,
+                        &config,
+                        remote_cwd.clone(),
+                        daemon_address.clone(),
+                        cols,
+                        rows,
+                    );
+                    Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
+                    let mut panel = Self::new_common(
+                        panel_id,
+                        workspace_id,
+                        active_tab_id,
+                        active_tab_label,
+                        PanelContent::Terminal(terminal_view),
+                        cx,
+                    );
+                    panel.ssh_config_id = Some(config.id());
+                    return panel;
+                }
+
                 // 先试着接回同一个 SSH 会话：远端的长任务还在跑，重连会让你
                 // 丢掉它（`htop` 退出、编译中断）。
                 if let Some(address) = daemon_address.as_deref()
-                    && let Some(config) = state.content.ssh_config_with_proxy()
                     && let Some(terminal_view) =
                         TerminalView::attach_existing(cx, address, None, None, &[], hint)
                 {
                     log::info!("已接回守护进程中的远程终端 {address}");
                     terminal_view.update(cx, |this, _cx| {
-                        this.adopt_ssh_session(config, remote_cwd.clone());
+                        // 守护进程里的终端无法自己记住它属于哪种传输模式；
+                        // 会话快照是唯一依据，漏了这个标记会让旧 SSH 标签在
+                        // 下次保存时被误记成远端 core。
+                        if *legacy_ssh {
+                            this.adopt_legacy_ssh_session(config.clone(), remote_cwd.clone());
+                        } else {
+                            this.adopt_ssh_session(config.clone(), remote_cwd.clone());
+                        }
                     });
                     Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
                     let mut panel = Self::new_common(
@@ -812,27 +974,51 @@ impl Panel {
                         PanelContent::Terminal(terminal_view),
                         cx,
                     );
-                    panel.ssh_config_id = Some(
-                        state
-                            .content
-                            .ssh_config_with_proxy()
-                            .map(|c| c.id())
-                            .unwrap_or_default(),
-                    );
+                    panel.ssh_config_id = Some(config.id());
                     return panel;
                 }
                 if daemon_address.is_some() {
                     log::info!("远程终端已不在守护进程中，重新连接 {}", state.id);
                 }
-                // 经 `ssh_config_with_proxy` 还原代理标记：`config` 上的
-                // `use_system_proxy` 是 `serde(skip)` 的，标记存在会话状态的同级
-                // 字段里，不合回去的话恢复出来的海外主机是直连。
-                let config = state
-                    .content
-                    .ssh_config_with_proxy()
-                    .expect("Ssh 分支必有配置");
-                let terminal_view =
-                    TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone());
+
+                let (cols, rows) = hint
+                    .map(|hint| (hint.cols, hint.rows))
+                    .or_else(TerminalView::grid_size_hint)
+                    .or_else(|| TerminalView::grid_size_from_active_window(cx))
+                    .unwrap_or((80, 24));
+                let terminal_view = if *legacy_ssh {
+                    // 旧模式只在用户曾显式选择过时恢复。持久守护进程不可用
+                    // 时退回进程内 SSH 仍是同一传输语义，因此允许；但必须
+                    // 继续打上 legacy 标记，否则下次保存会悄悄切回远端 core。
+                    let view = TerminalView::new_persistent_legacy_ssh(
+                        cx,
+                        &config,
+                        remote_cwd.clone(),
+                        cols,
+                        rows,
+                    )
+                    .unwrap_or_else(|e| {
+                        log::warn!("旧 SSH 持久模式不可用（{e}），退回进程内 SSH");
+                        let view =
+                            TerminalView::new_ssh_with_remote_cwd(cx, &config, remote_cwd.clone());
+                        view.update(cx, |this, _cx| {
+                            this.adopt_legacy_ssh_session(config.clone(), remote_cwd.clone());
+                        });
+                        view
+                    });
+                    view
+                } else {
+                    // 默认路径失败必须可见地失败，不能静默启动旧 SSH：
+                    // 那会让用户误以为远端任务仍由远端 core 保活。
+                    TerminalView::new_remote_core_ssh_resuming(
+                        cx,
+                        &config,
+                        remote_cwd.clone(),
+                        daemon_address.clone(),
+                        cols,
+                        rows,
+                    )
+                };
                 Self::subscribe_terminal_events(&panel_id, &terminal_view, cx);
                 let mut panel = Self::new_common(
                     panel_id,

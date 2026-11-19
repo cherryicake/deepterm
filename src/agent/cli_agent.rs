@@ -342,6 +342,58 @@ impl CLIAgent {
             .find(|a| a.aliases().contains(&token))
     }
 
+    /// argv 里**是否还认得出**这个 agent。
+    ///
+    /// 用来判断 hook 自报的身份是否已经过期：hook 只在 agent 自己发 OSC 777
+    /// 时更新，而 `AgentHookState` 没有清空路径，所以 claude 退出后它仍是
+    /// `Some(Claude)`。前台换成 nvim 时若继续采信它，标签就会"文字写 nvim、
+    /// 图标画 claude"。
+    ///
+    /// 与 [`Self::detect_from_argv_with`] 的区别：那个回答"是哪个 agent"，
+    /// 这个只回答"这个特定 agent 还在不在"，不需要认出别的 agent。
+    pub fn is_present_in(self, argv: &[String]) -> bool {
+        argv.iter().any(|token| {
+            let stem = base_stem(token).to_ascii_lowercase();
+            self.aliases().iter().any(|a| *a == stem)
+        })
+    }
+
+    /// 单个进程名是否命中这个 agent 的任一别名。
+    ///
+    /// 与 [`Self::is_present_in`] 的区别：入参已经是进程名，不再做路径/扩展名
+    /// 归一化，因此也不分配内存。给热路径（标签渲染）做"这是不是 agent"的
+    /// 快速判定用。
+    pub fn matches_token(self, token: &str) -> bool {
+        self.aliases().iter().any(|a| a.eq_ignore_ascii_case(token))
+    }
+
+    /// agent 自报的身份，与实测的前台 argv 相比**是否仍然可信**。
+    ///
+    /// 这是「图标停留在已经退出的 agent 上」这条 bug 的唯一判据，两端
+    /// （守护进程 `compose_terminal_meta` 与 GUI `foreground_program`）都
+    /// 必须用它，否则两边会得出不同结论。
+    ///
+    /// 规则：
+    /// - argv 为空 / 取不到 → **可信**（没有反证，保持原状）；
+    /// - argv 里还能找到这个 agent → **可信**（wrapper、被改名的二进制）；
+    /// - 前台程序完全认不出来 → **可信**（无法判断，宁可保留）；
+    /// - 前台是表里已知的**普通程序**（nvim / htop / bash…）→ **不可信**。
+    ///
+    /// 失效的根因：`AgentHookState::observe` 只在事件带 agent 时赋值，没有
+    /// 任何清空路径，所以 claude 退出后上报的身份会一直留着。
+    pub fn self_report_still_holds(self, argv: Option<&[String]>) -> bool {
+        let Some(argv) = argv.filter(|a| !a.is_empty()) else {
+            return true;
+        };
+        // 1. 前台进程链里还有它（wrapper、被改名的二进制）→ 可信。
+        if self.is_present_in(argv) {
+            return true;
+        }
+        // 2. 前台是表里**已知**的程序 → 身份已经过期，无论那是普通程序
+        //    （nvim / htop）还是另一个 agent（换人之后旧图标更不该留着）。
+        !crate::programs::is_recognized(argv)
+    }
+
     /// 从 argv 判断跑的是哪个 agent。
     ///
     /// `custom` 是用户配置的「包装器名 → agent slug」映射，用来覆盖自定义脚本。
@@ -813,6 +865,57 @@ mod tests {
 
     fn detect(parts: &[&str]) -> Option<CLIAgent> {
         CLIAgent::detect_from_argv_with(&argv(parts), &HashMap::new())
+    }
+
+    /// `self_report_still_holds` 决定图标会不会停在已经退出的 agent 上。
+    ///
+    /// 四种情形必须分清，否则要么图标不更新（旧 agent 一直画着），要么
+    /// wrapper 场景图标乱闪。
+    #[test]
+    fn a_stale_self_report_is_dropped_only_when_the_program_is_known() {
+        // 1. 还有它自己：可信。
+        assert!(CLIAgent::Claude.self_report_still_holds(Some(&argv(&["claude"]))));
+        assert!(
+            CLIAgent::Claude
+                .self_report_still_holds(Some(&argv(&["node", "/usr/local/bin/claude-code"])))
+        );
+        // 2. 已知的普通程序：过期（这正是"nvim 显示成 claude 图标"的场景）。
+        assert!(!CLIAgent::Claude.self_report_still_holds(Some(&argv(&["nvim", "x.rs"]))));
+        assert!(!CLIAgent::Claude.self_report_still_holds(Some(&argv(&["htop"]))));
+        // 3. 换成了另一个 agent：旧身份同样过期。
+        assert!(!CLIAgent::Claude.self_report_still_holds(Some(&argv(&["opencode"]))));
+        // 4. 完全认不出来：无法判断，保留（wrapper 场景不能乱闪）。
+        assert!(CLIAgent::Claude.self_report_still_holds(Some(&argv(&["my-private-agent"]))));
+        // 5. 没有 argv：无反证，保留。
+        assert!(CLIAgent::Claude.self_report_still_holds(None));
+        assert!(CLIAgent::Claude.self_report_still_holds(Some(&argv(&[]))));
+        // 6. 被解释器包着：前台是 `node`/`python`，真正的程序在参数里，
+        //    不能因为"认得 node"就判定身份过期（否则图标签片消失）。
+        assert!(
+            CLIAgent::Claude
+                .self_report_still_holds(Some(&argv(&["node", "/home/u/bin/my-agent.js"])))
+        );
+        assert!(
+            CLIAgent::Claude
+                .self_report_still_holds(Some(&argv(&["python3", "/home/u/bin/agent.py"])))
+        );
+    }
+
+    /// `is_present_in` 只在 argv 里真的还有这个 agent 时才为真。
+    ///
+    /// 回归价值：它用来判断 hook 自报的身份是否过期。写成
+    /// `detect_from_argv_with(argv).is_some()` 就错了——那只能说明"前台是
+    /// 某个 agent"，不能说明"前台还是**这个** agent"，换个 agent 之后旧身份
+    /// 仍然会被采信，图标就会停在早已退出的那个上。
+    #[test]
+    fn presence_requires_the_same_agent_not_just_any_agent() {
+        assert!(CLIAgent::Claude.is_present_in(&argv(&["claude", "--resume"])));
+        assert!(CLIAgent::Claude.is_present_in(&argv(&["node", "/usr/local/bin/claude-code"])));
+        // 换了另一个 agent：对 claude 来说已经不在场了。
+        assert!(!CLIAgent::Claude.is_present_in(&argv(&["opencode"])));
+        // 普通程序：不在场。
+        assert!(!CLIAgent::Claude.is_present_in(&argv(&["nvim", "src/main.rs"])));
+        assert!(!CLIAgent::Claude.is_present_in(&argv(&[])));
     }
 
     /// 每个 agent 的圆盘图形都必须在自己底色上看得清。
