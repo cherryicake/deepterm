@@ -123,21 +123,126 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  core:
+    name: Core ${{ matrix.archive }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            archive: deepcore-linux-x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: deepcore-linux-aarch64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential musl-tools pkg-config clang libclang-dev \
+            libfontconfig-dev libfreetype-dev libncurses-dev ncurses-bin \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcb-xkb-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libvulkan1 libdbus-1-dev \
+            libssl-dev libzstd-dev libasound2-dev
+
+      - name: Build static deepcore
+        shell: bash
+        run: |
+          target_env=$(echo "${{ matrix.target }}" | tr 'a-z-' 'A-Z_')
+          musl_self="$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained"
+          printf '%s\n' '#!/bin/sh' "exec musl-gcc -L\"$musl_self\" \"\$@\"" \
+            > /tmp/deepterm-musl-linker
+          chmod +x /tmp/deepterm-musl-linker
+          export "CARGO_TARGET_${target_env}_LINKER=/tmp/deepterm-musl-linker"
+          export "CC_${target_env}=musl-gcc"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          export RUST_FONTCONFIG_DLOPEN=1
+          cargo build --release --locked --bin deepcore --target "${{ matrix.target }}"
+
+          binary="target/${{ matrix.target }}/release/deepcore"
+          strip --strip-all "$binary"
+          file "$binary"
+          if readelf -d "$binary" 2>&1 | grep -q 'NEEDED'; then
+            echo "::error::${{ matrix.target }} 的 deepcore 仍是动态链接，不能作为远端发布包"
+            readelf -d "$binary" | grep NEEDED
+            exit 1
+          fi
+          size=$(stat -c%s "$binary")
+          if [ "$size" -gt $((128 * 1024 * 1024)) ]; then
+            echo "::error::${{ matrix.target }} 的 deepcore 为 $size 字节，超过 128 MiB 安装上限"
+            exit 1
+          fi
+
+          mkdir -p dist
+          tar -czf "dist/${{ matrix.archive }}.tar.gz" -C "target/${{ matrix.target }}/release" deepcore
+
+      - name: Upload core artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: dist/${{ matrix.archive }}.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish Release
-    needs: build
+    needs: [build, core]
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download installers
         uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
-      - name: Generate checksums
+      - name: Generate core manifest
+        shell: bash
         run: |
           cd dist
-          sha256sum * > SHA256SUMS.txt
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -n1)
+          x86_sha=$(sha256sum deepcore-linux-x86_64.tar.gz | awk '{print $1}')
+          arm_sha=$(sha256sum deepcore-linux-aarch64.tar.gz | awk '{print $1}')
+          base="https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          cat > deepcore-manifest.json <<EOF
+          {
+            "version": "$version",
+            "targets": {
+              "linux-x86_64": {
+                "url": "$base/deepcore-linux-x86_64.tar.gz",
+                "sha256": "$x86_sha"
+              },
+              "linux-aarch64": {
+                "url": "$base/deepcore-linux-aarch64.tar.gz",
+                "sha256": "$arm_sha"
+              }
+            }
+          }
+          EOF
+
+          # manifest 本身也要进校验清单，避免发布后文件被静默替换。
+          find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%f\n' \
+            | sort \
+            | xargs sha256sum > SHA256SUMS.txt
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

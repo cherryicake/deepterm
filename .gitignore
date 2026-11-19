@@ -15,3 +15,5 @@
 .qoder/
 /nvim.log
 .openidea/
+.agents/
+skills-lock.json

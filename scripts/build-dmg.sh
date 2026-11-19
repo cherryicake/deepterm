@@ -33,6 +33,10 @@ rm -rf "${PROJECT_DIR}/${APP_BUNDLE}"
 # Build release binary with bundle
 echo -e "${GREEN}Building release bundle...${NC}"
 cd "$PROJECT_DIR"
+# `cargo bundle --bin deepterm` builds only the GUI. Build both release
+# binaries explicitly so the nested core can never be an older artifact left
+# over from a previous build.
+cargo build --release --bins
 # **必须显式指定 --bin deepterm**：cargo-bundle 在有多个二进制时会自己
 # 挑一个（这里挑成了 deepcore），导致 bundle 的 CFBundleExecutable 指向
 # 守护进程、GUI 二进制根本没进包——应用在 Dock 里点不开。
@@ -48,21 +52,31 @@ fi
 echo "Preparing app bundle..."
 cp -R "${BUNDLE_DIR}/${APP_BUNDLE}" "${PROJECT_DIR}/${APP_BUNDLE}"
 
-# 终端守护进程要进 Contents/MacOS/（与主可执行文件同目录）。
-#
-# cargo-bundle 只打包 `package.metadata.bundle` 里那一个二进制，不会带上
-# 别的。缺了它，应用能开窗，但"关掉窗口终端继续跑"会静默失效——
-# 客户端找不到 deepcore 就退回进程内 PTY（这是有意的降级），
-# 用户只会觉得功能没做。
+# 终端守护进程必须是**独立 app bundle**，不能只作为 DeepTerm.app 里的裸
+# Mach-O。macOS 的本地网络授权按 app 身份与 responsibility 归属；裸 core
+# 会继承 DeepTerm.app，GUI 退出后授权失效。结构照 herdr-core：独立
+# CFBundleIdentifier、独立 Info.plist、独立签名，再由 launchd 脱离 GUI
+# coalition。
 CORE_BIN="${PROJECT_DIR}/target/release/deepcore"
 if [ ! -f "${CORE_BIN}" ]; then
     echo -e "${RED}Error: deepcore not found at ${CORE_BIN}${NC}"
     echo "Run: cargo build --release --bins"
     exit 1
 fi
-cp "${CORE_BIN}" "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/deepcore"
-chmod +x "${PROJECT_DIR}/${APP_BUNDLE}/Contents/MacOS/deepcore"
-echo -e "${GREEN}deepcore bundled.${NC}"
+CORE_APP="${PROJECT_DIR}/${APP_BUNDLE}/Contents/Resources/DeepTerm Core.app"
+mkdir -p "${CORE_APP}/Contents/MacOS"
+cp "${CORE_BIN}" "${CORE_APP}/Contents/MacOS/deepcore"
+chmod +x "${CORE_APP}/Contents/MacOS/deepcore"
+CORE_VERSION=$("${CORE_BIN}" --version | awk '{print $2}')
+sed "s/@VERSION@/${CORE_VERSION}/g" \
+    "${PROJECT_DIR}/distribution/macos-core-Info.plist" \
+    > "${CORE_APP}/Contents/Info.plist"
+# Bind the stable identifier to the executable and then to its app bundle.
+# A future Developer ID build keeps this same identifier for TCC persistence.
+codesign --force --sign - --identifier dev.deepterm.core \
+    "${CORE_APP}/Contents/MacOS/deepcore"
+codesign --force --sign - "${CORE_APP}"
+echo -e "${GREEN}DeepTerm Core.app bundled and signed.${NC}"
 
 # Compile terminfo into app bundle (matching Alacritty's build process)
 echo "Compiling terminfo..."
@@ -83,8 +97,9 @@ PLIST="${PROJECT_DIR}/${APP_BUNDLE}/Contents/Info.plist"
 LOCAL_NET_DESC="DeepTerm 需要访问本地网络,以连接局域网中的 SSH 服务器。"
 /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string ${LOCAL_NET_DESC}" "${PLIST}" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription ${LOCAL_NET_DESC}" "${PLIST}"
-# Re-sign ad-hoc so the bundle signature matches the patched Info.plist
-codesign --force --deep --sign - "${PROJECT_DIR}/${APP_BUNDLE}"
+# The nested core is already signed. Sign only the outer bundle so codesign
+# does not replace the core's independently bound identifier.
+codesign --force --sign - "${PROJECT_DIR}/${APP_BUNDLE}"
 
 # Create DMG using create-dmg if available, otherwise use hdiutil
 if command -v create-dmg &> /dev/null; then

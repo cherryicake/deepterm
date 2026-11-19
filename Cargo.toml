@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 build = "build.rs"
+repository = "https://github.com/cherryicake/deepterm"
 
 [dependencies]
 gpui = { git = "https://github.com/zed-industries/zed.git", rev = "d25fa01ccd788d812f236810b71af4feff6b2e38" }
@@ -45,14 +46,22 @@ tokio-util = { version = "0.7", features = ["compat"] }
 #
 # feature 按平台显式声明各自的后端：macOS 是 Keychain、Windows 是 Credential
 # Manager、linux 是 freedesktop Secret Service（GNOME Keyring / KWallet 的共同
-# 后端）。
+# 后端）。Linux 远端 core 是静态 musl 产物，不能链接系统 libdbus；
+# `async-secret-service` 走纯 Rust 的 zbus，保持同一套 Secret Service
+# 语义与同步 `Entry` API，同时不把系统 C 库带进 core 发布包。
 #
 # 注意这不是「漏了某个平台就一定不能用」——实测 keyring 3.6 在 Windows 上即使
 # 只开 `apple-native` 也能正常读写 Credential Manager（库内有兜底）。显式列出
 # 的价值在于两点：一是 linux 侧确实需要一个真实后端（`linux-native` 是
 # keyutils，属于**会话级**内存键环、重启即失，承担不了「记住 SSH 密码」，所以
 # 选 Secret Service）；二是让依赖关系写在明面上，而不是依赖库的隐式兜底行为。
-keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = { version = "3.6", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "async-io",
+    "crypto-rust",
+] }
 
 # Async runtime compatibility
 tokio = { version = "1", features = [
@@ -87,6 +96,11 @@ pulldown-cmark = "0.12"
 # 后端 + 内置根证书，纯 Rust，不依赖系统 OpenSSL/SChannel）与 `gzip`。
 # 只用于 markdown 图片加载，不参与启动路径。
 ureq = { version = "3.5", default-features = false, features = ["rustls", "gzip"] }
+
+# 远端 core 发布包：manifest 里带 SHA-256，下载后必须在本地校验通过
+# 才允许上传；tar 只用于从固定布局的 release archive 中取出 deepcore。
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
 
 # Utility
 memchr = "2"

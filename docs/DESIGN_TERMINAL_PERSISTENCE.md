@@ -137,13 +137,23 @@ kitty 图形单独处理：守护进程自己跑一份扫描器维护共享存�
 ### 4.2 进程与 IPC
 
 ```
-deepterm (GUI)                    deepcore (守护进程)
-    │  Unix socket: $XDG_RUNTIME_DIR/deepterm/daemon.sock
-    │  Windows: \\.\pipe\deepterm-daemon
+deepterm (GUI)
+    │ 启动子进程，读写它的 stdin/stdout
     ▼
-    └──────── 9 字节头分帧 ────────▶ 终端注册表
-                                       └── 每终端一个 Pty + Term + poller 线程
+deepcore connect ── Unix socket / Named Pipe ──▶ deepcore (core)
+    │                                              │
+    └──────── 9 字节头分帧，原样中继 ──────────────┘
+                                                   │
+                         ┌─────────────────────────┴─────────────────────────┐
+                         ▼                                                   ▼
+              deepcore --holder --socket holder.<id>.sock      holder.sock（旧版）
+                   └── Pty + Term + poller                         └── Pty + Term + poller
 ```
+
+GUI 不直接持有 socket：它启动 `deepcore connect`，只面对两根管道。这与
+herdr 的 `hc connect` 同构，也为后续“通过 SSH channel 执行远端
+`deepcore connect`”留下同一条传输路径。`connect` 只做字节中继，不解析业务
+帧，也不替 GUI 完成 `hello`。
 
 **两个独立二进制**，源码在 `src/bin/deepterm.rs` 与 `src/bin/deepcore.rs`：
 
@@ -174,11 +184,43 @@ deepterm (GUI)                    deepcore (守护进程)
 （deb 的 `/usr/bin`、macOS 的 `Contents/MacOS/`、Windows 的安装目录），
 所以"同目录"覆盖绝大多数情况。
 
-启动时自动拉起：连不上就 `Command::new(current_exe).arg("__daemon")` 后台起，
-再重试连接。
+启动时自动拉起：GUI 启动 `deepcore connect`；桥连不上 core 时就拉起
+`deepcore`，等 socket 就绪后转发。core 第一次需要终端时再拉起 holder。
 
-**协议**：长度前缀帧（4 字节小端长度 + JSON），与 herdr 的 framed 模式同构。
-每个终端一条逻辑 channel，二进制数据走独立的帧类型避免 base64 膨胀。
+**协议**：9 字节头（channel `u32` + kind `u8` + payload 长度 `u32`），与
+herdr 的 framed 模式同构。控制面是 channel 0 上的 JSON，终端字节走独立
+channel 与 `Data` 帧，避免 base64 膨胀。
+
+### 4.2.1 多 holder、构建指纹与 drain（对齐 herdr）
+
+早期实现固定复用 `holder.sock`，core 升级后仍会连回旧 holder。旧 holder
+没有 `Meta` 能力，于是 GUI 重启后终端画面能回来，但 Tab 的程序名、图标和
+agent 状态回不来。这与 herdr 的 holder 升级模型不一致：**旧 holder 可以
+继续持有旧终端，但新终端必须进入新构建的 holder。**
+
+现在的规则：
+
+- core 启动时扫描运行时目录里的 `holder.sock` 与所有 `holder.<id>.sock`，
+  逐个鉴权接管。新 holder 使用随机唯一 socket；旧版固定 socket 仍可接管。
+- holder 的 `hello` 返回 `build` / `pid` / `draining`。`build` 是当前可执行
+  文件 SHA-256 的前 32 位（同一台机器内比较），因此同一版本号的不同构建
+  也能区分。旧 holder 没有 `build`，按空字符串处理。
+- 只有 `build == 当前 core 的 build` 且未 drain 的 holder 是 current。新
+  终端只交给 current holder；同一构建出现多个 current 时只保留一个，其余
+  收到 drain。
+- 旧构建或空构建的 holder 仍被接管：它的终端可以 `list`/`attach`/输入，
+  但永远不再接收新终端。drain 不结束现有程序，只关闭“接新终端”的入口。
+- `tN` 地址由 core 全局分配，而不是每个 holder 从 `t1` 开始。core 保存
+  `地址 → holder` 映射与已用编号高水位，所有 `attach`/`write`/`resize`/
+  `close` 先查映射再转发；接管旧 holder 时也会据其终端清单抬高水位。
+
+因此升级后的状态是“新旧 holder 并存”：旧终端原地继续跑，新开的终端落到
+新 holder 并具备完整 Meta。等旧终端全部退出、旧 holder 空闲退出后，运行
+时目录里只剩新 holder。
+
+**能力边界**：旧 holder 的既有终端在升级前没有保存过前台程序与 agent
+快照，新 core 无法事后补出这段信息。它们仍能恢复画面和交互，但 Tab 的
+程序/状态可能退回 shell 默认值；升级后新开的终端不受影响。
 
 ### 4.3 客户端挂接
 
@@ -204,35 +246,55 @@ deepterm (GUI)                    deepcore (守护进程)
 标签/面板的布局照旧从 `session_state.json` 读；与 herdr 把布局放进 core
 不同，deepterm 单机使用，本地文件已经够了，且能省掉 CAS 那一套。
 
-### 4.5 SSH 远程终端（已实施）
+### 4.4.1 Tab 程序与 agent 状态的快照重放
 
-远程终端本质就是"PTY 里跑 `ssh`"，所以**不需要新机制**：守护进程照常
-起一条 PTY，只不过里面跑的是 `ssh` 而不是 shell。
+挂接式终端没有 PTY master fd，GUI 自己无法执行 `tcgetpgrp` 或读取前台
+argv。这部分状态必须由 holder 持有并通过 `Kind::Meta` 下发。`TerminalMeta`
+包含：
 
-- `SshPtyTerminal::build_ssh_command` 被抽成独立函数，进程内路径与守护
-  进程路径共用同一份参数构造（StrictHostKeyChecking 策略、超时、保活、
-  代理、端口转发）。两边各写一份迟早会漂移，表现成"同一台主机在持久化
-  模式下连法不一样"。
-- spawn 请求新增 `env` 与 `remote` 两个字段：
-  - `env` 传 `SSHPASS` 等**凭据**。这些值只随这一次请求发出，守护进程
-    交给子进程环境后就不再保留，**绝不写进终端记录**（`terminals.json`
-    是同机可读的）。
-  - `remote: true` 表示"别套本地 shell integration"——远程主机上没有
-    deepterm 的集成脚本，注入 `ZDOTDIR`/`ENV` 只会把对方 shell 弄坏。
-- 会话状态里 `Ssh` 分支也带 `daemon_address`，恢复时优先挂接；接不上
-  才重连（重连会让远端的 `htop` 退出、编译中断）。
+- `foreground`：前台进程名；
+- `argv`：前台进程完整 argv，用于图标与 agent 识别；
+- `agent`：argv 识别出的 CLI agent（识别不到时用 hook 自报兜底）；
+- `agent_session`：agent 的 `Working` / `Waiting` / `Done` 等回合状态。
 
-**没有做的事：向远端部署 `deepcore`。** herdr 的做法是远端跑它自己的
-core（`hc machine add` 会用 `curl | sh` 装一个），那样终端进程才真正在
-远端机器上。deepterm 现阶段不这么做，理由：
+holder 每 500ms 用纯 syscall 探测一次前台进程，只在变化时广播；同时旁路
+扫描 PTY 输出里的 OSC 777 hook 事件。**即使没有任何 GUI 订阅者，holder 也
+会更新并保存这份状态。** 新订阅者 attach 后，`subscribe` 会先补发一帧
+完整 `Meta` 快照，再发送屏幕重绘与增量输出；因此 GUI 重启不需要等 agent
+下一次 hook，Tab 就能立刻恢复程序图标和状态点。前台确认回到 shell 时会
+同时清空 agent 身份与状态，避免留下永远不灭的状态点。
 
-1. 没有发布站，`curl | sh` 这条路不通；
-2. 传自编译二进制要面对 glibc 兼容（本机 2.39 vs 远端 2.35 起不来），
-   得先做 musl 静态构建；
-3. 收益只在"本机断网后远端进程仍要活着"时才体现。
+### 4.5 SSH 远程终端（默认远端 core，旧路径为显式降级）
 
-本方案下关闭 deepterm 不中断 SSH 连接，远端的 `htop`、长编译照常跑——
-"关掉 GUI 终端不死"这条需求已经满足。
+默认路径与 herdr 同构：本地 core 经 russh 建立 SSH channel，在远端执行
+`deepcore connect`，帧协议跑在 stdin/stdout 上。PTY、屏幕历史与程序都由
+远端 core/holder 持有，因此本机 GUI/core 重启或 SSH 传输断开后，远端任务
+仍在；line 恢复后按原 `<machine>/tN` 地址重新 attach。
+
+- 认证继续使用 DeepTerm 现有的 Keychain/密码、host-key 校验、代理与超时
+  配置，不改为系统 OpenSSH 的交互登录。
+- 远端 core 由 GitHub Release 的 Linux `x86_64`/`aarch64` musl 产物安装：
+  manifest + SHA-256 → SFTP 临时文件 → `--version` 探针 → 原子替换。版本
+  不一致自动更新，只停旧 core、不碰 holder。
+- Linux 有 systemd user manager 时用 `systemd-run --user` 托管 core/holder，
+  并通过 `loginctl enable-linger` 与状态上报处理 SSH 登出后的保活；没有
+  user manager 时回退 `setsid`，此时无法证实登出后仍存活，状态上报 `null`。
+
+旧的“本地 holder 的 PTY 里跑 `ssh`”保留为**显式降级选项**。它仍然复用
+`SshPtyTerminal::build_ssh_command` 的同一份参数构造（StrictHostKeyChecking
+策略、超时、保活、代理、端口转发）；两边各写一份迟早会漂移。该路径的
+spawn 请求带 `env`/`remote`：
+
+- `env` 传 `SSHPASS` 等**凭据**。这些值只随这一次请求发出，守护进程交给
+  子进程环境后就不再保留，**绝不写进终端记录**（`terminals.json` 是同机
+  可读的）。
+- `remote: true` 表示"别套本地 shell integration"——远程主机上没有 deepterm
+  的集成脚本，注入 `ZDOTDIR`/`ENV` 只会把对方 shell 弄坏。
+- 会话状态里 `Ssh` 分支带 `daemon_address`，恢复时优先挂接；接不上才重连
+  （旧路径重连会让远端的 `htop` 退出、编译中断）。
+
+远端 core 失败时不会静默切到旧路径：默认路径显示错误，旧路径只能由用户在
+标签菜单中显式选择“以旧 SSH 模式重连（不保活）”。
 
 ### 4.6 Windows（已实现，未验证）
 
@@ -824,6 +886,16 @@ shell 的绿色终端方块；程序本身活得好好的（接回来能继续�
 - `daemon::{terminal,client}::tests::buffered_frames_keep_their_kind`
   钉住"缓冲不能把 Meta 压成 Data"。
 
+agent 状态也属于同一份快照：holder 在无 GUI 时继续解析 OSC 777，
+`subscribe` 时把 `agent` 与 `agent_session` 连同 `foreground`/`argv` 一起
+补发。回归测试
+`a_late_subscriber_gets_agent_identity_and_turn_status` 钉住了
+`Working`/`Waiting` 状态不会等到下一次 hook 才出现。
+
+旧 holder 不具备这套 Meta/OSC 记录能力，因此升级前已经在旧 holder 里运行
+的终端无法事后恢复准确的程序名与 agent 状态；它们仍可接回并继续运行。
+必须新开终端，才能进入新当前构建的 holder 并获得完整恢复能力。
+
 ## 6.13 关窗再开就卡死：订阅者从不退订，额度只减不增
 
 §6.11 的开闸改造解决了"首屏能不能到"，这一节是它的**下半场**：首屏到了，
@@ -1028,9 +1100,9 @@ holder 用 `pre_exec(setsid)` 脱离 core 的会话。只脱离会话还不够�
 
 | | core | holder |
 | --- | --- | --- |
-| socket | `daemon.sock` | `holder.sock` |
-| pid | `daemon.pid` | `holder.pid` |
-| token | `daemon.token` | `holder.token` |
+| socket | `daemon.sock` | 旧版 `holder.sock`；新版 `holder.<id>.sock` |
+| pid | `daemon.pid` | 与 socket 同名，如 `holder.<id>.pid` |
+| token | `daemon.token` | 与 socket 同名，如 `holder.<id>.token` |
 | 日志 | `deepcore.log` | `holder.log` |
 
 这三个"按 socket 名区分"的文件都曾经是共用的，每一个都造成过真实故障：
