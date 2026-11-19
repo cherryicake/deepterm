@@ -3,15 +3,28 @@
 //! 与 `server.rs`（纯逻辑的请求分发）分开：这里全是 IO 与线程，
 //! 那边是可以单测的决策逻辑。
 
+use std::collections::HashMap;
 use std::io::BufWriter;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Value, json};
 
+use super::identity::ServerIdentity;
+use super::machines::Machines;
 use super::protocol::{CONTROL, Frame, Kind, read_frame};
 use super::registry::Registry;
 use super::server::handle_request;
+
+/// 一个 GUI channel 指向的 holder 与 holder 侧 channel。
+///
+/// 多个 holder 并存后，只记 channel 号已经不够：两个 holder 的 channel 都
+/// 从 1 开始，必须同时记“哪一条 holder 连接”。
+#[derive(Clone)]
+struct HolderRoute {
+    holder: Arc<super::core_holder::HolderClient>,
+    channel: u32,
+}
 
 /// 终端操作的实际执行者。
 ///
@@ -27,11 +40,16 @@ pub enum Backend {
 }
 
 /// 每个连接独立的状态。
+///
+/// 控制请求与数据帧在同一个连接上并行处理：远端 SSH 请求可能在网络抖动时
+/// 阻塞数秒，不能让它占住连接读循环，否则本地终端的按键和 resize 会排在
+/// 它后面。herdr 的 `server.rs` 对每条控制请求单独 `spawn`，这里用同构的
+/// 一线程一请求模型；状态按字段加锁，SSH 调用期间不持有任何路由锁。
 struct Connection {
     /// 下一个要分配的终端 channel（避开 0，那是控制面）。
-    next_channel: u32,
+    next_channel: AtomicU32,
     /// channel → 终端地址。
-    channels: std::collections::HashMap<u32, String>,
+    channels: Mutex<HashMap<u32, String>>,
     /// 本连接 channel → **holder 侧** channel。
     ///
     /// # 为什么需要这张表
@@ -48,9 +66,16 @@ struct Connection {
     ///
     /// 现在严格按 holder 回复里的 channel 号订阅，再用这张表把数据帧的
     /// channel 号**改写回本连接的编号**，GUI 侧的路由才认得。
-    holder_channels: std::collections::HashMap<u32, u32>,
+    holder_channels: Mutex<HashMap<u32, HolderRoute>>,
+    /// 本连接 channel → 远端终端订阅（每台机器共享 line，channel 各自独立）。
+    remote_channels: Mutex<HashMap<u32, super::machines::RemoteAttachment>>,
     /// 客户端订阅的输出。
     outgoing: async_channel::Sender<Frame>,
+    /// 本地终端订阅：channel → (地址, `Registry` 订阅 id)。
+    ///
+    /// 以 channel 为键而不是地址：同一个终端可以有多个挂接，退订时必须只
+    /// 退掉对应 channel，不能误伤另一个窗口。
+    attachments: Mutex<HashMap<u32, (String, u64)>>,
     /// 已挂接但**数据流还没开闸**的订阅票据。
     ///
     /// # 为什么需要开闸
@@ -65,7 +90,53 @@ struct Connection {
     ///
     /// 这里对齐同一策略：attach 时把 channel 记进这个集合，转发层看到它就
     /// 把帧压住；回复写进 outgoing 之后立刻移除，开始放行。
-    paused: Vec<u64>,
+    paused: Mutex<HashMap<u32, u64>>,
+}
+
+impl Connection {
+    fn new(outgoing: async_channel::Sender<Frame>) -> Self {
+        Self {
+            next_channel: AtomicU32::new(1),
+            channels: Mutex::new(HashMap::new()),
+            holder_channels: Mutex::new(HashMap::new()),
+            remote_channels: Mutex::new(HashMap::new()),
+            outgoing,
+            attachments: Mutex::new(HashMap::new()),
+            paused: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allocate_channel(&self) -> u32 {
+        self.next_channel.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn remote_attachment(&self, channel: u32) -> Option<super::machines::RemoteAttachment> {
+        lock(&self.remote_channels).get(&channel).cloned()
+    }
+
+    fn holder_route(&self, channel: u32) -> Option<HolderRoute> {
+        lock(&self.holder_channels).get(&channel).cloned()
+    }
+
+    fn channel_address(&self, channel: u32) -> Option<String> {
+        lock(&self.channels).get(&channel).cloned()
+    }
+
+    fn attachment_id(&self, channel: u32) -> Option<u64> {
+        lock(&self.attachments).get(&channel).map(|(_, id)| *id)
+    }
+
+    fn pause(&self, channel: u32, ticket: u64) {
+        lock(&self.paused).insert(channel, ticket);
+    }
+
+    fn take_paused(&self, channel: u32) -> Option<u64> {
+        lock(&self.paused).remove(&channel)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// 在已建立的连接上跑完整生命周期。
@@ -77,7 +148,9 @@ pub fn serve_connection(
     registry: Arc<Registry>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     backend: Backend,
+    machines: Arc<Machines>,
     socket_path: std::path::PathBuf,
+    identity: Arc<ServerIdentity>,
 ) {
     let write_stream = match super::transport::try_clone(&stream) {
         Ok(s) => s,
@@ -108,23 +181,19 @@ pub fn serve_connection(
         }
     };
 
-    let mut conn = Connection {
-        next_channel: 1,
-        channels: std::collections::HashMap::new(),
-        holder_channels: std::collections::HashMap::new(),
-        outgoing: out_tx.clone(),
-        paused: Vec::new(),
-    };
+    let conn = Arc::new(Connection::new(out_tx.clone()));
 
     let mut reader = stream;
-    let mut attachments: Vec<(String, u64)> = Vec::new();
+    // 控制请求各自执行；读循环只继续接收输入和 resize。连接关闭时再统一
+    // 等这些请求结束，避免它们在本连接清理后又注册回一条死连接。
+    let mut controls: Vec<std::thread::JoinHandle<()>> = Vec::new();
 
     // 鉴权：第一条控制帧必须是带正确 token 的 `hello`。
     //
     // 本地 socket 有 0700 目录保护，但远端部署走 TCP，`127.0.0.1:port`
     // 对同机所有用户开放——不验 token 的话，服务器上任何人都能连上来
     // 拿到别人的全部终端。
-    if !authenticate(&mut reader, &mut conn, &socket_path) {
+    if !authenticate(&mut reader, &conn, &socket_path, &identity) {
         return;
     }
 
@@ -145,29 +214,58 @@ pub fn serve_connection(
             // 控制请求。
             Kind::Json if frame.channel == CONTROL => {
                 let request: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                let mut response =
-                    dispatch_with(&registry, &request, &mut conn, &mut attachments, backend);
-                // 回填请求 id：客户端按 id 匹配回复，不回填的话它会一直等到
-                // 超时再失败——表现为"守护进程明明起来了，终端却退回进程内"，
-                // 而且日志里什么都看不到（超时是正常错误路径）。
-                if let Some(id) = request.get("id")
-                    && let Some(object) = response.as_object_mut()
-                {
-                    object.insert("id".into(), id.clone());
-                }
-                let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
-                if conn.outgoing.try_send(Frame::json(bytes)).is_err() {
-                    break;
-                }
-                // 回复已经排进 outgoing：可以放行这次 attach 的数据流了。
-                //
-                // 客户端此刻才可能拿到 channel 号并登记路由，所以顺序是
-                // "回复先入队、随后放行"。与 herdr 的 `out.resume` 同一位置
-                // （`server.rs:385`）。
-                if !conn.paused.is_empty() {
-                    let opened: Vec<u64> = conn.paused.drain(..).collect();
-                    if let Some(holder) = super::core_holder::holder() {
-                        holder.resume(opened);
+                // 与 herdr `server.rs:361-398` 相同：每条 call 独立执行，
+                // 一条慢请求不能挡住连接上的后续输入或其他请求。
+                let worker_conn = conn.clone();
+                let worker_registry = registry.clone();
+                let worker_machines = machines.clone();
+                let worker_identity = identity.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("daemon-conn-rpc".into())
+                    .spawn(move || {
+                        let mut response = match request.get("op").and_then(Value::as_str) {
+                            Some("server.status") => server_status(&worker_identity, &request),
+                            _ => dispatch_with(
+                                &worker_registry,
+                                &request,
+                                &worker_conn,
+                                backend,
+                                &worker_machines,
+                            ),
+                        };
+                        // 回填请求 id：客户端按 id 匹配回复，不回填的话它会
+                        // 一直等到超时再失败。
+                        if let Some(id) = request.get("id")
+                            && let Some(object) = response.as_object_mut()
+                        {
+                            object.insert("id".into(), id.clone());
+                        }
+                        let resumed = response
+                            .get("channel")
+                            .and_then(Value::as_u64)
+                            .and_then(|channel| worker_conn.take_paused(channel as u32));
+                        let bytes =
+                            serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+                        if worker_conn.outgoing.try_send(Frame::json(bytes)).is_ok()
+                            && let Some(ticket) = resumed
+                            && let Some(route) = worker_conn.holder_route(
+                                response
+                                    .get("channel")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default() as u32,
+                            )
+                        {
+                            // 回复已经入队后才放行这一个 attach 的数据流。
+                            // 不能像旧的串行实现那样一次 drain 全部票据：并发
+                            // attach 时那会把别的 channel 也提前开闸。
+                            route.holder.resume(vec![ticket]);
+                        }
+                    });
+                match spawned {
+                    Ok(handle) => controls.push(handle),
+                    Err(error) => {
+                        log::error!("无法启动控制请求线程: {error}");
+                        break;
                     }
                 }
             }
@@ -185,6 +283,16 @@ pub fn serve_connection(
             // 输出量大的场景，1 MiB 很快用尽，之后**所有输出都被丢弃**，
             // 界面从此不再刷新，看起来就是"卡死"。
             Kind::Data | Kind::Resize => {
+                if let Some(remote) = conn.remote_attachment(frame.channel) {
+                    if frame.kind == Kind::Resize {
+                        if let Some((cols, rows, _, _)) = Frame::decode_resize(&frame.payload) {
+                            remote.resize(cols, rows, frame.payload);
+                        }
+                    } else {
+                        remote.send(frame.kind, frame.payload);
+                    }
+                    continue;
+                }
                 if backend == Backend::Holder {
                     // **改写成本连接的 channel → holder 的 channel。**
                     //
@@ -192,7 +300,7 @@ pub fn serve_connection(
                     // 编号。两者是独立递增的，不改写就等于把输入发给一个
                     // 不存在/别的终端的 channel——表现为"接回来了、画面也在，
                     // 但打字没反应"。
-                    let Some(&holder_channel) = conn.holder_channels.get(&frame.channel) else {
+                    let Some(route) = conn.holder_route(frame.channel) else {
                         log::debug!(
                             "未知的本地 channel {}，{:?} 丢弃",
                             frame.channel,
@@ -200,19 +308,15 @@ pub fn serve_connection(
                         );
                         continue;
                     };
-                    if let Some(holder) = super::core_holder::holder() {
-                        let _ = holder.send(Frame::new(
-                            holder_channel,
-                            frame.kind,
-                            frame.payload.clone(),
-                        ));
-                    } else {
-                        log::warn!("holder 不可用，{:?} 被丢弃", frame.kind);
-                    }
+                    let _ = route.holder.send(Frame::new(
+                        route.channel,
+                        frame.kind,
+                        frame.payload.clone(),
+                    ));
                     continue;
                 }
-                if let Some(address) = conn.channels.get(&frame.channel)
-                    && let Some(handle) = registry.get(address)
+                if let Some(address) = conn.channel_address(frame.channel)
+                    && let Some(handle) = registry.get(&address)
                 {
                     match frame.kind {
                         Kind::Data => handle.write_input(frame.payload),
@@ -232,29 +336,27 @@ pub fn serve_connection(
             }
 
             Kind::Credit => {
+                if let Some(remote) = conn.remote_attachment(frame.channel) {
+                    remote.send(frame.kind, frame.payload);
+                    continue;
+                }
                 // core 只是管道：信用回执必须转给 holder，否则 holder 侧
                 // 的额度只减不增，用尽后输出永久被丢弃（界面"卡死"）。
                 if backend == Backend::Holder {
                     // 同样要改写 channel 号，理由见上面 Data/Resize 分支。
-                    let Some(&holder_channel) = conn.holder_channels.get(&frame.channel) else {
+                    let Some(route) = conn.holder_route(frame.channel) else {
                         continue;
                     };
-                    if let Some(holder) = super::core_holder::holder() {
-                        let _ = holder.send(Frame::new(
-                            holder_channel,
-                            frame.kind,
-                            frame.payload.clone(),
-                        ));
-                    }
+                    let _ = route.holder.send(Frame::new(
+                        route.channel,
+                        frame.kind,
+                        frame.payload.clone(),
+                    ));
                     continue;
                 }
-                if let Some(address) = conn.channels.get(&frame.channel)
-                    && let Some(handle) = registry.get(address)
-                    && let Ok(id) = attachments
-                        .iter()
-                        .find(|(a, _)| a == address)
-                        .map(|(_, id)| *id)
-                        .ok_or(())
+                if let Some(address) = conn.channel_address(frame.channel)
+                    && let Some(handle) = registry.get(&address)
+                    && let Some(id) = conn.attachment_id(frame.channel)
                     && frame.payload.len() >= 4
                 {
                     let n = u32::from_le_bytes(frame.payload[0..4].try_into().expect("已判长度"))
@@ -265,6 +367,14 @@ pub fn serve_connection(
 
             Kind::Close => break,
             _ => {}
+        }
+    }
+
+    // 控制请求可能正在等远端 SSH。先等它们退出，再清理路由；否则一个
+    // 迟到的 attach 会在清理之后又往已关闭的连接里登记订阅。
+    for control in controls {
+        if control.join().is_err() {
+            log::error!("控制请求线程异常退出");
         }
     }
 
@@ -288,174 +398,321 @@ pub fn serve_connection(
     // 更要紧的是**别把旧路由留在转发表里**：`Route` 按 holder channel 索引，
     // 旧连接的 local 编号与新连接重号（都从 1 起），留着就会把 holder 的
     // 新 channel 数据误投到一条已死的连接上。
-    for (address, id) in attachments {
+    for (_, (address, id)) in lock(&conn.attachments).drain() {
         if let Some(handle) = registry.get(&address) {
             handle.unsubscribe(id);
         }
     }
+    for (_, remote) in lock(&conn.remote_channels).drain() {
+        remote.detach();
+    }
     if backend == Backend::Holder {
-        for holder_channel in conn.holder_channels.values().copied() {
-            detach_from_holder(holder_channel);
+        for route in lock(&conn.holder_channels).values().cloned() {
+            detach_from_holder(&route.holder, route.channel);
         }
     }
-    drop(conn.outgoing);
+    drop(conn);
     drop(out_tx);
     let _ = writer_thread.join();
 }
 
 /// 分发一条控制请求；返回给客户端的 JSON。
 #[cfg(test)]
-fn dispatch(
-    registry: &Arc<Registry>,
-    request: &Value,
-    conn: &mut Connection,
-    attachments: &mut Vec<(String, u64)>,
-) -> Value {
-    dispatch_with(registry, request, conn, attachments, Backend::Local)
+fn dispatch(registry: &Arc<Registry>, request: &Value, conn: &Connection) -> Value {
+    let machines = Machines::empty();
+    dispatch_with(registry, request, conn, Backend::Local, &machines)
 }
 
 /// 按后端分发。
 fn dispatch_with(
     registry: &Arc<Registry>,
     request: &Value,
-    conn: &mut Connection,
-    attachments: &mut Vec<(String, u64)>,
+    conn: &Connection,
     backend: Backend,
+    machines: &Arc<Machines>,
 ) -> Value {
-    if backend == Backend::Holder {
-        // attach：holder 分配的 channel 号直接回给 UI，core 只做转发。
-        //
-        // 这里注册转发的时机很关键——必须**紧接**在拿到 channel 号之后，
-        // 而且 holder 侧已经为"登记前到达的帧"做了缓冲（见
-        // `core_holder::attach_channel`）。两处配合，整屏快照才不会丢。
-        if request.get("op").and_then(Value::as_str) == Some("attach")
-            && let Some(mut reply) = forward_to_holder(request)
-            && reply["ok"] == true
-        {
-            if let Some(holder_channel) = reply["channel"].as_u64() {
-                let address = request
-                    .get("address")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+    let op = request.get("op").and_then(Value::as_str).unwrap_or("");
 
-                // **用本连接的编号回给 GUI，不要用 holder 的。**
-                //
-                // 两端的 channel 号各自独立编号：holder 那条 core→holder 连接
-                // 有自己的 `next_channel`（已经涨到 13、14…），而每条 GUI
-                // 连接都从 1 开始。直接把 holder 的号回给 GUI，GUI 侧的路由表
-                // 里根本没有那个号 —— 数据帧到了也找不到接收端。
-                //
-                // 早期实现"恰好能用"只是因为 core 只服务一个 GUI、且两边同步
-                // 递增；一旦 GUI 重连，编号立刻错位，界面就冻死。
-                let local_channel = conn.next_channel;
-                conn.next_channel += 1;
+    // holder 专用的生命周期信号。旧 core/旧 holder 不认识它：新 core 发给
+    // 旧 holder 只会收到一条“未知请求”，不影响旧终端继续运行。
+    //
+    // **只对本地 backend（= holder 自己）生效。** core 的 registry 平时是空的
+    // （PTY 都在 holder 里），而 `listen` 一旦看到 `draining && is_empty` 就
+    // 退出整个进程——如果 core 接受这条请求，任何连上 core socket 的客户端
+    // 一句 `{"op":"drain"}` 就能把 core 关掉，所有 GUI 连接一起断。
+    if op == "drain" {
+        if backend != Backend::Local {
+            return json!({
+                "ok": false,
+                "error": "drain 只对 holder 有效",
+                "kind": "invalid_params",
+            });
+        }
+        super::holder::mark_draining();
+        return json!({"ok": true});
+    }
 
-                conn.holder_channels
-                    .insert(local_channel, holder_channel as u32);
-                // 先压住：转发层把这个 channel 的帧暂存，等回复写出去之后
-                // 再放行（见 `Connection::paused`）。
-                let ticket =
-                    register_holder_route(local_channel, holder_channel as u32, &address, conn);
-                if let Some(ticket) = ticket {
-                    conn.paused.push(ticket);
+    // 机器表只属于本地 core；远端 core 收到这些 op 时同样可管理“再下一台”，
+    // 但本期不做 peer/多跳，所以它们只在 app 面向的本地连接上使用。
+    match op {
+        "machine.add" => {
+            let Some(config) = request.get("ssh").or_else(|| request.get("config")) else {
+                return json!({"ok": false, "error": "缺少 ssh 配置", "kind": "invalid_params"});
+            };
+            let ssh = match serde_json::from_value::<crate::ssh::SshConnectionConfig>(
+                config.clone(),
+            ) {
+                Ok(ssh) => ssh,
+                Err(e) => {
+                    return json!({"ok": false, "error": format!("SSH 配置无效: {e}"), "kind": "invalid_params"});
                 }
-                conn.channels.insert(local_channel, address);
-
-                // 回给 GUI 的是本连接的编号。
-                if let Some(obj) = reply.as_object_mut() {
-                    obj.insert("channel".into(), json!(local_channel));
-                }
+            };
+            // 代理选择不走 serde（`use_system_proxy` 是 `#[serde(skip)]`，为了
+            // 不落盘），必须单独取回来，否则远端 core 永远直连。
+            let mut ssh = ssh;
+            if let Some(use_proxy) = request.get("use_system_proxy").and_then(Value::as_bool) {
+                ssh.use_system_proxy = use_proxy;
             }
-            return reply;
-        }
-        // 其余 op 也可能带 channel（`detach`）。转发前必须把本连接的
-        // channel 号改写成 holder 的，理由同 Data/Resize。
-        let forward = match request.get("channel").and_then(Value::as_u64) {
-            Some(local) => match conn.holder_channels.get(&(local as u32)) {
-                Some(&holder_channel) => {
-                    let mut rewritten = request.clone();
-                    if let Some(obj) = rewritten.as_object_mut() {
-                        obj.insert("channel".into(), json!(holder_channel));
-                    }
-                    if request.get("op").and_then(Value::as_str) == Some("detach") {
-                        conn.holder_channels.remove(&(local as u32));
-                        // 路由与 holder 侧订阅一起退掉：只删映射会让 holder
-                        // 继续往一条没人读的 channel 推，额度照耗。
-                        conn.channels.remove(&(local as u32));
-                        super::core_holder::holder()
-                            .inspect(|h| h.drop_route(holder_channel));
-                    }
-                    Some(rewritten)
+            let name = request
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let session = request
+                .get("session")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            return match machines.ensure(ssh, name, session) {
+                Ok(machine) => {
+                    let runtime = machines.runtime(&machine.id);
+                    json!({
+                        "ok": true,
+                        "machine": runtime.map(|r| r.view()).unwrap_or_else(|| machine.view()),
+                    })
                 }
-                None => None,
-            },
-            None => Some(request.clone()),
+                Err(e) => json!({"ok": false, "error": e, "kind": "invalid_params"}),
+            };
+        }
+        "machine.list" => {
+            return json!({"ok": true, "machines": machines.list()});
+        }
+        "machine.remove" => {
+            let Some(name) = request
+                .get("name")
+                .or_else(|| request.get("id"))
+                .and_then(Value::as_str)
+            else {
+                return json!({"ok": false, "error": "缺少 name", "kind": "invalid_params"});
+            };
+            return match machines.remove(name) {
+                Some(machine) => json!({"ok": true, "machine": machine.view()}),
+                None => json!({"ok": false, "error": "没有这台机器", "kind": "machine_unknown"}),
+            };
+        }
+        "machine.install" | "machine.update" => {
+            let Some(name) = request
+                .get("name")
+                .or_else(|| request.get("id"))
+                .and_then(Value::as_str)
+            else {
+                return json!({"ok": false, "error": "缺少 name", "kind": "invalid_params"});
+            };
+            let force = op == "machine.update";
+            return match machines.request_install(name, force) {
+                Ok(machine) => json!({"ok": true, "machine": machine}),
+                Err(e) => json!({"ok": false, "error": e, "kind": "machine_unknown"}),
+            };
+        }
+        _ => {}
+    }
+
+    if op == "list" {
+        let mut reply = if backend == Backend::Holder {
+            // 多 holder：把所有 holder 的终端合并成一份清单。只问当前
+            // holder 会漏掉旧 holder 手里的会话，GUI 重启后那些标签就找不
+            // 回来。
+            super::core_holder::list_all()
+                .unwrap_or_else(|| dispatch_local(registry, request, conn))
+        } else {
+            dispatch_local(registry, request, conn)
         };
-        if let Some(forward) = forward
-            && let Some(reply) = forward_to_holder(&forward)
+        let (remote, states) = machines.terminals(std::time::Duration::from_millis(1500));
+        if let Some(terminals) = reply.get_mut("terminals").and_then(Value::as_array_mut) {
+            terminals.extend(remote);
+        }
+        if let Some(object) = reply.as_object_mut() {
+            object.insert("machines".into(), json!(states));
+        }
+        return reply;
+    }
+
+    if op == "spawn"
+        && let Some(machine) = request.get("machine").and_then(Value::as_str)
+    {
+        let mut remote = request.clone();
+        if let Some(object) = remote.as_object_mut() {
+            object.remove("machine");
+            object.insert("remote".into(), json!(true));
+        }
+        return match machines.spawn(machine, remote) {
+            Ok(reply) => reply,
+            Err(e) => json!({
+                "ok": false,
+                "error": e,
+                "kind": machines.find(machine).map(|r| r.error_kind()).unwrap_or("machine_unknown"),
+            }),
+        };
+    }
+
+    if op == "attach"
+        && let Some(address) = request.get("address").and_then(Value::as_str)
+        && address.contains('/')
+    {
+        let Some((runtime, remote_address)) = machines.resolve(address) else {
+            return json!({"ok": false, "error": "未知机器", "kind": "machine_unknown"});
+        };
+        let local_channel = conn.allocate_channel();
+        let mut remote = request.clone();
+        if let Some(object) = remote.as_object_mut() {
+            object.remove("id");
+            object.remove("address");
+        }
+        return match machines.attach(
+            runtime.id(),
+            &remote_address,
+            remote,
+            local_channel,
+            conn.outgoing.clone(),
+        ) {
+            Ok((mut reply, attachment)) => {
+                if let Some(object) = reply.as_object_mut() {
+                    object.insert("channel".into(), json!(local_channel));
+                }
+                lock(&conn.remote_channels).insert(local_channel, attachment);
+                reply
+            }
+            Err(e) => json!({
+                "ok": false,
+                "error": e,
+                "kind": runtime.error_kind(),
+            }),
+        };
+    }
+
+    if op == "detach"
+        && let Some(channel) = request.get("channel").and_then(Value::as_u64)
+        && let Some(remote) = lock(&conn.remote_channels).remove(&(channel as u32))
+    {
+        remote.detach();
+        return json!({"ok": true});
+    }
+
+    if matches!(op, "get" | "close" | "remove" | "snapshot")
+        && let Some(address) = request.get("address").and_then(Value::as_str)
+        && address.contains('/')
+    {
+        let kind = machines
+            .resolve(address)
+            .map(|(runtime, _)| runtime.error_kind())
+            .unwrap_or("machine_unknown");
+        return match machines.call_address(
+            address,
+            request.clone(),
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(Some(reply)) => reply,
+            Ok(None) => json!({"ok": false, "error": "未知机器", "kind": "machine_unknown"}),
+            Err(e) => json!({"ok": false, "error": e, "kind": kind}),
+        };
+    }
+
+    if backend == Backend::Holder {
+        let holder_op = request.get("op").and_then(Value::as_str).unwrap_or("");
+
+        if holder_op == "spawn" {
+            if let Some(call) = super::core_holder::spawn(request) {
+                return call.reply;
+            }
+            log::warn!("holder 不可用，spawn 退回 core 本地 PTY（失去重启保活）");
+            return dispatch_local(registry, request, conn);
+        }
+
+        if holder_op == "attach" {
+            // attach：holder 分配的 channel 号直接回给 UI，core 只做转发。
+            //
+            // 这里注册转发的时机很关键——必须**紧接**在拿到 channel 号之后，
+            // 而且 holder 侧已经为"登记前到达的帧"做了缓冲。两处配合，整屏
+            // 快照才不会丢。
+            if let Some(call) = super::core_holder::call_for_address(request) {
+                let mut reply = call.reply;
+                if reply["ok"] == true
+                    && let Some(holder_channel) = reply["channel"].as_u64()
+                {
+                    let address = request
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+
+                    // **用本连接的编号回给 GUI，不要用 holder 的。**
+                    //
+                    // 两端的 channel 号各自独立编号：每条 GUI 连接都从 1
+                    // 开始，而 holder 那条连接有自己的计数器。直接把 holder
+                    // 的号回给 GUI，GUI 侧路由表里根本没有那个号。
+                    let local_channel = conn.allocate_channel();
+                    lock(&conn.holder_channels).insert(
+                        local_channel,
+                        HolderRoute {
+                            holder: call.holder.clone(),
+                            channel: holder_channel as u32,
+                        },
+                    );
+                    // 先压住：转发层把这个 channel 的帧暂存，等回复写出去
+                    // 之后再放行（见 `Connection::paused`）。
+                    let ticket = register_holder_route(
+                        &call.holder,
+                        local_channel,
+                        holder_channel as u32,
+                        conn,
+                    );
+                    conn.pause(local_channel, ticket);
+                    lock(&conn.channels).insert(local_channel, address);
+
+                    // 回给 GUI 的是本连接的编号。
+                    if let Some(object) = reply.as_object_mut() {
+                        object.insert("channel".into(), json!(local_channel));
+                    }
+                }
+                return reply;
+            }
+            log::warn!("找不到终端，attach 退回本地 registry");
+            return dispatch_local(registry, request, conn);
+        }
+
+        if holder_op == "detach"
+            && let Some(local) = request.get("channel").and_then(Value::as_u64)
         {
-            return reply;
+            if let Some(route) = lock(&conn.holder_channels).remove(&(local as u32)) {
+                lock(&conn.channels).remove(&(local as u32));
+                detach_from_holder(&route.holder, route.channel);
+            }
+            return json!({"ok": true});
+        }
+
+        if matches!(holder_op, "get" | "close" | "remove" | "snapshot") {
+            if let Some(call) = super::core_holder::call_for_address(request) {
+                return call.reply;
+            }
+            return dispatch_local(registry, request, conn);
+        }
+
+        if holder_op == "reap" {
+            return json!({"ok": true, "removed": super::core_holder::reap_all()});
         }
     }
-    dispatch_local(registry, request, conn, attachments)
+    dispatch_local(registry, request, conn)
 }
 
-/// 这条 op 是否要转发给 holder。
-///
-/// 抽成纯函数是为了可测：白名单漏项不会报错，只会静默作用到 core 里那份
-/// 空 registry 上。清单本身值得被测试钉住。
-fn holder_op(op: &str) -> bool {
-    matches!(
-        op,
-        "spawn" | "attach" | "close" | "get" | "list" | "snapshot" | "detach" | "remove" | "reap"
-    )
-}
-
-/// 把一条终端操作原样转给 holder。
-///
-/// 返回 `None` 表示这条请求不该转发（ping/list 之类由 core 自己答），
-/// 或者 holder 不可用——后者会退化成 core 自己建 PTY，功能仍然可用，
-/// 只是失去"活过 core 重启"这一条。
-fn forward_to_holder(request: &Value) -> Option<Value> {
-    let op = request.get("op").and_then(Value::as_str)?;
-    // 转发白名单必须覆盖**所有作用于真实终端的 op**。
-    //
-    // 漏一个的后果不是"报错"，而是静默作用到 core 里那份空 registry 上：
-    // 返回 `ok` 或 `not_found`，实际什么都没发生。
-    //
-    // - `detach`：不转发 → holder 侧的订阅者永远留着，每个挂接者都会
-    //   持续占用一条推送通道；
-    // - `remove` / `reap`：不转发 → 已退出的终端记录在 holder 里堆着，
-    //   `list` 会一直列出来。
-    if !holder_op(op) {
-        return None;
-    }
-    let holder = match super::core_holder::holder() {
-        Some(h) => h,
-        None => {
-            log::warn!("holder 不可用，{op} 由 core 自己处理");
-            return None;
-        }
-    };
-    match holder.call(request.clone()) {
-        Ok(reply) => {
-            log::info!("{op} 已由 holder 处理: {}", reply["address"]);
-            Some(reply)
-        }
-        Err(e) => {
-            log::warn!("转给 holder 的 {op} 失败: {e}");
-            None
-        }
-    }
-}
-
-fn dispatch_local(
-    registry: &Arc<Registry>,
-    request: &Value,
-    conn: &mut Connection,
-    attachments: &mut Vec<(String, u64)>,
-) -> Value {
+fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) -> Value {
     let op = request.get("op").and_then(Value::as_str).unwrap_or("");
     match op {
         "spawn" => super::server::handle_spawn(registry, request),
@@ -468,9 +725,8 @@ fn dispatch_local(
                 return json!({"ok": false, "error": "没有这个终端", "kind": "not_found"});
             };
 
-            let channel = conn.next_channel;
-            conn.next_channel += 1;
-            conn.channels.insert(channel, address.to_string());
+            let channel = conn.allocate_channel();
+            lock(&conn.channels).insert(channel, address.to_string());
 
             // **先按客户端尺寸 resize，再生成快照。**
             //
@@ -545,7 +801,7 @@ fn dispatch_local(
 
             let tx = conn.outgoing.clone();
             let id = handle.subscribe(channel, tx);
-            attachments.push((address.to_string(), id));
+            lock(&conn.attachments).insert(channel, (address.to_string(), id));
 
             json!({
                 "ok": true,
@@ -563,10 +819,8 @@ fn dispatch_local(
         "detach" => {
             if let Some(channel) = request.get("channel").and_then(Value::as_u64) {
                 let channel = channel as u32;
-                if let Some(address) = conn.channels.remove(&channel)
-                    && let Some(pos) = attachments.iter().position(|(a, _)| a == &address)
-                {
-                    let (_, id) = attachments.remove(pos);
+                lock(&conn.channels).remove(&channel);
+                if let Some((address, id)) = lock(&conn.attachments).remove(&channel) {
                     if let Some(handle) = registry.get(&address) {
                         handle.unsubscribe(id);
                     }
@@ -584,47 +838,53 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn connection() -> (
-        Connection,
-        async_channel::Receiver<Frame>,
-        Vec<(String, u64)>,
-    ) {
+    fn connection() -> (Arc<Connection>, async_channel::Receiver<Frame>) {
         let (tx, rx) = async_channel::unbounded();
-        (
-            Connection {
-                next_channel: 1,
-                channels: std::collections::HashMap::new(),
-                holder_channels: std::collections::HashMap::new(),
-                outgoing: tx,
-                paused: Vec::new(),
-            },
-            rx,
-            Vec::new(),
+        (Arc::new(Connection::new(tx)), rx)
+    }
+
+    fn identity() -> ServerIdentity {
+        ServerIdentity::for_tests(
+            "core-test",
+            "generation-test",
+            "host-test",
+            false,
+            Some("tester"),
         )
     }
 
-    /// **转发给 holder 的白名单必须覆盖所有作用于真实终端的 op。**
+    /// **非 holder 进程不得接受 `drain`。**
     ///
-    /// 回归价值：漏一个不会报错，只会静默作用到 core 里那份**空 registry**
-    /// 上——返回 `ok` 或 `not_found`，实际什么都没发生。这确实发生过：
-    /// `detach` 不转发 → holder 侧订阅者永久泄漏；`remove`/`reap` 不转发 →
-    /// 已退出的终端记录一直堆着，`list` 永远列得出来。
+    /// 回归价值：`drain` 会置一个进程级的 `DRAINING`，而 `listen` 一旦看到
+    /// `draining && registry.is_empty()` 就退出整个进程。core 的 registry
+    /// 平时就是空的（PTY 都在 holder），于是任何连上 core socket 的客户端
+    /// 发一句 `{"op":"drain"}` 就能把 core 关掉，所有 GUI 连接一起断。
     ///
-    /// 所以把白名单抽成 [`holder_op`] 这个纯函数，直接断言清单内容。
+    /// 这里只测被拒绝的那条路径：它必须**不**改动全局状态，所以不会污染
+    /// 同进程里其它用例。
     #[test]
-    fn every_terminal_op_is_declared_for_the_holder() {
-        for op in [
-            "spawn", "attach", "close", "get", "list", "snapshot", "detach", "remove", "reap",
-        ] {
-            assert!(
-                holder_op(op),
-                "{op} 必须转发给 holder（否则操作落在空 registry 上）"
-            );
-        }
-        // 反向：控制面 / 本地可答的 op 不该转发。
-        for op in ["ping", "hello", "definitely_not_an_op"] {
-            assert!(!holder_op(op), "{op} 不该转发给 holder");
-        }
+    fn drain_is_refused_outside_the_holder_backend() {
+        let registry = Arc::new(Registry::new());
+        let (conn, _rx) = connection();
+        let machines = Machines::empty();
+        let was_draining = crate::daemon::holder::draining();
+
+        // `Backend::Holder` 是 core 的后端（它把 PTY 转发给 holder）。
+        let reply = dispatch_with(
+            &registry,
+            &json!({"op": "drain"}),
+            &conn,
+            Backend::Holder,
+            &machines,
+        );
+
+        assert_eq!(reply["ok"], false, "core 不应接受 drain: {reply}");
+        assert_eq!(reply["kind"], "invalid_params");
+        assert_eq!(
+            crate::daemon::holder::draining(),
+            was_draining,
+            "被拒绝的 drain 不能改动进程级状态"
+        );
     }
 
     /// **`hello` 回复必须回填请求 id。**
@@ -640,18 +900,53 @@ mod tests {
     /// 早期版本"能工作"只是因为客户端当时从共享队列里抢第一条控制回复，
     /// 不校验 id；改成按 id 分发后 id 就成了必需品。
     #[test]
-    fn hello_replies_must_carry_the_request_id() {
-        // 构造与 `authenticate` 里同样形状的回复，断言 id 回填逻辑生效。
+    fn hello_replies_carry_identity_and_capabilities() {
         let request = json!({"id": 42, "op": "hello", "token": "x"});
-        let mut reply = json!({"ok": true, "op": "hello", "protocol": 2});
-        if let (Some(id), Some(obj)) = (request.get("id"), reply.as_object_mut()) {
-            obj.insert("id".into(), id.clone());
-        }
+        let reply = hello_reply(&identity(), &request);
         assert_eq!(
             reply.get("id").and_then(Value::as_u64),
             Some(42),
             "hello 回复必须带请求 id，否则客户端按 id 等不到它"
         );
+        for field in [
+            "protocol",
+            "version",
+            "core_id",
+            "generation",
+            "hostname",
+            "methods",
+            "capabilities",
+            "keeps_running_after_logout",
+            "logout_linger_user",
+        ] {
+            assert!(!reply[field].is_null(), "hello 必须带 {field}: {reply}");
+        }
+        assert_eq!(reply["core_id"], "core-test");
+        assert_eq!(reply["generation"], "generation-test");
+        let methods = reply["methods"].as_array().expect("methods 必须是数组");
+        for method in crate::daemon::protocol::REQUIRED_METHODS {
+            assert!(methods.iter().any(|value| value == method), "缺少 {method}");
+        }
+        let capabilities = reply["capabilities"]
+            .as_array()
+            .expect("capabilities 必须是数组");
+        for capability in crate::daemon::protocol::REQUIRED_CAPABILITIES {
+            assert!(
+                capabilities.iter().any(|value| value == capability),
+                "缺少 {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_replies_refresh_the_same_identity_without_reauthentication() {
+        let request = json!({"id": 7, "op": "server.status"});
+        let reply = server_status(&identity(), &request);
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["op"], "server.status");
+        assert_eq!(reply["id"], 7);
+        assert_eq!(reply["core_id"], "core-test");
+        assert_eq!(reply["keeps_running_after_logout"], false);
     }
 
     /// **本连接的 channel 号与 holder 的 channel 号必须分开记账。**
@@ -665,22 +960,37 @@ mod tests {
     /// 别处）。日志里每一步都"成功"，所以极难查。
     #[test]
     fn local_and_holder_channels_are_tracked_separately() {
-        let mut conn = connection().0;
-        // GUI 侧连续两个 attach 拿到的本地号。
-        let first_local = conn.next_channel;
-        conn.next_channel += 1;
-        let second_local = conn.next_channel;
-        conn.next_channel += 1;
+        let conn = connection().0;
+        let holder = Arc::new(super::super::core_holder::HolderClient::for_tests());
+        let first_local = conn.allocate_channel();
+        let second_local = conn.allocate_channel();
         assert_eq!((first_local, second_local), (1, 2), "本地号从 1 递增");
 
-        // holder 侧此刻可能已经涨到 13、14。
-        conn.channels.insert(first_local, "t1".into());
-        conn.holder_channels.insert(first_local, 13);
-        conn.channels.insert(second_local, "t8".into());
-        conn.holder_channels.insert(second_local, 14);
+        lock(&conn.channels).insert(first_local, "t1".into());
+        lock(&conn.holder_channels).insert(
+            first_local,
+            HolderRoute {
+                holder: holder.clone(),
+                channel: 13,
+            },
+        );
+        lock(&conn.channels).insert(second_local, "t8".into());
+        lock(&conn.holder_channels).insert(
+            second_local,
+            HolderRoute {
+                holder,
+                channel: 14,
+            },
+        );
 
-        assert_eq!(conn.holder_channels.get(&first_local), Some(&13));
-        assert_eq!(conn.holder_channels.get(&second_local), Some(&14));
+        assert_eq!(
+            conn.holder_route(first_local).map(|route| route.channel),
+            Some(13)
+        );
+        assert_eq!(
+            conn.holder_route(second_local).map(|route| route.channel),
+            Some(14)
+        );
         // 反向不会串：本地号 1 ≠ holder 号 13，这正是旧实现出错的地方。
         assert_ne!(first_local, 13);
     }
@@ -743,10 +1053,10 @@ mod tests {
     #[test]
     fn attach_replies_carry_the_request_id() {
         let registry = Arc::new(Registry::new());
-        let (mut conn, _rx, mut attachments) = connection();
+        let (conn, _rx) = connection();
         let request = json!({"id": 42, "op": "get", "address": "t1"});
 
-        let reply = dispatch(&registry, &request, &mut conn, &mut attachments);
+        let reply = dispatch(&registry, &request, &conn);
 
         // dispatch 本身不负责 id（由调用方回填），这里验的是核心前提：
         // 回复是 JSON 对象，能被塞进 id。
@@ -757,13 +1067,8 @@ mod tests {
     #[test]
     fn detaching_an_unknown_channel_is_a_no_op() {
         let registry = Arc::new(Registry::new());
-        let (mut conn, _rx, mut attachments) = connection();
-        let reply = dispatch(
-            &registry,
-            &json!({"op": "detach", "channel": 99}),
-            &mut conn,
-            &mut attachments,
-        );
+        let (conn, _rx) = connection();
+        let reply = dispatch(&registry, &json!({"op": "detach", "channel": 99}), &conn);
         assert_eq!(reply["ok"], true);
     }
 
@@ -771,12 +1076,11 @@ mod tests {
     #[test]
     fn attaching_to_a_missing_terminal_reports_not_found() {
         let registry = Arc::new(Registry::new());
-        let (mut conn, _rx, mut attachments) = connection();
+        let (conn, _rx) = connection();
         let reply = dispatch(
             &registry,
             &json!({"op": "attach", "address": "t404"}),
-            &mut conn,
-            &mut attachments,
+            &conn,
         );
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["kind"], "not_found");
@@ -795,10 +1099,7 @@ mod tests {
 ///
 /// 幂等：holder 已经不认这个 channel 时 `detach` 返回 `ok` 或
 /// `not_found`，两种都当成功。
-fn detach_from_holder(holder_channel: u32) {
-    let Some(holder) = super::core_holder::holder() else {
-        return;
-    };
+fn detach_from_holder(holder: &Arc<super::core_holder::HolderClient>, holder_channel: u32) {
     holder.drop_route(holder_channel);
     let _ = holder.call(json!({"op": "detach", "channel": holder_channel}));
 }
@@ -812,20 +1113,13 @@ fn detach_from_holder(holder_channel: u32) {
 /// 真正的转发在 holder 的 reader 线程里做（见
 /// [`HolderClient::register_route`]），这里只登记路由并返回开闸票据。
 fn register_holder_route(
+    holder: &Arc<super::core_holder::HolderClient>,
     local_channel: u32,
     holder_channel: u32,
-    address: &str,
     conn: &Connection,
-) -> Option<u64> {
-    let holder = super::core_holder::holder()?;
+) -> u64 {
     // 一律先压住：`attach` 的回复还没发出去，客户端此刻还没有登记路由。
-    Some(holder.register_route(
-        holder_channel,
-        local_channel,
-        address,
-        conn.outgoing.clone(),
-        true,
-    ))
+    holder.register_route(holder_channel, local_channel, conn.outgoing.clone(), true)
 }
 
 /// 校验连接的第一条帧是不是带正确 token 的 `hello`。
@@ -834,8 +1128,9 @@ fn register_holder_route(
 /// token 的熵（128 位），限制重试次数意义不大，但能省掉无谓的交互。
 fn authenticate(
     reader: &mut super::transport::Stream,
-    conn: &mut Connection,
+    conn: &Connection,
     socket: &std::path::Path,
+    identity: &ServerIdentity,
 ) -> bool {
     // 读**本 socket** 配套的 token：core 与 holder 各有一份，用错文件就
     // 会出现"core 拿自己的 token 去连 holder、被拒"。
@@ -870,7 +1165,11 @@ fn authenticate(
     }
     let provided = request.get("token").and_then(Value::as_str).unwrap_or("");
     if !constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
-        log::warn!("token 不匹配，拒绝连接");
+        log::warn!(
+            "token 不匹配，拒绝连接（携带 {} 字节，期望 {} 字节）",
+            provided.len(),
+            expected.len()
+        );
         return false;
     }
 
@@ -895,20 +1194,51 @@ fn authenticate(
     //
     // 早期版本这里不带 id 也能工作，因为客户端当时是"从共享队列里抢第一条
     // 控制回复"；改成按 id 分发之后，id 就成了必需品。
-    let id = request.get("id").cloned();
-    let mut reply = json!({
-        "ok": true,
-        "op": "hello",
-        "protocol": super::protocol::PROTOCOL_VERSION,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-    if let (Some(id), Some(obj)) = (id, reply.as_object_mut()) {
-        obj.insert("id".into(), id);
-    }
+    let reply = hello_reply(identity, &request);
     let _ = conn
         .outgoing
         .try_send(Frame::json(serde_json::to_vec(&reply).unwrap_or_default()));
     true
+}
+
+/// 构造成功的 `hello` 回复。
+///
+/// 回填请求 id 是必需的：客户端按 id 分发回复（见 `client::Client`），
+/// 缺少 id 会让它一直等到握手超时。
+fn hello_reply(identity: &ServerIdentity, request: &Value) -> Value {
+    let mut reply = server_status(identity, request);
+    let object = reply.as_object_mut().expect("status reply is an object");
+    object.insert("op".into(), json!("hello"));
+    // core 与 holder 是同一个可执行文件：holder 用它在接管时判断“新终端该
+    // 交给谁”。旧 holder 没有这个字段，按旧构建处理（只保留它手里的终端）。
+    object.insert("build".into(), json!(super::identity::build_id()));
+    object.insert("pid".into(), json!(std::process::id()));
+    object.insert("draining".into(), json!(super::holder::draining()));
+    object.insert("protocol".into(), json!(super::protocol::PROTOCOL_VERSION));
+    object.insert("methods".into(), json!(super::protocol::SUPPORTED_METHODS));
+    object.insert("capabilities".into(), json!(super::protocol::CAPABILITIES));
+    reply
+}
+
+/// 不重新鉴权即可查询的进程身份与保活状态。
+///
+/// 远端机器监督线程用它在长连接期间刷新 linger 状态，避免只在握手时
+/// 读一次、用户后来执行 `loginctl enable-linger` 却一直显示旧值。
+fn server_status(identity: &ServerIdentity, request: &Value) -> Value {
+    let mut reply = json!({
+        "ok": true,
+        "op": "server.status",
+        "version": env!("CARGO_PKG_VERSION"),
+        "core_id": identity.core_id.as_str(),
+        "generation": identity.generation.as_str(),
+        "hostname": identity.hostname.as_str(),
+        "keeps_running_after_logout": identity.keeps_running_after_logout(),
+        "logout_linger_user": identity.logout_linger_user(),
+    });
+    if let (Some(id), Some(object)) = (request.get("id"), reply.as_object_mut()) {
+        object.insert("id".into(), id.clone());
+    }
+    reply
 }
 
 /// 校验 `hello` 里的协议版本，返回不匹配时要回给客户端的回复。

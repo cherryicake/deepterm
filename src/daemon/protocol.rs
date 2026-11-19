@@ -63,8 +63,80 @@ pub const CONTROL: u32 = 0;
 /// 版本历史：
 /// - 1：原始版本（只有 token 校验，回复里没有版本）；
 /// - 2：`hello` 回复带 `protocol`；`attach` 支持 `history`；attach 快照
-///   附带 kitty 图像重放。
+///   附带 kitty 图像重放。后续在同一个线格式上扩展了 `hello` 的
+///   `methods` / `capabilities` / `generation` 等字段：服务端仍接受只报
+///   `protocol: 2` 的旧客户端；新客户端则要求这些字段齐全，缺字段时明确
+///   判为旧 core 并重启它（holder 不受影响）。
 pub const PROTOCOL_VERSION: u32 = 2;
+
+/// 本进程支持的控制面方法。
+///
+/// 握手时双方都报这份清单。客户端只把它当作“对面确实理解这些 op”的
+/// 明确凭据，不再靠版本号猜；远端 core 以后可以逐项协商能力。
+pub const SUPPORTED_METHODS: &[&str] = &[
+    "ping",
+    "list",
+    "get",
+    "spawn",
+    "attach",
+    "detach",
+    "close",
+    "remove",
+    "reap",
+    "snapshot",
+    "server.status",
+    "machine.add",
+    "machine.list",
+    "machine.remove",
+    "machine.install",
+    "machine.update",
+];
+
+/// 所有 core（含旧 holder）都必须具备的基础终端方法。
+///
+/// 机器 API 是后加的可选扩展：新 core 仍会连接升级前启动的旧 holder，
+/// 而旧 holder 不可能认识 `machine.*`。把它塞进必需项会让一次正常升级
+/// 重连失败，用户正在跑的远端/本地终端会全部从界面上消失。
+pub const REQUIRED_METHODS: &[&str] = &[
+    "ping", "list", "get", "spawn", "attach", "detach", "close", "remove", "reap", "snapshot",
+];
+
+/// 支持远端机器表所需的方法；调用方在使用机器 API 前单独检查。
+pub const MACHINE_METHODS: &[&str] = &[
+    "machine.add",
+    "machine.list",
+    "machine.remove",
+    "machine.install",
+    "machine.update",
+];
+
+/// 本进程声明的能力。
+pub const CAPABILITIES: &[&str] = &[
+    "framed.v2",
+    "core.identity",
+    "stdio.bridge",
+    "terminal.attach",
+    "terminal.snapshot",
+    "terminal.history",
+    "terminal.kitty-replay",
+    "terminal.meta",
+    "machines.v1",
+];
+
+/// 客户端握手时要求的基础终端能力。
+///
+/// 与 [`REQUIRED_METHODS`] 同理，`machines.v1` 不在这里。旧 holder 没有
+/// 远端机器概念，但仍必须能被新 core 接回。
+pub const REQUIRED_CAPABILITIES: &[&str] = &[
+    "framed.v2",
+    "core.identity",
+    "stdio.bridge",
+    "terminal.attach",
+    "terminal.snapshot",
+    "terminal.history",
+    "terminal.kitty-replay",
+    "terminal.meta",
+];
 
 /// 帧类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

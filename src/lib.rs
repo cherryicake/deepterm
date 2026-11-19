@@ -995,7 +995,16 @@ impl AppWindow {
     }
 
     fn defer_save_session(&mut self, cx: &mut Context<Self>) {
-        // 去抖：300ms 内多次触发仅落盘一次，旧任务随 Task drop 自动取消
+        // 只在没有待执行任务时排一次，而不是每次事件都重建任务。
+        //
+        // 终端的标题/目录变化是持续事件；旧实现每次都会替换定时任务，只要
+        // 事件间隔小于 300ms，保存就被无限推迟。用户切到远端 Tab 后退出时，
+        // 会话文件仍是启动时的旧内容，重启自然回到旧 Tab。这里改成「合并
+        // 这一段时间内的变更，首次事件后固定 300ms 落盘」。
+        if self.pending_save_task.is_some() {
+            return;
+        }
+        // 首次变更后固定等待 300ms，把这段时间里的连续变更合并成一次写盘。
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(300))
@@ -1923,6 +1932,19 @@ pub fn init(cx: &mut gpui::App) {
     workspace::init(cx);
     editor::init(cx);
     workspace::window_manager::WindowManager::init(cx);
+
+    // macOS 的 Cmd+Q 走平台原生退出，不保证经过 `actions!(Quit)`；只靠
+    // 快捷键 Action 补存会漏掉用户最常见的退出路径。退出钩子在任何退出
+    // 方式下都先同步落盘，保证活动 Tab、窗口尺寸和远端挂接地址是最新的。
+    cx.on_app_quit(|cx| {
+        for handle in cx.windows() {
+            if let Some(handle) = handle.downcast::<AppWindow>() {
+                let _ = handle.update(cx, |app, _window, cx| app.flush_pending_save(cx));
+            }
+        }
+        async {}
+    })
+    .detach();
 }
 
 #[cfg(test)]

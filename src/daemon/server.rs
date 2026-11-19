@@ -167,6 +167,10 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
         .get("rows")
         .and_then(Value::as_u64)
         .unwrap_or(super::registry::DEFAULT_ROWS as u64) as u16;
+    let address = request
+        .get("address")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
 
     // 请求方可以自带环境变量（远程 SSH 终端需要 `SSHPASS` 之类的凭据，
     // 那些值只能由 UI 侧提供——守护进程不持有用户的密钥链）。
@@ -214,6 +218,7 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
     spawn.env = env;
     spawn.cols = cols;
     spawn.rows = rows;
+    spawn.address = address;
 
     match registry.spawn(spawn) {
         Ok(handle) => json!({"ok": true, "address": handle.address}),

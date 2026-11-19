@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::connection::serve_connection;
+use super::machines::Machines;
 use super::registry::Registry;
 
 /// 没有连接时，守护进程空转多久后自行退出。
@@ -98,6 +99,7 @@ pub fn run() -> std::io::Result<()> {
         super::socket_path(),
         true,
         super::connection::Backend::Holder,
+        Machines::load_default(),
     )
 }
 
@@ -110,6 +112,7 @@ pub fn run_at(
     socket: std::path::PathBuf,
     idle_exit: bool,
     backend: super::connection::Backend,
+    machines: Arc<Machines>,
 ) -> std::io::Result<()> {
     let dir = super::runtime_dir();
 
@@ -154,6 +157,19 @@ pub fn run_at(
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
 
+    // 生成并落盘鉴权 token（0600）。
+    //
+    // **必须在 bind 之前**：客户端一旦能连上 socket 就会立即读 token 并握手。
+    // 先 bind 后写 token 会留下一个很短的窗口，桥进程恰好在这时连上就会得到
+    // “读不到守护进程 token”，把一次正常冷启动判成失败。
+    //
+    // 每次启动换一个：它是"本次守护进程的会话凭据"，不是长期密码，
+    // 不需要也不应该持久化到用户配置里。
+    let token = super::generate_token();
+    if let Err(e) = super::write_token_for(&path, &token) {
+        log::error!("无法写入 token 文件，远端连接将不可用: {e}");
+    }
+
     let listener = transport::bind(&path)?;
     transport::set_nonblocking(&listener, true)?;
 
@@ -167,22 +183,26 @@ pub fn run_at(
 
     log::info!("守护进程已启动，socket: {}", path.display());
 
-    // 生成并落盘鉴权 token（0600）。
-    //
-    // 每次启动换一个：它是"本次守护进程的会话凭据"，不是长期密码，
-    // 不需要也不应该持久化到用户配置里。
-    let token = super::generate_token();
-    if let Err(e) = super::write_token_for(&path, &token) {
-        log::error!("无法写入 token 文件，远端连接将不可用: {e}");
-    }
-
     install_signal_handlers();
 
+    // 身份在**进程启动时**固定：同一 core 上的所有连接看到同一个 generation，
+    // core 重启后才变化。app 用它判断“是重连还是换了一个 core”。
+    let identity = Arc::new(super::identity::ServerIdentity::detect());
+    identity.start_linger_refresh();
     let registry = Arc::new(Registry::new());
     let shutdown = Arc::new(AtomicBool::new(false));
     let connections = Arc::new(AtomicUsize::new(0));
     let idle_since = std::sync::Mutex::new(std::time::Instant::now());
     let mut last_reap = std::time::Instant::now();
+
+    // core 负责协调所有 holder。必须在 accept 之前接管：GUI 恢复会话时会
+    // 立刻 attach，地址到 holder 的映射晚一步就会出现“终端明明在跑却
+    // not_found”。旧 holder 也在这里被接上，它手里的终端继续可用。
+    if backend == super::connection::Backend::Holder
+        && let Err(error) = super::core_holder::adopt_all()
+    {
+        log::error!("接管现有 holder 失败: {error}");
+    }
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -210,6 +230,8 @@ pub fn run_at(
                 let registry = registry.clone();
                 let shutdown = shutdown.clone();
                 let socket_for_conn = path.clone();
+                let identity = identity.clone();
+                let machines = machines.clone();
                 let connections = connections.clone();
                 let counter = connections.clone();
                 std::thread::Builder::new()
@@ -220,7 +242,9 @@ pub fn run_at(
                             registry,
                             shutdown,
                             backend,
+                            machines,
                             socket_for_conn.clone(),
+                            identity,
                         );
                         counter.fetch_sub(1, Ordering::SeqCst);
                     })
@@ -246,6 +270,13 @@ pub fn run_at(
                 }
 
                 // 空闲退出：没有连接，也没有终端。
+                // drain 的 holder 是“只服务旧终端”的：终端一空就退出，不再
+                // 占着一个永远等新任务的进程。core 连接仍在也没关系——它的
+                // 出现只是为了让旧终端还能被 attach。
+                if super::holder::draining() && registry.is_empty() {
+                    log::info!("holder 已 drain 且没有终端，退出");
+                    break;
+                }
                 let idle = *idle_since.lock().expect("idle");
                 if idle_exit
                     && connections.load(Ordering::SeqCst) == 0

@@ -62,6 +62,11 @@ pub struct SpawnRequest {
     pub env: std::collections::HashMap<String, String>,
     pub cols: u16,
     pub rows: u16,
+    /// core 指定的全局地址。多 holder 时地址必须由 core 统一分配；holder
+    /// 自己的计数器各从 `t1` 开始，继续用它会出现两个同名终端。
+    ///
+    /// 旧 core 不带这个字段（`None`），仍按 holder 本地计数分配。
+    pub address: Option<Address>,
 }
 
 impl SpawnRequest {
@@ -73,6 +78,7 @@ impl SpawnRequest {
             env: std::collections::HashMap::new(),
             cols: DEFAULT_COLS,
             rows: DEFAULT_ROWS,
+            address: None,
         }
     }
 }
@@ -171,8 +177,32 @@ impl Registry {
     /// 失败时返回错误字符串，调用方把它回报给客户端——**不要**让守护进程
     /// 因为一个起不来的 shell 就退出，那会把所有正在跑的终端一起带走。
     pub fn spawn(&self, request: SpawnRequest) -> Result<Arc<TerminalHandle>, String> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let address = format!("t{id:x}");
+        let (id, address) = match request.address.as_deref() {
+            Some(address) => {
+                let id = parse_address_id(address)
+                    .ok_or_else(|| format!("无效的终端地址: {address}"))?;
+                if self
+                    .terminals
+                    .lock()
+                    .expect("registry")
+                    .contains_key(address)
+                {
+                    return Err(format!("终端地址已被占用: {address}"));
+                }
+                // 本地计数器也要越过它，避免后续未指定地址的 spawn 撞车。
+                //
+                // `saturating_add`：地址来自请求（`t<hex>`），对端可以发
+                // `tffffffffffffffff`。`id + 1` 会在 debug 下 panic、release
+                // 下回绕成 0，之后新地址全和 `t0` 撞车。
+                self.next_id
+                    .fetch_max(id.saturating_add(1), Ordering::Relaxed);
+                (id, address.to_string())
+            }
+            None => {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                (id, format!("t{id:x}"))
+            }
+        };
 
         let size = WindowSize {
             num_lines: request.rows,
@@ -263,6 +293,15 @@ impl Registry {
     }
 }
 
+/// 解析 `t<hex>` 形式的终端地址。
+pub fn parse_address_id(address: &str) -> Option<u64> {
+    let hex = address.strip_prefix('t')?;
+    if hex.is_empty() {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
 /// 终端主循环：读 PTY、喂 VT、广播输出，并把子进程退出转成 `Finished`。
 ///
 /// # 为什么写输入不能阻塞这条线程
@@ -312,7 +351,9 @@ fn run_terminal(
     };
     #[cfg(not(unix))]
     let master_fd: Option<i32> = None;
+    let mut last_probe: Option<super::terminal::TerminalMeta> = None;
     let mut last_meta_sent: Option<super::terminal::TerminalMeta> = None;
+    let mut last_hook_revision = 0;
     let mut next_meta_probe = std::time::Instant::now();
     let mut buf = vec![0u8; 64 * 1024];
     let mut events = Events::with_capacity(std::num::NonZeroUsize::new(4).expect("非零"));
@@ -330,6 +371,8 @@ fn run_terminal(
         handle.kitty_enabled(),
         Box::new(replies.clone()),
     );
+    let (agent_sink, agent_state) = super::terminal::agent_hook_state();
+    kitty.set_osc_sink(agent_sink);
     // 跨读被截断的 APC 残尾（大图分片必然跨 read）。
     let mut apc_pending: Vec<u8> = Vec::new();
 
@@ -552,16 +595,39 @@ fn run_terminal(
         // 500ms 的理由：毫秒级的频率会把这条读循环拖住，而用户敲下
         // `opencode` 之后标签只要能在一拍内跟上就够了。整个探测只有两次
         // syscall（`tcgetpgrp` + 读 argv），不起子进程。
+        let mut probe_changed = false;
         if std::time::Instant::now() >= next_meta_probe {
             next_meta_probe = std::time::Instant::now() + std::time::Duration::from_millis(500);
             // `None` = 查不了，**保持上一份快照**。当成"前台是 shell"会让
             // 每个短命子进程退出时标签都闪一下。
-            if let Some(probed) = super::terminal::probe_terminal_meta(master_fd, &handle)
-                && last_meta_sent.as_ref() != Some(&probed)
-            {
-                handle.broadcast_meta(&probed);
-                last_meta_sent = Some(probed);
+            if let Some(probed) = super::terminal::probe_terminal_meta(master_fd, &handle) {
+                probe_changed = last_probe.as_ref() != Some(&probed);
+                last_probe = Some(probed);
             }
+        }
+
+        // hook 状态要和前台探测合成后再广播。只在探测结果或 hook 版本变化时
+        // 进入，避免每个 500ms 采样都发一帧相同的 Meta。
+        let hook_revision = agent_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .revision();
+        if last_probe.is_some()
+            && (last_meta_sent.is_none() || probe_changed || hook_revision != last_hook_revision)
+        {
+            let hook = agent_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let meta = super::terminal::compose_terminal_meta(
+                last_probe.clone().expect("刚判过 is_some"),
+                &hook,
+            );
+            drop(hook);
+            if last_meta_sent.as_ref() != Some(&meta) {
+                handle.broadcast_meta(&meta);
+                last_meta_sent = Some(meta);
+            }
+            last_hook_revision = hook_revision;
         }
 
         // 扫描器攒下的探测应答（DA2 / XTVERSION / `CSI 16 t` / 尺寸上报）

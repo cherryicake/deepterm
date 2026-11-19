@@ -26,22 +26,28 @@
 use deepterm::utils::logging::{self, CappedLog};
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
     // 版本查询走最短路径：远端部署探针会在别的机器上跑 `--version`，
     // 那里可能没有可写的 HOME、没有图形环境，任何多余的初始化都可能
     // 让它失败——而探针失败会被判成"这个二进制不兼容"，把用户引到
     // 错误的方向上。
-    if std::env::args().any(|a| a == "--version" || a == "-V") {
+    if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("deepcore {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+
+    // macOS: a launchd launcher forks here and receives the pre-launch
+    // environment/limits before any threads exist. Holders also disclaim their
+    // privacy responsibility here, before creating PTYs.
+    let launchd_core = deepterm::daemon::platform::daemon_startup();
 
     // 守护进程的日志单独一份：和 GUI 混写会互相裁尾，
     // 而排查"终端为什么没恢复"正需要两边的时间线各自完整。
     let mut builder = logging::base_log_builder(logging::default_level());
     // holder 单独一个日志文件：它和 core 是两个进程，混写会让时间线
     // 互相穿插，而排查"终端为什么死了"最需要两者各自完整。
-    let is_holder_arg =
-        deepterm::daemon::holder::is_holder_invocation(&std::env::args().collect::<Vec<_>>());
+    let is_holder_arg = deepterm::daemon::holder::is_holder_invocation(&args);
     let mut log_path = None;
     let configured = if is_holder_arg {
         logging::holder_log_path()
@@ -70,14 +76,21 @@ fn main() {
 
     // 以 holder 身份运行？它不是"另一个程序"，只是同一份代码的另一种
     // 职责：持 PTY 而不是做协调。见 `daemon::holder` 的模块文档。
-    let args: Vec<String> = std::env::args().collect();
-    let is_holder = deepterm::daemon::holder::is_holder_invocation(&args);
+    let is_holder = !launchd_core && deepterm::daemon::holder::is_holder_invocation(&args);
+    let is_connect = !launchd_core && deepterm::daemon::connect::is_connect_invocation(&args);
 
     let result = if is_holder {
         log::info!("=== deepcore 以 holder 身份启动 ===");
         deepterm::daemon::holder::run()
+    } else if is_connect {
+        log::info!("=== deepcore 以 stdio 桥接身份启动 ===");
+        deepterm::daemon::connect::run()
     } else {
         log::info!("=== deepcore 以 core 身份启动 ===");
+        // A direct start is moved into launchd before it serves. On success this
+        // process exits and the launchd child becomes the core; a failure keeps
+        // the direct process with the inherited coalition.
+        deepterm::daemon::platform::prepare_core();
         deepterm::daemon::listen::run()
     };
 

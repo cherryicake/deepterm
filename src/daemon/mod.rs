@@ -3,11 +3,19 @@
 //! 设计见 `docs/DESIGN_TERMINAL_PERSISTENCE.md`。这里只放与 UI 无关的部分：
 //! 协议、socket 路径、终端登记。
 
+pub mod bootstrap;
 pub mod client;
+pub mod connect;
 pub mod connection;
 pub mod core_holder;
+pub mod deploy;
 pub mod holder;
+pub mod identity;
+#[cfg(unix)]
+pub mod launcher;
 pub mod listen;
+pub mod machines;
+pub mod platform;
 pub mod protocol;
 pub mod pump;
 pub mod registry;
@@ -98,9 +106,52 @@ pub fn socket_path() -> PathBuf {
 /// holder 就拉一个，之后所有 PTY 都建在 holder 里。
 pub const HOLDER_SOCKET_FILE_NAME: &str = "holder.sock";
 
+/// 新 holder 的 socket 前缀：`holder.<id>.sock`。
+pub const HOLDER_SOCKET_PREFIX: &str = "holder.";
+
 /// holder 的 socket 路径。
 pub fn holder_socket_path() -> PathBuf {
     runtime_dir().join(HOLDER_SOCKET_FILE_NAME)
+}
+
+/// 为一个新 holder 生成唯一 socket 路径。
+///
+/// 与 herdr 的 `<session>.holder.<id>.sock` 同构：core 不再假设“全世界只有
+/// 一个 holder”。旧 holder 继续用 `holder.sock`，新 holder 各用各的路径，
+/// 升级时互不打扰。
+pub fn new_holder_socket_path() -> PathBuf {
+    loop {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let path = runtime_dir().join(format!("{HOLDER_SOCKET_PREFIX}{}.sock", &id[..8]));
+        if !path.exists() {
+            return path;
+        }
+    }
+}
+
+/// 当前运行时目录里所有可能属于 holder 的 socket。
+///
+/// 同时接受旧版固定的 `holder.sock` 与新版 `holder.<id>.sock`。排序保证
+/// 接管顺序稳定，排障日志可复现。
+pub fn holder_socket_candidates() -> Vec<PathBuf> {
+    let dir = runtime_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![dir.join(HOLDER_SOCKET_FILE_NAME)];
+    };
+    let mut sockets: Vec<PathBuf> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_holder = name == HOLDER_SOCKET_FILE_NAME
+                || (name.starts_with(HOLDER_SOCKET_PREFIX) && name.ends_with(".sock"));
+            is_holder.then(|| entry.path())
+        })
+        .collect();
+    if sockets.is_empty() {
+        sockets.push(dir.join(HOLDER_SOCKET_FILE_NAME));
+    }
+    sockets.sort();
+    sockets
 }
 
 /// 鉴权 token 的文件名。
@@ -204,6 +255,11 @@ pub mod transport {
         stream.try_clone()
     }
 
+    /// 半关闭写端。`deepcore connect` 的 stdin 结束时用它通知 core。
+    pub fn shutdown_write(stream: &Stream) -> std::io::Result<()> {
+        stream.shutdown(std::net::Shutdown::Write)
+    }
+
     /// socket 路径 → 传输层能用的名字。
     pub fn address(path: &std::path::Path) -> String {
         path.to_string_lossy().into_owned()
@@ -235,6 +291,11 @@ pub mod transport {
     /// 命名管道句柄可以再复制一份（`DuplicateHandle`），供读写两个线程用。
     pub fn try_clone(stream: &Stream) -> std::io::Result<Stream> {
         stream.try_clone_handle()
+    }
+
+    /// Windows 命名管道没有与 Unix 对应的半关闭；连接由进程结束时关闭。
+    pub fn shutdown_write(_stream: &Stream) -> std::io::Result<()> {
+        Ok(())
     }
 
     /// 运行时目录 + 固定文件名 → `\\.\pipe\deepterm-<user>`。
@@ -457,6 +518,36 @@ mod path_tests {
         assert_eq!(
             socket_path(),
             PathBuf::from("/tmp/deepterm-test-rt/daemon.sock")
+        );
+    }
+
+    /// 每个新 holder 必须有自己的 socket。
+    ///
+    /// 固定复用 `holder.sock` 会让升级后的 core 永远接到旧 holder 上：旧
+    /// holder 不懂 `Meta`，GUI 重启后远程 Tab 只会显示 shell，程序图标与
+    /// agent 状态都丢了。Herdr 用 `<session>.holder.<id>.sock` 的原因相同。
+    #[test]
+    fn new_holders_get_unique_socket_names() {
+        let dir = format!(
+            "/tmp/deepterm-holder-name-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        let _guard = super::RuntimeDirGuard::new(&dir);
+        let first = new_holder_socket_path();
+        let second = new_holder_socket_path();
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(PathBuf::from(&dir).as_path()));
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(
+                    |name| name.starts_with(HOLDER_SOCKET_PREFIX) && name.ends_with(".sock")
+                )
         );
     }
 }

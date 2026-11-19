@@ -19,6 +19,7 @@
 //! 这个可以随便重启的进程做协调、holder 只负责持 PTY，职责更清楚，也和
 //! herdr 的分工一致。
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,16 +29,35 @@ use super::protocol::{CONTROL, Frame};
 use super::transport;
 
 /// 等 holder 起来的最长时间。
-const HOLDER_STARTUP: Duration = Duration::from_secs(3);
+const HOLDER_STARTUP: Duration = Duration::from_secs(5);
 
 /// 拉起后重试连接的间隔。
 const CONNECT_RETRY: Duration = Duration::from_millis(50);
 
-/// 与 holder 的连接。
+/// 一个 holder 的身份。握手时由 holder 自报。
 ///
-/// 全局单例：core 只有一个 holder，所有终端都走这一条连接（holder 侧
-/// 每条连接要占两个线程，按终端各连一条会白白多出一堆）。
+/// `build` 是**同一台机器上**的可执行文件指纹：core 与 holder 来自同一份
+/// 二进制时必须相等。旧 holder 没有这个字段，按 `build == ""` 处理；它的
+/// 终端仍然接管，但新终端不会再交给它。
+#[derive(Clone, Debug, Default)]
+pub struct HolderInfo {
+    pub socket: PathBuf,
+    pub instance: String,
+    pub build: String,
+    pub pid: u32,
+    /// 与本 core 同一构建且没有在 drain：新终端只交给它。
+    pub current: bool,
+    pub draining: bool,
+}
+
+/// 与一个 holder 的连接。
+///
+/// 每条 core→holder 连接承载该 holder 下的所有终端。多个 holder 并存时，
+/// 地址 → holder 的映射由 core 维护（全局 [`HolderSet`]）。
 pub struct HolderClient {
+    info: HolderInfo,
+    /// 连接期间被要求 drain。`info.draining` 只是握手时的初始状态。
+    draining: std::sync::atomic::AtomicBool,
     /// 待写帧的队列（由专用写线程消费）。
     ///
     /// # 为什么不在调用方线程直接写
@@ -95,6 +115,20 @@ pub struct HolderClient {
     pending: Arc<Mutex<std::collections::HashMap<u32, Pending>>>,
 }
 
+impl HolderClient {
+    pub fn info(&self) -> &HolderInfo {
+        &self.info
+    }
+
+    pub fn socket(&self) -> &Path {
+        &self.info.socket
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.info.current && !self.draining.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// 一条 holder channel 的转发目标。
 struct Route {
     /// 目标连接的出帧队列。
@@ -105,8 +139,6 @@ struct Route {
     /// `next_channel` 取值，而 GUI 连接从 1 递增。转发时必须改写，
     /// 否则 GUI 的路由表里找不到这个号。
     local_channel: u32,
-    /// 终端地址（holder 重连后按它重新挂接）。
-    address: String,
     /// 还没开闸时攒下的帧（见 [`HolderClient::resume`]）。
     ///
     /// `attach` 时先压住数据，等回复写出去之后再放行：客户端必须先拿到
@@ -153,122 +185,509 @@ struct Pending {
 /// 只是过手），那边是 GUI 侧上限，GUI 的内存压力与这里无关。
 const MAX_PENDING: usize = 8 * 1024 * 1024;
 
-static HOLDER: Mutex<Option<Arc<HolderClient>>> = Mutex::new(None);
+/// core 见到的全部 holder。
+///
+/// herdr 的模型：新旧 holder 同时存在。新终端只交给与当前 core 同 build 的
+/// holder；旧 holder 继续服务它手里的终端，直到那些终端结束。这样 core 升级
+/// 不会杀掉任何程序，同时新终端能用上新协议（前台程序、agent 状态、回滚等）。
+#[derive(Default)]
+struct HolderSet {
+    clients: Vec<Arc<HolderClient>>,
+    by_address: std::collections::HashMap<String, Arc<HolderClient>>,
+    next_address: u64,
+}
 
-/// 取（必要时拉起）holder 连接。
-pub fn holder() -> Option<Arc<HolderClient>> {
-    let guard = || {
-        HOLDER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+/// 全局 holder 表。`None` 表示还没扫描过。
+static HOLDERS: Mutex<Option<HolderSet>> = Mutex::new(None);
+/// 扫描/接管只做一次；start 有自己的锁，避免并发拉起两个同 build holder。
+static ADOPTING: Mutex<()> = Mutex::new(());
+static STARTING: Mutex<()> = Mutex::new(());
+static ADOPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn holders_guard() -> std::sync::MutexGuard<'static, Option<HolderSet>> {
+    HOLDERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn current_in_set() -> Option<Arc<HolderClient>> {
+    holders_guard()
+        .as_ref()?
+        .clients
+        .iter()
+        .find(|client| client.is_current() && !client.is_closed())
+        .cloned()
+}
+
+fn snapshot_clients() -> Vec<Arc<HolderClient>> {
+    holders_guard()
+        .as_ref()
+        .map(|set| set.clients.clone())
+        .unwrap_or_default()
+}
+
+fn prune_closed() {
+    let mut guard = holders_guard();
+    let Some(set) = guard.as_mut() else {
+        return;
     };
+    let live: std::collections::HashSet<PathBuf> = set
+        .clients
+        .iter()
+        .filter(|client| !client.is_closed())
+        .map(|client| client.info.socket.clone())
+        .collect();
+    set.clients
+        .retain(|client| !client.is_closed() || live.contains(client.socket()));
+    set.by_address
+        .retain(|_, client| live.contains(client.socket()));
+}
 
-    if let Some(client) = guard().as_ref()
-        && !client.is_closed()
-    {
-        return Some(client.clone());
+/// 接管运行时目录里所有还活着的 holder。
+///
+/// core 启动时调用一次，且必须在接受 GUI 连接之前完成：GUI 恢复会话时会
+/// 立刻按地址 `attach`，地址到 holder 的映射必须先建立好。
+pub fn adopt_all() -> std::io::Result<()> {
+    let _adopting = ADOPTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if ADOPTED.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(());
     }
 
-    match connect_or_start() {
-        Ok(client) => {
-            let client = Arc::new(client);
-            let mut slot = guard();
-            match slot.as_ref().filter(|existing| !existing.is_closed()) {
-                Some(existing) => Some(existing.clone()),
-                None => {
-                    let previous = slot.replace(client.clone());
-                    log::info!("已（重新）连接 holder");
-                    drop(slot);
-                    // 换了新连接：把已有的挂接全部重新登记一遍。
-                    //
-                    // 新连接上 holder 的 channel 号从头开始，旧号一律失效。
-                    // 不重建的话所有 viewer 会永久静默（数据在跑、画面不动）。
-                    if previous.is_some() {
-                        client.recover_routes();
-                    }
-                    Some(client)
-                }
+    let mut clients: Vec<Arc<HolderClient>> = Vec::new();
+    for socket in super::holder_socket_candidates() {
+        if !socket.exists() {
+            continue;
+        }
+        match connect_existing_holder(&socket) {
+            Ok(client) => {
+                log::info!(
+                    "接管 holder: socket={} instance={} pid={} build={} current={}",
+                    socket.display(),
+                    client.info.instance,
+                    client.info.pid,
+                    if client.info.build.is_empty() {
+                        "legacy"
+                    } else {
+                        client.info.build.as_str()
+                    },
+                    client.info.current
+                );
+                clients.push(Arc::new(client));
+            }
+            Err(error) => {
+                log::warn!("无法接管 holder {}: {error}", socket.display());
+                remove_stale_holder_files(&socket, &error);
             }
         }
-        Err(e) => {
-            log::error!("无法连接 holder: {e}");
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    {
+        let mut guard = holders_guard();
+        let set = guard.get_or_insert_with(HolderSet::default);
+        for client in clients {
+            if seen.insert(client.info.instance.clone()) {
+                set.clients.push(client);
+            }
+        }
+    }
+
+    // 同一个 build 只保留一个 current；多余的让它 drain，只服务已有终端。
+    let snapshot = snapshot_clients();
+    let mut kept_current = false;
+    for client in snapshot {
+        if client.is_current() {
+            if kept_current {
+                client.send_drain();
+            } else {
+                kept_current = true;
+            }
+        } else {
+            // 旧 build / 已在 drain：接管它的终端，但不再给它新终端。
+            client.send_drain();
+        }
+    }
+
+    if !kept_current {
+        start_current_holder()?;
+    }
+    refresh_addresses();
+    ADOPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(())
+}
+
+fn connect_existing_holder(socket: &Path) -> std::io::Result<HolderClient> {
+    let stream = transport::connect(socket)?;
+    HolderClient::from_stream(stream, socket.to_path_buf())
+}
+
+/// 只清真正“没有监听者”的残留文件。
+///
+/// 连接被拒绝说明进程已经不在；权限错误、超时等则可能是活着的 holder
+/// 暂时忙，绝不能删它的 socket 把终端变成孤儿。
+fn remove_stale_holder_files(socket: &Path, error: &std::io::Error) {
+    if error.kind() != std::io::ErrorKind::ConnectionRefused
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return;
+    }
+    let _ = std::fs::remove_file(socket);
+    let _ = std::fs::remove_file(socket.with_extension("pid"));
+    let _ = std::fs::remove_file(super::token_path_for(socket));
+}
+
+/// 取（必要时拉起）当前 build 的 holder。
+pub fn current_holder() -> Option<Arc<HolderClient>> {
+    prune_closed();
+    if let Some(client) = current_in_set() {
+        return Some(client);
+    }
+    match start_current_holder() {
+        Ok(client) => Some(client),
+        Err(error) => {
+            log::error!("无法启动当前 build 的 holder: {error}");
             None
         }
     }
 }
 
-/// 连接 holder；没在跑就拉起来。
-fn connect_or_start() -> std::io::Result<HolderClient> {
-    let path = super::holder_socket_path();
-    if let Ok(stream) = transport::connect(&path) {
-        return HolderClient::from_stream(stream);
+fn start_current_holder() -> std::io::Result<Arc<HolderClient>> {
+    let _starting = STARTING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    prune_closed();
+    if let Some(client) = current_in_set() {
+        return Ok(client);
     }
 
-    spawn_holder()?;
-
+    let socket = super::new_holder_socket_path();
+    spawn_holder(&socket)?;
     let deadline = Instant::now() + HOLDER_STARTUP;
     let mut last = None;
-    while Instant::now() < deadline {
-        match transport::connect(&path) {
-            Ok(stream) => return HolderClient::from_stream(stream),
-            Err(e) => {
-                last = Some(e);
+    loop {
+        match connect_existing_holder(&socket) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                if !client.info.current {
+                    client.send_drain();
+                    return Err(std::io::Error::other(format!(
+                        "新 holder 的 build {} 与 core {} 不一致",
+                        client.info.build,
+                        super::identity::build_id()
+                    )));
+                }
+                {
+                    let mut guard = holders_guard();
+                    let set = guard.get_or_insert_with(HolderSet::default);
+                    if !set
+                        .clients
+                        .iter()
+                        .any(|item| item.info.instance == client.info.instance)
+                    {
+                        set.clients.push(client.clone());
+                    }
+                }
+                log::info!(
+                    "新 holder 已就绪: socket={} instance={} pid={}",
+                    socket.display(),
+                    client.info.instance,
+                    client.info.pid
+                );
+                return Ok(client);
+            }
+            Err(error) if Instant::now() < deadline => {
+                last = Some(error);
                 std::thread::sleep(CONNECT_RETRY);
+            }
+            Err(error) => {
+                return Err(last.unwrap_or(error));
             }
         }
     }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::TimedOut, "holder 未能在预期时间内启动")
-    }))
 }
 
-/// 拉起 `deepcore --holder`。
-fn spawn_holder() -> std::io::Result<()> {
+/// 拉起 `deepcore --holder --socket <path>`。
+fn spawn_holder(socket: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    log::info!("拉起 holder: {}", exe.display());
+    let socket_text = socket.to_string_lossy().into_owned();
+    log::info!(
+        "拉起 holder: {}（socket {}）",
+        exe.display(),
+        socket.display()
+    );
 
-    let mut command = std::process::Command::new(exe);
-    command.arg(super::holder::HOLDER_FLAG);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    // 关键：让 holder 脱离 core 的会话。
-    //
-    // 不脱离的话，core 退出时（用户关掉 deepterm、`kill` 掉 core、或
-    // 终端会话结束）holder 会跟着收到 SIGHUP/SIGTERM——而"活过 core 重启"
-    // 正是它存在的全部意义。
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        // SAFETY：`setsid` 在 fork 后的子进程里执行，失败返回 -1；
-        // 调用的是 async-signal-safe 的系统调用。
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-    }
+    return super::launcher::spawn_detached(
+        &exe,
+        &[
+            super::holder::HOLDER_FLAG,
+            super::holder::HOLDER_SOCKET_FLAG,
+            socket_text.as_str(),
+        ],
+        "holder",
+    );
+
     #[cfg(windows)]
     {
+        let mut command = std::process::Command::new(exe);
+        command.args([
+            super::holder::HOLDER_FLAG,
+            super::holder::HOLDER_SOCKET_FLAG,
+            socket_text.as_str(),
+        ]);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         use std::os::windows::process::CommandExt as _;
         // `DETACHED_PROCESS` + `CREATE_NEW_PROCESS_GROUP`：不附着到 core 的
         // 控制台，也不接收 core 的控制台事件（Ctrl+C 之类）。
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+        command.spawn()?;
+        Ok(())
     }
+}
 
-    command.spawn()?;
-    Ok(())
+/// 一条控制请求的结果以及处理它的 holder。
+pub struct HolderCall {
+    pub holder: Arc<HolderClient>,
+    pub reply: Value,
+}
+
+/// 地址属于哪个 holder。
+pub fn holder_for_address(address: &str) -> Option<Arc<HolderClient>> {
+    prune_closed();
+    holders_guard()
+        .as_ref()?
+        .by_address
+        .get(address)
+        .filter(|client| !client.is_closed())
+        .cloned()
+}
+
+fn record_address(address: &str, holder: &Arc<HolderClient>) {
+    let id = super::registry::parse_address_id(address);
+    let mut guard = holders_guard();
+    let set = guard.get_or_insert_with(HolderSet::default);
+    match set.by_address.get(address) {
+        Some(existing) if existing.info.instance != holder.info.instance => {
+            log::warn!(
+                "终端地址 {address} 同时出现在 holder {} 与 {}；保留先登记的那个",
+                existing.info.instance,
+                holder.info.instance
+            );
+        }
+        _ => {
+            set.by_address.insert(address.to_string(), holder.clone());
+        }
+    }
+    if let Some(id) = id {
+        // `saturating_add`：id 来自 holder 上报的地址，与 `registry` 那边同理，
+        // 不能假设它一定小于 `u64::MAX`。
+        set.next_address = set.next_address.max(id.saturating_add(1));
+    }
+}
+
+fn forget_address(address: &str, holder: &Arc<HolderClient>) {
+    let mut guard = holders_guard();
+    if let Some(set) = guard.as_mut()
+        && set
+            .by_address
+            .get(address)
+            .is_some_and(|existing| existing.info.instance == holder.info.instance)
+    {
+        set.by_address.remove(address);
+    }
+}
+
+fn record_list(reply: &Value, holder: &Arc<HolderClient>) {
+    let Some(terminals) = reply.get("terminals").and_then(Value::as_array) else {
+        return;
+    };
+    for terminal in terminals {
+        if let Some(address) = terminal.get("address").and_then(Value::as_str) {
+            record_address(address, holder);
+        }
+    }
+}
+
+/// 向所有 holder 查一遍终端地址。返回是否有 holder 答上。
+pub fn refresh_addresses() -> bool {
+    let clients = snapshot_clients();
+    let mut answered = false;
+    for client in clients {
+        if client.is_closed() {
+            continue;
+        }
+        match client.call_timeout(json!({"op": "list"}), Duration::from_secs(3)) {
+            Ok(reply) if reply["ok"] == true => {
+                record_list(&reply, &client);
+                answered = true;
+            }
+            Ok(reply) => log::warn!(
+                "holder {} 的 list 失败: {}",
+                client.info.instance,
+                reply["error"].as_str().unwrap_or("未知错误")
+            ),
+            Err(error) => log::warn!("holder {} 的 list 超时/断开: {error}", client.info.instance),
+        }
+    }
+    answered
+}
+
+/// 把一条带 `address` 的请求交给正确的 holder。
+///
+/// 地址映射可能因为 holder 里刚 spawn、刚 reap 而短暂过期：遇到
+/// `not_found` 时刷新一次映射并重试，避免把“映射旧了”误报成“终端没了”。
+pub fn call_for_address(request: &Value) -> Option<HolderCall> {
+    let address = request.get("address").and_then(Value::as_str)?.to_string();
+    for attempt in 0..2 {
+        let holder = if attempt == 0 {
+            holder_for_address(&address)
+        } else {
+            refresh_addresses();
+            holder_for_address(&address)
+        };
+        let Some(holder) = holder else {
+            continue;
+        };
+        match holder.call(request.clone()) {
+            Ok(reply) => {
+                if reply["ok"] == true {
+                    record_address(&address, &holder);
+                    return Some(HolderCall { holder, reply });
+                }
+                if reply["kind"].as_str() == Some("not_found") {
+                    forget_address(&address, &holder);
+                    if attempt == 0 {
+                        continue;
+                    }
+                }
+                return Some(HolderCall { holder, reply });
+            }
+            Err(error) => {
+                log::warn!(
+                    "向 holder {} 发送 {} 失败: {error}",
+                    holder.info.instance,
+                    request.get("op").and_then(Value::as_str).unwrap_or("?")
+                );
+            }
+        }
+    }
+    None
+}
+
+/// 起一个新终端。地址由 core 统一分配，避免多个 holder 各自从 `t1` 开始。
+pub fn spawn(request: &Value) -> Option<HolderCall> {
+    for _ in 0..2 {
+        let holder = current_holder()?;
+        let address = allocate_address();
+        let mut request = request.clone();
+        request["address"] = json!(address);
+        match holder.call(request) {
+            Ok(reply) => {
+                if reply["ok"] == true
+                    && let Some(address) = reply["address"].as_str()
+                {
+                    record_address(address, &holder);
+                }
+                return Some(HolderCall { holder, reply });
+            }
+            Err(error) => {
+                log::warn!("holder {} 创建终端失败: {error}", holder.info.instance);
+            }
+        }
+    }
+    None
+}
+
+fn allocate_address() -> String {
+    loop {
+        let id = {
+            let mut guard = holders_guard();
+            let set = guard.get_or_insert_with(HolderSet::default);
+            let id = set.next_address.max(1);
+            // `saturating_add`：`next_address` 可能被 `record_address` 推进到
+            // `u64::MAX`（地址来自 holder 上报）。这里再 `+1` 会溢出。
+            set.next_address = id.saturating_add(1);
+            id
+        };
+        let address = format!("t{id:x}");
+        if holder_for_address(&address).is_none() {
+            return address;
+        }
+    }
+}
+
+/// 合并所有 holder 的终端清单。
+pub fn list_all() -> Option<Value> {
+    prune_closed();
+    if snapshot_clients().is_empty() && current_holder().is_none() {
+        return None;
+    }
+    let clients = snapshot_clients();
+    let mut terminals = Vec::new();
+    let mut answered = false;
+    for client in clients {
+        if client.is_closed() {
+            continue;
+        }
+        match client.call_timeout(json!({"op": "list"}), Duration::from_secs(5)) {
+            Ok(reply) if reply["ok"] == true => {
+                answered = true;
+                record_list(&reply, &client);
+                if let Some(items) = reply.get("terminals").and_then(Value::as_array) {
+                    terminals.extend(items.iter().cloned());
+                }
+            }
+            Ok(reply) => log::warn!(
+                "holder {} 的 list 失败: {}",
+                client.info.instance,
+                reply["error"].as_str().unwrap_or("未知错误")
+            ),
+            Err(error) => log::warn!("holder {} 的 list 超时/断开: {error}", client.info.instance),
+        }
+    }
+    if !answered {
+        return None;
+    }
+    terminals.sort_by(|left, right| {
+        left.get("address")
+            .and_then(Value::as_str)
+            .cmp(&right.get("address").and_then(Value::as_str))
+    });
+    Some(json!({"ok": true, "terminals": terminals}))
+}
+
+/// 清扫所有 holder 里已结束的终端。
+pub fn reap_all() -> Vec<String> {
+    let mut removed = Vec::new();
+    for client in snapshot_clients() {
+        if client.is_closed() {
+            continue;
+        }
+        match client.call_timeout(json!({"op": "reap"}), Duration::from_secs(5)) {
+            Ok(reply) if reply["ok"] == true => {
+                if let Some(items) = reply.get("removed").and_then(Value::as_array) {
+                    for item in items.iter().filter_map(Value::as_str) {
+                        forget_address(item, &client);
+                        removed.push(item.to_string());
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("holder {} 的 reap 失败: {error}", client.info.instance),
+        }
+    }
+    removed
 }
 
 impl HolderClient {
-    fn from_stream(stream: transport::Stream) -> std::io::Result<Self> {
+    fn from_stream(stream: transport::Stream, socket: PathBuf) -> std::io::Result<Self> {
         let read_stream = transport::try_clone(&stream)?;
         let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = closed.clone();
@@ -425,14 +844,23 @@ impl HolderClient {
                 .ok();
         }
 
-        let client = Self {
+        let mut client = Self {
+            info: HolderInfo {
+                socket: socket.clone(),
+                ..HolderInfo::default()
+            },
+            draining: std::sync::atomic::AtomicBool::new(false),
             outbox: out_tx,
             pending_replies,
             closed,
             routes,
             pending,
         };
-        client.handshake()?;
+        client.info = client.handshake(&socket)?;
+        client.info.current = holder_is_current(&client.info.build, client.info.draining);
+        client
+            .draining
+            .store(client.info.draining, std::sync::atomic::Ordering::SeqCst);
         Ok(client)
     }
 
@@ -441,8 +869,8 @@ impl HolderClient {
     /// holder 与 core 各有一份 token（见 `token_path_for`）；这里读 holder
     /// 的那份。漏掉这一步时，后续每条请求都会被服务端拒掉，而表面上
     /// 连接是"成功"的——最初的表现就是"spawn 说成功，holder 里却没有"。
-    fn handshake(&self) -> std::io::Result<()> {
-        let token = super::read_token_for(&super::holder_socket_path()).map_err(|e| {
+    fn handshake(&self, socket: &Path) -> std::io::Result<HolderInfo> {
+        let token = super::read_token_for(socket).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("读不到 holder token: {e}"),
@@ -495,7 +923,38 @@ impl HolderClient {
                         super::protocol::PROTOCOL_VERSION
                     );
                 }
-                Ok(())
+                let mut info = HolderInfo {
+                    socket: socket.to_path_buf(),
+                    instance: reply
+                        .get("generation")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            socket
+                                .file_stem()
+                                .map(|stem| stem.to_string_lossy().into_owned())
+                        })
+                        .unwrap_or_default(),
+                    build: reply
+                        .get("build")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    pid: reply
+                        .get("pid")
+                        .and_then(Value::as_u64)
+                        .and_then(|pid| u32::try_from(pid).ok())
+                        .unwrap_or(0),
+                    current: false,
+                    draining: reply
+                        .get("draining")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                };
+                if info.instance.is_empty() {
+                    info.instance = info.socket.display().to_string();
+                }
+                Ok(info)
             }
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -508,76 +967,16 @@ impl HolderClient {
         self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// 登记一个终端 channel，返回它的输出流。
+    /// 告诉 holder：不要再接新终端，把现有终端跑完即可退出。
     ///
-    /// core 与 holder 之间**沿用同一个 channel 号**：UI 请求 attach 时拿到
-    /// 的编号会原样告诉 holder，holder 推数据也用这个号。这样 core 只需要
-    /// 按号转发，不必维护一张额外的映射表（映射表还有个隐患：holder 重启
-    /// 后旧编号可能撞上新终端）。
-    /// 换连接之后，把所有挂接重新 attach 一遍。
-    ///
-    /// 新连接上 holder 的 channel 号从 1 重新开始，旧号全部失效。这里按
-    /// 地址重新 attach，拿到新号后**就地更新路由**——所以对上层（GUI）来说
-    /// channel 号完全不变，只是底层换了条通道。
-    ///
-    /// 整个过程在后台线程做：`call` 要等 holder 回复，不能阻塞调用方
-    /// （可能是某条连接的读线程）。
-    fn recover_routes(self: &Arc<Self>) {
-        let this = self.clone();
-        std::thread::Builder::new()
-            .name("holder-recover".into())
-            .spawn(move || {
-                // 给 holder 一点时间就位。
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let routes: Vec<(u32, String, async_channel::Sender<Frame>, u32)> = {
-                    let guard = this.routes.lock().expect("holder routes");
-                    guard
-                        .iter()
-                        .map(|(holder_ch, r)| {
-                            (*holder_ch, r.address.clone(), r.tx.clone(), r.local_channel)
-                        })
-                        .collect()
-                };
-                if routes.is_empty() {
-                    return;
-                }
-                let mut recovered = Vec::with_capacity(routes.len());
-                for (old_holder_ch, address, tx, local_channel) in routes {
-                    let reply = this.call(serde_json::json!({
-                        "op": "attach",
-                        "address": address,
-                        "history": 0,
-                    }));
-                    let Ok(reply) = reply else { continue };
-                    let Some(new_ch) = reply["channel"].as_u64() else {
-                        continue;
-                    };
-                    recovered.push((old_holder_ch, new_ch as u32, address, tx, local_channel));
-                }
-                if recovered.is_empty() {
-                    return;
-                }
-                {
-                    let mut guard = this.routes.lock().expect("holder routes");
-                    for (old_ch, new_ch, address, tx, local_channel) in &recovered {
-                        guard.remove(old_ch);
-                        guard.insert(
-                            *new_ch,
-                            Route {
-                                tx: tx.clone(),
-                                local_channel: *local_channel,
-                                address: address.clone(),
-                                // 恢复时通道已经是通的（GUI 那侧早就登记过路由）。
-                                held: Vec::new(),
-                                paused: false,
-                                ticket: next_ticket(),
-                            },
-                        );
-                    }
-                }
-                log::info!("holder 重连后恢复了 {} 个挂接", recovered.len());
-            })
-            .ok();
+    /// 旧 holder 不认识这个 op，只会回一条错误；那不影响它继续服务已有
+    /// 终端，core 也不会再向它发 spawn。
+    pub fn send_drain(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Err(error) = self.call_timeout(json!({"op": "drain"}), Duration::from_secs(2)) {
+            log::debug!("向 holder {} 发送 drain 失败: {error}", self.info.instance);
+        }
     }
 
     /// 登记一条 holder channel 的转发目标。
@@ -589,7 +988,6 @@ impl HolderClient {
         &self,
         holder_channel: u32,
         local_channel: u32,
-        address: &str,
         tx: async_channel::Sender<Frame>,
         paused: bool,
     ) -> u64 {
@@ -603,7 +1001,6 @@ impl HolderClient {
                 Route {
                     tx: tx.clone(),
                     local_channel,
-                    address: address.to_string(),
                     held: Vec::new(),
                     paused,
                     ticket,
@@ -701,6 +1098,11 @@ impl HolderClient {
 
     /// 控制面调用。
     pub fn call(&self, request: Value) -> std::io::Result<Value> {
+        self.call_timeout(request, Duration::from_secs(10))
+    }
+
+    /// 带超时的控制面调用。
+    pub fn call_timeout(&self, request: Value, timeout: Duration) -> std::io::Result<Value> {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut request = request;
@@ -717,7 +1119,7 @@ impl HolderClient {
             .insert(id, tx);
         self.send(Frame::json(serde_json::to_vec(&request)?))?;
 
-        match rx.recv_timeout(Duration::from_secs(10)) {
+        match rx.recv_timeout(timeout) {
             Ok(frame) => {
                 let reply: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
                 Ok(reply)
@@ -732,12 +1134,36 @@ impl HolderClient {
             )),
         }
     }
+
+    /// 单元测试用的空连接：没有读/写线程，只用来验证路由表。
+    #[cfg(test)]
+    pub fn for_tests() -> Self {
+        let (outbox, _) = async_channel::unbounded();
+        Self {
+            info: HolderInfo::default(),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            outbox,
+            pending_replies: Arc::default(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            routes: Arc::default(),
+            pending: Arc::default(),
+        }
+    }
+}
+
+/// 一个 holder 是否有资格接收新终端。
+///
+/// 旧 holder 的 hello 没有 `build`，空串必须判为旧构建。只按版本号判是不
+/// 够的：本地构建、开发构建和补丁版都可能共享 `0.1.0`，Herdr 也因此用
+/// 二进制 build id 而不是版本号。
+fn holder_is_current(build: &str, draining: bool) -> bool {
+    !build.is_empty() && build == super::identity::build_id() && !draining
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::protocol::Kind;
+    use super::*;
 
     /// **登记前到达的帧必须保留帧类型。**
     ///
@@ -748,7 +1174,9 @@ mod tests {
     #[test]
     fn buffered_frames_keep_their_kind() {
         let mut pending = Pending::default();
-        pending.frames.push(Frame::new(1, Kind::Meta, b"{\"foreground\":null}".to_vec()));
+        pending
+            .frames
+            .push(Frame::new(1, Kind::Meta, b"{\"foreground\":null}".to_vec()));
         pending.bytes += pending.frames.last().expect("刚推入").payload.len();
         pending.frames.push(Frame::data(1, b"screen".to_vec()));
         pending.bytes += pending.frames.last().expect("刚推入").payload.len();
@@ -760,7 +1188,10 @@ mod tests {
             vec![Kind::Meta, Kind::Data],
             "缓冲不能把 Meta 压成 Data"
         );
-        assert!(pending.bytes > 0, "字节计数要跟上，否则 MAX_PENDING 不起作用");
+        assert!(
+            pending.bytes > 0,
+            "字节计数要跟上，否则 MAX_PENDING 不起作用"
+        );
     }
 
     /// holder 与 core 必须用不同的 socket。
@@ -782,5 +1213,14 @@ mod tests {
             "deepcore".into(),
             super::super::holder::HOLDER_FLAG.into()
         ]));
+    }
+
+    /// 旧 holder 没有 `build` 字段；它手里的终端要接管，但绝不能再接新终端。
+    #[test]
+    fn legacy_holders_are_not_current() {
+        assert!(!holder_is_current("", false));
+        assert!(!holder_is_current("sha256:another-build", false));
+        assert!(!holder_is_current(super::super::identity::build_id(), true));
+        assert!(holder_is_current(super::super::identity::build_id(), false));
     }
 }

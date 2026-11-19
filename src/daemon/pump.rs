@@ -464,10 +464,7 @@ mod tests {
         hub.broadcast(b"delta", || unreachable!("已没人欠快照，不该生成快照"));
         let frame = rxs[1].try_recv().expect("活着的订阅者应收到增量");
         assert_eq!(frame.payload, b"delta");
-        assert!(
-            rxs[0].try_recv().is_err(),
-            "退订的订阅者不该再收到任何东西"
-        );
+        assert!(rxs[0].try_recv().is_err(), "退订的订阅者不该再收到任何东西");
     }
 
     /// 注销后不再收到任何东西。

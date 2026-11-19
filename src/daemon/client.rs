@@ -3,22 +3,20 @@
 //! UI 进程只通过这里与守护进程打交道。所有"发现没连上 → 拉起 → 重试"
 //! 的逻辑都收在这一个文件里，调用方拿到的永远是"连上了"或一个明确的错误。
 
-use std::io::{BufWriter, Write as _};
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::process::Child;
+#[cfg(not(test))]
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+pub use super::bootstrap::{
+    CONNECT_RETRY, DAEMON_BIN, DAEMON_ENV, STARTUP_TIMEOUT, daemon_binary_path,
+};
 use super::protocol::{CONTROL, Frame, Kind, read_frame};
-
-/// 拉起守护进程后最多等多久。
-///
-/// 首次启动要创建 PTY、加载 shell 集成脚本；3 秒足够，超时说明真的出问题了。
-const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// 拉起后重试连接的间隔。
-const CONNECT_RETRY: Duration = Duration::from_millis(50);
 
 /// 一条与守护进程的连接。
 ///
@@ -61,9 +59,23 @@ pub struct Client {
     routes: Arc<std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>>,
     /// reader 线程是否已退出（守护进程没了）。
     closed: Arc<AtomicBool>,
+    /// 建立连接的时刻，与 `last_rx_ms` 一起计算这条 line 已经静默多久。
+    read_since: Instant,
+    /// reader 最后一次读到任意帧的时间（相对 `read_since` 的毫秒数）。
+    ///
+    /// SSH 半开时 `is_closed()` 可能永远为 false，控制请求只会各自超时。
+    /// Herdr 在 wire 层记录“最后一次听到真实字节”，这里用同样的判据：
+    /// 只要还有终端输出或 status 回复在流动，line 就不算死；完全没有任何
+    /// 字节超过上限，supervisor 才主动重拨。
+    last_rx_ms: Arc<AtomicU64>,
     /// 路由尚未登记时提前到达的帧（见 `attach_channel`）。
     pending: Arc<std::sync::Mutex<std::collections::HashMap<u32, Pending>>>,
     next_id: AtomicU64,
+    /// 由本进程启动的 `deepcore connect` 子进程。
+    ///
+    /// 直接连 socket（测试与显式兼容路径）时为 `None`。最后一条 `Client`
+    /// 释放时 guard 会结束桥进程；core/holder 是独立会话，不受影响。
+    _bridge: Option<BridgeProcess>,
 }
 
 impl Client {
@@ -74,63 +86,77 @@ impl Client {
     /// 的意义。反过来"直接拒绝"会让用户升级后完全失去持久化能力（旧 core 还
     /// 在跑、新 GUI 连不上，正在运行的程序既看不见也接不回来）。
     pub fn connect_or_start() -> std::io::Result<Self> {
-        let path = super::socket_path();
-        if let Ok(stream) = super::transport::connect(&path) {
-            match Self::from_stream(stream) {
-                Ok(client) => return Ok(client),
+        // 单元测试绝不能拉起生产进程：测试直接走 socket 探测路径，通常
+        // 立即失败；需要真实协议的测试自行提供隔离的 socket。
+        #[cfg(test)]
+        {
+            return Self::connect_existing();
+        }
+
+        #[cfg(not(test))]
+        {
+            match Self::connect_via_bridge() {
+                Ok(client) => Ok(client),
                 Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
                     log::warn!("守护进程协议过旧，重启 core（keep-alive 由 holder 保证）");
+                    let path = super::socket_path();
                     Self::restart_stale_core(&path)?;
-                    // **结束旧 core 之后必须自己拉起新的。**
-                    //
-                    // 只删 socket 不拉新进程的话，这一轮会一直连不上并超时
-                    // 返回错误；调用方看到一个失败，终端视图就把"接不回来"
-                    // 当成"终端已经不存在"，按会话重建面板——用户看到的是
-                    // 标签被换掉、原来的 shell 不见了。实测正是如此：日志里
-                    // `t1` 的重连失败紧接着
-                    // "终端已不在守护进程中，按会话重建面板"。
-                    spawn_daemon()?;
-                    let deadline = Instant::now() + STARTUP_TIMEOUT;
-                    while Instant::now() < deadline {
-                        match super::transport::connect(&path) {
-                            Ok(stream) => {
-                                return Self::from_stream(stream).map_err(|e| {
-                                    std::io::Error::new(
-                                        e.kind(),
-                                        format!("重启后的守护进程仍无法握手: {e}"),
-                                    )
-                                });
-                            }
-                            Err(connect_err) => {
-                                log::debug!("等待重启后的守护进程: {connect_err}");
-                                std::thread::sleep(CONNECT_RETRY);
-                            }
-                        }
-                    }
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "重启守护进程后未能重新连上",
-                    ));
+                    Self::connect_via_bridge().map_err(|e| {
+                        std::io::Error::new(e.kind(), format!("重启后的守护进程仍无法握手: {e}"))
+                    })
                 }
-                Err(e) => return Err(e),
+                Err(e) => Err(e),
             }
         }
-        spawn_daemon()?;
+    }
 
-        let deadline = Instant::now() + STARTUP_TIMEOUT;
-        let mut last_error = None;
-        while Instant::now() < deadline {
-            match super::transport::connect(&path) {
-                Ok(stream) => return Self::from_stream(stream),
-                Err(e) => {
-                    last_error = Some(e);
-                    std::thread::sleep(CONNECT_RETRY);
-                }
-            }
+    /// 通过 `deepcore connect` 的 stdin/stdout 建立连接。
+    #[cfg(not(test))]
+    fn connect_via_bridge() -> std::io::Result<Self> {
+        let exe = daemon_binary_path().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "找不到 {DAEMON_BIN}（应与 {} 在同一目录，或在 PATH 里）",
+                    DAEMON_BIN
+                ),
+            )
+        })?;
+
+        log::info!("启动 stdio 桥: {} connect", exe.display());
+        let mut command = Command::new(exe);
+        command.arg(super::connect::CONNECT_COMMAND);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
         }
-        Err(last_error.unwrap_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "守护进程未能在预期时间内启动")
-        }))
+
+        let mut child = command.spawn()?;
+        let Some(stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "deepcore connect 没有 stdin",
+            ));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "deepcore connect 没有 stdout",
+            ));
+        };
+        let client = Self::from_io(stdout, stdin, Some(BridgeProcess::new(child)))?;
+        client.handshake()?;
+        Ok(client)
     }
 
     /// 让旧 core 退出，给新版本腾出 socket。
@@ -142,6 +168,7 @@ impl Client {
     ///
     /// 用 pid 文件而不是按进程名 `pkill`：按名字杀会同时命中 holder（两者是
     /// 同一个二进制），那正是这里最不能发生的事。
+    #[cfg(not(test))]
     fn restart_stale_core(socket: &std::path::Path) -> std::io::Result<()> {
         let pid_file = socket.with_extension("pid");
         let pid = std::fs::read_to_string(&pid_file)
@@ -210,6 +237,20 @@ impl Client {
 
     fn from_stream(stream: super::transport::Stream) -> std::io::Result<Self> {
         let read_stream = super::transport::try_clone(&stream)?;
+        let client = Self::from_io(read_stream, stream, None)?;
+        client.handshake()?;
+        Ok(client)
+    }
+
+    /// 从一对独立的读/写端建立协议连接。
+    ///
+    /// socket 路径把同一对象克隆成两半；stdio 路径天然就是两根管道。把
+    /// “读写如何取得”留在这里，上面的分帧、路由、握手逻辑完全复用。
+    fn from_io(
+        read_stream: impl Read + Send + 'static,
+        write_stream: impl Write + Send + 'static,
+        bridge: Option<BridgeProcess>,
+    ) -> std::io::Result<Self> {
         let routes: Arc<
             std::sync::Mutex<std::collections::HashMap<u32, async_channel::Sender<Frame>>>,
         > = Arc::default();
@@ -224,14 +265,21 @@ impl Client {
         > = Arc::default();
         let pending_replies_for_client = pending_replies.clone();
         let reader_replies = pending_replies.clone();
+        let read_since = Instant::now();
+        let last_rx_ms = Arc::new(AtomicU64::new(0));
+        let reader_last_rx_ms = last_rx_ms.clone();
 
         std::thread::Builder::new()
             .name("daemon-client-read".into())
             .spawn(move || {
-                let mut reader = read_stream;
+                let mut reader = BufReader::new(read_stream);
                 loop {
                     match read_frame(&mut reader) {
                         Ok(Some(frame)) => {
+                            reader_last_rx_ms.store(
+                                read_since.elapsed().as_millis() as u64,
+                                Ordering::Relaxed,
+                            );
                             if frame.channel == CONTROL {
                                 // 按请求 id 分发：**只喂给等它的那一个 call**。
                                 // 见 `pending_replies` 的说明——共享队列会让
@@ -343,7 +391,7 @@ impl Client {
         // 在 core 重启后持续了几分钟，日志里是成百上千条同样的写入失败。
         let (out_tx, out_rx) = async_channel::unbounded::<Frame>();
         {
-            let mut buf = BufWriter::new(stream);
+            let mut buf = BufWriter::new(write_stream);
             let closed_flag = closed.clone();
             let writer_routes = routes.clone();
             std::thread::Builder::new()
@@ -372,10 +420,23 @@ impl Client {
             pending_replies: pending_replies_for_client,
             routes,
             closed,
+            read_since,
+            last_rx_ms,
             next_id: AtomicU64::new(1),
+            _bridge: bridge,
         };
-        client.handshake()?;
         Ok(client)
+    }
+
+    /// 从任意同步读写端建立协议连接，不自动握手。
+    ///
+    /// 远端 line 用这个入口：Transport 的另一端是 russh channel，而握手
+    /// 由 [`MachineRuntime`](super::machines::MachineRuntime) 按协议检查。
+    pub(crate) fn from_transport(
+        read_stream: impl Read + Send + 'static,
+        write_stream: impl Write + Send + 'static,
+    ) -> std::io::Result<Self> {
+        Self::from_io(read_stream, write_stream, None)
     }
 
     /// 建立连接后的鉴权握手。
@@ -383,66 +444,100 @@ impl Client {
     /// 服务端要求第一条帧是带正确 token 的 `hello`，否则直接关连接。
     /// token 读不到时给出明确错误——比"连上了但所有请求都超时"好查得多。
     fn handshake(&self) -> std::io::Result<()> {
-        let token = super::read_token().map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("读不到守护进程 token: {e}"),
-            )
-        })?;
-        let request = json!({
-            "id": 0,
-            "op": "hello",
-            "token": token,
-            "protocol": super::protocol::PROTOCOL_VERSION,
-        });
-        // 先登记 id=0 的等待者，再发请求：回复可能比 `register` 更早到。
-        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        self.pending_replies
-            .lock()
-            .expect("pending replies")
-            .insert(0, tx);
-        self.send(Frame::json(serde_json::to_vec(&request)?))?;
-
-        match rx.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(frame) => {
-                let reply: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
-                if reply["ok"] != true {
-                    // 版本不匹配要给出可操作的错误：只说"被拒绝"会让用户以为
-                    // 是 token 问题，然后开始翻权限。
-                    if reply["kind"].as_str() == Some("version_mismatch") {
-                        let daemon = reply["protocol"].as_u64().unwrap_or(0) as u32;
-                        return Err(version_mismatch_error(daemon));
+        // 经 `deepcore connect` 建链时，桥进程要先拉起 core；app 拿到管道
+        // 时 token 文件可能还没出现。这里等一个启动窗口，而不是把正常的
+        // 冷启动竞态报成 "读不到 token"。桥若先退出则立刻失败。
+        let deadline = Instant::now() + STARTUP_TIMEOUT;
+        let token = loop {
+            match super::read_token() {
+                Ok(token) => break token,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if self.is_closed() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            format!("stdio 桥在 core 就绪前退出: {e}"),
+                        ));
                     }
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("读不到守护进程 token: {e}"),
+                        ));
+                    }
+                    std::thread::sleep(CONNECT_RETRY);
+                }
+                Err(e) => {
                     return Err(std::io::Error::new(
-                        std::io::ErrorKind::PermissionDenied,
-                        "守护进程拒绝了鉴权",
+                        std::io::ErrorKind::NotFound,
+                        format!("读不到守护进程 token: {e}"),
                     ));
                 }
-
-                // **必须核对回复里的版本。**
-                //
-                // 旧守护进程不认识 `protocol` 字段，会照常回
-                // `{"ok": true, "op": "hello"}`——它不会拒绝，也不知道要
-                // 报版本。只看 `ok` 的话新 GUI 会静默连上旧 core，然后
-                // `attach` 的 history 与图像回放全被忽略：用户升级后看到
-                // "重连没有回滚、图片没了"，而日志里一条错误都没有。
-                //
-                // 这正是这条检查存在的唯一理由，回归测试见
-                // `a_daemon_that_omits_its_version_is_rejected`。
-                protocol_from_hello_reply(&reply)?;
-                Ok(())
             }
-            Err(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "鉴权时连接断开",
-            )),
+        };
+        self.hello(Some(&token), STARTUP_TIMEOUT).map(|_| ())
+    }
+
+    /// 发 `hello` 并校验核心身份与能力。
+    ///
+    /// 本地 app 传 token；远端 line 不传——`deepcore connect` 会用远端 core
+    /// 自己的 token 补上。两种情况都必须经过同一套协议/能力校验。
+    pub(crate) fn hello(&self, token: Option<&str>, timeout: Duration) -> std::io::Result<Value> {
+        let mut request = json!({
+            "op": "hello",
+            "protocol": super::protocol::PROTOCOL_VERSION,
+            "methods": super::protocol::SUPPORTED_METHODS,
+            "capabilities": super::protocol::CAPABILITIES,
+        });
+        if let Some(token) = token {
+            request["token"] = json!(token);
         }
+        let reply = self.call_timeout(request, timeout)?;
+        if reply["ok"] != true {
+            // 版本不匹配要给出可操作的错误：只说"被拒绝"会让用户以为
+            // 是 token 问题，然后开始翻权限。
+            if reply["kind"].as_str() == Some("version_mismatch") {
+                let daemon = reply["protocol"].as_u64().unwrap_or(0) as u32;
+                return Err(version_mismatch_error(daemon));
+            }
+            let detail = reply["error"]
+                .as_str()
+                .filter(|error| !error.is_empty())
+                .unwrap_or("守护进程拒绝了鉴权");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                detail.to_string(),
+            ));
+        }
+
+        // **必须核对回复里的版本。**
+        //
+        // 旧守护进程不认识 `protocol` 字段，会照常回
+        // `{"ok": true, "op": "hello"}`——它不会拒绝，也不知道要报版本。
+        // 只看 `ok` 的话新 GUI 会静默连上旧 core，然后 `attach` 的 history
+        // 与图像回放全被忽略：用户升级后看到"重连没有回滚、图片没了"，而
+        // 日志里一条错误都没有。回归测试见
+        // `a_daemon_that_omits_its_version_is_rejected`。
+        protocol_from_hello_reply(&reply)?;
+        Ok(reply)
     }
 
     /// 连接是否已经断了。
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    /// 这条连接是否已经连续 `quiet` 没收到任何字节。
+    ///
+    /// 只统计真实到达的帧，不统计“请求还在等回复”：慢链路上一个大帧只要
+    /// 还在流动就不算静默，与 Herdr 的 `wire::Heard` 判据一致。
+    pub(crate) fn silent_for(&self, quiet: Duration) -> bool {
+        let last_rx_ms = self.last_rx_ms.load(Ordering::Relaxed);
+        self.read_since
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last_rx_ms))
+            >= quiet
+    }
+
     /// 登记一个终端 channel，返回它的输出接收端。
     ///
     /// 每个 `attach` 拿到的 channel 对应一个接收端。接收端被丢弃时
@@ -493,9 +588,27 @@ impl Client {
         if let Some(obj) = request.as_object_mut() {
             obj.insert("id".into(), json!(id));
         }
+        // 先登记再发送：回复可能在 `send` 返回后、`await_reply` 登记前
+        // 就到达。高延迟的远端 line 上这个窗口比本地 socket 更容易命中。
+        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
+        self.pending_replies
+            .lock()
+            .expect("pending replies")
+            .insert(id, tx);
+        // 登记之后**每条退出路径**都要摘掉：正常回复由 reader 摘、超时由
+        // `PendingReply` 摘、序列化/发送失败由它的析构摘掉。
+        //
+        // 以前只在 `send` 失败时摘，超时那条会永久留下一个 `Sender`。半开
+        // SSH（本仓库专门要活下来的场景）下每次 30 秒超时都留一份；更要命
+        // 的是 reader 对**没带 id** 的旧版回复取 `keys().min()`，一个早就
+        // 超时的僵尸登记会顶替真正在等握手的那一个，把 hello 回复吃掉。
+        let _pending = PendingReply {
+            map: self.pending_replies.clone(),
+            id,
+        };
         let bytes = serde_json::to_vec(&request)?;
         self.send(Frame::json(bytes))?;
-        self.await_reply(id, timeout)
+        self.await_reply(rx, timeout)
     }
 
     /// 等一条指定 id 的控制回复。
@@ -510,7 +623,11 @@ impl Client {
     /// 折中办法：另起一条线程做阻塞收，主线程带超时地等它。多一条线程
     /// 的代价可以接受——只有 `call` 期间才存在，且控制面调用是低频的
     /// （开终端、挂接、列终端）。
-    fn await_reply(&self, id: u64, timeout: Duration) -> std::io::Result<Value> {
+    fn await_reply(
+        &self,
+        rx: std::sync::mpsc::Receiver<Frame>,
+        timeout: Duration,
+    ) -> std::io::Result<Value> {
         // 登记"我在等 id"，然后带超时地等 —— **不再起临时线程抢共享队列**。
         //
         // 旧实现每次 call 都新起一条线程去 `recv_blocking()` 同一个共享接收端，
@@ -518,12 +635,6 @@ impl Client {
         // `get`/`list`/`attach`）B 会把 A 的回复吃掉，A 等到超时。`attach`
         // 超时的后果不是"报个错"：拿不到 `channel` 就不会登记路由，之后该
         // 终端的数据全被丢进 `pending`，界面永久冻在最后一屏。
-        let (tx, rx) = std::sync::mpsc::channel::<Frame>();
-        self.pending_replies
-            .lock()
-            .expect("pending replies")
-            .insert(id, tx);
-
         match rx.recv_timeout(timeout) {
             Ok(frame) => {
                 let reply: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
@@ -587,104 +698,51 @@ impl Client {
     }
 }
 
-/// 后台拉起守护进程。
-/// 守护进程的可执行文件名。
-pub const DAEMON_BIN: &str = "deepcore";
+/// 一次控制调用登记的清理 guard。
+///
+/// `call_timeout` 登记等待者之后，无论走哪条退出路径都必须把它摘掉。正常
+/// 收到回复时 reader 线程已经 `remove` 过，这里再摘一次是幂等的。
+struct PendingReply {
+    map: Arc<std::sync::Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<Frame>>>>,
+    id: u64,
+}
 
-/// 拉起守护进程。
-///
-/// # 怎么找到 `deepcore`
-///
-/// 1. `$DEEPTERM_DEEPCORE`（测试与自定义安装）；
-/// 2. 与当前可执行文件**同目录**——发布包里两个二进制并排放，
-///    这一条覆盖绝大多数情况；
-/// 3. `PATH`。
-///
-/// 不硬编码安装路径：开发时是 `target/debug/`，打包后可能是
-/// `/usr/lib/deepterm/` 或 `DeepTerm.app/Contents/MacOS/`。
-fn spawn_daemon() -> std::io::Result<()> {
-    // 测试进程绝不能拉起守护进程。
-    //
-    // 只靠"把 `$DEEPTERM_DEEPCORE` 指向不存在的文件"不够：查找链还有两条
-    // 兜底——与当前可执行文件同目录（`cargo test` 的产物目录里确实有
-    // `deepcore`）、以及 PATH（装了正式版的机器上有
-    // `/Applications/DeepTerm.app/Contents/MacOS`）。两条都会命中，
-    // 于是测试真的起了一个守护进程、在临时目录里跑真实 shell。
-    //
-    // 判断依据是测试二进制的固有属性（`cfg!(test)` 在 lib 测试里为真），
-    // 不依赖任何环境变量，因此没有竞态。
-    #[cfg(test)]
-    {
-        log::warn!("测试进程不拉起守护进程");
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "测试进程禁止拉起守护进程",
-        ))
+impl Drop for PendingReply {
+    fn drop(&mut self) {
+        if let Ok(mut replies) = self.map.lock() {
+            replies.remove(&self.id);
+        }
     }
+}
 
+/// `deepcore connect` 子进程的清理 guard。
+///
+/// 最后一条 `Client` 释放时结束桥进程。core 与 holder 都在独立会话里，
+/// 不会跟着结束；下一次连接会重新接回同一批终端。
+struct BridgeProcess {
+    child: std::sync::Mutex<Option<Child>>,
+}
+
+impl BridgeProcess {
     #[cfg(not(test))]
-    {
-        let exe = daemon_binary_path().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "找不到 {DAEMON_BIN}（应与 {} 在同一目录，或在 PATH 里）",
-                    DAEMON_BIN
-                ),
-            )
-        })?;
-        log::info!("拉起守护进程: {}", exe.display());
-        let mut command = std::process::Command::new(&exe);
-        // Windows 上别弹控制台窗口。
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
+    fn new(child: Child) -> Self {
+        Self {
+            child: std::sync::Mutex::new(Some(child)),
         }
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
-        Ok(())
     }
 }
 
-/// 定位 `deepcore` 可执行文件。
-///
-/// 抽成独立函数是为了可测：`spawn_daemon` 没法在测试里安全调用
-/// （真会起进程），而"找不找得到"恰恰是最容易因为打包布局变化而坏掉的地方。
-pub fn daemon_binary_path() -> Option<std::path::PathBuf> {
-    if let Some(configured) = std::env::var_os(DAEMON_ENV).filter(|v| !v.is_empty()) {
-        let path = std::path::PathBuf::from(configured);
-        if path.is_file() {
-            return Some(path);
+impl Drop for BridgeProcess {
+    fn drop(&mut self) {
+        let Ok(slot) = self.child.get_mut() else {
+            return;
+        };
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
-
-    let name = format!("{DAEMON_BIN}{}", std::env::consts::EXE_SUFFIX);
-    // 与 GUI 同目录（发布包的常态）。
-    if let Ok(current) = std::env::current_exe()
-        && let Some(dir) = current.parent()
-    {
-        let sibling = dir.join(&name);
-        if sibling.is_file() {
-            return Some(sibling);
-        }
-    }
-    // PATH 兜底。
-    std::env::var_os("PATH")
-        .map(|paths| {
-            std::env::split_paths(&paths)
-                .map(|dir| dir.join(&name))
-                .find(|candidate| candidate.is_file())
-        })
-        .unwrap_or(None)
 }
-
-/// 指定 `deepcore` 路径的环境变量（测试与自定义安装）。
-pub const DAEMON_ENV: &str = "DEEPTERM_DEEPCORE";
 
 /// 路由登记之前到达的一批帧。
 ///
@@ -717,9 +775,10 @@ const MAX_PENDING: usize = 256 * 1024;
 
 /// 从 `hello` 回复里取对端协议版本并校验，返回校验通过的版本号。
 ///
-/// 缺字段按 **1** 处理（老版本连这个字段都不认识），此时一定不等于当前
-/// 版本，因此被判为不匹配——这是有意的：老版本对 `attach` 的 history 与
-/// 图像回放是静默忽略的，不能算"连上了"。
+/// 协议号相同还不够：旧 core 也会报 `protocol: 2`，但缺少能力清单与身份
+/// 字段。那些 core 对 `attach` 的 history、kitty 回放等能力只能靠猜；这里
+/// 要求字段齐全，缺任何一项都用 `Unsupported` 拒绝，让调用方走“重启 core、
+/// 不碰 holder”的升级路径。
 ///
 /// 抽成纯函数是为了可测：`handshake` 要真实 socket 与 token 文件。
 fn protocol_from_hello_reply(reply: &Value) -> std::io::Result<u32> {
@@ -731,7 +790,60 @@ fn protocol_from_hello_reply(reply: &Value) -> std::io::Result<u32> {
     if version != super::protocol::PROTOCOL_VERSION {
         return Err(version_mismatch_error(version));
     }
+
+    for field in [
+        "version",
+        "core_id",
+        "generation",
+        "hostname",
+        "methods",
+        "capabilities",
+        "keeps_running_after_logout",
+        "logout_linger_user",
+    ] {
+        if reply.get(field).is_none() {
+            return Err(missing_hello_field(field));
+        }
+    }
+    for field in ["version", "core_id", "generation", "hostname"] {
+        if reply[field]
+            .as_str()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Err(missing_hello_field(field));
+        }
+    }
+    if !reply["keeps_running_after_logout"].is_boolean()
+        && !reply["keeps_running_after_logout"].is_null()
+    {
+        return Err(missing_hello_field("keeps_running_after_logout"));
+    }
+
+    for (field, required) in [
+        ("methods", super::protocol::REQUIRED_METHODS),
+        ("capabilities", super::protocol::REQUIRED_CAPABILITIES),
+    ] {
+        let Some(advertised) = reply[field].as_array() else {
+            return Err(missing_hello_field(field));
+        };
+        for item in required {
+            if !advertised.iter().any(|value| value.as_str() == Some(item)) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!("守护进程没有声明必需能力 {item}（{field} 不完整）"),
+                ));
+            }
+        }
+    }
     Ok(version)
+}
+
+fn missing_hello_field(field: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("守护进程 hello 回复缺少必需字段 {field}"),
+    )
 }
 
 /// 协议版本不匹配时的统一错误。
@@ -752,6 +864,22 @@ fn version_mismatch_error(daemon_protocol: u32) -> std::io::Error {
 mod tests {
     use super::*;
 
+    fn current_hello() -> Value {
+        json!({
+            "ok": true,
+            "op": "hello",
+            "protocol": crate::daemon::protocol::PROTOCOL_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "core_id": "core-test",
+            "generation": "generation-test",
+            "hostname": "host-test",
+            "methods": crate::daemon::protocol::SUPPORTED_METHODS,
+            "capabilities": crate::daemon::protocol::CAPABILITIES,
+            "keeps_running_after_logout": false,
+            "logout_linger_user": Value::Null,
+        })
+    }
+
     /// **登记前到达的帧必须保留帧类型。**
     ///
     /// 回归价值：`attach` 的整屏快照总在回复之前到达，客户端要等回复解析出
@@ -761,13 +889,48 @@ mod tests {
     #[test]
     fn buffered_frames_keep_their_kind() {
         let mut pending = Pending::default();
-        pending.frames.push(Frame::new(1, Kind::Meta, b"{}".to_vec()));
+        pending
+            .frames
+            .push(Frame::new(1, Kind::Meta, b"{}".to_vec()));
         pending.bytes += pending.frames.last().expect("刚推入").payload.len();
         pending.frames.push(Frame::data(1, b"screen".to_vec()));
         pending.bytes += pending.frames.last().expect("刚推入").payload.len();
 
         let kinds: Vec<Kind> = pending.frames.iter().map(|f| f.kind).collect();
-        assert_eq!(kinds, vec![Kind::Meta, Kind::Data], "缓冲不能把 Meta 压成 Data");
+        assert_eq!(
+            kinds,
+            vec![Kind::Meta, Kind::Data],
+            "缓冲不能把 Meta 压成 Data"
+        );
+    }
+
+    /// 静默判据必须看“真实到达的字节”，并在新帧到达后复位。
+    ///
+    /// 回归价值：SSH 半开时 reader 不会收到 EOF，只有这个时间戳能让
+    /// supervisor 判断 line 已经不可用；若只看控制请求是否成功，一次
+    /// 慢请求就可能误杀仍在正常推流的终端。
+    #[cfg(unix)]
+    #[test]
+    fn incoming_bytes_reset_the_silence_clock() {
+        use std::os::unix::net::UnixStream;
+
+        let (read_stream, mut peer_write) = UnixStream::pair().expect("read pair");
+        let (write_stream, _peer_keepalive) = UnixStream::pair().expect("write pair");
+        let client = Client::from_transport(read_stream, write_stream).expect("in-memory client");
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(client.silent_for(Duration::from_millis(20)));
+
+        Frame::json(br#"{"id":1,"ok":true}"#.to_vec())
+            .write_to(&mut peer_write)
+            .expect("write frame");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while client.silent_for(Duration::from_millis(20)) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !client.silent_for(Duration::from_millis(20)),
+            "收到帧后静默计时必须复位"
+        );
     }
 
     /// 只连不拉起：没有守护进程时必须立刻返回错误，而不是卡住或起一个。
@@ -784,42 +947,6 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "必须快速失败，实际耗时 {:?}",
             start.elapsed()
-        );
-    }
-
-    /// 配置了 `$DEEPTERM_DEEPCORE` 就必须用它。
-    ///
-    /// 这条保护测试隔离与自定义安装：没有它，`daemon_binary_path` 会退到
-    /// "同目录找 deepcore"，而 `cargo test` 的产物目录里确实有那个文件，
-    /// 于是一次误调用就真的把用户的守护进程拉起来了。
-    #[test]
-    fn the_configured_daemon_binary_wins() {
-        let dir = std::env::temp_dir().join(format!("deepcore-path-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let fake = dir.join(format!("{DAEMON_BIN}{}", std::env::consts::EXE_SUFFIX));
-        std::fs::write(
-            &fake,
-            b"#!/bin/sh
-",
-        )
-        .expect("write");
-
-        let _guard = super::super::EnvGuard::set(DAEMON_ENV, &fake);
-        assert_eq!(daemon_binary_path().as_deref(), Some(fake.as_path()));
-        drop(_guard);
-
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    /// 配置指向不存在的文件时要忽略它，而不是返回一个坏路径。
-    #[test]
-    fn a_bogus_configured_path_is_ignored() {
-        let _guard = super::super::EnvGuard::set(DAEMON_ENV, "/nonexistent/deepcore-xyz");
-        let resolved = daemon_binary_path();
-        assert_ne!(
-            resolved.as_deref(),
-            Some(std::path::Path::new("/nonexistent/deepcore-xyz")),
-            "不存在的路径不该被采用"
         );
     }
 
@@ -864,6 +991,43 @@ mod tests {
         assert!(pending.lock().unwrap().is_empty(), "分发后不应残留等待者");
     }
 
+    /// 超时的调用必须把自己的登记摘掉，不能留下僵尸等待者。
+    ///
+    /// 回归价值：以前只在 `send` 失败时 `remove`，超时那条会永久留在
+    /// `pending_replies` 里。半开 SSH 下每次超时都留一份，而且 reader 对
+    /// 没带 id 的旧版回复取 `keys().min()`——一个早就超时的僵尸会顶替真正
+    /// 在等握手的那一个，把 hello 回复吃掉，于是"连接明明活着却握手失败"。
+    #[test]
+    fn a_timed_out_call_leaves_no_waiter_behind() {
+        // reader 端永不回话：用一对空管道模拟"对端不响应"。
+        let client =
+            Client::from_transport(std::io::Cursor::new(Vec::<u8>::new()), Vec::<u8>::new())
+                .expect("in-memory client");
+
+        let result = client.call_timeout(json!({"op": "hello"}), Duration::from_millis(30));
+        assert!(result.is_err(), "没有回复就应该是超时错误");
+        assert_eq!(
+            client
+                .pending_replies
+                .lock()
+                .expect("pending replies")
+                .len(),
+            0,
+            "超时后不得残留等待者"
+        );
+        // 再调一次也不该累加。
+        let _ = client.call_timeout(json!({"op": "hello"}), Duration::from_millis(10));
+        assert_eq!(
+            client
+                .pending_replies
+                .lock()
+                .expect("pending replies")
+                .len(),
+            0,
+            "连续超时也不得累积等待者"
+        );
+    }
+
     /// 启动超时必须是个合理的值：太短会让慢机器上的守护进程起不来。
     #[test]
     fn the_startup_timeout_is_generous_enough_for_a_cold_start() {
@@ -888,11 +1052,7 @@ mod tests {
         let err = protocol_from_hello_reply(&legacy).expect_err("不报版本必须被拒");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
 
-        let current = json!({
-            "ok": true,
-            "op": "hello",
-            "protocol": crate::daemon::protocol::PROTOCOL_VERSION,
-        });
+        let current = current_hello();
         assert_eq!(
             protocol_from_hello_reply(&current).unwrap(),
             crate::daemon::protocol::PROTOCOL_VERSION
@@ -902,6 +1062,80 @@ mod tests {
         assert!(
             protocol_from_hello_reply(&newer).is_err(),
             "更新的协议也必须拒绝：本进程不认识它的新字段"
+        );
+    }
+
+    /// **协议号相同但能力字段缺失的旧 core 也必须拒绝。**
+    ///
+    /// 这是协议 2 扩展字段的兼容边界：旧 core 报同样的 `protocol: 2`，
+    /// 但不知道自己在 hello 里要提供能力清单。只看版本号会让 app 静默
+    /// 接上一个“看起来兼容、实际少一半语义”的 core。
+    #[test]
+    fn a_daemon_without_hello_capabilities_is_rejected() {
+        for field in [
+            "generation",
+            "core_id",
+            "hostname",
+            "methods",
+            "capabilities",
+            "keeps_running_after_logout",
+            "logout_linger_user",
+        ] {
+            let mut hello = current_hello();
+            hello.as_object_mut().expect("object").remove(field);
+            let err =
+                protocol_from_hello_reply(&hello).expect_err(&format!("缺少 {field} 时必须拒绝"));
+            assert_eq!(err.kind(), std::io::ErrorKind::Unsupported, "{err}");
+            assert!(err.to_string().contains(field), "错误应点名 {field}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_unconfirmed_linger_state_is_valid_and_stays_unknown() {
+        let mut hello = current_hello();
+        hello["keeps_running_after_logout"] = Value::Null;
+        assert_eq!(
+            protocol_from_hello_reply(&hello).expect("null 表示无法证实，仍是合法握手"),
+            crate::daemon::protocol::PROTOCOL_VERSION
+        );
+    }
+
+    /// 清单结构对但少一项必需能力时也要拒绝，并点名缺的是哪项。
+    #[test]
+    fn a_daemon_missing_a_required_capability_is_rejected() {
+        let mut hello = current_hello();
+        let capabilities: Vec<&str> = crate::daemon::protocol::REQUIRED_CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|capability| *capability != "terminal.attach")
+            .collect();
+        hello["capabilities"] = json!(capabilities);
+        let err = protocol_from_hello_reply(&hello).expect_err("缺能力必须被拒");
+        assert!(err.to_string().contains("terminal.attach"), "{err}");
+    }
+
+    /// 旧 holder 没有机器 API，但仍是合法的终端后端。
+    ///
+    /// 回归价值：core 升级后第一次重连必须接回旧 holder 里正在跑的 PTY；
+    /// 若 `machines.v1` 被误列为必需能力，用户会看到所有终端突然消失。
+    #[test]
+    fn a_holder_without_machine_support_is_still_compatible() {
+        let mut hello = current_hello();
+        let methods: Vec<&str> = crate::daemon::protocol::SUPPORTED_METHODS
+            .iter()
+            .copied()
+            .filter(|method| !crate::daemon::protocol::MACHINE_METHODS.contains(method))
+            .collect();
+        let capabilities: Vec<&str> = crate::daemon::protocol::CAPABILITIES
+            .iter()
+            .copied()
+            .filter(|capability| *capability != "machines.v1")
+            .collect();
+        hello["methods"] = json!(methods);
+        hello["capabilities"] = json!(capabilities);
+        assert_eq!(
+            protocol_from_hello_reply(&hello).expect("hello 里带着协议版本"),
+            crate::daemon::protocol::PROTOCOL_VERSION
         );
     }
 }
