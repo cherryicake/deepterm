@@ -649,6 +649,28 @@ impl TerminalBounds {
         }
     }
 
+    /// 让 `n` 个单元格正好落在 `size` 里，供"已知行列数、反算像素尺寸"使用。
+    ///
+    /// 不能直接写 `cell * n as f32`：`num_columns()` 是
+    /// `(size / cell).floor()`，浮点乘法的一次舍入就可能把结果算少一格
+    /// （实测 `cell = 9.6px` 时 15 列 → 14 列）。少一格会让渲染层按错误
+    /// 列数排版、`term_geometry` 上报错像素，远端 TUI 的图像缩放跟着错。
+    ///
+    /// 逐次加 1/1024 px 直到向下取整落回 `n`；最多四次，不足一像素。
+    fn extent_for(cell: Pixels, n: usize) -> Pixels {
+        let cell = cell.as_f32();
+        if cell <= 0.0 {
+            return px(0.0);
+        }
+        let mut extent = cell * n as f32;
+        let mut guard = 0;
+        while ((extent / cell).floor() as usize) < n && guard < 4 {
+            extent += 0.000_976_562_5;
+            guard += 1;
+        }
+        px(extent)
+    }
+
     pub fn num_lines(&self) -> usize {
         (self.bounds.size.height.as_f32() / self.line_height.as_f32()).floor() as usize
     }
@@ -1991,6 +2013,14 @@ impl Terminal {
         }
     }
 
+    /// 构造一个没有 PTY 的错误占位终端。
+    ///
+    /// 远端 core 启动失败时，界面需要保留一个可渲染的终端实体来显示
+    /// `SshConnectView` 的失败页；不能为此偷偷启动本地 shell 或旧 SSH 连接。
+    pub fn new_error(cx: &mut App) -> Entity<Self> {
+        cx.new(|_| Self::create_error_terminal())
+    }
+
     /// 创建新的 SSH 远程终端
     ///
     /// 优先使用 russh 库进行原生 SSH 连接，采用异步初始化：
@@ -2058,8 +2088,8 @@ impl Terminal {
             Bounds {
                 origin: Point::default(),
                 size: Size {
-                    width: template.cell_width * cols as f32,
-                    height: template.line_height * rows as f32,
+                    width: TerminalBounds::extent_for(template.cell_width, cols as usize),
+                    height: TerminalBounds::extent_for(template.line_height, rows as usize),
                 },
             },
         );
@@ -2069,7 +2099,7 @@ impl Terminal {
             listener.clone(),
         )));
 
-        Self::build_attachable(
+        let terminal = Self::build_attachable(
             cx,
             TerminalType::Attached { address },
             term,
@@ -2080,7 +2110,22 @@ impl Terminal {
             resize,
             scrollback_lines,
             None,
-        )
+        );
+        // **`terminal_bounds` 必须与守护进程那份网格一致。**
+        //
+        // `build_attachable` 把 `terminal_bounds` 留成 `TerminalBounds::default()`
+        // （55×18）。这对本地终端无害——首帧 layout 会立刻改正它；但挂接式终端
+        // 的尺寸来源是它自己：
+        //   1. `TerminalView::remote_attach_grid` 读 `terminal_bounds` 决定向远端
+        //      报多少列行；
+        //   2. `snapshot` 是"绝对定位 + `?7l`"的字节流，只有行列数与本地 VT
+        //      完全一致才能还原成同一屏。
+        // 于是首帧布局尚未到达时，55×18 会被当成真实尺寸发给远端：TUI 真的按
+        // 55 列重排一次，随后又被改回真实尺寸，两套布局叠在同一屏上——用户看到
+        // 的正是"恢复后 TUI 整个糊掉、拖一下窗口才好"。这里按 attach 拿到的
+        // 真实网格预置，缺的那一步就补上了。
+        terminal.update(cx, |this, _cx| this.terminal_bounds = initial);
+        terminal
     }
 
     fn new_ssh_russh(
@@ -2468,9 +2513,82 @@ impl Terminal {
     /// 守护进程里的终端地址。
     pub fn attached_address(&self) -> Option<&str> {
         match &self.terminal_type {
-            TerminalType::Attached { address } => Some(address),
+            TerminalType::Attached { address } if !address.is_empty() => Some(address),
             _ => None,
         }
+    }
+
+    /// 后台 attach 成功后，把视图地址从占位状态换成真实的 `machine/tN`。
+    ///
+    /// 视图必须先于网络连接存在（Herdr 的 pane 模型），所以新建连接时地址
+    /// 一开始是空的；同一个终端实体不能在成功后重建，否则首帧、搜索状态和
+    /// 面板订阅都会丢。
+    pub fn set_attached_address(&mut self, address: String) {
+        if let TerminalType::Attached { address: current } = &mut self.terminal_type {
+            *current = address;
+        }
+    }
+
+    /// 把本地 VT 的网格对齐到 attach 回复里的**实际**尺寸。
+    ///
+    /// # 为什么必须在喂快照之前做
+    ///
+    /// `attach` 的整屏快照是"绝对定位 + 关闭自动折行"的字节流：每行以
+    /// `CSI row;1H` 定位、写满 `cols` 个字符后手动换行。它只有在本地 VT 的
+    /// 行列数与生成快照的那份网格**完全一致**时才能还原成同一屏。差一列就会
+    /// 多出/截掉一截，差一行就会把底部内容顶掉——表现正是"恢复后 TUI 布局
+    /// 乱掉"，而要等下一次 resize 触发整屏重绘才自己好。
+    ///
+    /// 正常情况下 `Terminal::new_attached` 已按会话尺寸建好网格，这里是兜底：
+    /// - 守护进程在 `attach` 时按客户端尺寸 resize，但 resize 是**异步**的，
+    ///   它只等 120ms 就生成快照；超过时限时回复里的 `cols`/`rows` 是真实值，
+    ///   与客户端请求的尺寸不同；
+    /// - 远端重挂时，另一个 viewer 可能已经把终端改成别的尺寸。
+    ///
+    /// 返回是否真的改了网格（调用方据此决定要不要重绘）。
+    pub fn adopt_daemon_grid(&mut self, cols: u16, rows: u16) -> bool {
+        if cols == 0 || rows == 0 {
+            return false;
+        }
+        if self.terminal_bounds.num_columns() == cols as usize
+            && self.terminal_bounds.num_lines() == rows as usize
+        {
+            return false;
+        }
+        let template = self.terminal_bounds;
+        let bounds = TerminalBounds::new(
+            template.line_height,
+            template.cell_width,
+            Bounds {
+                origin: template.bounds.origin,
+                size: Size {
+                    width: TerminalBounds::extent_for(template.cell_width, cols as usize),
+                    height: TerminalBounds::extent_for(template.line_height, rows as usize),
+                },
+            },
+        );
+        self.terminal_bounds = bounds;
+        {
+            let mut term = self.term.lock();
+            // 与 `apply_pending_resize` 同一条理由：宽窗口会把"按行"的历史
+            // 线性放大（250 列 × 10k 行 ≈ 60 MB）。必须在 reflow **之前**
+            // 按新列数缩历史，否则峰值仍然顶到 60 MB，缩完才降下来。
+            let desired = scrollback_lines_for_cols(self.scrollback_requested, cols as usize);
+            if term.grid().history_size() > desired {
+                term.set_options(Self::terminal_config_with_scrollback(desired));
+            }
+            term.resize(alacritty_terminal::term::test::TermSize::new(
+                cols as usize,
+                rows as usize,
+            ));
+        }
+        // 扫描器的几何要跟着走：`CSI 16 t` / in-band size reports 与图像
+        // 像素换算都读它，挂在旧行列数上会让远端程序按错误视口算布局。
+        self.sync_remote_scanner_geometry();
+        // 网格换了，旧的输入区锚点与快照都作废。
+        self.input_area_start = None;
+        let _ = self.update_last_content(true);
+        true
     }
 
     /// 获取远程连接信息（如果是远程终端）
@@ -2486,9 +2604,14 @@ impl Terminal {
     }
 
     /// 判断当前交互上下文是否仍然是 shell 提示符。
-    /// 本地终端通过前台进程组判断，远程终端通过远程 shell 发回的提示符标记判断。
+    ///
+    /// - 本地：看 PTY 的前台进程组是不是 shell；
+    /// - 远程 / **挂接式**：看 OSC 133 提示符标记（`remote_shell_ready`）。
+    ///   挂接式终端的 PTY 在守护进程里，本进程没有 fd，走本地分支恒为
+    ///   `false`——那会让"输入区锚点"和 `/` 内建命令判定在远端面板上失效。
+    ///   这些字节同样流经本进程的 VT，标记是可信的。
     pub fn is_shell_in_foreground(&self) -> bool {
-        if self.is_remote() {
+        if self.is_remote() || self.is_attached() {
             return self.remote_shell_ready;
         }
 
@@ -2727,11 +2850,18 @@ impl Terminal {
     ///
     /// - 本地（unix）：子进程存活且 TTY 前台进程组不是 shell → 有 TUI/长任务
     ///   在跑，关闭会杀掉它；shell 在提示符时直接关，不阻塞。
-    /// - 远程：SSH 仍连接且远端不在 shell 提示符（OSC 133 标记位）时需要确认。
+    /// - 远程（旧 SSH）：SSH 仍连接且远端不在 shell 提示符（OSC 133 标记位）。
+    /// - **挂接式（远端 core / 守护进程）**：PTY 不在本进程，既没有 master fd
+    ///   也没有子进程 pid，前两条判据都不成立。这里改用守护进程推来的
+    ///   `remote_process_name`——它由 `Kind::Meta` 每 500 毫秒实测一次，非空
+    ///   就代表前台不是 shell、确实有程序在跑。漏掉这一支的后果是关闭远端
+    ///   面板时**静默**杀掉里面正在跑的任务，连一句确认都没有。
     /// - Windows：暂无前台进程组检测手段，不阻塞（后续可补 Job Object）。
     pub fn needs_close_confirmation(&self) -> bool {
         if self.is_remote() {
             self.is_ssh_connected() && !self.is_shell_in_foreground()
+        } else if self.is_attached() {
+            self.attached_has_foreground_program()
         } else {
             #[cfg(unix)]
             {
@@ -2747,10 +2877,24 @@ impl Terminal {
         }
     }
 
+    /// 挂接式终端的前台是否有程序（由守护进程的 `Kind::Meta` 实测得出）。
+    ///
+    /// `remote_process_name` 为 `None` 表示"前台就是 shell"或"守护进程还没报"
+    /// ——两种都按"没有需要保护的程序"处理，避免刚 attach 就弹确认框。
+    fn attached_has_foreground_program(&self) -> bool {
+        self.remote_process_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty())
+    }
+
     /// 终端承载的进程是否仍在运行。
     ///
     /// - 本地：看 PTY 子进程是否还活着；
-    /// - 远程：看 SSH 通道是否还连着；
+    /// - 远程（旧 SSH）：看 SSH 通道是否还连着；
+    /// - 挂接式：PTY 不在本进程，没有 pid 可探。连接还在就保守地当成"还活着"
+    ///   （终端由守护进程托管，本进程无从确认它是否已退出；真正的退出由守护
+    ///   进程推 `Kind::Close` 通知）。判成 `false` 会让用户刚关掉的远端标签
+    ///   进不了 undo 栈，`cmd-shift-t` 恢复不出来。
     /// - Windows：无进程存活探测手段，退化为 true（保守视为「可能还活着」）。
     ///
     /// 用于区分「用户主动关闭一个还在跑的终端」与「shell 已正常 exit 退出」——
@@ -2758,6 +2902,9 @@ impl Terminal {
     pub fn process_alive(&self) -> bool {
         if self.is_remote() {
             self.is_ssh_connected()
+        } else if self.is_attached() {
+            // 没有本地 pid；由守护进程负责生命周期，这里保守返回 true。
+            true
         } else {
             #[cfg(unix)]
             {
@@ -3233,18 +3380,18 @@ impl Terminal {
     /// 状态点等所有下游消费者都无需区分终端类型。
     pub fn apply_daemon_meta(
         &mut self,
-        foreground: Option<String>,
-        argv: Option<Vec<String>>,
+        meta: crate::daemon::terminal::TerminalMeta,
         cx: &mut Context<Self>,
     ) {
         // 守护进程说"前台就是 shell"：这是一条**有效结论**，要清空而不是保持。
         //
         // 与本地探测的 `LocalAgentOutcome::Unavailable` 相反：那里是"查不了"，
         // 必须保留旧值；这里是"查了，确实没有程序"。
-        let argv_changed = argv.as_ref() != self.foreground_argv.as_ref();
-        self.foreground_argv = argv.clone().or_else(|| {
-            foreground.as_ref().map(|name| vec![name.clone()])
-        });
+        let argv_changed = meta.argv.as_ref() != self.foreground_argv.as_ref();
+        self.foreground_argv = meta
+            .argv
+            .clone()
+            .or_else(|| meta.foreground.as_ref().map(|name| vec![name.clone()]));
 
         // 复用同一套 agent 识别，保证本地/挂接两条路径的结论一致。
         //
@@ -3252,13 +3399,42 @@ impl Terminal {
         // 由 `TerminalView` 那一层持有；这里拿不到 `App`，而认错一个自定义
         // 包装器的代价（标签晚 500ms 才更新）远小于把它写成另一套识别逻辑。
         // 内置 agent 的识别不依赖它。
-        let agent = self.foreground_argv.as_deref().and_then(|argv| {
-            CLIAgent::detect_from_argv_with(argv, &std::collections::HashMap::new())
+        let agent = meta.agent.or_else(|| {
+            self.foreground_argv.as_deref().and_then(|argv| {
+                CLIAgent::detect_from_argv_with(argv, &std::collections::HashMap::new())
+            })
         });
 
         let agent_changed = self.foreground_agent != agent;
-        self.set_foreground_agent(agent, cx);
-        if argv_changed && !agent_changed {
+        // **「没有 agent 就没有 session」这条不变量由这里兜底。**
+        //
+        // 守护进程的 `compose_terminal_meta` 目前保证不会报出
+        // `agent: None, agent_session: Some(..)`，但那是另一个进程的约定，
+        // 隔着协议边界；不能把它当成客户端状态的唯一保障。版本错配、mock、
+        // 或以后新增的生产者都可能送出这个组合，落地后会留下一个没有图标
+        // 却一直亮着的状态点，而本地没有任何路径把它消掉。
+        let next_session = if agent.is_none() {
+            None
+        } else {
+            meta.agent_session
+        };
+        let session_changed = self.agent_session != next_session;
+
+        if agent_changed {
+            // 走 setter：它维护「清空 agent ⇒ 清空 session」，并 emit
+            // `AgentChanged`。直接写字段就绕过了这条不变量——本函数此前
+            // 正是在这里把它丢掉的。
+            self.set_foreground_agent(agent, cx);
+            self.agent_session = next_session;
+        } else if session_changed {
+            // agent 没变、只有回合状态变了（hook 又报了一次），或者当前
+            // 正处于「agent 已是 None 但 session 还留着」的不一致状态：
+            // 后者会被 setter 的提前返回放过，只能在这里修掉。
+            self.agent_session = next_session;
+            cx.emit(Event::AgentChanged);
+        }
+
+        if !agent_changed && !session_changed && argv_changed {
             cx.emit(Event::TitleChanged);
         }
     }
@@ -5070,15 +5246,27 @@ impl Terminal {
         // 对应 ghostty `Terminal.resize` 的 cols/rows 未变早退。
         let applied_cols = self.terminal_bounds.num_columns();
         let applied_rows = self.terminal_bounds.num_lines();
-        if cols == applied_cols && rows == applied_rows && !scale_changed {
+        // **度量变化也要算变化。**
+        //
+        // 早退只看行列数会吞掉字体变更（用户改字号、换字体）后的新 cell
+        // 尺寸：行列数可能恰好没变，但 `bounds` 里的 cell 宽高变了，而
+        // `term_geometry`（`CSI 14/16 t` 上报、kitty 扫描器换算像素）与
+        // PTY 的 `ws_xpixel` 都读它。吞掉之后 TUI 按旧像素尺寸算布局比例、
+        // 图像缩放就会错，而本地渲染用的是每帧重算的度量，看不出异常。
+        //
+        // 挂接式终端还多一种来源：`new_attached` 用默认度量预置网格，首帧
+        // 真实布局若行列数刚好相同，不比较度量就永远不会改正它。
+        let metrics_changed = bounds.cell_width != self.terminal_bounds.cell_width
+            || bounds.line_height != self.terminal_bounds.line_height;
+        if cols == applied_cols && rows == applied_rows && !scale_changed && !metrics_changed {
             // 尺寸已与应用一致（可能拖回了旧尺寸）：撤销待应用的中间值。
             self.pending_resize = None;
             self.resize_task = None;
             return;
         }
         if cols == applied_cols && rows == applied_rows {
-            // 只有 DPI 变化：没有网格 reflow 可合并，但 PTY 与扫描器必须
-            // 立刻拿到新几何，所以绕过 25ms 合并定时器直接应用。
+            // 只有 DPI / 字体度量变化：没有网格 reflow 可合并，但 PTY 与
+            // 扫描器必须立刻拿到新几何，所以绕过 25ms 合并定时器直接应用。
             self.pending_resize = Some(bounds);
             self.apply_pending_resize(false, cx);
             return;
@@ -6506,6 +6694,21 @@ mod tests {
         });
     }
 
+    /// 远端视图先于连接存在时，地址为空；attach 成功后同一实体必须接收
+    /// 返回的 `machine/tN`。若这里仍是空串，会话保存会再次丢掉地址，GUI
+    /// 重启只能新建终端，前台 `opencode` 也会丢失。
+    #[gpui::test]
+    fn attached_address_can_be_bound_after_the_view_is_created(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, String::new(), 80, 24, 1_000, |_| {}, |_, _, _| {})
+        });
+        terminal.update(cx, |terminal, _cx| {
+            assert_eq!(terminal.attached_address(), None);
+            terminal.set_attached_address("lingsi-ubuntu/t42".into());
+            assert_eq!(terminal.attached_address(), Some("lingsi-ubuntu/t42"));
+        });
+    }
+
     /// 普通本地终端不能被误判成挂接式。
     ///
     /// 反向保护：若 `is_attached` 写错（比如 `matches!` 用反了），
@@ -6517,6 +6720,78 @@ mod tests {
             assert!(!t.is_attached());
             assert_eq!(t.attached_address(), None);
         });
+    }
+
+    /// **挂接式终端的渲染几何在构造时必须等于会话网格。**
+    ///
+    /// 这是"恢复后 TUI 布局全乱、拖一下窗口才好"的直接修复：`Term` 按
+    /// attach 的 cols/rows 建，但 `terminal_bounds` 若停在 `default()`
+    /// （55×18），`TerminalView::remote_attach_grid` 会把 55×18 当成真实
+    /// 尺寸报给守护进程，远端 TUI 于是按 55 列重排一次，随后又被改回来。
+    #[gpui::test]
+    fn attached_terminal_geometry_starts_at_the_session_grid(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t1".into(), 126, 43, 1_000, |_| {}, |_, _, _| {})
+        });
+        terminal.read_with(cx, |t, _| {
+            assert_eq!(
+                (
+                    t.terminal_bounds.num_columns(),
+                    t.terminal_bounds.num_lines()
+                ),
+                (126, 43),
+                "挂接式终端一开始就必须按会话网格渲染，否则首帧会把错误尺寸报给守护进程"
+            );
+        });
+    }
+
+    /// attach 回复里的实际网格与本地不同时必须能对齐过去。
+    ///
+    /// 守护进程的 resize 只等 120ms，超时就会按旧网格生成快照；快照是
+    /// "绝对定位 + `?7l`"的字节流，网格差一列就会错位。`adopt_daemon_grid`
+    /// 是唯一能在喂字节之前纠正它的地方。
+    #[gpui::test]
+    fn adopt_daemon_grid_reflows_the_local_vt(cx: &mut TestAppContext) {
+        let terminal = cx.update(|cx| {
+            Terminal::new_attached(cx, "t1".into(), 126, 43, 1_000, |_| {}, |_, _, _| {})
+        });
+        terminal.update(cx, |t, cx| {
+            assert!(t.adopt_daemon_grid(174, 66));
+            assert_eq!(t.terminal_bounds.num_columns(), 174);
+            assert_eq!(t.terminal_bounds.num_lines(), 66);
+            {
+                let term = t.term.lock();
+                assert_eq!(
+                    alacritty_terminal::grid::Dimensions::columns(term.grid()),
+                    174
+                );
+            }
+            // 已经一致：不该再 reflow（resize 会重排回滚、并触发整屏重绘）。
+            assert!(!t.adopt_daemon_grid(174, 66));
+            // 非法尺寸不能把网格弄成 0 列（`num_columns` 是除法，0 会 panic）。
+            assert!(!t.adopt_daemon_grid(0, 0));
+            let _ = cx;
+        });
+    }
+
+    /// "已知行列数反算像素尺寸"必须真的换回同样的行列数。
+    ///
+    /// `num_columns()` 是 `(size / cell).floor()`：浮点乘一次就可能少算一格
+    /// （实测 `cell = 9.6px` 时 15 列会算成 14 列）。少一格会让渲染层与
+    /// `term_geometry` 上报都按错误列数走。
+    #[test]
+    fn extent_for_round_trips_every_grid_count() {
+        let cells = [9.0f32, 9.6, 8.5, 7.8, 11.11, 6.666_666_5, 1.0, 16.0];
+        for cell in cells {
+            let cell = px(cell);
+            for n in 1..=400usize {
+                let extent = TerminalBounds::extent_for(cell, n);
+                let back = (extent.as_f32() / cell.as_f32()).floor() as usize;
+                assert_eq!(back, n, "cell={cell:?} n={n} extent={extent:?}");
+            }
+        }
+        // 0 单元格不能返回正数（否则调用方会拿到一个假的尺寸）。
+        assert_eq!(TerminalBounds::extent_for(px(9.0), 0), px(0.0));
     }
 
     #[test]
@@ -6874,6 +7149,42 @@ mod tests {
             Terminal::parse_working_directory_osc(b"633;P;Cwd=/opt/app", false),
             Some("/opt/app".to_string())
         );
+    }
+
+    /// 挂接式终端（远端 core / 守护进程）的前台程序也必须参与关闭确认。
+    ///
+    /// 回归价值：这类终端**没有** master fd、也没有子进程 pid，原先
+    /// `needs_close_confirmation` 落进本地分支后三项判据全部为假，于是关闭
+    /// 一个正在远端跑 `claude` / `nvim` 的面板时**静默**杀掉进程，连确认框
+    /// 都不弹。唯一可用的信号是守护进程经 `Kind::Meta` 推来的前台进程名。
+    #[gpui::test]
+    fn attached_terminals_confirm_close_while_a_program_is_in_front(cx: &mut TestAppContext) {
+        let terminal = cx.new(|_| {
+            let mut t = Terminal::create_error_terminal();
+            t.terminal_type = TerminalType::Attached {
+                address: "lingsi-ubuntu/t7".into(),
+            };
+            t
+        });
+
+        terminal.update(cx, |t, _cx| {
+            // 守护进程还没报：按"没有需要保护的程序"处理，别弹框。
+            assert!(
+                !t.needs_close_confirmation(),
+                "还没有前台程序信息时不该弹确认框"
+            );
+
+            // 守护进程报来 nvim 在前台 → 必须确认。
+            t.remote_process_name = Some("nvim".into());
+            assert!(
+                t.needs_close_confirmation(),
+                "远端在跑 nvim，关闭面板必须确认，不能静默杀掉"
+            );
+
+            // 回到 shell（守护进程报 None）→ 不再确认。
+            t.remote_process_name = None;
+            assert!(!t.needs_close_confirmation(), "回到 shell 后直接关闭即可");
+        });
     }
 
     // ===== 输入区锚点（空行判定）测试 =====
@@ -7795,6 +8106,48 @@ mod tests {
         });
     }
 
+    /// 守护进程报来的 meta 也必须守住「agent 清空 ⇒ session 清空」。
+    ///
+    /// 回归价值：这条不变量原本由 `set_foreground_agent` 独占维护，而
+    /// `apply_daemon_meta` 一度直接写 `foreground_agent` / `agent_session`
+    /// 两个字段，把它绕开了。`compose_terminal_meta` 现在不会送出
+    /// `agent: None + agent_session: Some(..)`，但那是**另一个进程**的约定；
+    /// 一旦它变了（版本错配、mock、新增生产者），客户端会留下一个没有图标
+    /// 却一直亮着的状态点，而本地没有任何路径能把它消掉。
+    #[gpui::test]
+    fn daemon_meta_never_leaves_a_session_without_an_agent(cx: &mut TestAppContext) {
+        use crate::agent::{AgentSessionState, CLIAgent};
+        use crate::daemon::terminal::TerminalMeta;
+
+        let terminal = cx.new(|_| anchor_test_terminal());
+        terminal.update(cx, |t, cx| {
+            // 前提：先有一个真的在跑 agent 的状态。
+            t.set_foreground_agent(Some(CLIAgent::Claude), cx);
+            t.agent_session = Some(AgentSessionState::default());
+            assert!(t.agent_session().is_some());
+
+            // 不一致的快照：没有 agent，却带着回合状态。
+            t.apply_daemon_meta(
+                TerminalMeta {
+                    foreground: None,
+                    argv: None,
+                    agent: None,
+                    agent_session: Some(AgentSessionState::default()),
+                },
+                cx,
+            );
+
+            assert!(
+                t.foreground_agent().is_none(),
+                "守护进程说前台是 shell，身份必须清空"
+            );
+            assert!(
+                t.agent_session().is_none(),
+                "身份清空后不能残留 session（否则状态点永不熄灭）"
+            );
+        });
+    }
+
     /// 本地 OSC 7 的 host 必须是本机才采信（`require_local_osc7_host = true`）。
     ///
     /// 远程路径传 `false`（host 属于远端，拿本机 hostname 比对必然失败）。
@@ -8129,6 +8482,51 @@ mod tests {
     fn grid_size(t: &Terminal) -> (usize, usize) {
         let c = t.last_content();
         (c.cols, c.rows)
+    }
+
+    /// **行列数不变、只有字体度量变化时也必须重新通知。**
+    ///
+    /// 早退条件只看 `cols`/`rows` 会吞掉字号/字体变更：`CSI 14/16 t` 上报、
+    /// kitty 扫描器的像素换算、PTY 的 `ws_xpixel` 全读 `terminal_bounds`
+    /// 里的 cell 宽高。吞掉之后 TUI 按旧像素尺寸算图像缩放与布局比例，
+    /// 本地渲染却每帧重算度量——只有远端程序表现错。
+    ///
+    /// 挂接式终端同样依赖它：`new_attached` 用默认度量预置网格，首帧真实
+    /// 布局若行列数恰好相同，没有这条就永远停在默认度量上。
+    #[gpui::test]
+    fn metric_only_resize_still_notifies(cx: &mut TestAppContext) {
+        let (terminal, calls) = resize_test_terminal(cx);
+
+        terminal.update(cx, |t, cx| t.resize(bounds_for(40, 14), 1.0, cx));
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        // 同一组行列数，只把 cell 宽高换成真实字体度量。
+        //
+        // 尺寸必须按新度量反算，否则行列数会跟着变，走的是 reflow 路径而
+        // 不是这里要测的「度量-only」分支。
+        let metrics_only = TerminalBounds::new(
+            px(15.25),
+            px(8.5),
+            Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(8.5 * 40.0), px(15.25 * 14.0)),
+            ),
+        );
+        terminal.update(cx, |t, cx| t.resize(metrics_only, 1.0, cx));
+        terminal.read_with(cx, |t, _| {
+            assert_eq!(t.terminal_bounds.cell_width, px(8.5), "度量必须落盘");
+            assert_eq!(t.terminal_bounds.line_height, px(15.25));
+            assert_eq!(grid_size(t), (40, 14), "行列数不变，不应 reflow");
+        });
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            2,
+            "度量变化必须重新通知 PTY / 扫描器"
+        );
+
+        // 完全相同的输入应当早退，不再通知。
+        terminal.update(cx, |t, cx| t.resize(metrics_only, 1.0, cx));
+        assert_eq!(calls.lock().unwrap().len(), 2, "无变化时应早退");
     }
 
     /// ghostty 语义：25ms 非重置节流（定时器活动期间只更新最新值），

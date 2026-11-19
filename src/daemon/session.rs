@@ -33,6 +33,11 @@ use crate::terminal::Terminal;
 /// 表现为"守护进程明明重启了，终端却再也接不回来"。
 static CLIENT: std::sync::Mutex<Option<Arc<Client>>> = std::sync::Mutex::new(None);
 
+/// 重挂退避：与 `daemon::machines` 的拨号退避一致。连接暂时失败时快速
+/// 重试，长时间断网后降到低频，避免每个终端各烧一条重连风暴。
+const RECONNECT_MIN: std::time::Duration = std::time::Duration::from_millis(300);
+const RECONNECT_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 取（必要时建立）全局连接。失败时返回 `None` 并记日志——终端不该因为
 /// 守护进程起不来就打不开，调用方应退回普通本地终端。
 pub fn client() -> Option<Arc<Client>> {
@@ -118,6 +123,96 @@ impl Session {
     }
 }
 
+/// 一个终端视图当前绑定的 daemon 会话。
+///
+/// 视图先建立、连接后建立时，输入和尺寸回调不能捕获某一次的 `Session`：
+/// 断线重挂会换 channel，旧 channel 上的键入会静默丢失。这里与 herdr 的
+/// `Grid { channel: Option<u32> }` 等价——终端持有“当前会话”，attach/重挂成功
+/// 后原位替换，回调永远写到最新 channel。
+#[derive(Clone, Default)]
+pub struct SessionHandle {
+    state: Arc<std::sync::Mutex<SessionHandleState>>,
+}
+
+#[derive(Default)]
+struct SessionHandleState {
+    current: Option<Session>,
+    /// 最后一次客户端尺寸。视图在 attach 完成前也会收到布局 resize；
+    /// 那些通知没有 channel 可写，不能直接丢掉，否则恢复后会一直按旧网格
+    /// 显示，直到用户再次拖动窗口。绑定新会话时补发最新值。
+    size: Option<(u16, u16, u16, u16)>,
+}
+
+impl SessionHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SessionHandleState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 装上新会话；同一视图内的重挂也走这里。
+    pub fn bind(&self, session: Session) {
+        let pending_size = {
+            let mut state = self.lock();
+            state.current = Some(session.clone());
+            state.size
+        };
+        let Some((cols, rows, cell_width, cell_height)) = pending_size else {
+            return;
+        };
+        // 网格已经一致时**不要**再发一次 resize。
+        //
+        // 刚 attach 回来的会话本来就是这个尺寸，补发一次会让守护进程做一次
+        // 多余的 reflow，并触发一整屏重绘；那份重绘与客户端本地 VT 的网格
+        // 之间还可能存在时序竞态（重绘先到、本地布局后到），正是"恢复瞬间
+        // 画面花一下"的来源。只有视图在 attach 期间真的被改过尺寸才需要补。
+        if (cols, rows) == (session.cols, session.rows) {
+            return;
+        }
+        session.resize(cols, rows, cell_width, cell_height);
+    }
+
+    /// 连接彻底不可用时停止把输入发往已经不存在的 channel。
+    pub fn clear(&self) {
+        self.lock().current = None;
+    }
+
+    fn clone_current(&self) -> Option<Session> {
+        self.lock().current.clone()
+    }
+
+    pub fn write(&self, bytes: &[u8]) {
+        if let Some(session) = self.clone_current() {
+            session.write(bytes);
+        }
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16, cell_width: u16, cell_height: u16) {
+        let session = {
+            let mut state = self.lock();
+            state.size = Some((cols, rows, cell_width, cell_height));
+            state.current.clone()
+        };
+        if let Some(session) = session {
+            session.resize(cols, rows, cell_width, cell_height);
+        }
+    }
+
+    /// 本视图最后一次向守护进程声明的网格。
+    ///
+    /// 供会话持久化使用：保存路径（每次自动保存、复制标签页、分屏）不该为了
+    /// 一个尺寸去做同步 RPC——`terminal_grid` 是 150ms 超时的阻塞调用，而
+    /// 这些路径都在 UI 线程上。这里返回的值正是 daemon 被 resize 成的那一份，
+    /// 与远端真实网格一致。
+    pub fn grid(&self) -> Option<(u16, u16)> {
+        self.lock().size.map(|(cols, rows, _, _)| (cols, rows))
+    }
+}
+
 /// 在守护进程里起一个新终端并返回它的地址。
 pub fn spawn_terminal(
     cwd: Option<&std::path::Path>,
@@ -141,6 +236,160 @@ pub fn spawn_remote_terminal(
     rows: u16,
 ) -> Result<String, String> {
     spawn_with(None, Some(command), args, env, true, cols, rows)
+}
+
+/// 把一台 SSH 主机加入机器表，并返回包含运行时状态的机器视图。
+///
+/// 认证配置只是交给本地 core；core 仍走 DeepTerm 原有的 russh / Keychain /
+/// 主机密钥校验路径，不会改用系统 `ssh` 命令。
+pub fn add_machine(
+    config: &crate::ssh::SshConnectionConfig,
+    name: Option<String>,
+    session: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
+    let mut request = serde_json::json!({
+        "op": "machine.add",
+        "ssh": config,
+        // `SshConnectionConfig::use_system_proxy` 是 `serde(skip)` 的（它只是
+        // 这一次连接的选择，不该写进 `ssh.json`），所以上面那份序列化出来的
+        // 配置里恒为 false。不单独带一个字段过去，core 就永远按直连处理
+        // ——「使用系统代理连接」在远端 core 路径上会静默失效。
+        "use_system_proxy": config.use_system_proxy,
+    });
+    if let Some(name) = name {
+        request["name"] = serde_json::json!(name);
+    }
+    if let Some(session) = session {
+        request["session"] = serde_json::json!(session);
+    }
+    let reply = client
+        .call(request)
+        .map_err(|e| format!("添加机器失败: {e}"))?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("守护进程拒绝添加机器")
+            .to_string());
+    }
+    Ok(reply["machine"].clone())
+}
+
+/// 在远端 core 里创建终端，返回 `machine/tN` 地址。
+///
+/// 首次连接可能要建立 SSH、拉起远端 core，因此超时比普通控制请求长；
+/// 不能让 app 在本地 core 仍等待远端握手时先超时。
+pub fn spawn_machine_terminal(
+    machine: &str,
+    cwd: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
+    let mut request = serde_json::json!({
+        "op": "spawn",
+        "machine": machine,
+        "cols": cols,
+        "rows": rows,
+    });
+    if let Some(cwd) = cwd.filter(|cwd| !cwd.trim().is_empty()) {
+        request["cwd"] = serde_json::json!(cwd);
+    }
+    let reply = client
+        .call_timeout(request, crate::daemon::machines::MACHINE_SPAWN_TIMEOUT)
+        .map_err(|e| format!("远端终端没有响应: {e}"))?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("远端 core 拒绝创建终端")
+            .to_string());
+    }
+    reply["address"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "远端 core 没有返回终端地址".to_string())
+}
+
+/// 恢复一个远端终端：优先接回会话里保存的 `machine/tN`，接不上再新建。
+///
+/// 这个函数会做阻塞的 daemon RPC（包括首次部署远端 core 时的 SSH 握手），
+/// 因此**只能从后台线程调用**。UI 线程负责在结果返回后装配 `TerminalView`。
+///
+/// 保存的地址仍然存在时必须优先复用：那正是“关掉 GUI 再重开，远端的
+/// `opencode` / 编译任务还在原来的屏幕上”这一能力的核心。只有守护进程
+/// 明确回答 `not_found` 才新建；超时、连接中断等错误直接上报，避免把一次
+/// 临时拥塞误判成“终端已消失”，从而额外拉起一个重复的 shell。
+pub fn restore_machine_terminal(
+    config: &crate::ssh::SshConnectionConfig,
+    name: Option<String>,
+    cwd: Option<&str>,
+    address: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Result<Session, String> {
+    if let Some(address) = address {
+        match attach_with_history(address, Some((cols, rows)), DEFAULT_ATTACH_HISTORY) {
+            Ok(session) => {
+                log::info!("已接回远端终端 {address}");
+                return Ok(session);
+            }
+            Err(error) if is_missing_terminal_error(&error) => {
+                log::info!("远端终端 {address} 已不存在，将新建终端: {error}");
+            }
+            Err(error) if is_unknown_machine_error(&error) => {
+                // 本地 core 可能刚重启，机器表还没装进运行时。先按保存的
+                // SSH 配置重新登记，再挂**原地址**；地址本身仍是终端身份，
+                // 不能因为一次 core 重启就新建一个 shell。
+                log::info!("远端机器尚未恢复，重新登记后接回 {address}: {error}");
+                add_machine(config, name.clone(), None)?;
+                match attach_with_history(address, Some((cols, rows)), DEFAULT_ATTACH_HISTORY) {
+                    Ok(session) => {
+                        log::info!("已接回远端终端 {address}");
+                        return Ok(session);
+                    }
+                    Err(error) if is_missing_terminal_error(&error) => {
+                        log::info!("远端终端 {address} 已不存在，将新建终端: {error}");
+                    }
+                    Err(error) => {
+                        return Err(format!("接回远端终端 {address} 失败: {error}"));
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(format!("接回远端终端 {address} 失败: {error}"));
+            }
+        }
+    }
+
+    let machine = add_machine(config, name, None)?;
+    let machine_name = machine["name"]
+        .as_str()
+        .ok_or_else(|| "守护进程没有返回机器名".to_string())?;
+    let new_address = spawn_machine_terminal(machine_name, cwd, cols, rows)?;
+    match attach_with_history(&new_address, Some((cols, rows)), DEFAULT_ATTACH_HISTORY) {
+        Ok(session) => Ok(session),
+        Err(error) => {
+            // 新终端已经建出来却挂不上时，不能把它留在远端占着 PTY；
+            // 用户看不到它，也没有任何入口再关闭它。
+            close_terminal(&new_address);
+            Err(format!(
+                "远端终端 {new_address} 已创建，但挂接失败: {error}"
+            ))
+        }
+    }
+}
+
+/// 守护进程对已消失终端给出的稳定错误文案。
+///
+/// `attach_with_history` 为了兼容旧 core 目前只保留文本错误；这里做一次
+/// 窄匹配，**不能**把所有 attach 错误都当成“不存在”，否则一次临时超时
+/// 就会多开一个远端终端。
+pub(crate) fn is_missing_terminal_error(error: &str) -> bool {
+    error.contains("没有这个终端") || error.contains("not_found")
+}
+
+fn is_unknown_machine_error(error: &str) -> bool {
+    error.contains("未知机器") || error.contains("unknown machine")
 }
 
 /// 起终端请求的统一实现。
@@ -232,6 +481,13 @@ pub fn attach(address: &str, size: Option<(u16, u16)>) -> Result<Session, String
 /// 编译输出"，又不至于让 attach 变成一次几 MB 的传输。
 pub const DEFAULT_ATTACH_HISTORY: usize = 2000;
 
+/// 远端 attach 要允许本地 core 先重拨 SSH、再等首帧穿过慢链路。
+///
+/// 本地 core 的最坏路径是等待新 line（30 秒）加远端 attach（30 秒），
+/// 所以 app 侧必须比它更长；否则 app 先超时重试，会同时留下多条未完成的
+/// attach，反而制造更多快照和在途数据。本机 attach 仍用默认的 10 秒。
+const REMOTE_ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(70);
+
 /// 带显式回滚行数的挂接。
 ///
 /// `history = 0` 表示只要当前屏幕（测试与"重连时不想看见旧内容"的场景）。
@@ -250,7 +506,14 @@ pub fn attach_with_history(
         request["cols"] = serde_json::json!(cols);
         request["rows"] = serde_json::json!(rows);
     }
-    let reply = client.call(request).map_err(|e| format!("挂接失败: {e}"))?;
+    let timeout = if address.contains('/') {
+        REMOTE_ATTACH_TIMEOUT
+    } else {
+        std::time::Duration::from_secs(10)
+    };
+    let reply = client
+        .call_timeout(request, timeout)
+        .map_err(|e| format!("挂接失败: {e}"))?;
     if reply["ok"] != true {
         return Err(reply["error"]
             .as_str()
@@ -309,14 +572,21 @@ pub fn terminal_grid(address: &str) -> Option<(u16, u16)> {
 /// 返回的句柄不需要保留——任务随实体一起被丢弃。但**调用方要负责在实体
 /// 销毁时 `detach`**，否则守护进程会一直往一个没人读的 channel 发数据
 /// （虽然它会因发送失败自行清理，但那要等下一次输出）。
-pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
+pub fn pump_into(
+    session: Session,
+    terminal: Entity<Terminal>,
+    handle: SessionHandle,
+    cx: &mut App,
+) {
     let address = session.address.clone();
     let terminal = terminal.downgrade();
+    handle.bind(session.clone());
 
     cx.spawn(async move |cx: &mut gpui::AsyncApp| {
         // 当前挂接的 channel 与它的输出流，每轮重连后更新。
         let mut incoming = session.client.attach_channel(session.channel);
         let mut current = session;
+        let mut reconnect_delay = RECONNECT_MIN;
 
         'outer: loop {
             // 等第一帧（真正阻塞，没数据时任务睡眠，不占 CPU）。
@@ -395,7 +665,7 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
                                 >(&frame.payload)
                                 {
                                     let _ = terminal.update(cx, |terminal, cx| {
-                                        terminal.apply_daemon_meta(meta.foreground, meta.argv, cx);
+                                        terminal.apply_daemon_meta(meta, cx);
                                     });
                                 }
                             }
@@ -433,47 +703,69 @@ pub fn pump_into(session: Session, terminal: Entity<Terminal>, cx: &mut App) {
             // 程序卡死了。要试着挂接回去；守护进程重启过的话原来的地址
             // 已经不存在，`attach` 会返回 not_found，那时才真的放弃。
             log::warn!("终端 {address} 的挂接流断开，尝试重新挂接");
-
-            // 给守护进程一点时间起来（它可能正在被重新拉起）。
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(300))
-                .await;
-
-            match attach(&address, None) {
-                Ok(fresh) => {
-                    log::info!("已重新挂接终端 {address}");
-                    // 先登记新 channel，**再**替换 `incoming`。
-                    //
-                    // 顺序反了会形成重连风暴：`attach_channel` 往 routes 里
-                    // 插入同名 channel 会**替换**掉旧的发送端，旧接收端的
-                    // 所有 sender 随即被丢弃，它的 `recv()` 立刻返回 `Err`
-                    // ——正好落回本循环的重连分支，于是 300ms 一次无限重连，
-                    // 每个终端每秒烧掉几十次重连请求，CPU 空转到 120%+。
-                    //
-                    // `attach`（不是 `attach_with_history`）：重连时本地 VT
-                    // 里已经有断开前的回滚，再要一份会让历史翻倍——每断一次
-                    // 多一倍。
-                    let next = fresh.client.attach_channel(fresh.channel);
-                    // 旧 channel 一并注销，避免 routes 里留下没人读的条目。
-                    if fresh.channel != current.channel {
-                        current.client.detach_channel(current.channel);
-                    }
-                    incoming = next;
-                    current = fresh;
-                }
-                Err(e) => {
-                    log::warn!("终端 {address} 无法重新挂接: {e}");
-                    // 真接不回来了：告诉用户，别让画面静默冻住。
-                    let _ = terminal.update(cx, |terminal, cx| {
-                        terminal.handle_connection_lost(cx);
-                    });
+            // Herdr 在流丢失后保持终端视图，由窗口轮询对**同一地址**持续
+            // reattach；这里在泵任务内做等价退避重挂。网络、机器运行时和
+            // 本地 core 都可能按不同节奏恢复，只尝试一次仍会让终端永久停在
+            // 最后一屏。
+            handle.clear();
+            loop {
+                // 视图已经关掉就没必要继续拨号；也避免任务在标签关闭后永久
+                // 持有重试循环。
+                if terminal.update(cx, |_, _| {}).is_err() {
                     break 'outer;
+                }
+                // 给守护进程/机器运行时一点时间恢复。`attach` 是阻塞 RPC，
+                // 首次重拨还可能等 SSH 握手，必须放在后台 executor。
+                cx.background_executor().timer(reconnect_delay).await;
+                let attach_address = address.clone();
+                let attached = cx
+                    .background_executor()
+                    .spawn(async move { attach(&attach_address, None) })
+                    .await;
+                match attached {
+                    Ok(fresh) => {
+                        log::info!("已重新挂接终端 {address}");
+                        // 先登记新 channel，**再**替换 `incoming`。顺序反了会
+                        // 让旧接收端立刻关闭并再次进入重连分支，形成风暴。
+                        //
+                        // 用 `attach` 而不是 `attach_with_history`：本地 VT
+                        // 已保留断开前的回滚，再次回放会让历史成倍增长。
+                        let next = fresh.client.attach_channel(fresh.channel);
+                        if fresh.channel != current.channel {
+                            current.client.detach_channel(current.channel);
+                        }
+                        handle.bind(fresh.clone());
+                        incoming = next;
+                        current = fresh;
+                        reconnect_delay = RECONNECT_MIN;
+                        break;
+                    }
+                    Err(e) if is_missing_terminal_error(&e) => {
+                        log::warn!("终端 {address} 已不存在，停止重挂: {e}");
+                        // 程序确实不在了，不能把“连接失败”伪装成仍在重连。
+                        let _ = terminal.update(cx, |terminal, cx| {
+                            terminal.handle_connection_lost(cx);
+                        });
+                        handle.clear();
+                        break 'outer;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "终端 {address} 暂时无法重新挂接: {e}；{}ms 后重试",
+                            reconnect_delay.as_millis()
+                        );
+                        reconnect_delay = (reconnect_delay * 2).min(RECONNECT_MAX);
+                    }
                 }
             }
         }
 
         // 只 detach 最后一次握着的那个 channel；之前的都随连接一起没了。
-        current.detach();
+        // detach 会走控制面 RPC，不能在 UI 线程等一个可能已经失联的 core。
+        let last = current.clone();
+        cx.background_executor()
+            .spawn(async move { last.detach() })
+            .await;
         log::debug!("终端 {address} 的挂接任务结束");
     })
     .detach();
@@ -509,5 +801,23 @@ mod tests {
         let _env = super::super::IsolatedTestEnv::new("/tmp/deepterm-none");
         let result = spawn_terminal(None, None, &[], 80, 24);
         assert!(result.is_err(), "没有守护进程时应报错");
+    }
+
+    /// attach 完成前收到的布局 resize 不能丢：绑定会话后必须还能拿到
+    /// 最后一次真实尺寸并补发。否则连接期间用户改过窗口，远端会一直停在
+    /// attach 时的旧网格，直到下一次 resize。
+    #[test]
+    fn session_handle_keeps_the_latest_resize_before_binding() {
+        let handle = SessionHandle::new();
+        handle.resize(126, 50, 0, 0);
+        handle.resize(126, 43, 2, 3);
+        assert_eq!(handle.lock().size, Some((126, 43, 2, 3)));
+
+        handle.clear();
+        assert_eq!(
+            handle.lock().size,
+            Some((126, 43, 2, 3)),
+            "clear 只断开当前会话，最新尺寸要留给下一次 bind"
+        );
     }
 }

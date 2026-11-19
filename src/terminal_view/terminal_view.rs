@@ -18,7 +18,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::builtin_commands::executor::CommandResult;
 use crate::file_manager::TransferRequest;
 use crate::ssh::platform::RemoteOS;
-use crate::ssh_view::connect::Event::Reconnect;
+use crate::ssh_view::connect::{Event::Reconnect, ReconnectTarget};
 /// Events emitted by TerminalView
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -44,6 +44,8 @@ pub enum Event {
     SshReconnect {
         config: SshConnectionConfig,
     },
+    /// 用户要求重试远端 core。由 Panel 重建默认路径，不能切换到旧 SSH。
+    RetryRemoteCore,
     /// 远程操作系统已检测到
     RemoteOsDetected {
         os: RemoteOS,
@@ -63,6 +65,19 @@ pub enum Event {
 }
 
 impl EventEmitter<Event> for TerminalView {}
+
+/// 远端 core 初次恢复失败后的重拨退避。与机器运行时自己的拨号逻辑一致：
+/// 尽快接上刚恢复的网络，同时在长时间离线时保持低请求频率。
+const REMOTE_ATTACH_RETRY_MIN: Duration = Duration::from_millis(300);
+const REMOTE_ATTACH_RETRY_MAX: Duration = Duration::from_secs(30);
+/// 首次远端 attach 前等待一次真实布局的上限。
+///
+/// attach 会先按客户端尺寸 resize 远端终端，再生成整屏快照。若这里用恢复
+/// 文件里的旧网格（窗口改过大小后可能是 126×50），而当前 pane 只有 43 行，
+/// 本地 VT 随后会 reflow，把快照顶部几行推进回滚区，表现为恢复后页面整体
+/// 下移、标题栏丢失。Herdr 同样在首次 attach 前等待 pane 布局，最多 100ms；
+/// 未显示的标签不会布局，超时后仍用保存尺寸继续，不能因此永远不连接。
+const REMOTE_ATTACH_LAYOUT_WAIT: Duration = Duration::from_millis(100);
 
 /// ASCII control character for Ctrl+V (SYN - Synchronous Idle)
 ///
@@ -481,6 +496,8 @@ pub struct TerminalView {
     terminal_subscription: Option<Subscription>,
     working_directory: Option<PathBuf>,
     ssh_config: Option<SshConnectionConfig>,
+    /// 用户是否显式选择了旧 SSH 兼容模式。
+    legacy_ssh: bool,
     /// 本地终端以指定命令启动时保存的命令（如 wsl.exe / powershell.exe），用于会话重连
     command: Option<String>,
     /// 与 `command` 配套的启动参数，用于会话重连
@@ -536,6 +553,11 @@ pub struct TerminalView {
     ssh_connect_subscription: Option<Subscription>,
     /// SSH 连接视图隐藏任务 - 用于取消延迟隐藏任务
     ssh_connect_hide_task: Option<Task<()>>,
+    /// 当前视图绑定的 daemon 会话。先行建视图时为空，attach 成功后装入；
+    /// 断线重挂会在同一个句柄里替换 channel。
+    attached_session: Option<crate::daemon::session::SessionHandle>,
+    /// 每次发起远端 attach 递增；迟到的旧结果据此丢弃，不能覆盖新连接。
+    remote_attach_generation: u64,
     /// 检测到的远程操作系统（仅对SSH终端有意义）
     remote_os: Option<RemoteOS>,
     cached_working_directory: Option<String>,
@@ -986,6 +1008,12 @@ static GRID_SIZE_HINT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU
 impl TerminalView {
     /// 处理 SSH 连接异常断开事件
     fn handle_ssh_abnormal_disconnect(&self, cx: &mut Context<Self>) {
+        if !self.legacy_ssh {
+            // 远端 core 的 SSH line 断开会由本地 supervisor 自动重连并重新
+            // attach，不能把 panel 切到旧 SSH 模式——那会静默改变保活语义。
+            log::info!("忽略非旧 SSH 会话的异常断开事件，交由远端机器 supervisor 处理");
+            return;
+        }
         if let Some(config) = self.ssh_config.as_ref() {
             log::info!("SSH 连接异常断开，触发重连: {}", config.host_label());
             cx.emit(Event::SshReconnect {
@@ -1303,6 +1331,7 @@ impl TerminalView {
             terminal_subscription: Some(subscription),
             working_directory,
             ssh_config,
+            legacy_ssh: false,
             command,
             command_args,
             focus_handle,
@@ -1326,6 +1355,8 @@ impl TerminalView {
             ssh_connect_view: None,
             ssh_connect_subscription: None,
             ssh_connect_hide_task: None,
+            attached_session: None,
+            remote_attach_generation: 0,
             remote_os: None,
             cached_working_directory: None,
             process_cwd: ProcessCwdCache::default(),
@@ -1583,10 +1614,34 @@ impl TerminalView {
                 return None;
             }
         };
+        Some(Self::from_attached_session(
+            cx,
+            session,
+            working_directory,
+            command,
+            args,
+        ))
+    }
+
+    /// 用一条**已经完成 daemon attach** 的会话装配终端视图。
+    ///
+    /// 把 attach 与视图构造拆开，是为了让会话恢复可以在后台线程完成阻塞
+    /// 的 daemon/SSH 握手，而 UI 线程只在结果返回后做本地对象装配。若在
+    /// UI 线程里先 attach 再构造，守护进程慢一次就会让整个窗口无响应。
+    pub(crate) fn from_attached_session(
+        cx: &mut App,
+        session: crate::daemon::session::Session,
+        working_directory: Option<PathBuf>,
+        command: Option<&str>,
+        args: &[String],
+    ) -> Entity<Self> {
         // 输入与尺寸回写：各持一份 `Session`，直接用自己的 channel，
         // 不查表——查表在 detach 之后会静默写到别的终端上。
-        let input_session = session.clone();
-        let resize_session = session.clone();
+        let address = session.address.clone();
+        let handle = crate::daemon::session::SessionHandle::new();
+        handle.bind(session.clone());
+        let input_handle = handle.clone();
+        let resize_handle = handle.clone();
         // 用守护进程报的真实尺寸建本地 VT。
         //
         // 这里以前硬编码 80×24，而守护进程里的终端可能是 174×66：重放的
@@ -1598,8 +1653,8 @@ impl TerminalView {
             session.cols,
             session.rows,
             Self::persistent_scrollback_lines(cx),
-            move |bytes| input_session.write(bytes),
-            move |cols, rows, _scale| resize_session.resize(cols, rows, 0, 0),
+            move |bytes| input_handle.write(bytes),
+            move |cols, rows, _scale| resize_handle.resize(cols, rows, 0, 0),
         );
 
         let view = Self::create_terminal_view(
@@ -1612,8 +1667,12 @@ impl TerminalView {
             args.to_vec(),
         );
 
-        crate::daemon::session::pump_into(session, terminal, cx);
-        Some(view)
+        view.update(cx, |this, _cx| {
+            this.attached_session = Some(handle.clone());
+        });
+
+        crate::daemon::session::pump_into(session, terminal, handle, cx);
+        view
     }
 
     /// 使用指定命令创建新的本地终端（起点目录可继承：复制 / 重连标签）。
@@ -1712,6 +1771,7 @@ impl TerminalView {
                 terminal_subscription: Some(terminal_subscription),
                 working_directory: None,
                 ssh_config: Some(ssh_config_clone.clone()),
+                legacy_ssh: true,
                 command: None,
                 command_args: Vec::new(),
                 focus_handle,
@@ -1735,6 +1795,8 @@ impl TerminalView {
                 ssh_connect_view: Some(connect_view.clone()),
                 ssh_connect_subscription: None,
                 ssh_connect_hide_task: None,
+                attached_session: None,
+                remote_attach_generation: 0,
                 remote_os: None,
                 cached_working_directory: None,
                 process_cwd: ProcessCwdCache::default(),
@@ -1815,16 +1877,381 @@ impl TerminalView {
     pub fn adopt_ssh_session(&mut self, config: SshConnectionConfig, remote_cwd: Option<String>) {
         self.ssh_config = Some(config);
         self.pending_remote_cwd_restore = remote_cwd;
+        self.legacy_ssh = false;
     }
 
-    /// 在守护进程里起一个 SSH 终端。
+    /// 把视图标记为显式旧 SSH 会话。
+    pub fn adopt_legacy_ssh_session(
+        &mut self,
+        config: SshConnectionConfig,
+        remote_cwd: Option<String>,
+    ) {
+        self.ssh_config = Some(config);
+        self.pending_remote_cwd_restore = remote_cwd;
+        self.legacy_ssh = true;
+    }
+
+    /// 在远端机器上起一个由远端 core 持有的 SSH 终端。
     ///
-    /// 与 [`Self::new_ssh_with_remote_cwd`] 的区别：`ssh` 进程跑在 `deepcore`
-    /// 里而不是本进程。关掉 deepterm 时 SSH 连接不会断，远端的 `htop`、编译
-    /// 任务继续跑；重开时挂接回同一个连接。
+    /// 与旧路径 [`Self::new_persistent_legacy_ssh`] 的区别：SSH 连接由本地
+    /// core 建立，但 `deepcore` 与 PTY 都在远端；本地只中转帧。关掉本机
+    /// deepterm 后远端的 `htop`、编译任务继续跑，重开时按 `machine/tN`
+    /// 接回同一条远端 line 与终端。
     ///
-    /// 失败返回 `Err`，调用方应退回进程内 SSH。
-    pub fn new_persistent_ssh(
+    /// 与 herdr 一样，这里**只同步建立视图**；SSH 握手、远端 core 部署、
+    /// attach 全部由 [`Self::connect_remote_core`] 放到后台 executor 执行。
+    /// 窗口首帧因此不会被一次慢连接拖住。
+    pub fn new_remote_core_ssh(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> Entity<Self> {
+        Self::new_remote_core_ssh_resuming(cx, ssh_config, remote_cwd, None, cols, rows)
+    }
+
+    /// 从持久化会话恢复远端终端。
+    ///
+    /// `address` 是上次保存的 `machine/tN`。视图立即出现并保留这个地址，
+    /// 后台先 attach 原终端；只有守护进程明确回答不存在时才建立新终端。
+    /// 这避免 GUI 重启时同步等 SSH，也避免每次重开都新建 shell 从而丢掉
+    /// `opencode` 等前台程序。
+    pub fn new_remote_core_ssh_resuming(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        address: Option<String>,
+        cols: u16,
+        rows: u16,
+    ) -> Entity<Self> {
+        Self::new_remote_core_view(cx, ssh_config, remote_cwd, address, cols, rows, None, true)
+    }
+
+    /// 远端 core 启动失败的可见错误页。
+    ///
+    /// 默认路径失败时**不得**静默启动旧 SSH：那会让用户误以为远端任务仍由
+    /// 远端 core 持有。这里保留终端面板并显示失败原因，用户可从标签菜单
+    /// 显式选择旧 SSH 模式。
+    pub fn new_remote_core_error(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        error: impl Into<String>,
+    ) -> Entity<Self> {
+        Self::new_remote_core_view(
+            cx,
+            ssh_config,
+            remote_cwd,
+            None,
+            80,
+            24,
+            Some(error.into()),
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_remote_core_view(
+        cx: &mut App,
+        ssh_config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        address: Option<String>,
+        cols: u16,
+        rows: u16,
+        error: Option<String>,
+        connect: bool,
+    ) -> Entity<Self> {
+        let config = ssh_config.clone();
+        let focus_handle = cx.focus_handle();
+        cx.new(|cx| {
+            let handle = crate::daemon::session::SessionHandle::new();
+            let input_handle = handle.clone();
+            let resize_handle = handle.clone();
+            // 首帧布局会通过尺寸回调发一次信号。attach 任务只在第一次连接
+            // 时等它（最多 100ms），随后从 Terminal 的已应用几何读取真实
+            // pane 大小，而不是继续使用恢复文件里的旧网格。
+            let layout_ready = connect.then(|| async_channel::bounded::<()>(1));
+            let layout_ready_tx = layout_ready.as_ref().map(|(tx, _)| tx.clone());
+            let scrollback_lines = Self::persistent_scrollback_lines(cx);
+            let terminal = crate::terminal::Terminal::new_attached(
+                cx,
+                address.clone().unwrap_or_default(),
+                cols,
+                rows,
+                scrollback_lines,
+                move |bytes| input_handle.write(bytes),
+                move |cols, rows, _scale| {
+                    resize_handle.resize(cols, rows, 0, 0);
+                    if let Some(ready) = &layout_ready_tx {
+                        let _ = ready.try_send(());
+                    }
+                },
+            );
+            let terminal_clone = terminal.clone();
+            let subscription = cx.subscribe(
+                &terminal_clone,
+                |this: &mut TerminalView, terminal, event: &TerminalEvent, cx| {
+                    this.handle_terminal_event(
+                        &terminal,
+                        event,
+                        TerminalEventSource::SshConnecting,
+                        cx,
+                    );
+                },
+            );
+            let connect_view = cx.new(|cx| {
+                let mut view = crate::ssh_view::SshConnectView::new(config.clone(), cx);
+                view.set_reconnect_target(ReconnectTarget::RemoteCore);
+                if let Some(error) = &error {
+                    view.set_failed(error.clone(), cx);
+                }
+                view
+            });
+            let mut this = Self::build_with_terminal(
+                cx,
+                terminal_clone,
+                None,
+                Some(config.clone()),
+                config.host_label().into(),
+                None,
+                Vec::new(),
+                focus_handle,
+            );
+            this.terminal_subscription = Some(subscription);
+            this.ssh_connect_subscription =
+                Some(this.subscribe_ssh_connect_view(&connect_view, cx));
+            this.ssh_connect_view = Some(connect_view);
+            this.pending_remote_cwd_restore = remote_cwd;
+            this.attached_session = Some(handle.clone());
+            if connect {
+                let layout_ready = layout_ready.map(|(_, ready)| ready);
+                this.connect_remote_core(handle, address, layout_ready, cx);
+            }
+            this
+        })
+    }
+
+    /// 当前窗口真实的远端 attach 网格。
+    ///
+    /// 远端 attach 必须按 Terminal 已经应用的网格发出，不能继续使用视图
+    /// 构造时的持久化尺寸。首帧布局可能已经把本地 VT reflow 到真实 pane
+    /// 大小；报告旧尺寸会让远端快照按错误行数生成，恢复后顶部内容进入
+    /// 回滚区。
+    fn remote_attach_grid(&self, cx: &gpui::App) -> (u16, u16) {
+        let bounds = self.terminal.read(cx).terminal_bounds;
+        (
+            bounds.num_columns().clamp(2, u16::MAX as usize) as u16,
+            bounds.num_lines().clamp(1, u16::MAX as usize) as u16,
+        )
+    }
+
+    /// 在后台连接/挂接远端终端；成功后把 channel 装进**现有**视图。
+    ///
+    /// 这是 DeepTerm 对应 herdr `TerminalView::connect` 的位置：阻塞的
+    /// `restore_machine_terminal` 永远在 background executor 上执行，UI
+    /// 线程只处理结果。重试也复用同一实体，不会先结束旧会话。
+    #[allow(clippy::too_many_arguments)]
+    fn connect_remote_core(
+        &mut self,
+        handle: crate::daemon::session::SessionHandle,
+        saved_address: Option<String>,
+        layout_ready: Option<async_channel::Receiver<()>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(config) = self.ssh_config.clone() else {
+            return;
+        };
+        let remote_cwd = self.pending_remote_cwd_restore.clone();
+        let terminal = self.terminal.clone();
+        let connect_view = self.ssh_connect_view.clone();
+        self.remote_attach_generation = self.remote_attach_generation.wrapping_add(1);
+        let generation = self.remote_attach_generation;
+
+        if let Some(connect_view) = &connect_view {
+            connect_view.update(cx, |view, cx| view.set_connecting(cx));
+        }
+
+        cx.spawn(async move |this, cx| {
+            enum Attempt {
+                Attached,
+                Retry,
+                Stale,
+            }
+
+            let mut retry_delay = REMOTE_ATTACH_RETRY_MIN;
+            let mut layout_ready = layout_ready;
+            loop {
+                // 等首帧真实布局。活动标签通常在一个渲染帧内完成；隐藏标签
+                // 永远不会布局，100ms 后按保存尺寸继续连接，避免后台标签
+                // 因为等不到信号而一直不 attach。
+                if let Some(ready) = layout_ready.take() {
+                    let deadline = cx.background_executor().timer(REMOTE_ATTACH_LAYOUT_WAIT);
+                    let mut ready = std::pin::pin!(ready.recv());
+                    let mut deadline = std::pin::pin!(deadline);
+                    std::future::poll_fn(|cx| {
+                        if ready.as_mut().poll(cx).is_ready()
+                            || deadline.as_mut().poll(cx).is_ready()
+                        {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                }
+
+                // attach 必须先 resize 远端、再取快照，因此这里必须使用
+                // Terminal 已应用的网格，而不是构造视图时的旧提示。
+                let Ok(size) = this.update(cx, |this, cx| this.remote_attach_grid(cx)) else {
+                    break;
+                };
+                let attach_cols = size.0;
+                let attach_rows = size.1;
+
+                let name = config.nickname.clone();
+                let config_for_attach = config.clone();
+                let cwd_for_attach = remote_cwd.clone();
+                let saved_for_attach = saved_address.clone();
+                let attached = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::daemon::session::restore_machine_terminal(
+                            &config_for_attach,
+                            name,
+                            cwd_for_attach.as_deref(),
+                            saved_for_attach.as_deref(),
+                            attach_cols,
+                            attach_rows,
+                        )
+                    })
+                    .await;
+
+                let newly_created = saved_address.is_none();
+                let orphan = match (&attached, newly_created) {
+                    (Ok(session), true) => Some(session.address.clone()),
+                    _ => None,
+                };
+                let attempt = this
+                    .update(cx, |this, cx| {
+                        if this.remote_attach_generation != generation {
+                            return Attempt::Stale;
+                        }
+                        match attached {
+                            Ok(session) => {
+                                let address = session.address.clone();
+                                log::info!(
+                                    "远端终端已挂接: {address}（网格 {}x{}）",
+                                    session.cols,
+                                    session.rows
+                                );
+                                // 快照的字节是按守护进程**实际**网格生成的。若它与
+                                // 本地 VT 预置的网格不同（attach 时守护进程的 resize
+                                // 超时、或另一个 viewer 改过尺寸），必须先对齐再喂
+                                // 数据，否则整屏快照会错位——"恢复后 TUI 布局乱掉，
+                                // 拖一下窗口才好"。
+                                let grid_changed = terminal.update(cx, |terminal, _cx| {
+                                    terminal.set_attached_address(address);
+                                    terminal.adopt_daemon_grid(session.cols, session.rows)
+                                });
+                                if grid_changed {
+                                    cx.notify();
+                                }
+                                handle.bind(session.clone());
+                                crate::daemon::session::pump_into(
+                                    session,
+                                    terminal.clone(),
+                                    handle.clone(),
+                                    cx,
+                                );
+                                if let Some(connect_view) = &connect_view {
+                                    this.handle_ssh_connect_status(
+                                        connect_view,
+                                        SshCheckOutcome::Connected,
+                                        cx,
+                                    );
+                                }
+                                // `machine/tN` 是恢复身份，必须在 attach 成功后
+                                // 尽快落盘，不能等下一次布局变化。
+                                cx.emit(Event::WorkingDirectoryChanged);
+                                cx.notify();
+                                Attempt::Attached
+                            }
+                            Err(error) => {
+                                log::warn!(
+                                    "远端 core 会话连接失败: {error}；{}ms 后重试",
+                                    retry_delay.as_millis()
+                                );
+                                handle.clear();
+                                if let Some(connect_view) = &connect_view {
+                                    connect_view.update(cx, |view, cx| {
+                                        view.set_failed(error, cx);
+                                    });
+                                }
+                                cx.notify();
+                                Attempt::Retry
+                            }
+                        }
+                    })
+                    .unwrap_or(Attempt::Stale);
+
+                match attempt {
+                    Attempt::Attached => break,
+                    Attempt::Stale => {
+                        // 视图在连接期间被关闭：新建出来的远端终端没人观看，
+                        // 回收它；原本就存在的 `machine/tN` 不能动。
+                        if let Some(address) = orphan {
+                            cx.background_executor()
+                                .spawn(async move {
+                                    crate::daemon::session::close_terminal(&address);
+                                })
+                                .await;
+                        }
+                        break;
+                    }
+                    Attempt::Retry => {
+                        cx.background_executor().timer(retry_delay).await;
+                        retry_delay = (retry_delay * 2).min(REMOTE_ATTACH_RETRY_MAX);
+                        let still_current = this
+                            .update(cx, |this, cx| {
+                                if this.remote_attach_generation != generation {
+                                    return false;
+                                }
+                                if let Some(connect_view) = &connect_view {
+                                    connect_view.update(cx, |view, cx| view.set_connecting(cx));
+                                }
+                                cx.notify();
+                                true
+                            })
+                            .unwrap_or(false);
+                        if !still_current {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 用户的 Retry 按钮：在同一个视图上重新 attach，不先 kill 旧会话。
+    pub fn retry_remote_core(&mut self, cx: &mut Context<Self>) {
+        if self.legacy_ssh {
+            return;
+        }
+        let Some(handle) = self.attached_session.clone() else {
+            return;
+        };
+        let address = self.terminal.read(cx).attached_address().map(str::to_owned);
+        self.connect_remote_core(handle, address, None, cx);
+    }
+
+    /// 旧的兼容路径：在本地 core 的 PTY 里运行 `ssh`。
+    ///
+    /// 只作为用户显式选择的降级方案保留。默认连接必须走
+    /// [`Self::new_remote_core_ssh`]；自动回退会掩盖远端部署失败，并让用户
+    /// 误以为关掉窗口后远端任务仍会继续。
+    pub fn new_persistent_legacy_ssh(
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
         remote_cwd: Option<String>,
@@ -1845,7 +2272,7 @@ impl TerminalView {
         let view = Self::attach_existing(cx, &address, None, None, &[], hint)
             .ok_or_else(|| "无法挂接刚创建的远程终端".to_string())?;
         view.update(cx, |this, _cx| {
-            this.adopt_ssh_session(ssh_config.clone(), remote_cwd);
+            this.adopt_legacy_ssh_session(ssh_config.clone(), remote_cwd);
         });
         Ok(view)
     }
@@ -2017,7 +2444,15 @@ impl TerminalView {
         cx.subscribe(
             connect_view,
             move |this: &mut TerminalView, _view, event: &crate::ssh_view::connect::Event, cx| {
-                let Reconnect { config } = event;
+                let Reconnect { config, target } = event;
+                if *target == ReconnectTarget::RemoteCore {
+                    log::info!(
+                        "远端 core 会话请求重试: {}；保持远端 core 模式",
+                        config.host_label()
+                    );
+                    cx.emit(Event::RetryRemoteCore);
+                    return;
+                }
                 log::info!("重新连接 SSH: {}", config.host_label());
 
                 // 清理旧订阅
@@ -2088,18 +2523,34 @@ impl TerminalView {
         self.ssh_config.as_ref()
     }
 
+    /// 供会话持久化的网格：优先用 `SessionHandle` 缓存的"最后一次声明值"。
+    ///
+    /// 保存路径（自动保存、复制标签页、分屏）都在 UI 线程上，而
+    /// `session::terminal_grid` 是个 150ms 超时的同步 RPC；core 一慢就会
+    /// 变成"每个标签卡 150ms"的界面冻结。缓存命中时零成本。
+    ///
+    /// 只有在没有绑定会话（例如刚恢复、还没 attach 上）时才退回 RPC，
+    /// 那时也确实没有"本视图声明过的尺寸"可用。
+    fn daemon_grid(&self, address: Option<&str>) -> Option<(u16, u16)> {
+        if let Some(grid) = self.attached_session.as_ref().and_then(|h| h.grid()) {
+            return Some(grid);
+        }
+        address.and_then(crate::daemon::session::terminal_grid)
+    }
+
     pub fn session_state(&self, cx: &App) -> TerminalSessionState {
         if let Some(config) = self.ssh_config.clone() {
             // 远程终端同样要记住守护进程地址：否则重开只能重连，远端
             // 正在跑的任务就断了。
             let mut state =
-                TerminalSessionState::ssh(config, self.current_remote_working_directory(cx));
+                TerminalSessionState::ssh(config, self.current_remote_working_directory(cx))
+                    .with_legacy_ssh(self.legacy_ssh);
             let address = self.terminal.read(cx).attached_address().map(str::to_owned);
-            // 与本地终端同理：尺寸要问守护进程。非活动标签的本地 VT
-            // 尺寸是构造默认值，存下来只会让重开时排错。
-            let grid = address
-                .as_deref()
-                .and_then(crate::daemon::session::terminal_grid);
+            // 与本地终端同理：尺寸要用"守护进程被 resize 成的那一份"，
+            // 不能用本地 VT 的 `terminal_bounds`（非活动标签停在构造默认值）。
+            // 优先读 `SessionHandle` 缓存：保存路径在 UI 线程上，不该为了一
+            // 个尺寸去做 150ms 的同步 RPC。
+            let grid = self.daemon_grid(address.as_deref());
             if let TerminalSessionState::Ssh {
                 daemon_address,
                 daemon_grid,
@@ -2119,12 +2570,11 @@ impl TerminalView {
         // 记下真实网格尺寸：重开时靠它向守护进程 attach，守护进程据此
         // 先 resize 再生产快照。
         //
-        // **必须问守护进程**，不能用本地 VT 的 `terminal_bounds`：
-        // 非活动标签从未布局过，那个值还停在构造时的默认 55×18，存下来
-        // 等于存了个错的——重开时照它 resize，全屏程序就排到错误的列数上。
-        let daemon_grid = daemon_address
-            .as_deref()
-            .and_then(crate::daemon::session::terminal_grid);
+        // **不能用本地 VT 的 `terminal_bounds`**：非活动标签从未布局过，那个
+        // 值还停在构造时的默认 55×18，存下来等于存了个错的——重开时照它
+        // resize，全屏程序就排到错误的列数上。优先读 `SessionHandle` 里记的
+        // 那份（就是本视图最后一次 resize 声明给 daemon 的值）。
+        let daemon_grid = self.daemon_grid(daemon_address.as_deref());
         TerminalSessionState::Local {
             cwd: cwd.map(|path| path.to_string_lossy().to_string()),
             command: self.command.clone(),
@@ -2846,7 +3296,17 @@ impl TerminalView {
         let term = self.terminal.read(cx);
 
         // 远程终端：HostName - process: ~/cwd
-        if term.is_remote() {
+        //
+        // **判据不能只是 `term.is_remote()`。** 远端 core 的终端在本进程看来
+        // 是 `TerminalType::Attached`（PTY 在远端 holder 里，本地只是挂接者），
+        // `is_remote()` 恒为 false。只认 `is_remote()` 的话它会掉进下面的本地
+        // 分支：本机没有 PTY fd、拿不到前台进程，`cwd` 也只能取到本机目录，
+        // 两者都为空时就显示成 "Local Terminal"——重启 GUI 后远端标签变成
+        // "Local Terminal" 就是这么来的。
+        //
+        // 只要这个视图带着 SSH 配置，它就是一台远程主机上的终端，与"谁持有
+        // PTY""谁建立 SSH"无关。
+        if term.is_remote() || self.ssh_config.is_some() {
             let host = self
                 .ssh_config
                 .as_ref()
@@ -2926,7 +3386,10 @@ impl TerminalView {
     pub fn tab_title_parts(&self, cx: &App) -> (String, String) {
         let term = self.terminal.read(cx);
 
-        if term.is_remote() {
+        // 与 [`Self::tab_label`] 同一个判据：远端 core 的终端是 `Attached`，
+        // `is_remote()` 为 false，但它确实在远端主机上。只认 `is_remote()`
+        // 会让重启后的远端标签显示成本地的 "Local Terminal"。
+        if term.is_remote() || self.ssh_config.is_some() {
             let host = self
                 .ssh_config
                 .as_ref()
@@ -3004,8 +3467,20 @@ impl TerminalView {
     /// `node` / `python`。这与 herdr 的 `programs::of(app, argv)` 同一套顺序。
     pub fn foreground_program(&self, cx: &App) -> crate::programs::Program {
         let term = self.terminal.read(cx);
-        let app = term.foreground_agent().map(|agent| agent.slug());
         let own_argv = term.foreground_argv();
+        // agent 身份优先，但**不能与前台程序自相矛盾**。
+        //
+        // `programs::of` 的第一步就是"agent 自报优先"，它直接返回、根本不看
+        // argv。只要 `foreground_agent` 里残留着上一个 agent，图标就会停在
+        // 那个 agent 上，而标签文字取自 argv、显示的是真正的前台程序——
+        // "文字写 nvim、图标画 claude"。
+        //
+        // 判据与守护进程侧共用 [`CLIAgent::self_report_still_holds`]，两个
+        // 进程边界不能各写一套；那段注释解释了为什么失效的身份必须丢弃。
+        let agent = term
+            .foreground_agent()
+            .filter(|agent| agent.self_report_still_holds(own_argv.as_deref()));
+        let app = agent.map(|agent| agent.slug());
         let remote = term.remote_process_name();
         let shell = term.shell_name();
         if own_argv.is_none()
@@ -6582,6 +7057,41 @@ mod tests {
         );
     }
 
+    /// attach 必须使用首帧布局后的真实网格，而不是恢复文件里的旧网格。
+    ///
+    /// 回归：窗口从 50 行变成 43 行后恢复远程终端，若仍按 50 行 attach，
+    /// 本地 VT reflow 会把快照顶部 7 行推进回滚区，`top`/`opencode` 的
+    /// 标题栏看起来像丢了。
+    #[gpui::test]
+    fn remote_attach_grid_tracks_the_applied_layout(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            TerminalView::build_headless(cx, terminal)
+        });
+
+        let actual = TerminalBounds::new(
+            px(16.0),
+            px(9.0),
+            Bounds::new(
+                point(px(0.0), px(0.0)),
+                size(px(9.0 * 126.0), px(16.0 * 43.0)),
+            ),
+        );
+        view.update(cx, |view, cx| {
+            view.terminal
+                .update(cx, |terminal, cx| terminal.resize(actual, 1.0, cx));
+            assert_eq!(
+                view.remote_attach_grid(cx),
+                (126, 43),
+                "attach 网格必须跟随首帧布局，不能用旧尺寸"
+            );
+        });
+    }
+
     fn key_event(spec: &str) -> KeyDownEvent {
         KeyDownEvent {
             keystroke: gpui::Keystroke::parse(spec).expect("击键应可解析"),
@@ -7527,6 +8037,139 @@ mod tests {
                     .is_none(),
                 "复制后选区必须清空，否则下一次 Ctrl+C 仍只会复制"
             );
+        });
+    }
+
+    /// 远端 core 失败页的 Reconnect 必须继续走远端 core。
+    ///
+    /// 曾经这里复用旧 SSH 的重连事件：首次连接只要慢于 20 秒，用户点一下
+    /// Reconnect 就会悄悄切到“本地 PTY 里跑 ssh”。标签看起来能用了，但断网
+    /// 后远端程序随 SSH 一起消失，完全违背保活语义。
+    #[gpui::test]
+    fn remote_core_error_retry_stays_on_the_remote_core_path(cx: &mut TestAppContext) {
+        use crate::ssh::config::AuthMethod;
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let config = SshConnectionConfig::new("example.com", "tester", AuthMethod::Agent);
+        let remote_cwd = Some("/srv/work".to_string());
+        let view = cx.update(|cx| {
+            TerminalView::new_remote_core_error(cx, &config, remote_cwd, "connecting")
+        });
+
+        let (target, legacy_ssh) = view.read_with(cx, |view, cx| {
+            let target = view
+                .ssh_connect_view
+                .as_ref()
+                .expect("error view must keep a retry control")
+                .read(cx)
+                .reconnect_target;
+            let state = view.session_state(cx);
+            let legacy_ssh = match state {
+                TerminalSessionState::Ssh { legacy_ssh, .. } => legacy_ssh,
+                _ => panic!("remote core error must still describe an SSH session"),
+            };
+            (target, legacy_ssh)
+        });
+
+        assert_eq!(target, ReconnectTarget::RemoteCore);
+        assert!(!legacy_ssh, "远端 core 错误页不能被记成旧 SSH 会话");
+    }
+
+    /// 远端 core 的标签必须显示主机名，而不是 "Local Terminal"。
+    ///
+    /// 回归价值：远端 core 的终端在本进程看来是 `TerminalType::Attached`
+    /// ——PTY 在远端 holder 里，本地只是挂接者——所以 `Terminal::is_remote()`
+    /// 恒为 false。`tab_label` / `tab_title_parts` 原本只认 `is_remote()`，
+    /// 于是这类标签掉进本地分支：本机没有 PTY fd 取不到前台进程、cwd 也只能
+    /// 取到本机目录，两者皆空时就渲染成 "Local Terminal"，
+    /// 用户重启 GUI 后看到远端标签变成 "Local Terminal" 正是这个原因。
+    ///
+    /// 判据必须是「带着 SSH 配置」，与谁持有 PTY、谁建立 SSH 无关。
+    #[gpui::test]
+    fn remote_core_tab_shows_the_host_not_local_terminal(cx: &mut TestAppContext) {
+        use crate::ssh::config::AuthMethod;
+
+        let _env = crate::daemon::IsolatedTestEnv::new("/tmp/deepterm-remote-label");
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        // 手工 ssh 连接（没有 nickname）应显示 host。
+        let config = SshConnectionConfig::new("192.168.194.4", "tester", AuthMethod::Agent);
+        let view = cx.update(|cx| {
+            TerminalView::new_remote_core_ssh_resuming(
+                cx,
+                &config,
+                Some("/home/tester".into()),
+                Some("lingsi-ubuntu/t19".to_string()),
+                120,
+                40,
+            )
+        });
+
+        view.read_with(cx, |view, cx| {
+            // 前提：这类终端确实不是 `Remote`，所以本测试守的是"不能只靠它"。
+            assert!(
+                !view.terminal.read(cx).is_remote(),
+                "前提：远端 core 终端是 Attached，is_remote() 为 false"
+            );
+
+            let label = view.tab_label(cx);
+            assert!(
+                !label.contains("Local Terminal"),
+                "远端标签不得显示成 Local Terminal，实际 {label:?}"
+            );
+            assert!(
+                label.contains("192.168.194.4"),
+                "手工 ssh 连接的标签应包含服务器地址，实际 {label:?}"
+            );
+            // 远端工作路径也要出现，并且把 `/home/<user>` 缩成 `~`。
+            assert!(
+                label.contains("~"),
+                "远端 cwd 应相对家目录缩写，实际 {label:?}"
+            );
+
+            let (name, _cwd) = view.tab_title_parts(cx);
+            assert!(
+                !name.contains("Local Terminal"),
+                "两段式标签的名字段也不能是 Local Terminal，实际 {name:?}"
+            );
+            assert!(
+                name.contains("192.168.194.4"),
+                "两段式标签的名字段应含主机，实际 {name:?}"
+            );
+        });
+    }
+
+    /// Herdr 式恢复：视图必须在任何网络调用之前返回，并把保存的
+    /// `machine/tN` 保留为自己的身份。旧实现会在这里同步等 SSH，GUI 重启
+    /// 时整窗无响应；地址丢失则会另起一个 shell，让 `opencode` 消失。
+    #[gpui::test]
+    fn remote_core_view_returns_before_connecting_and_keeps_its_address(cx: &mut TestAppContext) {
+        use crate::ssh::config::AuthMethod;
+
+        let _env = crate::daemon::IsolatedTestEnv::new("/tmp/deepterm-remote-view");
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+        let config = SshConnectionConfig::new("unreachable.invalid", "tester", AuthMethod::Agent);
+        let address = Some("lingsi-ubuntu/t19".to_string());
+        let started = std::time::Instant::now();
+        let view = cx.update(|cx| {
+            TerminalView::new_remote_core_ssh_resuming(cx, &config, None, address.clone(), 120, 40)
+        });
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "视图构造不得等待后台 SSH/daemon attach"
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(!view.legacy_ssh, "默认远端路径不能降级成旧 SSH");
+            assert_eq!(view.session_state(cx).daemon_address(), address.as_deref());
         });
     }
 }
