@@ -42,6 +42,11 @@ const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_BINARY_BYTES: u64 = 128 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(90);
+/// 远端 shell 命令（`uname`、`mkdir`、探针、停旧 core）的时间上限。
+///
+/// 这些命令都是毫秒级；给 30 秒是留给"远端刚启动、负载很高"的情况。
+/// 没有上限的版本会把机器监督线程永远卡在一条挂死的远端命令上。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const MISSING_PROBE_MARKER: &str = "__DEEPTERM_CORE_MISSING__";
 
@@ -148,6 +153,49 @@ fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// 校验下载地址：`https://`、`file://` 或**回环地址上的**明文 `http://`。
+///
+/// # 为什么明文 http 只放行回环
+///
+/// manifest 没有签名：它同时给出归档 URL 与哈希，两者来自同一份未认证
+/// 文档。走公网明文时网络攻击者可以同时替换两者——`sha256` 只防损坏、
+/// 不防替换，最终就是远端主机上的任意代码执行。
+///
+/// 回环地址供本地测试夹具（`tests/remote_machine_e2e.rs` 用
+/// `http://127.0.0.1:<port>` 发布归档）与 `DEEPTERM_RELEASES_URL` 指向
+/// 本地镜像，不经过网络。
+fn validate_artifact_url(url: &str) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return Err("地址为空".into());
+    }
+    if url.starts_with("https://") || url.starts_with("file://") {
+        return Ok(());
+    }
+    if let Some(rest) = url.strip_prefix("http://") {
+        // authority = 到第一个 '/' 为止；再从中剥掉端口。IPv6 字面量带方括号，
+        // 直接按 ':' 切会把 `[::1]` 切成 `[`。
+        let authority = rest.split('/').next().unwrap_or_default();
+        let host = if let Some(stripped) = authority.strip_prefix('[') {
+            // `[::1]:8080` → `::1`
+            stripped.split(']').next().unwrap_or_default()
+        } else {
+            authority.split(':').next().unwrap_or_default()
+        };
+        let loopback = matches!(host, "localhost" | "::1")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|addr| addr.is_loopback());
+        if loopback {
+            return Ok(());
+        }
+        return Err(format!(
+            "公网明文 http 不可用（manifest 未签名，可被同时替换 URL 与哈希）: {url}"
+        ));
+    }
+    Err(format!("不支持的协议: {url}"))
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct CoreArtifact {
     pub url: String,
@@ -181,13 +229,8 @@ impl CoreManifest {
             if !valid_sha256(&artifact.sha256) {
                 return Err(format!("target {key} 的 sha256 无效"));
             }
-            if artifact.url.trim().is_empty()
-                || !(artifact.url.starts_with("https://")
-                    || artifact.url.starts_with("http://")
-                    || artifact.url.starts_with("file://"))
-            {
-                return Err(format!("target {key} 的下载地址无效: {}", artifact.url));
-            }
+            validate_artifact_url(&artifact.url)
+                .map_err(|e| format!("target {key} 的下载地址无效: {e}"))?;
             if artifact.size.is_some_and(|size| size > MAX_BINARY_BYTES) {
                 return Err(format!("target {key} 声明的大小超过限制"));
             }
@@ -229,11 +272,17 @@ pub fn ensure_remote_core(
     session: Option<&str>,
     mode: InstallMode,
 ) -> Result<InstallOutcome, String> {
+    // 这是 `pub` 入口：不能假设调用方都先过了 `MachineBook::ensure`。
+    // `session` 会拼进远端 shell 命令与安装路径。
+    if let Some(session) = session {
+        super::validate_session(session)?;
+    }
+
     let mut sftp = BlockingSftpSession::connect(config)
         .map_err(|e| format!("无法通过 SFTP 连接远端（安装 deepcore）: {e}"))?;
 
     let (code, stdout, stderr) = sftp
-        .exec_capture("uname -sm")
+        .exec_capture("uname -sm", PROBE_TIMEOUT)
         .map_err(|e| format!("无法探测远端平台: {e}"))?;
     if code != Some(0) {
         return Err(format!(
@@ -299,11 +348,14 @@ pub fn ensure_remote_core(
         .parent()
         .ok_or_else(|| "远端安装路径没有父目录".to_string())?;
     let install_dir = install_dir.to_string_lossy();
-    let mkdir = sftp.exec_capture(&format!(
-        "mkdir -p {} && chmod 700 {}",
-        shell_quote(&install_dir),
-        shell_quote(&install_dir)
-    ));
+    let mkdir = sftp.exec_capture(
+        &format!(
+            "mkdir -p {} && chmod 700 {}",
+            shell_quote(&install_dir),
+            shell_quote(&install_dir)
+        ),
+        PROBE_TIMEOUT,
+    );
     let (code, stdout, stderr) = mkdir.map_err(|e| format!("创建远端安装目录失败: {e}"))?;
     if code != Some(0) {
         return Err(format!(
@@ -350,11 +402,14 @@ pub fn ensure_remote_core(
         ));
     }
 
-    let replace = sftp.exec_capture(&format!(
-        "chmod 700 {temp} && mv -f {temp} {target}",
-        temp = shell_quote(&temp_path),
-        target = shell_quote(&install_path)
-    ));
+    let replace = sftp.exec_capture(
+        &format!(
+            "chmod 700 {temp} && mv -f {temp} {target}",
+            temp = shell_quote(&temp_path),
+            target = shell_quote(&install_path)
+        ),
+        PROBE_TIMEOUT,
+    );
     let (code, stdout, stderr) = replace.map_err(|e| format!("替换远端 core 失败: {e}"))?;
     if code != Some(0) {
         let _ = remove_remote_file(&sftp, &temp_path);
@@ -377,7 +432,7 @@ pub fn ensure_remote_core(
 
 fn remote_home(sftp: &BlockingSftpSession) -> Result<String, String> {
     let (code, stdout, stderr) = sftp
-        .exec_capture("printf '%s' \"$HOME\"")
+        .exec_capture("printf '%s' \"$HOME\"", PROBE_TIMEOUT)
         .map_err(|e| format!("读取远端 HOME 失败: {e}"))?;
     let home = stdout.trim();
     if code != Some(0) || !home.starts_with('/') || home.contains('\n') {
@@ -413,7 +468,7 @@ fn probe_version_at(sftp: &BlockingSftpSession, path: &str) -> Result<String, St
         marker = shell_quote(MISSING_PROBE_MARKER)
     );
     let (code, stdout, stderr) = sftp
-        .exec_capture(&command)
+        .exec_capture(&command, PROBE_TIMEOUT)
         .map_err(|e| format!("执行远端探针失败: {e}"))?;
     if code == Some(3) && stdout.trim() == MISSING_PROBE_MARKER {
         return Err(MISSING_PROBE_MARKER.to_string());
@@ -431,13 +486,20 @@ fn probe_version_at(sftp: &BlockingSftpSession, path: &str) -> Result<String, St
 /// 是可执行的 deepcore 且不是 holder，避免异常 pid 文件误杀别的进程。
 fn restart_remote_core(sftp: &BlockingSftpSession, session: Option<&str>) -> Result<(), String> {
     let query = match session {
-        Some(session) => format!("printf '%s' \"$HOME/{INSTALL_DIR}/sessions/{session}\""),
+        // 与 `machines::shell_quote` 同语义：单引号里 `$HOME` 不会被本地
+        // shell 展开，但远端 shell 收到的是带引号的**字面量**——所以这里
+        // 用双引号是对的（需要远端展开 `$HOME`），唯一的风险字符是
+        // `session` 本身，而它已经过 `validate_session`，仍再做一次转义。
+        Some(session) => format!(
+            "printf '%s' \"$HOME/{INSTALL_DIR}/sessions/{}\"",
+            double_quote_escape(session)
+        ),
         None => "runtime=${DEEPTERM_RUNTIME_DIR:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/deepterm}}; \
                  runtime=${runtime:-$HOME/.config/deepterm}; printf '%s' \"$runtime\""
             .to_string(),
     };
     let (code, stdout, stderr) = sftp
-        .exec_capture(&query)
+        .exec_capture(&query, PROBE_TIMEOUT)
         .map_err(|e| format!("读取远端运行时目录失败: {e}"))?;
     if code != Some(0) {
         return Err(format!(
@@ -464,7 +526,7 @@ fn restart_remote_core(sftp: &BlockingSftpSession, session: Option<&str>) -> Res
         runtime = shell_quote(runtime),
     );
     let (code, stdout, stderr) = sftp
-        .exec_capture(&script)
+        .exec_capture(&script, PROBE_TIMEOUT)
         .map_err(|e| format!("停止旧远端 core 失败: {e}"))?;
     if code != Some(0) {
         return Err(format!(
@@ -476,9 +538,10 @@ fn restart_remote_core(sftp: &BlockingSftpSession, session: Option<&str>) -> Res
 }
 
 fn remove_remote_file(sftp: &BlockingSftpSession, path: &str) -> Result<(), String> {
+    let command = format!("rm -f -- {}", shell_quote(path));
     let (code, stdout, stderr) = sftp
-        .exec_capture(&format!("rm -f -- {}", shell_quote(path)))
-        .map_err(|e| e.to_string())?;
+        .exec_capture(&command, PROBE_TIMEOUT)
+        .map_err(|e| format!("删除远端文件 {path} 失败: {e}"))?;
     if code != Some(0) {
         return Err(format_remote_error(&stdout, &stderr));
     }
@@ -499,6 +562,21 @@ fn format_remote_error(stdout: &str, stderr: &str) -> String {
 /// 防止用户名或 HOME 中的引号改变远端 shell 语义。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// 双引号上下文里的转义：`\`、`"`、`$`、反引号。
+///
+/// 只在**必须让远端展开 `$HOME`** 的地方使用（`shell_quote` 会连 `$HOME`
+/// 一起变成字面量）。凡是落进双引号的值走这里。
+fn double_quote_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '"' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -734,6 +812,41 @@ mod tests {
         assert!(value.artifact_for(CoreTarget::LinuxAarch64).is_err());
         value.targets.get_mut("linux-x86_64").unwrap().sha256 = "xyz".into();
         assert!(value.validate().is_err());
+    }
+
+    /// **公网明文 http 必须被拒绝，回环上的放行。**
+    ///
+    /// 回归价值：manifest 未签名，同时给出 URL 与哈希；走明文时攻击者可以
+    /// 把两者一起换掉，`sha256` 校验完全失效（它只防损坏）。而本地测试
+    /// 夹具（`tests/remote_machine_e2e.rs`）与本地镜像用的是
+    /// `http://127.0.0.1:<port>`，不能一并禁掉。
+    #[test]
+    fn artifact_urls_require_tls_except_on_loopback() {
+        for ok in [
+            "https://github.com/x/y.tar.gz",
+            "file:///tmp/y.tar.gz",
+            "http://127.0.0.1:8080/y.tar.gz",
+            "http://localhost:8080/y.tar.gz",
+            "http://[::1]:8080/y.tar.gz",
+        ] {
+            assert!(validate_artifact_url(ok).is_ok(), "{ok} 应当放行");
+        }
+        for bad in [
+            "http://example.com/y.tar.gz",
+            "http://192.168.1.10/y.tar.gz",
+            "ftp://example.com/y.tar.gz",
+            "",
+        ] {
+            assert!(validate_artifact_url(bad).is_err(), "{bad} 应当拒绝");
+        }
+
+        let mut value = manifest();
+        value.targets.get_mut("linux-x86_64").unwrap().url =
+            "http://example.com/deepcore.tar.gz".into();
+        assert!(
+            value.validate().is_err(),
+            "公网明文必须让整份 manifest 无效"
+        );
     }
 
     #[test]

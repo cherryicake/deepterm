@@ -6,13 +6,17 @@
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 /// systemd 在都没有调用方时也会无限保留用户管理器。
+#[cfg(target_os = "linux")]
 const SYSTEMD_INFINITY: &str = "18446744073709551615";
+#[cfg(target_os = "linux")]
 const LINGER_REFRESH: Duration = Duration::from_secs(60);
+#[cfg(target_os = "linux")]
 const LOGINCTL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// linger 状态。`None` 表示无法证实“登出后一定会停”，不是“一定会停”。
@@ -31,13 +35,24 @@ pub struct ServerIdentity {
     linger: Mutex<LingerReport>,
 }
 
-/// 当前可执行文件的内容指纹。
+/// 当前可执行文件的构建指纹。
 ///
-/// core 与 holder 是**同一个二进制**的两个角色，但可以来自不同构建：升级
-/// 后新 core 必须能认出旧 holder（它手里还有用户的终端），同时不能让新终端
+/// core 与 holder 是**同一个构建**的两个角色，但可以来自不同构建：升级后
+/// 新 core 必须能认出旧 holder（它手里还有用户的终端），同时不能让新终端
 /// 继续落到旧 holder 上。版本号做不到这一点——同一个 `0.1.0` 可以从不同源码
-/// 构建出来。herdr 用链接器写入的 build id 区分，这里对可执行文件内容做
-/// 一次 SHA-256；结果只算一次，之后是常量。
+/// 构建出来。
+///
+/// # 为什么 macOS 上必须用 `LC_UUID` 而不是文件哈希
+///
+/// 分发时 `deepcore` 与 `deepholder` 是**两份分别签名的副本**（各自独立的
+/// app bundle，活动监视器里才会分别显示 `DeepTerm Core` / `DeepHolder`）。
+/// `codesign` 会往文件尾部写签名 blob，两份副本因此字节不同、SHA-256 也不同
+/// ——而 `holder_is_current` 正是按这个指纹决定“新终端交给谁”。用文件哈希会
+/// 让刚拉起来的 holder 永远被判成旧构建并立刻 drain。
+///
+/// `LC_UUID` 由链接器写入 Mach-O 头部，签名不会改动它（实测签名前后完全
+/// 一致），因此它才是“同一份构建”的判据——这正是 herdr 用链接器 build id
+/// 的原因。其余平台仍然用文件哈希。
 ///
 /// 注意这个指纹只在**同一台机器**内比较：GUI 与远端 core 是不同平台的
 /// 二进制，跨机器不能用它判断版本。
@@ -45,25 +60,143 @@ pub fn build_id() -> &'static str {
     static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     BUILD.get_or_init(|| {
         let Ok(exe) = std::env::current_exe() else {
-            return format!("version:{}", env!("CARGO_PKG_VERSION"));
+            return version_fallback();
         };
-        let Ok(mut file) = std::fs::File::open(&exe) else {
-            return format!("version:{}", env!("CARGO_PKG_VERSION"));
-        };
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            match std::io::Read::read(&mut file, &mut buffer) {
-                Ok(0) => break,
-                Ok(read) => hasher.update(&buffer[..read]),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return format!("version:{}", env!("CARGO_PKG_VERSION")),
+        #[cfg(target_os = "macos")]
+        {
+            match macho_build_id(&exe) {
+                Some(id) => return id,
+                // 解析失败只能退回文件哈希。这样两份分别签名的副本又会得到
+                // 不同指纹，所以必须留下线索，否则现场表现只是“新 holder
+                // 一启动就 drain”，没有任何日志能解释。
+                None => log::warn!(
+                    "无法从 {} 读取 LC_UUID，退回文件哈希；核心与 holder 若分别签名会被判成不同构建",
+                    exe.display()
+                ),
             }
         }
-        let digest = hasher.finalize();
-        let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-        format!("sha256:{}", &hex[..32])
+        file_digest(&exe).unwrap_or_else(version_fallback)
     })
+}
+
+fn version_fallback() -> String {
+    format!("version:{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// 对文件内容做一次 SHA-256（非 macOS 的构建指纹）。
+fn file_digest(path: &std::path::Path) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match std::io::Read::read(&mut file, &mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hasher.update(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Some(format!("sha256:{}", &hex[..32]))
+}
+
+/// Mach-O 里 `LC_UUID` 的载入命令号。
+#[cfg(target_os = "macos")]
+const LC_UUID: u32 = 0x1b;
+/// 64 位 Mach-O 头部长度（load command 从这里开始）。
+#[cfg(target_os = "macos")]
+const MACHO_HEADER_64: usize = 32;
+#[cfg(target_os = "macos")]
+const MH_MAGIC_64: u32 = 0xfeed_facf;
+#[cfg(target_os = "macos")]
+const FAT_MAGIC_32: u32 = 0xcafe_babe;
+#[cfg(target_os = "macos")]
+const FAT_MAGIC_64: u32 = 0xcafe_babf;
+
+/// 读当前可执行文件的 `LC_UUID`，格式化成 `macho:<UUID>`。
+#[cfg(target_os = "macos")]
+fn macho_build_id(path: &std::path::Path) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path).ok()?;
+    // 头部 + load command 都在文件最前面；64 KiB 足够覆盖任何正常构建。
+    let mut header = vec![0u8; 64 * 1024];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+    header.truncate(filled);
+    macho_uuid(&header).map(|uuid| format!("macho:{uuid}"))
+}
+
+/// 从 Mach-O 字节里取 `LC_UUID`；fat 二进制取第一个架构切片。
+#[cfg(target_os = "macos")]
+fn macho_uuid(bytes: &[u8]) -> Option<String> {
+    let start = match read_be32(bytes, 0)? {
+        FAT_MAGIC_32 => {
+            if read_be32(bytes, 4)? == 0 {
+                return None;
+            }
+            read_be32(bytes, 16)? as usize
+        }
+        FAT_MAGIC_64 => {
+            if read_be32(bytes, 4)? == 0 {
+                return None;
+            }
+            let offset: [u8; 8] = bytes.get(16..24)?.try_into().ok()?;
+            usize::try_from(u64::from_be_bytes(offset)).ok()?
+        }
+        _ => 0,
+    };
+
+    if read_le32(bytes, start)? != MH_MAGIC_64 {
+        // 本项目的 macOS 构建都是 64 位，32 位 Mach-O 不认。
+        return None;
+    }
+    let ncmds = read_le32(bytes, start + 16)?;
+    let mut at = start + MACHO_HEADER_64;
+    for _ in 0..ncmds {
+        let command = read_le32(bytes, at)?;
+        let size = read_le32(bytes, at + 4)? as usize;
+        if size < 8 {
+            return None;
+        }
+        if command == LC_UUID {
+            return Some(format_uuid(bytes.get(at + 8..at + 24)?));
+        }
+        at += size;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_be32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+#[cfg(target_os = "macos")]
+fn read_le32(bytes: &[u8], at: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
+}
+
+/// 16 字节 UUID → 标准 `XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX` 大写形式。
+#[cfg(target_os = "macos")]
+fn format_uuid(raw: &[u8]) -> String {
+    let hex: String = raw.iter().map(|byte| format!("{byte:02X}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 impl ServerIdentity {
@@ -113,17 +246,29 @@ impl ServerIdentity {
     ///
     /// herdr 的取舍同样如此：polkit 可能让 `loginctl` 卡很久，所以
     /// `enable-linger` 必须放到独立线程里；状态每 60 秒重算一次。
+    ///
+    /// **只在 Linux 上跑。** `loginctl` 是 systemd 的命令，macOS / Windows
+    /// 上根本不存在：那条线程会每 60 秒 `spawn` 一个必然失败的子进程，
+    /// 直到进程退出，且永远不会被 join。
     pub fn start_linger_refresh(self: &Arc<Self>) {
-        let identity = self.clone();
-        if std::thread::Builder::new()
-            .name("linger-refresh".into())
-            .spawn(move || identity.refresh_linger())
-            .is_err()
+        #[cfg(target_os = "linux")]
         {
-            log::warn!("无法启动 linger 探测线程");
+            let identity = self.clone();
+            if std::thread::Builder::new()
+                .name("linger-refresh".into())
+                .spawn(move || identity.refresh_linger())
+                .is_err()
+            {
+                log::warn!("无法启动 linger 探测线程");
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self;
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn refresh_linger(&self) {
         let mut enable_attempted = false;
         loop {
@@ -197,24 +342,32 @@ fn current_user() -> Option<String> {
 
 /// 启动路径上只做一次尽量短的探测；拿不到结论时保持 `None`，由后台线程
 /// 在 `loginctl enable-linger` 之后更新。
+///
+/// 非 Linux 上没有 systemd，`Linger` 概念不成立：直接保持 `None`
+/// （= "无法证实登出后一定会停"），而不是启动一个必然失败的子进程。
 fn initial_linger_report(user: Option<String>) -> LingerReport {
+    #[cfg(target_os = "linux")]
     let keeps_running = match user.as_deref() {
         Some(user) if linger_marker_exists(user) => Some(true),
         Some(user) => probe_loginctl(user, Duration::from_secs(2)),
         None => None,
     };
+    #[cfg(not(target_os = "linux"))]
+    let keeps_running = None;
     LingerReport {
         keeps_running,
         user,
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linger_marker_exists(user: &str) -> bool {
     std::path::Path::new("/var/lib/systemd/linger")
         .join(user)
         .exists()
 }
 
+#[cfg(target_os = "linux")]
 fn probe_linger(user: Option<&str>) -> LingerReport {
     let Some(user) = user else {
         return LingerReport::default();
@@ -234,6 +387,7 @@ fn probe_linger(user: Option<&str>) -> LingerReport {
 ///
 /// 只有能同时证实 Linger 关闭、且 UserStopDelayUSec 是有限值时才敢断言
 /// `Some(false)`；无穷大表示 systemd 不会因为登出回收管理器，不能报警。
+#[cfg(target_os = "linux")]
 fn linger_from_loginctl(marker_exists: bool, output: &str) -> Option<bool> {
     if marker_exists {
         return Some(true);
@@ -259,6 +413,7 @@ fn linger_from_loginctl(marker_exists: bool, output: &str) -> Option<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn probe_loginctl(user: &str, timeout: Duration) -> Option<bool> {
     let output = run_with_timeout(
         "loginctl",
@@ -276,6 +431,7 @@ fn probe_loginctl(user: &str, timeout: Duration) -> Option<bool> {
     linger_from_loginctl(linger_marker_exists(user), &output)
 }
 
+#[cfg(target_os = "linux")]
 fn try_enable_linger(user: &str) {
     let Some(output) = run_with_timeout(
         "loginctl",
@@ -289,6 +445,7 @@ fn try_enable_linger(user: &str) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn run_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     let mut child = std::process::Command::new(program)
         .args(args)
@@ -341,6 +498,80 @@ fn hostname() -> String {
 mod tests {
     use super::*;
 
+    /// **签名后的两份副本必须得到同一个指纹。**
+    ///
+    /// 回归价值：`codesign` 会往文件尾部写签名 blob，而打包时 core 与 holder
+    /// 是两次独立签名。若指纹按文件内容算，两份字节不同 → 新 holder 一启动
+    /// 就被 `holder_is_current` 判成旧构建并立刻 drain，现场表现是“新终端
+    /// 打不开”且没有任何日志。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_uuid_survives_codesign_rewrites() {
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let original = std::fs::read(&exe).expect("读测试二进制");
+        let uuid = macho_uuid(&original).expect("测试二进制应有 LC_UUID");
+
+        // 模拟 codesign：改尾部字节（签名 blob 所在区），并改掉文件长度。
+        let mut signed = original.clone();
+        let tail = signed.len().saturating_sub(4096);
+        for byte in &mut signed[tail..] {
+            *byte ^= 0xff;
+        }
+        signed.extend_from_slice(b"fake-signature");
+        assert_eq!(
+            macho_uuid(&signed).as_deref(),
+            Some(uuid.as_str()),
+            "签名改写尾部后 LC_UUID 必须不变"
+        );
+        assert_ne!(
+            file_digest(&exe).expect("文件哈希"),
+            {
+                let digest = Sha256::digest(&signed);
+                let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+                format!("sha256:{}", &hex[..32])
+            },
+            "这条测试的前提是文件哈希确实会变，否则测不到回归"
+        );
+    }
+
+    /// fat 二进制取第一个架构切片的 UUID。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fat_binaries_use_the_first_slice() {
+        // 构造一个最小的 64 位 Mach-O：ncmds=1，唯一一条 LC_UUID。
+        let slice = |uuid: [u8; 16]| {
+            let mut bytes = vec![0u8; MACHO_HEADER_64];
+            bytes[0..4].copy_from_slice(&MH_MAGIC_64.to_le_bytes());
+            bytes[16..20].copy_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(&LC_UUID.to_le_bytes());
+            bytes.extend_from_slice(&24u32.to_le_bytes());
+            bytes.extend_from_slice(&uuid);
+            bytes
+        };
+        let arm = slice([0xab; 16]);
+        let offset = 4096usize;
+        let mut fat = vec![0u8; offset];
+        fat[0..4].copy_from_slice(&FAT_MAGIC_64.to_be_bytes());
+        fat[4..8].copy_from_slice(&1u32.to_be_bytes());
+        fat[16..24].copy_from_slice(&(offset as u64).to_be_bytes());
+        fat.extend_from_slice(&arm);
+
+        assert_eq!(
+            macho_uuid(&fat),
+            Some("ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB".to_string())
+        );
+    }
+
+    /// 非 Mach-O 输入返回 `None`，由调用方退回文件哈希。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn garbage_is_not_mistaken_for_a_macho() {
+        assert_eq!(macho_uuid(b"not a mach-o file"), None);
+        assert_eq!(macho_uuid(&[]), None);
+    }
+
     #[test]
     fn hostname_is_never_empty() {
         assert!(!hostname().is_empty());
@@ -358,6 +589,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn linger_requires_both_a_disabled_marker_and_a_finite_stop_delay() {
         assert_eq!(linger_from_loginctl(true, "Linger=no"), Some(true));

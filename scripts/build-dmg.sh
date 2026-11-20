@@ -78,6 +78,37 @@ codesign --force --sign - --identifier dev.deepterm.core \
 codesign --force --sign - "${CORE_APP}"
 echo -e "${GREEN}DeepTerm Core.app bundled and signed.${NC}"
 
+# holder 单独一个 app bundle：它注册 AppKit（换成 accessory app）之后活动
+# 监视器显示的是 CFBundleDisplayName，和 core 共用 bundle 时会被显示成同一个
+# 名字。二进制必须是同一份构建的副本——core 用 holder 的 hello.build 判断
+# “新终端交给谁”，指纹不一致会让刚拉起的 holder 立刻 drain。
+HOLDER_APP="${PROJECT_DIR}/${APP_BUNDLE}/Contents/Resources/DeepHolder.app"
+mkdir -p "${HOLDER_APP}/Contents/MacOS"
+cp "${CORE_BIN}" "${HOLDER_APP}/Contents/MacOS/deepholder"
+chmod +x "${HOLDER_APP}/Contents/MacOS/deepholder"
+sed "s/@VERSION@/${CORE_VERSION}/g" \
+    "${PROJECT_DIR}/distribution/macos-holder-Info.plist" \
+    > "${HOLDER_APP}/Contents/Info.plist"
+codesign --force --sign - --identifier dev.deepterm.holder \
+    "${HOLDER_APP}/Contents/MacOS/deepholder"
+codesign --force --sign - "${HOLDER_APP}"
+echo -e "${GREEN}DeepHolder.app bundled and signed.${NC}"
+
+# **两份二进制必须来自同一份构建。** 签名会改写文件尾部，所以不能比较整个
+# 文件的哈希；`identity::build_id()` 在 macOS 上取的是链接器写入的 LC_UUID，
+# 签名不影响它。这里直接读 LC_UUID 断言，否则 holder 会被 core 判成旧构建。
+uuid_of() {
+    otool -l "$1" | awk '/LC_UUID/{found=1; next} found && $1=="uuid"{print $2; exit}'
+}
+CORE_UUID=$(uuid_of "${CORE_APP}/Contents/MacOS/deepcore")
+HOLDER_UUID=$(uuid_of "${HOLDER_APP}/Contents/MacOS/deepholder")
+if [ -z "${CORE_UUID}" ] || [ "${CORE_UUID}" != "${HOLDER_UUID}" ]; then
+    echo -e "${RED}Error: core 与 holder 的 LC_UUID 不一致（${CORE_UUID} vs ${HOLDER_UUID}）${NC}"
+    echo "两者必须来自同一次 cargo build，否则新 holder 会被判成旧构建并立刻 drain。"
+    exit 1
+fi
+echo -e "${GREEN}core 与 holder 的构建指纹一致: ${CORE_UUID}${NC}"
+
 # Compile terminfo into app bundle (matching Alacritty's build process)
 echo "Compiling terminfo..."
 if ! command -v tic &> /dev/null; then

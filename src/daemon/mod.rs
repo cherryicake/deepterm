@@ -88,6 +88,55 @@ pub fn runtime_dir() -> PathBuf {
     config
 }
 
+/// `/tmp` 兜底目录是否可信：必须是本人拥有的真实目录且不可被他人写入。
+///
+/// # 为什么必须校验
+///
+/// `/tmp` 是 `01777`：任何用户都能预先建出 `/tmp/deepterm-<uid>` 或放一个
+/// 指向自己目录的软链。之后守护进程会把 token 写进那个目录，而同机其他
+/// 用户就能读到它——token 拿到即拿到该用户的所有终端。`set_permissions`
+/// 在别人的目录上还会 `EPERM`，而这个错误很容易被 `let _ =` 吞掉。
+///
+/// # Errors
+///
+/// 目录不存在、不是目录、是软链、属主不是当前用户，或组/其他用户有任意
+/// 权限位时返回错误。
+#[cfg(unix)]
+pub fn verify_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} 不是安全的目录（软链或非目录）", dir.display()),
+        ));
+    }
+    let uid = unsafe { libc::getuid() };
+    if metadata.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} 属于 uid {}，当前用户是 {}",
+                dir.display(),
+                metadata.uid(),
+                uid
+            ),
+        ));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "{} 权限过宽（{:o}），组/其他用户可访问",
+                dir.display(),
+                metadata.mode() & 0o777
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// socket（或 Named Pipe）的完整路径。
 pub fn socket_path() -> PathBuf {
     runtime_dir().join(SOCKET_FILE_NAME)
@@ -154,6 +203,34 @@ pub fn holder_socket_candidates() -> Vec<PathBuf> {
     sockets
 }
 
+/// 校验远端独立运行时目录名（`sessions/<session>`）。
+///
+/// # 为什么必须在这里、且必须拒绝 `.` / `..`
+///
+/// 这个值会**拼进远端 shell 命令**（`machines::remote_connect_command`、
+/// `deploy::remote_core_path`）和文件路径。只在 `MachineBook::ensure`
+/// 校验是不够的：`machines.json` 是普通文件，回滚、手改、从别处拷一份
+/// 过来都会绕过那次调用。而 `.`/`..` 虽然字符集合法，却会让
+/// `sessions/..` 解析成安装根目录——"沙箱化安装"于是覆盖生产 core。
+///
+/// # Errors
+///
+/// 为空、超过 64 字节、含字母数字与 `-_.` 之外的字符，或恰为 `.`/`..`。
+pub fn validate_session(session: &str) -> Result<(), String> {
+    if session.is_empty()
+        || session.len() > 64
+        || matches!(session, "." | "..")
+        || !session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "session 只能包含字母、数字、'-'、'_'、'.'（最长 64 字节，且不能是 . 或 ..）".into(),
+        );
+    }
+    Ok(())
+}
+
 /// 鉴权 token 的文件名。
 pub const TOKEN_FILE_NAME: &str = "token";
 
@@ -179,29 +256,39 @@ pub fn token_path_for(socket: &std::path::Path) -> PathBuf {
 /// token 写在 `token_path_for(socket)`，文件权限 0600。它随运行时目录一起创建，
 /// 不是长期凭据：守护进程重启就换一个，不落任何"用户配置"。
 pub fn generate_token() -> String {
-    use std::io::Read as _;
-    let mut bytes = [0u8; 16];
-    // 优先用内核熵源。读不到就退回时间 + pid 混合——**不如前者安全**，
-    // 但比"没有 token"好得多，且这种情况本身说明系统有问题。
-    let ok = std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .is_ok();
-    if !ok {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mixed = (nanos ^ (std::process::id() as u128)).to_le_bytes();
-        bytes.copy_from_slice(&mixed[..16]);
-        log::warn!("无法读取 /dev/urandom，token 退化到时间+pid 派生");
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    // 用 UUIDv4 的 128 位随机数：它在各平台都走操作系统的 CSPRNG
+    // （Unix 是 `/dev/urandom`，Windows 是 `BCryptGenRandom`），一次取满
+    // 16 字节。
+    //
+    // # 不能退回"时间 + pid"
+    //
+    // 旧实现在读不到 `/dev/urandom` 时用 `nanos ^ pid` 兜底，而 Windows
+    // 上 `/dev/urandom` **永远**打不开——那条兜底就是 Windows 的默认路径。
+    // 更糟的是 `nanos` 装得进 `u64`，`to_le_bytes()[..16]` 的后 8 字节
+    // 恒为零：32 个十六进制字符里有一半是常量，实际只有 64 位熵，而
+    // token 是同机任何进程都能尝试连接的命名管道的唯一凭据。
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 /// 写入 token 文件（0600）。
+///
+/// **创建时就带 0600**，不能 `fs::write` 之后补 `chmod`：那会在两步之间
+/// 留下一个组/其他用户可读的窗口，而 `chmod` 本身失败时（FAT、特殊挂载、
+/// 未来的便携构建）宽权限会永久保留。事后那次 `set_permissions` 只用于
+/// 收紧历史版本留下的宽权限文件，不承担首建语义。
 pub fn write_token_for(socket: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     let path = token_path_for(socket);
-    std::fs::write(&path, token)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(token.as_bytes())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -298,15 +385,25 @@ pub mod transport {
         Ok(())
     }
 
-    /// 运行时目录 + 固定文件名 → `\\.\pipe\deepterm-<user>`。
+    /// 运行时目录 + 固定文件名 → `\\.\pipe\deepterm-<user>-<dir>`。
     ///
     /// 用用户名而不是路径：管道名是全局命名空间，塞进完整路径既没必要
     /// 也更容易撞上非法字符。
+    ///
+    /// # 必须把 `path` 也编进名字
+    ///
+    /// 旧实现直接丢弃 `path`，于是 `DEEPTERM_RUNTIME_DIR` 在 Windows 上
+    /// **完全不生效**：两套并行安装、两个测试分片、一个残留的旧守护进程
+    /// 全都落在同一个管道上互相串话。这里取路径的稳定哈希后缀区分。
     pub fn address(path: &std::path::Path) -> String {
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".into());
-        // 文件名部分（`daemon.sock`）在管道下没有意义，只用目录区分会话。
-        let _ = path;
-        format!("{PIPE_PREFIX}-{user}")
+        // 只用文件名的部分没有意义（都是 `daemon.sock`）；对**整个路径**
+        // 取一个短哈希，保证不同运行时目录互不干扰。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::{Hash, Hasher};
+        path.hash(&mut hasher);
+        let suffix = hasher.finish();
+        format!("{PIPE_PREFIX}-{user}-{suffix:016x}")
     }
 }
 

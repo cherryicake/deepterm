@@ -64,16 +64,25 @@ pub fn is_holder_invocation(args: &[String]) -> bool {
 ///
 /// 支持 `--socket PATH` 与 `--socket=PATH`。没给时退回旧的固定路径，保证
 /// 手工启动的 holder 与旧脚本仍可用。
-pub fn socket_from_args(args: &[String]) -> Option<std::path::PathBuf> {
+///
+/// # Errors
+///
+/// 写了 `--socket` 却没给值：退回固定路径会把 holder 绑到**旧地址**上，
+/// 新 core 扫不到它，用户的终端会从界面上消失。
+pub fn socket_from_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
     let mut iter = args
         .iter()
         .skip_while(|arg| arg.as_str() != HOLDER_SOCKET_FLAG);
     if iter.next().is_some() {
-        return iter.next().map(std::path::PathBuf::from);
+        return iter
+            .next()
+            .map(|value| Some(std::path::PathBuf::from(value)))
+            .ok_or_else(|| format!("{HOLDER_SOCKET_FLAG} 缺少路径参数"));
     }
-    args.iter()
+    Ok(args
+        .iter()
         .find_map(|arg| arg.strip_prefix("--socket="))
-        .map(std::path::PathBuf::from)
+        .map(std::path::PathBuf::from))
 }
 
 /// 启动 holder 的监听循环（阻塞）。
@@ -83,7 +92,9 @@ pub fn socket_from_args(args: &[String]) -> Option<std::path::PathBuf> {
 /// - **不**做空闲退出（holder 要一直活着等 core 回来），除非一个终端都没有。
 pub fn run() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let socket = socket_from_args(&args).unwrap_or_else(super::holder_socket_path);
+    let socket = socket_from_args(&args)
+        .map_err(std::io::Error::other)?
+        .unwrap_or_else(super::holder_socket_path);
     super::platform::prepare_holder();
     super::listen::run_at(
         socket,
@@ -135,14 +146,20 @@ mod tests {
                 HOLDER_FLAG.into(),
                 HOLDER_SOCKET_FLAG.into(),
                 path.into(),
-            ]),
+            ])
+            .expect("应解析成功"),
             Some(std::path::PathBuf::from(path))
         );
         assert_eq!(
-            socket_from_args(&["deepcore".into(), format!("--socket={path}")]),
+            socket_from_args(&["deepcore".into(), format!("--socket={path}")]).expect("应解析成功"),
             Some(std::path::PathBuf::from(path))
         );
-        assert_eq!(socket_from_args(&["deepcore".into()]), None);
+        assert_eq!(
+            socket_from_args(&["deepcore".into()]).expect("缺省不是错误"),
+            None
+        );
+        // `--socket` 没有值：必须报错，而不是静默退回固定路径。
+        assert!(socket_from_args(&["deepcore".into(), HOLDER_SOCKET_FLAG.into()]).is_err());
     }
 
     /// holder 用的是与 core 同一份 `Registry` 实现。

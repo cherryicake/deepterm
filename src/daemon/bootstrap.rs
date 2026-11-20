@@ -99,6 +99,9 @@ fn spawn_daemon() -> std::io::Result<()> {
                 .spawn()?;
             return Ok(());
         }
+        // 这一行不是死代码：Windows 上上面那个块已经 `return` 了，而
+        // `#[cfg(unix)]` 在 Windows 构建里被整体删除。两种配置下函数都有
+        // 一条可达的返回路径，不需要再补兜底分支。
         #[cfg(unix)]
         return super::launcher::spawn_detached(&exe, &[], "core");
     }

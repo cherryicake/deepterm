@@ -384,8 +384,26 @@ pub fn restore_machine_terminal(
 /// `attach_with_history` 为了兼容旧 core 目前只保留文本错误；这里做一次
 /// 窄匹配，**不能**把所有 attach 错误都当成“不存在”，否则一次临时超时
 /// 就会多开一个远端终端。
+/// 守护进程对已消失终端给出的稳定错误标记。
+///
+/// 与人类可读文案分开：`attach_with_history` 会把守护进程的 `kind` 原样拼
+/// 进错误串（见 [`describe_attach_failure`]），下游据此判定"真的不存在"
+/// 还是"临时连不上"。只认 `kind` 字段，不再匹配中文文案。
+pub const MISSING_TERMINAL_MARKER: &str = "kind: not_found";
+
+/// 把 `attach` 的失败回复压成一个错误串，保留 `kind` 供下游判别。
+fn describe_attach_failure(reply: &serde_json::Value) -> String {
+    let error = reply["error"].as_str().unwrap_or("守护进程拒绝挂接");
+    match reply["kind"].as_str() {
+        Some(kind) => format!("{error}（kind: {kind}）"),
+        None => error.to_string(),
+    }
+}
+
 pub(crate) fn is_missing_terminal_error(error: &str) -> bool {
-    error.contains("没有这个终端") || error.contains("not_found")
+    error.contains(MISSING_TERMINAL_MARKER)
+        || error.contains("没有这个终端")
+        || error.contains("not_found")
 }
 
 fn is_unknown_machine_error(error: &str) -> bool {
@@ -515,18 +533,35 @@ pub fn attach_with_history(
         .call_timeout(request, timeout)
         .map_err(|e| format!("挂接失败: {e}"))?;
     if reply["ok"] != true {
-        return Err(reply["error"]
-            .as_str()
-            .unwrap_or("守护进程拒绝挂接")
-            .to_string());
+        // **把守护进程给的 `kind` 一起带回去。**
+        //
+        // 旧实现只保留 `error` 文案，调用方（`restore_machine_terminal`、
+        // `pump_into`）只能靠 `contains("没有这个终端")` 猜——改一句措辞就
+        // 会把"终端已消失"判成"临时故障"，于是多开一个远端 shell，或者
+        // 让重连循环永远转下去。
+        return Err(describe_attach_failure(&reply));
     }
-    let channel = reply["channel"]
-        .as_u64()
-        .ok_or_else(|| "挂接回复缺少 channel".to_string())? as u32;
+    // 守护进程回来的数字都是不可信输入：`as u16` 会把 65537 截成 1，
+    // 于是客户端"成功"地按 1 列布局整屏。范围外一律当缺失处理（走下面的
+    // 保守默认值），而不是截断。
+    let channel = u32::try_from(
+        reply["channel"]
+            .as_u64()
+            .ok_or_else(|| "挂接回复缺少 channel".to_string())?,
+    )
+    .map_err(|_| "挂接回复的 channel 超出 u32".to_string())?;
     // 尺寸缺失时退回一个保守值而不是报错：老版本守护进程不会带这两个字段，
     // 直接失败会让"升级 GUI 但没升级 core"变成打不开终端。
-    let cols = reply["cols"].as_u64().unwrap_or(80) as u16;
-    let rows = reply["rows"].as_u64().unwrap_or(24) as u16;
+    let cols = reply["cols"]
+        .as_u64()
+        .and_then(|cols| u16::try_from(cols).ok())
+        .unwrap_or(80)
+        .max(1);
+    let rows = reply["rows"]
+        .as_u64()
+        .and_then(|rows| u16::try_from(rows).ok())
+        .unwrap_or(24)
+        .max(1);
     Ok(Session {
         address: address.to_string(),
         channel,
@@ -559,8 +594,15 @@ pub fn terminal_grid(address: &str) -> Option<(u16, u16)> {
         )
         .ok()?;
     let term = reply.get("terminal")?;
-    let cols = term.get("cols")?.as_u64()? as u16;
-    let rows = term.get("rows")?.as_u64()? as u16;
+    // 同上：不可信数字不做截断转换，越界直接当"查不到"。
+    let cols = term
+        .get("cols")?
+        .as_u64()
+        .and_then(|cols| u16::try_from(cols).ok())?;
+    let rows = term
+        .get("rows")?
+        .as_u64()
+        .and_then(|rows| u16::try_from(rows).ok())?;
     if cols == 0 || rows == 0 {
         return None;
     }

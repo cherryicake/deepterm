@@ -290,7 +290,7 @@ impl Client {
                                     .and_then(|v| v.get("id").and_then(Value::as_u64));
                                 let waiter = {
                                     let mut replies =
-                                        reader_replies.lock().expect("pending replies");
+                                        reader_replies.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     match id {
                                         Some(id) => replies.remove(&id),
                                         // **兼容旧守护进程**：老版本可能不回
@@ -317,7 +317,7 @@ impl Client {
                             let channel = frame.channel;
                             let sender = reader_routes
                                 .lock()
-                                .expect("client routes")
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .get(&channel)
                                 .cloned();
                             match sender {
@@ -326,7 +326,7 @@ impl Client {
                                         // 接收端没了：删掉登记，免得一直投递。
                                         reader_routes
                                             .lock()
-                                            .expect("client routes")
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                                             .remove(&channel);
                                     }
                                 }
@@ -341,7 +341,7 @@ impl Client {
                                     //
                                     // 与 `core_holder` 侧是同一个问题、同一个
                                     // 修法：先攒着，登记时补发。
-                                    let mut p = pending.lock().expect("client pending");
+                                    let mut p = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let buf = p.entry(channel).or_default();
                                     if buf.bytes + frame.payload.len() <= MAX_PENDING {
                                         buf.bytes += frame.payload.len();
@@ -375,7 +375,7 @@ impl Client {
                 // 只置 `closed` 标志是不够的：泵任务阻塞在 `recv()` 上，
                 // 它不会被那个标志唤醒，于是终端静默冻结在最后一屏——
                 // 用户看到的是"程序卡住了"，而实际是连接早就断了。
-                reader_routes.lock().expect("client routes").clear();
+                reader_routes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
                 closed_flag.store(true, Ordering::SeqCst);
             })?;
 
@@ -409,10 +409,17 @@ impl Client {
                     let _ = buf.flush();
                     // 与读端同一套收尾：清路由，让挂接方的 `recv()` 立刻
                     // 返回 `Err` 而不是永久阻塞，再置 closed 让上层重连。
-                    writer_routes.lock().expect("client routes").clear();
+                    writer_routes
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clear();
                     closed_flag.store(true, Ordering::SeqCst);
                 })
-                .ok();
+                // **创建失败必须上报。** 吞掉它的话：闭包被丢弃 → `out_rx`
+                // 关闭 → 所有 `send` 都报"写线程已退出"，但 `closed` 永远
+                // 是 false，`session::client()` 会一直复用这条死连接，终端
+                // 既不发重连也不给用户任何信号，只停在最后一屏。
+                .map_err(|e| std::io::Error::other(format!("无法启动客户端写线程: {e}")))?;
         }
         let client = Self {
             pending: pending_for_client,
@@ -544,17 +551,21 @@ impl Client {
     /// reader 线程会自动注销该 channel。
     pub fn attach_channel(&self, channel: u32) -> async_channel::Receiver<Frame> {
         let (tx, rx) = async_channel::unbounded();
-        self.routes
-            .lock()
-            .expect("client routes")
-            .insert(channel, tx.clone());
 
-        // 补发登记之前就到的数据（attach 的整屏快照通常在这时到达）。
-        // 必须在返回接收端之前：晚了这些字节会被排到新输出后面，顺序反掉。
+        // **必须在一把锁里完成"排空 pending → 登记路由"。**
+        //
+        // reader 线程投递前也要拿 `routes`。若先登记再排空，它就能在两步
+        // 之间塞进一段实时增量，随后又被更早的整屏快照覆盖——客户端 VT
+        // 先应用新状态、再被旧画面盖掉。持锁期间 reader 只是等锁，不会丢
+        // 帧（`pending` 由它自己写入，与 `routes` 加锁顺序一致）。
+        let mut routes = self
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let buffered = self
             .pending
             .lock()
-            .expect("client pending")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&channel);
         if let Some(pending) = buffered
             && !pending.frames.is_empty()
@@ -566,12 +577,17 @@ impl Client {
                 let _ = tx.try_send(frame);
             }
         }
+        routes.insert(channel, tx);
+        drop(routes);
         rx
     }
 
     /// 注销一个 channel。
     pub fn detach_channel(&self, channel: u32) {
-        self.routes.lock().expect("client routes").remove(&channel);
+        self.routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&channel);
     }
 
     /// 发一个控制请求并等回复。
@@ -593,7 +609,7 @@ impl Client {
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
         self.pending_replies
             .lock()
-            .expect("pending replies")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
         // 登记之后**每条退出路径**都要摘掉：正常回复由 reader 摘、超时由
         // `PendingReply` 摘、序列化/发送失败由它的析构摘掉。
@@ -761,17 +777,24 @@ struct Pending {
 /// 这个缓冲只服务于**一个极短的窗口**：`attach` 的回复还在路上、而 holder
 /// 已经把整屏快照推过来了。正常几十毫秒内就会被认领。
 ///
-/// 取 256 KiB（与初始流控额度同量级）而不是 8 MiB：实测一屏 180×50 的完整
-/// 重绘约 200 KB，256 KiB 刚好容得下；而万一某个 channel 永远没人认领
-/// （客户端 bug、或对端发了没人要的号），最多也只占这么多，不会把 GUI 的
-/// 内存吃掉。
+/// 取 16 MiB（原为 256 KiB）：够放一次最坏情况的 attach 重放，而不是
+/// "一屏可见区"。关键区别在于这个缓冲承载的是**回滚**，不是视口——
+/// 视口重绘走的是登记之后的增量路径，不经过这里。
 ///
-/// 值**故意**小于 `core_holder::MAX_PENDING`（8 MiB）：那个是 core 中转
-/// 上限，这里是 GUI 自己的上限，两者压力模型不同，别"顺手统一"。
+/// # 但它必须容得下一次 attach
+///
+/// 这个缓冲只在 `attach` 回复到达前用得上，而那时唯一的流量就是守护进程
+/// 先发出来的整屏重放：最多 `terminal::MAX_ATTACH_HISTORY`（2000）行回滚
+/// 加 `KITTY_REPLAY_BUDGET`（8 MiB）图像。定成几十 KiB 会让"带回滚的
+/// 终端"必然超限，而超限的处置是**丢掉整段**——重连后整屏空白，协议里
+/// 没有任何补发路径（`subscribe` 只补 `Meta`，sink 初始就是 `Live`）。
+///
+/// 取 16 MiB：与守护进程侧 `core_holder::MAX_PENDING` 同量级，并在
+/// `the_attach_buffer_holds_a_worst_case_replay` 里钉住这条约束。
 ///
 /// 超限时**丢掉整段缓冲**而不是截断——截断会把半截转义序列留在客户端，
 /// 反而让后续数据全部错位（这正是 `render_screen` 要发 `CAN` 的原因）。
-const MAX_PENDING: usize = 256 * 1024;
+const MAX_PENDING: usize = 16 * 1024 * 1024;
 
 /// 从 `hello` 回复里取对端协议版本并校验，返回校验通过的版本号。
 ///
@@ -878,6 +901,22 @@ mod tests {
             "keeps_running_after_logout": false,
             "logout_linger_user": Value::Null,
         })
+    }
+
+    /// **登记前缓冲必须容得下一次最坏情况的 attach 重放。**
+    ///
+    /// 回归价值：这个上限曾经是 256 KiB，理由是"一屏 180×50 约 200 KB"。
+    /// 但缓冲里装的不是视口，而是 `attach_paint` 的整段重放——最多
+    /// `MAX_ATTACH_HISTORY`（2000）行回滚，外加 `KITTY_REPLAY_BUDGET`
+    /// （8 MiB）图像。超限的处置是**丢掉整段**，而协议里没有补发路径
+    /// （`subscribe` 只补 `Meta`，sink 初始就是 `Live`），于是重连回来的
+    /// 面板会一直空白，直到用户拖动窗口触发重绘。
+    #[test]
+    fn the_attach_buffer_holds_a_worst_case_replay() {
+        // 编译期断言：两个 `const` 的比较若写成运行时 `assert!`，clippy
+        // 会如实指出"这个断言恒为真"，反而看不出它守的是哪条约束。
+        const _: () = assert!(MAX_PENDING > 8 * 1024 * 1024);
+        assert_eq!(MAX_PENDING / (1024 * 1024), 16, "上限已变更，请复核注释");
     }
 
     /// **登记前到达的帧必须保留帧类型。**
@@ -1010,7 +1049,7 @@ mod tests {
             client
                 .pending_replies
                 .lock()
-                .expect("pending replies")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             0,
             "超时后不得残留等待者"
@@ -1021,7 +1060,7 @@ mod tests {
             client
                 .pending_replies
                 .lock()
-                .expect("pending replies")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
             0,
             "连续超时也不得累积等待者"

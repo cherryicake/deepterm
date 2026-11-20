@@ -128,11 +128,25 @@ pub fn run_at(
     {
         use std::os::unix::fs::PermissionsExt as _;
         if !dir.exists() {
-            std::fs::create_dir_all(&dir)?;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            // 先按 0700 建目录本身，再逐级补父目录：`create_dir_all` 没有
+            // "指定权限"参数，先建后 chmod 会留下一个按 umask 可写的窗口。
+            let created = std::fs::create_dir(&dir).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    // 父目录还不存在：退化成 create_dir_all，然后收紧自己这层。
+                    std::fs::create_dir_all(&dir).and_then(|()| {
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    })
+                } else {
+                    Err(e)
+                }
+            });
+            created?;
         }
-        // 已存在也校验一次：目录可能被别的进程按更宽的权限建过。
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        // 已存在也校验：目录可能被别的进程按更宽的权限建过，或者是别人
+        // 预置的软链。校验失败必须中止——带着可读的 token 继续跑，等于
+        // 把该用户的所有终端交给同机其他用户。
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        super::verify_private_dir(&dir)?;
     }
     #[cfg(not(unix))]
     {
@@ -154,6 +168,20 @@ pub fn run_at(
         log::info!("守护进程已在运行（{}），本实例退出", path.display());
         return Ok(());
     }
+
+    // 抢占 pid 文件，**必须在删 socket / bind 之前**。
+    //
+    // 上面那次 `connect` 探测有竞态：两个实例同时启动时都能探测失败，然后
+    // 先后 `remove_file` + `bind`，后者把前者的 socket 删掉，两个都活着、
+    // 客户端却在两边之间漂移。`create_new` 是原子的，谁先建到谁就是合法
+    // 监听者。
+    let pid_file = path.with_extension("pid");
+    let pid = std::process::id().to_string();
+    if !claim_pid_file(&pid_file, &pid)? {
+        log::warn!("{} 已被仍在运行的进程占用，本实例退出", pid_file.display());
+        return Ok(());
+    }
+
     #[cfg(unix)]
     let _ = std::fs::remove_file(&path);
 
@@ -166,20 +194,13 @@ pub fn run_at(
     // 每次启动换一个：它是"本次守护进程的会话凭据"，不是长期密码，
     // 不需要也不应该持久化到用户配置里。
     let token = super::generate_token();
-    if let Err(e) = super::write_token_for(&path, &token) {
-        log::error!("无法写入 token 文件，远端连接将不可用: {e}");
-    }
+    // 写不进去就必须中止：`authenticate` 在读不到 token 时会拒绝所有连接
+    // （见 `connection::authenticate`），此时进程只会空转 5 分钟然后退出，
+    // 用户看到的是"鉴权失败"而不是"守护进程坏了"。
+    super::write_token_for(&path, &token)?;
 
     let listener = transport::bind(&path)?;
     transport::set_nonblocking(&listener, true)?;
-
-    // pid 文件：便于排障与"这个 socket 是谁的"。
-    //
-    // **按 socket 名区分**：core 与 holder 是两个进程，共用一个 pid 文件
-    // 时后启动的会把先启动的覆盖掉——排查时按那个文件去 kill，杀的是
-    // 另一个进程（本地实测就踩了：以为在杀 core，实际杀的是 holder）。
-    let pid_file = path.with_extension("pid");
-    let _ = std::fs::write(&pid_file, std::process::id().to_string());
 
     log::info!("守护进程已启动，socket: {}", path.display());
 
@@ -290,17 +311,89 @@ pub fn run_at(
             }
             Err(e) => {
                 log::warn!("accept 失败: {e}");
+                // 文件描述符耗尽（`EMFILE`/`ENFILE`）在"一连接一线程"的
+                // 模型下很现实，而这条分支会以 20 Hz 无限刷日志、什么也不
+                // 恢复。按平台区分：资源类错误退避，其余继续轮询。
+                #[cfg(unix)]
+                {
+                    use std::io::ErrorKind;
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::OutOfMemory | ErrorKind::Other | ErrorKind::PermissionDenied
+                    ) {
+                        std::thread::sleep(Duration::from_secs(1));
+                        continue;
+                    }
+                }
                 std::thread::sleep(ACCEPT_POLL);
             }
         }
     }
 
-    #[cfg(unix)]
-    let _ = std::fs::remove_file(&path);
-    let _ = std::fs::remove_file(path.with_extension("pid"));
-    let _ = std::fs::remove_file(super::token_path_for(&path));
+    // 只删自己登记的文件：core 被 SIGTERM 后可能已经有新实例 bind 成功，
+    // 无条件 `remove_file` 会把新守护进程的 socket/pid/token 一起删掉，
+    // 让它活着却永远不可达。
+    let owns_pid_file = std::fs::read_to_string(&pid_file)
+        .ok()
+        .is_some_and(|text| text.trim() == std::process::id().to_string());
+    if owns_pid_file {
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(super::token_path_for(&path));
+    } else {
+        log::info!("pid 文件已属于新实例，保留其 socket 与 token");
+    }
     log::info!("守护进程已退出");
     Ok(())
+}
+
+/// 抢占 pid 文件，返回自己是否成为合法监听者。
+///
+/// 用 `create_new` 而不是 `write`：两个实例同时启动时，这是唯一的原子
+/// 仲裁点。已存在时只有在**持有者已经不在**的情况下才接管，否则让位。
+fn claim_pid_file(pid_file: &std::path::Path, pid: &str) -> std::io::Result<bool> {
+    use std::io::Write as _;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(pid_file)
+    {
+        Ok(mut file) => {
+            file.write_all(pid.as_bytes())?;
+            file.sync_all()?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let holder = std::fs::read_to_string(pid_file)
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok());
+            let stale = holder.is_none_or(|holder| !process_is_alive(holder));
+            if !stale {
+                return Ok(false);
+            }
+            std::fs::write(pid_file, pid)?;
+            Ok(true)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 进程是否存在（用于判断残留的 pid 文件是否还能代表一个活着的守护进程）。
+///
+/// 信号 0 只做存在性检查，不投递信号。
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    // SAFETY：`kill` 只做存在性检查，不投递信号。
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    // Windows 上无法用信号探测：按"已残留"处理，交由 `create_new` 之外的
+    // 命名管道探测兜底。
+    true
 }
 
 #[cfg(test)]

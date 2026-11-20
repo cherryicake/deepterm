@@ -202,9 +202,15 @@ agent 状态回不来。这与 herdr 的 holder 升级模型不一致：**旧 ho
 
 - core 启动时扫描运行时目录里的 `holder.sock` 与所有 `holder.<id>.sock`，
   逐个鉴权接管。新 holder 使用随机唯一 socket；旧版固定 socket 仍可接管。
-- holder 的 `hello` 返回 `build` / `pid` / `draining`。`build` 是当前可执行
-  文件 SHA-256 的前 32 位（同一台机器内比较），因此同一版本号的不同构建
-  也能区分。旧 holder 没有 `build`，按空字符串处理。
+- holder 的 `hello` 返回 `build` / `pid` / `draining`。`build` 是**当前可执行
+  文件的构建指纹**（同一台机器内比较），因此同一版本号的不同构建也能区分。
+  旧 holder 没有 `build`，按空字符串处理。
+  - Linux/Windows：可执行文件 SHA-256 的前 32 位。
+  - macOS：链接器写入的 `LC_UUID`（`macho:<UUID>`）。**不能**用文件哈希：
+    分发包里 core 与 holder 是两个独立 app bundle（`DeepTerm Core.app` /
+    `DeepHolder.app`），各自签名后文件字节不同，文件哈希会把刚拉起的 holder
+    判成旧构建并立刻 drain。`LC_UUID` 签名前后不变，正是“同一份构建”的判据。
+    打包脚本 `build-dmg.sh` 会断言两者的 `LC_UUID` 相同。
 - 只有 `build == 当前 core 的 build` 且未 drain 的 holder 是 current。新
   终端只交给 current holder；同一构建出现多个 current 时只保留一个，其余
   收到 drain。
@@ -217,6 +223,31 @@ agent 状态回不来。这与 herdr 的 holder 升级模型不一致：**旧 ho
 因此升级后的状态是“新旧 holder 并存”：旧终端原地继续跑，新开的终端落到
 新 holder 并具备完整 Meta。等旧终端全部退出、旧 holder 空闲退出后，运行
 时目录里只剩新 holder。
+
+### 4.2.2 macOS 的两个 app bundle：core 与 holder 分名（对齐 herdr）
+
+`deepcore` 只有**一个**可执行文件，按参数分三个角色（core / holder /
+`connect` 桥）。但 macOS 上 holder 会调 `NSApplication.finishLaunching`
+注册成 accessory app（`platform/macos_appkit.rs`），注册之后**活动监视器显示
+的是 bundle 的 `CFBundleDisplayName`，而不是可执行文件名**。共用一个 bundle
+时，core 与 holder 会显示成同一个名字，排查“谁在持 PTY”只能靠 `ps` 参数。
+
+分发包因此放两个 bundle，并排于 GUI 的 `Contents/Resources/` 下：
+
+| bundle | 可执行文件 | identifier | 注册 AppKit | 活动监视器 |
+| --- | --- | --- | --- | --- |
+| `DeepTerm Core.app` | `deepcore` | `dev.deepterm.core` | 否（走 launchd 交接） | `deepcore` |
+| `DeepHolder.app` | `deepholder` | `dev.deepterm.holder` | 是（accessory） | `DeepHolder` |
+
+要点：
+
+- `deepholder` 是 `deepcore` 的**同一份构建的副本**，不是另一个二进制。
+  `spawn_holder` 优先用 `DeepHolder.app` 里的那份，找不到就退回 core 自己
+  的路径（功能正确，只是名字又混在一起），并在 `check_in` 里留一条 warn。
+- 两份二进制**必须来自同一次构建**：签名会改写文件尾部，所以打包脚本用
+  `LC_UUID` 断言（见 4.2.1），不是比较文件哈希。
+- 两个 identifier 必须不同，否则各自独立签名时会互相覆盖，TCC 授权也会打架。
+- 布局自检：`python3 scripts/check-bundles.py /Applications/DeepTerm.app`。
 
 **能力边界**：旧 holder 的既有终端在升级前没有保存过前台程序与 agent
 快照，新 core 无法事后补出这段信息。它们仍能恢复画面和交互，但 Tab 的

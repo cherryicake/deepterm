@@ -233,11 +233,23 @@ impl Frame {
 
     /// 写成一帧。帧头与负载分两次写：调用方通常持有 `BufWriter`，
     /// 合并不了两次 `write_all` 的开销，但能少一次拷贝。
+    ///
+    /// # Errors
+    ///
+    /// 负载超过 `u32::MAX` 时返回 `InvalidInput`：直接 `as u32` 会回绕成
+    /// 一个很小、却很"合法"的长度，对面会在读完那一小段后把后续所有字节
+    /// 都按错位的帧头解析——比明确失败糟得多。
     pub fn write_to(&self, w: &mut impl Write) -> io::Result<()> {
+        let len = u32::try_from(self.payload.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("帧负载 {} 字节超过 u32 上限", self.payload.len()),
+            )
+        })?;
         let mut header = [0u8; HEADER_LEN];
         header[0..4].copy_from_slice(&self.channel.to_le_bytes());
         header[4] = self.kind as u8;
-        header[5..9].copy_from_slice(&(self.payload.len() as u32).to_le_bytes());
+        header[5..9].copy_from_slice(&len.to_le_bytes());
         w.write_all(&header)?;
         w.write_all(&self.payload)?;
         w.flush()
@@ -248,13 +260,16 @@ impl Frame {
 ///
 /// 帧头完整但负载被截断时报 `UnexpectedEof`——那是真的坏了，
 /// 不能当成"对面干净地关了"。
+///
+/// 同理，帧头本身只读到一半也是截断：先单独读首字节（`0` 才是干净的
+/// EOF），其余 8 字节用 `read_exact`，这样"写完 5 字节就崩了"会如实报错，
+/// 而不是被当成正常断开——后者会让上层放弃重连。
 pub fn read_frame(r: &mut impl Read) -> io::Result<Option<Frame>> {
     let mut header = [0u8; HEADER_LEN];
-    match r.read_exact(&mut header) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e),
+    if r.read(&mut header[..1])? == 0 {
+        return Ok(None);
     }
+    r.read_exact(&mut header[1..])?;
     let channel = u32::from_le_bytes(header[0..4].try_into().expect("4 字节"));
     let kind_raw = header[4];
     let len = u32::from_le_bytes(header[5..9].try_into().expect("4 字节")) as usize;
@@ -353,6 +368,23 @@ mod tests {
 
         let err = read_frame(&mut Cursor::new(buf)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// 帧头只读到一半同样是截断，不能当成正常断开。
+    ///
+    /// 回归价值：旧实现用 `read_exact` 读整个 9 字节帧头，并把**所有**
+    /// `UnexpectedEof` 都映射成 `Ok(None)`——"写到第 5 个字节就崩了"于是
+    /// 和"对面干净地关了"无法区分，上层据此放弃重连，界面永久停在最后一屏。
+    #[test]
+    fn a_truncated_header_is_an_error_not_a_clean_close() {
+        for len in 1..HEADER_LEN {
+            let err = read_frame(&mut Cursor::new(vec![0u8; len])).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof,
+                "{len} 字节的帧头必须报截断"
+            );
+        }
     }
 
     /// 超过上限的长度必须拒绝，且**不能**去分配那块内存。

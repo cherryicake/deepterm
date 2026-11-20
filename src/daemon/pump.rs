@@ -66,6 +66,12 @@ pub struct Sink {
     credit: u64,
     /// 投递状态。
     delivery: Delivery,
+    /// 上一次整屏快照的字节数（缓存，见 [`Hub::grant_credit`]）。
+    ///
+    /// 没有它时 `grant_credit` 只能先生成快照再判断额度够不够，而额度是
+    /// 按收到的数据块逐块归还的——一次 resize 之后会把整屏渲染好几遍再
+    /// 全部丢掉，而且是在必须同时接收按键的连接读线程上。
+    snapshot_len: usize,
 }
 
 /// 流控额度：每个订阅者初始能收多少字节。
@@ -115,6 +121,7 @@ impl Hub {
             channel,
             credit: INITIAL_CREDIT,
             delivery: Delivery::Live,
+            snapshot_len: 0,
         });
         id
     }
@@ -146,9 +153,13 @@ impl Hub {
         }
         // 欠着重绘：额度够了就立刻补一帧整屏。
         //
-        // 必须先算快照再判断额度（快照长度决定够不够），但要避免"算了却
-        // 发不出去"的浪费——所以先看一眼额度是否明显不够。
+        // **先按上一次快照的长度粗筛，再决定要不要生成快照。** 生成快照
+        // 要遍历整张网格并拼 SGR，是本模块最贵的操作；而额度是按收到
+        // 的数据块逐块归还的，直接 `paint()` 会把整屏渲染好几遍再丢掉。
         if sink.credit == 0 {
+            return;
+        }
+        if sink.credit < sink.snapshot_len as u64 {
             return;
         }
         drop(sinks);
@@ -157,6 +168,7 @@ impl Hub {
         let Some(sink) = sinks.iter_mut().find(|s| s.id == id) else {
             return;
         };
+        sink.snapshot_len = snapshot.len();
         if sink.credit < snapshot.len() as u64 {
             // 还不够：保持 NeedsPaint，等下一次信用。
             return;
@@ -214,6 +226,7 @@ impl Hub {
                 if sink.delivery != Delivery::NeedsPaint {
                     continue;
                 }
+                sink.snapshot_len = snapshot.len();
                 if sink.credit < snapshot.len() as u64 {
                     continue;
                 }
@@ -246,6 +259,7 @@ impl Hub {
         let mut sinks = self.lock();
         let mut dropped = Vec::new();
         for (idx, sink) in sinks.iter_mut().enumerate() {
+            sink.snapshot_len = snapshot.len();
             if sink.credit < snapshot.len() as u64 {
                 // 额度不够就跳过这次重绘，等客户端还信用。
                 //

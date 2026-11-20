@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <!-- holder 是 PTY 的父进程，必须与 core 分开成独立 app：
+         活动监视器显示的是 bundle 的 CFBundleDisplayName，共用 bundle 时
+         core 与 holder 会显示同一个名字，排查时只能靠 ps 参数区分。
+         identifier 与 core 分开，TCC 授权才不会互相覆盖。 -->
+    <key>CFBundleIdentifier</key><string>dev.deepterm.holder</string>
+    <key>CFBundleName</key><string>DeepHolder</string>
+    <key>CFBundleDisplayName</key><string>DeepHolder</string>
+    <key>CFBundleExecutable</key><string>deepholder</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <!-- holder 没有任何窗口，Dock 里不该出现图标。 -->
+    <key>LSUIElement</key><true/>
+    <key>CFBundleVersion</key><string>@VERSION@</string>
+    <key>CFBundleShortVersionString</key><string>@VERSION@</string>
+    <!-- holder 从不主动连网，但 PTY 里的程序会用它的隐私责任身份申请权限，
+         这些描述必须在 holder 自己的 bundle 里，否则弹窗显示成 core 的。 -->
+    <key>NSLocalNetworkUsageDescription</key><string>DeepHolder 需要访问本地网络，以运行终端中启动的程序。</string>
+    <key>NSAppleEventsUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权控制其他应用。</string>
+    <key>NSMicrophoneUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权录制音频。</string>
+    <key>NSCameraUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权使用摄像头。</string>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权与蓝牙设备通信。</string>
+    <key>NSDesktopFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改桌面文件。</string>
+    <key>NSDocumentsFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改“文稿”文件夹。</string>
+    <key>NSDownloadsFolderUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改“下载”文件夹。</string>
+    <key>NSNetworkVolumesUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改网络卷。</string>
+    <key>NSRemovableVolumesUsageDescription</key><string>在 DeepTerm 终端中运行的程序可经你授权读取和修改可移除卷。</string>
+</dict></plist>

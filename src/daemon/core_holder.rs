@@ -411,6 +411,13 @@ fn start_current_holder() -> std::io::Result<Arc<HolderClient>> {
 /// 拉起 `deepcore --holder --socket <path>`。
 fn spawn_holder(socket: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
+    // macOS 上优先用 GUI 内嵌的 `DeepHolder.app`：它与 core 来自同一份构建，
+    // 但有自己的 bundle，活动监视器里能区分“谁在持 PTY”。找不到就退回 core
+    // 自己的路径（同一个二进制，仍然可用）。
+    let exe = super::platform::gui_holder_executable(&exe).unwrap_or_else(|| {
+        log::debug!("未找到 DeepHolder.app，holder 复用 core 的可执行文件");
+        exe
+    });
     let socket_text = socket.to_string_lossy().into_owned();
     log::info!(
         "拉起 holder: {}（socket {}）",
@@ -686,6 +693,24 @@ pub fn reap_all() -> Vec<String> {
     removed
 }
 
+/// 一次 holder 控制调用的登记清理守卫。
+///
+/// `call_timeout` 登记等待者之后，无论走哪条退出路径都必须把它摘掉：
+/// 正常回复由 reader 线程 `remove`，超时/发送失败/连接断开由这里的
+/// `Drop` 兜底（再摘一次是幂等的）。
+struct PendingHolderReply {
+    map: Arc<Mutex<std::collections::HashMap<u64, std::sync::mpsc::Sender<Frame>>>>,
+    id: u64,
+}
+
+impl Drop for PendingHolderReply {
+    fn drop(&mut self) {
+        if let Ok(mut replies) = self.map.lock() {
+            replies.remove(&self.id);
+        }
+    }
+}
+
 impl HolderClient {
     fn from_stream(stream: transport::Stream, socket: PathBuf) -> std::io::Result<Self> {
         let read_stream = transport::try_clone(&stream)?;
@@ -726,8 +751,9 @@ impl HolderClient {
                                     .as_ref()
                                     .and_then(|v| v.get("id").and_then(Value::as_u64));
                                 let waiter = {
-                                    let mut replies =
-                                        reader_replies.lock().expect("pending replies");
+                                    let mut replies = reader_replies
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     match id {
                                         Some(id) => replies.remove(&id),
                                         None => {
@@ -759,7 +785,9 @@ impl HolderClient {
                             let kind = frame.kind;
                             let payload = frame.payload;
                             let action = {
-                                let mut routes = reader_routes.lock().expect("holder routes");
+                                let mut routes = reader_routes
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
 
                                 match routes.get_mut(&channel) {
                                     Some(route) if route.paused => {
@@ -784,7 +812,7 @@ impl HolderClient {
                                     if tx.try_send(f).is_err() {
                                         reader_routes
                                             .lock()
-                                            .expect("holder routes")
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                                             .remove(&channel);
                                     }
                                 }
@@ -803,7 +831,9 @@ impl HolderClient {
                                     // "nvim 不再像全屏程序"。
                                     //
                                     // 先攒着，登记路由时补发。
-                                    let mut p = pending_rx.lock().expect("pending");
+                                    let mut p = pending_rx
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let buf = p.entry(channel).or_default();
                                     // 上限保护：没人来认领的 channel 不该
                                     // 无限吃内存（正常会在毫秒内被取走）。
@@ -821,7 +851,10 @@ impl HolderClient {
                         }
                     }
                 }
-                reader_routes.lock().expect("holder routes").clear();
+                reader_routes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clear();
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             })?;
 
@@ -841,7 +874,10 @@ impl HolderClient {
                     let _ = std::io::Write::flush(&mut buf);
                     closed_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 })
-                .ok();
+                // 创建失败必须上报：否则 `send` 在一个没有消费者的无界
+                // 队列上永远返回 `Ok`，而每次 `call_timeout` 都要白等满
+                // 10 秒才发现没人回。
+                .map_err(|e| std::io::Error::other(format!("无法启动 holder 写线程: {e}")))?;
         }
 
         let mut client = Self {
@@ -886,7 +922,7 @@ impl HolderClient {
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
         self.pending_replies
             .lock()
-            .expect("pending replies")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(0, tx);
         self.send(Frame::json(serde_json::to_vec(&request)?))?;
 
@@ -995,7 +1031,10 @@ impl HolderClient {
         // 登记路由与取 pending 分两次加锁，不嵌套（与 reader 的加锁顺序一致，
         // 避免 AB/BA 死锁形态）。
         {
-            let mut routes = self.routes.lock().expect("holder routes");
+            let mut routes = self
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             routes.insert(
                 holder_channel,
                 Route {
@@ -1010,14 +1049,17 @@ impl HolderClient {
         let buffered = self
             .pending
             .lock()
-            .expect("pending")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&holder_channel);
         if let Some(pending) = buffered
             && !pending.frames.is_empty()
         {
             if paused {
                 // 还没开闸：先攒在路由里，等 `resume` 时一并发出。
-                let mut routes = self.routes.lock().expect("holder routes");
+                let mut routes = self
+                    .routes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if let Some(route) = routes.get_mut(&holder_channel) {
                     route.held.extend(
                         pending
@@ -1046,11 +1088,11 @@ impl HolderClient {
     pub fn drop_route(&self, holder_channel: u32) {
         self.routes
             .lock()
-            .expect("holder routes")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&holder_channel);
         self.pending
             .lock()
-            .expect("pending")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&holder_channel);
     }
 
@@ -1063,7 +1105,10 @@ impl HolderClient {
             return;
         }
         let drained: Vec<(async_channel::Sender<Frame>, u32, Vec<Frame>)> = {
-            let mut routes = self.routes.lock().expect("holder routes");
+            let mut routes = self
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             routes
                 .values_mut()
                 .filter(|r| tickets.contains(&r.ticket) && r.paused)
@@ -1112,11 +1157,20 @@ impl HolderClient {
         // 登记 id → 等待者，然后带超时地等。见 `pending_replies` 的说明：
         // 共享队列 + id 不匹配就丢弃的旧写法会让并发 call 互相吞回复，
         // 而且 `recv_blocking` 没有超时会**永久卡住 core 的连接线程**。
+        //
+        // **每条退出路径都要摘掉登记**（守卫的 `Drop` 负责）：超时、发送
+        // 失败、读线程已退出都会走到这里。以前只在读到回复时由 reader
+        // `remove`，于是"holder 卡住 + 周期性的 list/reap"会让这张表
+        // 无界增长，每个僵尸条目还 pin 着一个 `Sender`。
         let (tx, rx) = std::sync::mpsc::channel::<Frame>();
         self.pending_replies
             .lock()
-            .expect("pending replies")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(id, tx);
+        let _pending = PendingHolderReply {
+            map: self.pending_replies.clone(),
+            id,
+        };
         self.send(Frame::json(serde_json::to_vec(&request)?))?;
 
         match rx.recv_timeout(timeout) {

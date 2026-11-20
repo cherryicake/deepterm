@@ -16,6 +16,20 @@ use super::protocol::{CONTROL, Frame, Kind, read_frame};
 use super::registry::Registry;
 use super::server::handle_request;
 
+/// `attach` 快照的分块大小。
+///
+/// 必须小于 `client::MAX_PENDING`（256 KiB），并给同窗口里的其它帧留出
+/// 余量：快照是客户端登记路由前唯一的大块数据，分块后每帧都能被完整
+/// 缓冲，不会被"超限丢整段"的规则整体丢弃。
+const ATTACH_CHUNK_BYTES: usize = 64 * 1024;
+
+/// 单条连接上同时允许运行的控制请求线程数。
+///
+/// 控制请求是低频的（开终端、挂接、列终端），但协议允许客户端任意灌。
+/// 每条线程最多阻塞一个远端调用（`list` 是 1.5 秒），没有上限时客户端
+/// 可以凭空造出成千上万条线程。
+const MAX_CONTROL_THREADS: usize = 64;
+
 /// 一个 GUI channel 指向的 holder 与 holder 侧 channel。
 ///
 /// 多个 holder 并存后，只记 channel 号已经不够：两个 holder 的 channel 都
@@ -216,6 +230,28 @@ pub fn serve_connection(
                 let request: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
                 // 与 herdr `server.rs:361-398` 相同：每条 call 独立执行，
                 // 一条慢请求不能挡住连接上的后续输入或其他请求。
+                //
+                // 但也不能无界：每条 RPC 一条线程，而 `list` 会在
+                // `machines.terminals` 里阻塞 1.5 秒。一个灌 `{"op":"list"}`
+                // 的客户端能凭空造出成千上万条线程。超过上限就明确回一条
+                // `busy`，而不是让守护进程被自己的线程数拖垮。
+                controls.retain(|handle| !handle.is_finished());
+                if controls.len() >= MAX_CONTROL_THREADS {
+                    log::warn!("连接上并发控制请求过多（{}），拒绝一条", controls.len());
+                    let mut response = json!({
+                        "ok": false,
+                        "error": "守护进程繁忙，请稍后重试",
+                        "kind": "busy",
+                    });
+                    if let Some(id) = request.get("id").cloned()
+                        && let Some(object) = response.as_object_mut()
+                    {
+                        object.insert("id".into(), id);
+                    }
+                    let bytes = serde_json::to_vec(&response).unwrap_or_else(|_| b"{}".to_vec());
+                    let _ = conn.outgoing.try_send(Frame::json(bytes));
+                    continue;
+                }
                 let worker_conn = conn.clone();
                 let worker_registry = registry.clone();
                 let worker_machines = machines.clone();
@@ -308,11 +344,15 @@ pub fn serve_connection(
                         );
                         continue;
                     };
-                    let _ = route.holder.send(Frame::new(
-                        route.channel,
-                        frame.kind,
-                        frame.payload.clone(),
-                    ));
+                    // 直接移走 payload：这一帧在匹配臂里是独占的，不需要
+                    // 再为热路径（每个按键、每一块输出）memcpy 一次。
+                    if let Err(e) =
+                        route
+                            .holder
+                            .send(Frame::new(route.channel, frame.kind, frame.payload))
+                    {
+                        log::debug!("转发到 holder 失败（channel {}）: {e}", route.channel);
+                    }
                     continue;
                 }
                 if let Some(address) = conn.channel_address(frame.channel)
@@ -347,11 +387,13 @@ pub fn serve_connection(
                     let Some(route) = conn.holder_route(frame.channel) else {
                         continue;
                     };
-                    let _ = route.holder.send(Frame::new(
-                        route.channel,
-                        frame.kind,
-                        frame.payload.clone(),
-                    ));
+                    if let Err(e) =
+                        route
+                            .holder
+                            .send(Frame::new(route.channel, frame.kind, frame.payload))
+                    {
+                        log::debug!("转发信用失败（channel {}）: {e}", route.channel);
+                    }
                     continue;
                 }
                 if let Some(address) = conn.channel_address(frame.channel)
@@ -403,11 +445,22 @@ pub fn serve_connection(
             handle.unsubscribe(id);
         }
     }
-    for (_, remote) in lock(&conn.remote_channels).drain() {
+    // **先摘锁再调远端。** `detach` 是 1 秒级的 SSH 往返，
+    // `detach_from_holder` 是 10 秒级的 holder 调用。持锁做这件事会挡住
+    // 同一条连接上所有终端的 `Data`/`Credit`（它们走同一把锁）。
+    let remotes: Vec<_> = lock(&conn.remote_channels)
+        .drain()
+        .map(|(_, r)| r)
+        .collect();
+    for remote in remotes {
         remote.detach();
     }
     if backend == Backend::Holder {
-        for route in lock(&conn.holder_channels).values().cloned() {
+        let routes: Vec<_> = lock(&conn.holder_channels)
+            .drain()
+            .map(|(_, route)| route)
+            .collect();
+        for route in routes {
             detach_from_holder(&route.holder, route.channel);
         }
     }
@@ -740,15 +793,19 @@ fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) 
             // 状态栏跑进中间。用户拖一下窗口就能看到"布局乱了"。
             //
             // 客户端没报尺寸时（无窗口场景、测试）保持守护进程现状。
+            //
+            // 范围检查后**拒绝**而不是 `as u16` 截断：`65537` 截成 `1` 会让
+            // 客户端"成功"地把终端 resize 成一个错误列数，全屏程序当场错位。
             if let (Some(cols), Some(rows)) = (
                 request.get("cols").and_then(Value::as_u64),
                 request.get("rows").and_then(Value::as_u64),
-            ) && cols > 0
+            ) && let (Ok(cols), Ok(rows)) = (u16::try_from(cols), u16::try_from(rows))
+                && cols > 0
                 && rows > 0
             {
                 handle.resize(alacritty_terminal::event::WindowSize {
-                    num_lines: rows as u16,
-                    num_cols: cols as u16,
+                    num_lines: rows,
+                    num_cols: cols,
                     cell_width: 0,
                     cell_height: 0,
                 });
@@ -757,7 +814,7 @@ fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) 
                 // 当成新尺寸发出去。
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
                 while std::time::Instant::now() < deadline {
-                    if handle.size() == (cols as u16, rows as u16) {
+                    if handle.size() == (cols, rows) {
                         break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -796,8 +853,18 @@ fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) 
 
             // 先把当前屏幕（+ 回滚 + kitty 图像）发过去，再开始推送新输出。
             // 顺序不能反：反了的话先到的增量会被随后的整屏重绘覆盖掉。
+            //
+            // **必须分块。** 这一帧是 `attach` 回复**之前**发出去的，客户端
+            // 还没登记路由，只能先攒在 `client::MAX_PENDING`（256 KiB）里；
+            // 而这里的内容是 2000 行回滚 + 最多 8 MiB kitty 回放。整帧发出
+            // 会稳定超限，客户端按"丢整段而不是截断"的规则把**整屏**丢掉，
+            // 而协议里没有任何补发路径——重连回来的面板会一直空白。
+            //
+            // 切成小帧在 VT 语义上完全等价：终端字节本来就是流。
             let snapshot = handle.attach_paint(history, replay_images);
-            let _ = conn.outgoing.try_send(Frame::data(channel, snapshot));
+            for chunk in snapshot.chunks(ATTACH_CHUNK_BYTES) {
+                let _ = conn.outgoing.try_send(Frame::data(channel, chunk.to_vec()));
+            }
 
             let tx = conn.outgoing.clone();
             let id = handle.subscribe(channel, tx);

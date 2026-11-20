@@ -137,6 +137,22 @@ impl MachineBook {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e),
         };
+        // **落盘值也必须校验。**
+        //
+        // `session` 会拼进远端 shell 命令与安装路径。只在 `ensure` 校验
+        // 挡不住这条路径：`machines.json` 是普通文件，回滚、手改、从别处
+        // 拷一份过来都会绕过 `ensure`。这里拒绝整份文件，而不是丢掉坏行
+        // ——静默丢行会让用户的机器列表凭空少一台，比明确报错更难查。
+        for machine in &machines {
+            if let Some(session) = machine.session.as_deref() {
+                super::validate_session(session).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("{} 中机器 {} 的 {e}", path.display(), machine.name),
+                    )
+                })?;
+            }
+        }
         Ok(Self {
             path,
             machines: Mutex::new(machines),
@@ -173,7 +189,7 @@ impl MachineBook {
         session: Option<String>,
     ) -> Result<Machine, String> {
         if let Some(session) = session.as_deref() {
-            validate_session(session)?;
+            super::validate_session(session)?;
         }
         let mut machines = self.lock();
         if let Some(existing) = machines
@@ -325,18 +341,6 @@ fn unique_name(requested: String, machines: &[Machine]) -> String {
     unreachable!()
 }
 
-fn validate_session(session: &str) -> Result<(), String> {
-    if session.is_empty()
-        || session.len() > 64
-        || !session
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    {
-        return Err("session 只能包含字母、数字、'-'、'_'、'.'（最长 64 字节）".into());
-    }
-    Ok(())
-}
-
 /// line 的连接状态。与“终端程序退出”严格分开：机器掉线时终端记录仍保留。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkKind {
@@ -378,6 +382,12 @@ struct LinkStatus {
 struct LiveLine {
     generation: u64,
     client: Arc<Client>,
+    /// 建立这条 line 时用的 SSH 配置。
+    ///
+    /// 用来判断"用户改了 host/port/认证之后，这条 line 还在对着旧目标
+    /// 说话"。只存与本机身份相关的那部分（`PartialEq` 已经把代理标记与
+    /// 时间戳排除在外）。
+    config: SshConnectionConfig,
 }
 
 struct RuntimeState {
@@ -450,6 +460,34 @@ impl MachineRuntime {
             client.close();
         }
         self.changed.notify_all();
+    }
+
+    /// 这台机器是否已被移除（监督线程与所有中继线程的退出条件）。
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// 配置（host/port/认证/端口转发）变了就作废当前 line，让监督线程按新
+    /// 配置重拨。
+    ///
+    /// 只在"确实变了"时动手：`ensure` 每次连接都会被调用，无条件重拨会让
+    /// 每条 GUI 请求都踢掉一条健康的 SSH 连接。
+    pub fn invalidate_if_config_changed(&self, current: &SshConnectionConfig) {
+        let stale = {
+            let state = self.lock_state();
+            state
+                .live
+                .as_ref()
+                .is_some_and(|line| line.config != *current)
+        };
+        if !stale {
+            return;
+        }
+        let generation = self.lock_state().live.as_ref().map(|line| line.generation);
+        if let Some(generation) = generation {
+            log::info!("机器 {} 的连接配置已变更，作废当前 line", self.id);
+            self.invalidate_line(generation, "连接配置已变更");
+        }
     }
 
     /// 请求监督线程安装/更新 core。`force` 为 true 时即使版本相同也重新
@@ -607,12 +645,25 @@ impl MachineRuntime {
     }
 
     fn call_now(&self, mut request: Value, timeout: Duration) -> Result<Value, String> {
+        // **一个截止时间管两段。** 先等 line、再发请求；两段各自用满
+        // `timeout` 会让整次调用翻倍（spawn 最长 120 秒，而 app 侧在
+        // `MACHINE_SPAWN_TIMEOUT`（70 秒）就放弃了）。用户重试后远端
+        // 会多出一个 shell，而它的地址从未返回——`close_terminal` 从此
+        // 够不到它。
+        let deadline = Instant::now() + timeout;
         let line = self.wait_for_line(timeout)?;
-        match line.client.call_timeout(request.take(), timeout) {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match line.client.call_timeout(request.take(), remaining) {
             Ok(reply) => Ok(reply),
             Err(e) => {
                 self.invalidate_line(line.generation, format!("远端调用失败: {e}"));
-                Err(format!("远端 core 没有响应: {e}"))
+                // 带上机器名：多机器日志里"远端 core 没有响应"没法定位是谁。
+                Err(format!(
+                    "{}: 远端 core 没有响应: {e}",
+                    self.machine()
+                        .map(|m| m.name)
+                        .unwrap_or_else(|| self.id.clone())
+                ))
             }
         }
     }
@@ -705,26 +756,43 @@ impl MachineRuntime {
     /// 只作废 `generation` 仍然匹配的那一条：并发的多个调用可能同时超时，
     /// 旧调用不能误杀监督线程刚建立的新 line。
     fn invalidate_line(&self, generation: u64, why: impl Into<String>) {
+        // **取 client 与写状态必须在同一个临界区。**
+        //
+        // 旧写法先在锁里 `take` 出 client、放锁、再交给 `set_down` 重新
+        // 加锁写 `live = None`。中间这段窗口里监督线程可能刚好发布一条新
+        // line，`set_down` 会把那条健康的 `Connected` 一起抹成 `Unreachable`
+        // 并触发重拨。
+        let why = why.into();
         let client = {
             let mut state = self.lock_state();
-            if state
+            let stale = state
                 .live
                 .as_ref()
-                .is_some_and(|line| line.generation == generation)
-            {
-                state.live.take().map(|line| line.client)
-            } else {
-                None
+                .is_some_and(|line| line.generation == generation);
+            if !stale {
+                return;
             }
+            let since_ms = if state.status.kind == LinkKind::Connected {
+                now_ms()
+            } else {
+                state.status.since_ms
+            };
+            let client = state.live.take().map(|live| live.client);
+            state.status = LinkStatus {
+                kind: LinkKind::Unreachable,
+                since_ms,
+                why: Some(format!("line 失活: {why}")),
+            };
+            client
         };
-        let Some(client) = client else { return };
-        let why = why.into();
         log::warn!(
             "机器 {} 的 line generation {generation} 失活，关闭并重连: {why}",
             self.id
         );
-        self.set_down(LinkKind::Unreachable, format!("line 失活: {why}"));
-        client.close();
+        self.changed.notify_all();
+        if let Some(client) = client {
+            client.close();
+        }
     }
 
     fn supervise(self: Arc<Self>) {
@@ -914,6 +982,7 @@ impl MachineRuntime {
                 state.live = Some(LiveLine {
                     generation,
                     client: client.clone(),
+                    config: machine.ssh.clone(),
                 });
                 self.changed.notify_all();
                 generation
@@ -1108,9 +1177,20 @@ impl Machines {
             .runtimes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !runtimes.contains_key(&machine.id) {
-            let runtime = MachineRuntime::start(self.book.clone(), machine.id.clone());
-            runtimes.insert(machine.id.clone(), runtime);
+        match runtimes.get(&machine.id) {
+            Some(runtime) => {
+                // **配置变了就必须作废现有 line。**
+                //
+                // `MachineBook::ensure` 只更新 `machines.json` 里的配置，而
+                // 活着的 line 用的是建连时的 host/port/认证。用户改了端口
+                // 或换了主机后，旧实现会继续对着**旧目标**说话，直到 45 秒
+                // 静默超时把它作废——这期间的所有操作都打到了错误的机器上。
+                runtime.invalidate_if_config_changed(&machine.ssh);
+            }
+            None => {
+                let runtime = MachineRuntime::start(self.book.clone(), machine.id.clone());
+                runtimes.insert(machine.id.clone(), runtime);
+            }
         }
         Ok(machine)
     }
@@ -1305,10 +1385,15 @@ impl Machines {
         localize_reply(&runtime, &mut reply);
         let relay = attachment.clone();
         let generation = line.generation;
-        std::thread::Builder::new()
+        // 中继线程创建失败时必须先退订：否则远端仍为我们推数据、额度只减
+        // 不增，最后停在 `NeedsPaint` 谁也救不回来。
+        if let Err(e) = std::thread::Builder::new()
             .name("machine-attach".into())
             .spawn(move || relay.run(receiver, generation, local_channel, sink))
-            .map_err(|e| format!("无法启动远端终端中继: {e}"))?;
+        {
+            attachment.detach();
+            return Err(format!("无法启动远端终端中继: {e}"));
+        }
         Ok((reply, attachment))
     }
 
@@ -1383,6 +1468,13 @@ impl RemoteAttachment {
                 json!({"op": "detach", "channel": channel}),
                 Duration::from_secs(1),
             );
+            // **必须注销本地的接收端。**
+            //
+            // `run` 阻塞在 `receiver.recv_blocking()`：置 `stop` 唤不醒它，
+            // 而 detach 之后远端不再产帧，于是它永远等下去——每关一个远端
+            // 标签就漏一条线程加一个 `Arc<RemoteAttachment>`，直到整台机器
+            // 被移除、`client.close()` 把所有 route sender 一起丢弃。
+            line.client.detach_channel(channel);
         }
     }
 
@@ -1443,7 +1535,12 @@ impl RemoteAttachment {
             // `generation` 只从成功的 attach 取（`line.generation`），绝不
             // 本地自增——它必须始终是运行时真的发布过的值，否则一定超前。
             loop {
-                if self.stop.load(Ordering::SeqCst) {
+                // **两个退出条件都要检查。** `wait_for_line_after` 在运行时
+                // 停止时会**立刻**返回 `None`，而下面 `continue` 会不带任何
+                // 睡眠地空转——100% CPU 直到进程退出。`MachineRuntime::stop`
+                // 也不会去置 attachment 自己的 `stop`（那只由 `detach` 置），
+                // 所以这里必须直接看运行时。
+                if self.stop.load(Ordering::SeqCst) || self.runtime.is_stopped() {
                     return;
                 }
                 if self
@@ -1695,12 +1792,17 @@ impl RemoteDiagnostics {
 
 fn remote_connect_command(session: Option<&str>) -> String {
     match session {
-        Some(session) => format!(
-            "export DEEPTERM_RUNTIME_DIR=\"$HOME/.local/share/deepterm/sessions/{session}\"; \
-             if [ -x \"$HOME/.local/share/deepterm/sessions/{session}/deepcore\" ]; then \
-             exec \"$HOME/.local/share/deepterm/sessions/{session}/deepcore\" connect; \
-             else echo \"{MISSING_MARKER}\" >&2; exit 127; fi"
-        ),
+        // `session` 已由 `validate_session` 收口，这里仍然统一加引号：
+        // 这是拼进 `sh -c` 的最后一道边，不该依赖上游一定校验过。
+        Some(session) => {
+            let dir = shell_quote(&format!("$HOME/.local/share/deepterm/sessions/{session}"));
+            format!(
+                "export DEEPTERM_RUNTIME_DIR={dir}; \
+                 if [ -x {dir}/deepcore ]; then \
+                 exec {dir}/deepcore connect; \
+                 else echo \"{MISSING_MARKER}\" >&2; exit 127; fi"
+            )
+        }
         None => format!(
             "if [ -x \"$HOME/.local/share/deepterm/deepcore\" ]; then \
              exec \"$HOME/.local/share/deepterm/deepcore\" connect; \
@@ -1709,6 +1811,14 @@ fn remote_connect_command(session: Option<&str>) -> String {
              else echo \"{MISSING_MARKER}\" >&2; exit 127; fi"
         ),
     }
+}
+
+/// POSIX 单引号转义。
+///
+/// 与 `deploy::shell_quote` 同一语义：单引号里的一切都是字面量，唯一的
+/// 特殊字符是单引号本身（闭合后接 `\'` 再重开）。
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn now_ms() -> u64 {
@@ -1861,6 +1971,61 @@ mod tests {
         assert!(MACHINE_SPAWN_TIMEOUT > MACHINE_START_TIMEOUT);
     }
 
+    /// **配置变了才作废旧 line，配置没变不能重拨。**
+    ///
+    /// 回归价值：`Machines::ensure` 每次连接都会被调用，而旧实现只更新
+    /// `machines.json`、从不碰活着的 line——用户改了端口后，监督线程会继续
+    /// 对着**旧目标**说话，直到 45 秒静默超时。反过来，如果无条件作废，
+    /// 每条 GUI 请求都会踢掉一条健康的 SSH 连接。
+    #[test]
+    fn a_config_change_invalidates_the_line_but_an_identical_one_does_not() {
+        let (book, path) = book();
+        let client = Arc::new(
+            Client::from_transport(std::io::Cursor::new(Vec::<u8>::new()), Vec::<u8>::new())
+                .expect("in-memory client"),
+        );
+        let original = SshConnectionConfig::new("old.example", "root", AuthMethod::Agent);
+        let runtime = MachineRuntime {
+            book,
+            id: "box".into(),
+            state: Mutex::new(RuntimeState {
+                status: LinkStatus {
+                    kind: LinkKind::Connected,
+                    since_ms: now_ms(),
+                    why: None,
+                },
+                live: Some(LiveLine {
+                    generation: 3,
+                    client,
+                    config: original.clone(),
+                }),
+                generation: 3,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+            install_requested: AtomicBool::new(false),
+            install_force: AtomicBool::new(false),
+        };
+
+        // 同样的配置（含代理标记这种"本次连接的选择"）：保持不动。
+        let mut same = original.clone();
+        same.use_system_proxy = true;
+        runtime.invalidate_if_config_changed(&same);
+        assert!(
+            runtime.line_is_current(3),
+            "配置没变不该重拨，否则每次请求都踢掉健康的 SSH 连接"
+        );
+
+        // 端口变了：必须作废。
+        let mut changed = original.clone();
+        changed.port = 2222;
+        runtime.invalidate_if_config_changed(&changed);
+        assert!(!runtime.line_is_current(3), "端口变了必须作废旧 line");
+        assert_eq!(runtime.status().kind, LinkKind::Unreachable);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     /// 半开 SSH 上 `Client::is_closed()` 可能永远为 false；只要运行时把
     /// `live` 清掉，监督线程就必须能从 generation 判断自己已被作废。
     #[test]
@@ -1882,6 +2047,7 @@ mod tests {
                 live: Some(LiveLine {
                     generation: 7,
                     client,
+                    config: SshConnectionConfig::new("host", "u", AuthMethod::Agent),
                 }),
                 generation: 7,
             }),
@@ -1926,6 +2092,7 @@ mod tests {
                 live: Some(LiveLine {
                     generation: 9,
                     client,
+                    config: SshConnectionConfig::new("host", "u", AuthMethod::Agent),
                 }),
                 generation: 9,
             }),

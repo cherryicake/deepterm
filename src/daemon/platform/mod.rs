@@ -112,6 +112,32 @@ pub fn gui_core_executable(gui: &Path) -> Option<PathBuf> {
     }
 }
 
+/// GUI 内嵌的 holder 可执行文件（`DeepHolder.app`）。
+///
+/// `core_holder::spawn_holder` 用它拉起 holder。找不到时返回 `None`，调用方
+/// 退回 **core 自己的路径** —— 那是同一份二进制，功能上仍然正确（只是活动
+/// 监视器里显示成 `DeepTerm Core`），因此这里失败不该阻止终端启动。
+pub fn gui_holder_executable(core: &Path) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // 只对“确实跑在 DeepTerm Core.app 里”的 core 推导兄弟 bundle：
+        // 开发构建的 `target/debug/deepcore` 往上三级只是 target 目录，
+        // 按它拼出来的路径必然不存在，白白制造一次 stat。
+        let canonical = core.canonicalize().unwrap_or_else(|_| core.to_path_buf());
+        let root = macos_bundle::bundle_root(&canonical)?;
+        let resources = root.parent()?;
+        let holder = resources
+            .join(macos_bundle::HOLDER_APP_NAME)
+            .join(macos_bundle::HOLDER_EXECUTABLE);
+        holder.is_file().then_some(holder)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = core;
+        None
+    }
+}
+
 pub fn core_log_path() -> PathBuf {
     crate::utils::logging::core_log_path()
         .unwrap_or_else(|| crate::daemon::runtime_dir().join("deepcore.log"))

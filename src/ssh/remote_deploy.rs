@@ -37,6 +37,7 @@
 //! shell 配置、不注册服务、不需要 root。
 
 use std::path::Path;
+use std::time::Duration;
 
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::BlockingSftpSession;
@@ -46,6 +47,13 @@ const REMOTE_INSTALL_DIR: &str = ".local/share/deepterm";
 
 /// 探针超时秒数（远端跑 `--version`，正常是毫秒级）。
 const PROBE_TIMEOUT_SECS: u32 = 20;
+
+/// 外层 `exec_capture` 的兜底时间上限。
+///
+/// 比 `PROBE_TIMEOUT_SECS` 宽一点：远端的 `timeout` 命令先到期，这里只在
+/// 远端连 `timeout` 都没有（老 busybox、精简镜像）时兜底，防止把机器
+/// 监督线程永久挂死。
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(PROBE_TIMEOUT_SECS as u64 + 10);
 
 /// 一次部署的结果。
 #[derive(Debug)]
@@ -194,15 +202,18 @@ pub fn start_remote_core(
         "if [ -S {sock} ]; then echo ALIVE; else echo NONE; fi",
         sock = sock
     );
-    if let Ok((_, out, _)) = session.exec_capture(&probe) {
+    if let Ok((_, out, _)) = session.exec_capture(&probe, CAPTURE_TIMEOUT) {
         if out.contains("ALIVE") {
             log::info!("远端 core 已在运行");
             // 但要确认它真的能应答，而不是一个残留的 socket 文件。
-            if let Ok((Some(0), _, _)) = session.exec_capture(&format!(
-                "DEEPTERM_RUNTIME_DIR=$(dirname {home}) {bin} --ping 2>/dev/null && echo OK",
-                home = shell_quote(&home_quoted),
-                bin = bin
-            )) {
+            if let Ok((Some(0), _, _)) = session.exec_capture(
+                &format!(
+                    "DEEPTERM_RUNTIME_DIR=$(dirname {home}) {bin} --ping 2>/dev/null && echo OK",
+                    home = shell_quote(&home_quoted),
+                    bin = bin
+                ),
+                CAPTURE_TIMEOUT,
+            ) {
                 return Ok(format!("$HOME/{REMOTE_SOCKET_REL}"));
             }
         }
@@ -217,7 +228,7 @@ pub fn start_remote_core(
         home = shell_quote(&home_quoted),
         bin = bin
     );
-    match session.exec_capture(&start) {
+    match session.exec_capture(&start, CAPTURE_TIMEOUT) {
         Ok((_, out, _)) if out.contains("STARTED") => {
             log::info!("远端 core 已启动");
             Ok(format!("$HOME/{REMOTE_SOCKET_REL}"))
@@ -248,7 +259,9 @@ fn probe(session: &mut BlockingSftpSession, remote_path: &str) -> anyhow::Result
         "command -v timeout >/dev/null 2>&1 && timeout {PROBE_TIMEOUT_SECS} {path} --version || {path} --version",
         path = shell_quote(remote_path),
     );
-    let (code, stdout, _stderr) = session.exec_capture(&command)?;
+    // 命令内部已经套了 `timeout PROBE_TIMEOUT_SECS`；外层再兜一层，
+    // 防止远端根本没有 `timeout` 命令时把监督线程挂死。
+    let (code, stdout, _stderr) = session.exec_capture(&command, CAPTURE_TIMEOUT)?;
     match code {
         // 退出码 0 且输出带版本号才算通过。
         Some(0) if !stdout.trim().is_empty() => Ok(Some(stdout.trim().to_string())),
@@ -268,7 +281,7 @@ fn probe_diagnosis(session: &mut BlockingSftpSession, remote_path: &str) -> Stri
          echo '--- glibc ---'; ldd --version 2>&1 | head -1; \
          echo '--- arch ---'; uname -m"
     );
-    match session.exec_capture(&command) {
+    match session.exec_capture(&command, CAPTURE_TIMEOUT) {
         Ok((_, stdout, stderr)) => {
             let text = format!("{stdout}{stderr}");
             text.trim().to_string()

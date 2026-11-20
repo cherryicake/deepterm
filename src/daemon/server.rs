@@ -159,14 +159,21 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
         })
         .unwrap_or_default();
     let cwd = request.get("cwd").and_then(Value::as_str).map(Into::into);
+    // 客户端报来的数字不可信：`as u16` 会把 65536 截成 0，而下面的
+    // `Registry::spawn` 会照着这个 0 建出一个 0×0 的网格。越界一律退回
+    // 默认值，而不是截断成另一个合法但错误的尺寸。
     let cols = request
         .get("cols")
         .and_then(Value::as_u64)
-        .unwrap_or(super::registry::DEFAULT_COLS as u64) as u16;
+        .and_then(|cols| u16::try_from(cols).ok())
+        .unwrap_or(super::registry::DEFAULT_COLS)
+        .max(1);
     let rows = request
         .get("rows")
         .and_then(Value::as_u64)
-        .unwrap_or(super::registry::DEFAULT_ROWS as u64) as u16;
+        .and_then(|rows| u16::try_from(rows).ok())
+        .unwrap_or(super::registry::DEFAULT_ROWS)
+        .max(1);
     let address = request
         .get("address")
         .and_then(Value::as_str)

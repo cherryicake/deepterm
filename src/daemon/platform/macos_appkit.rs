@@ -4,8 +4,19 @@ use std::ffi::{c_char, c_void};
 use std::io;
 
 pub fn check_in() -> io::Result<()> {
-    if !super::macos_bundle::source_is_bundle(&std::env::current_exe()?.canonicalize()?) {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    if !super::macos_bundle::source_is_bundle(&exe) {
         return Ok(());
+    }
+    // 打包漏掉 `DeepHolder.app` 时 holder 会退回 core 的二进制：功能正常，
+    // 但活动监视器里显示成 `DeepTerm Core`。这条日志是排查“名字怎么又一样
+    // 了”的唯一线索，必须留下。
+    if !super::macos_bundle::holder_has_own_bundle(&exe) {
+        log::warn!(
+            "holder 运行在 {} 而不是 DeepHolder.app：活动监视器会把它显示成 core，\
+             检查分发包里是否缺了 DeepHolder.app",
+            exe.display()
+        );
     }
     let Some(session) = super::macos_session::graphic_session()? else {
         return Ok(());

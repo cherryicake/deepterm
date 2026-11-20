@@ -129,7 +129,25 @@ impl BlockingSftpSession {
     /// "跑一下看看"的小命令，不占用用户的终端。
     ///
     /// 退出码为 `None` 表示远端没给（被信号打断，或对方实现不规范）。
-    pub fn exec_capture(&self, command: &str) -> anyhow::Result<(Option<u32>, String, String)> {
+    ///
+    /// # 为什么必须有超时与输出上限
+    ///
+    /// 调用方是机器监督线程：远端命令一旦挂住（死挂载上的 `mkdir`、
+    /// profile 阻塞的 shell、被信号打断但 channel 不关的程序），没有超时
+    /// 就意味着这条机器永远不再重连；没有上限则一条 `cat /dev/zero`
+    /// 就能把本地内存吃光。两者都按 [`MAX_COMMAND_OUTPUT_BYTES`] 与
+    /// 调用方给的预算收口。
+    ///
+    /// 超时后主动关闭 channel，避免远端进程继续占着会话。
+    ///
+    /// # Errors
+    ///
+    /// 打开 channel、执行命令失败，或超过 `timeout` 时返回错误。
+    pub fn exec_capture(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<(Option<u32>, String, String)> {
         let rt = crate::ssh::shared_runtime::shared_ssh_runtime();
         let handle = &self.handle;
         let command = command.to_string();
@@ -139,23 +157,42 @@ impl BlockingSftpSession {
 
             let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
             let mut code = None;
-            // russh 的 channel 是一条消息流：数据、扩展数据（stderr）、
-            // 退出状态混在一起，必须读完才知道结果。
-            while let Some(msg) = channel.wait().await {
-                match msg {
-                    russh::ChannelMsg::Data { ref data } => {
-                        stdout.extend_from_slice(data);
-                    }
-                    russh::ChannelMsg::ExtendedData { ref data, ext } => {
-                        if ext == 1 {
-                            stderr.extend_from_slice(data);
+            let collect = async {
+                // russh 的 channel 是一条消息流：数据、扩展数据（stderr）、
+                // 退出状态混在一起，必须读完才知道结果。
+                while let Some(msg) = channel.wait().await {
+                    match msg {
+                        russh::ChannelMsg::Data { ref data } => {
+                            if stdout.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                                anyhow::bail!(
+                                    "远端命令输出超过上限 {MAX_COMMAND_OUTPUT_BYTES} 字节"
+                                );
+                            }
+                            stdout.extend_from_slice(data);
                         }
+                        russh::ChannelMsg::ExtendedData { ref data, ext } => {
+                            if ext == 1 {
+                                if stderr.len() + data.len() > MAX_COMMAND_OUTPUT_BYTES {
+                                    anyhow::bail!(
+                                        "远端命令 stderr 超过上限 {MAX_COMMAND_OUTPUT_BYTES} 字节"
+                                    );
+                                }
+                                stderr.extend_from_slice(data);
+                            }
+                        }
+                        russh::ChannelMsg::ExitStatus { exit_status } => {
+                            code = Some(exit_status);
+                        }
+                        _ => {}
                     }
-                    russh::ChannelMsg::ExitStatus { exit_status } => {
-                        code = Some(exit_status);
-                    }
-                    _ => {}
                 }
+                anyhow::Ok(())
+            };
+            if tokio::time::timeout(timeout, collect).await.is_err() {
+                // 尽力关掉 channel：否则远端的命令会一直挂着，下一次探测
+                // 还要再占一个会话。
+                let _ = channel.close().await;
+                anyhow::bail!("远端命令超时（{} 秒）", timeout.as_secs());
             }
             anyhow::Ok((
                 code,

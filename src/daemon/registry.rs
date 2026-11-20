@@ -86,6 +86,12 @@ impl SpawnRequest {
 /// 守护进程的终端表。
 pub struct Registry {
     terminals: Mutex<BTreeMap<Address, Arc<TerminalHandle>>>,
+    /// 正在创建、尚未就绪的地址（`spawn` 的预留）。
+    ///
+    /// 与 `terminals` 分开两把锁会引入"预留成功、登记前 `list` 看不到"
+    /// 的中间态——那与旧行为一致，但**必须**保证释放与转正都是原子的，
+    /// 否则并发 `spawn` 会把同一个地址建两次。
+    reserved: Mutex<std::collections::BTreeSet<Address>>,
     next_id: AtomicU64,
 }
 
@@ -99,6 +105,7 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             terminals: Mutex::new(BTreeMap::new()),
+            reserved: Mutex::new(std::collections::BTreeSet::new()),
             next_id: AtomicU64::new(1),
         }
     }
@@ -107,7 +114,7 @@ impl Registry {
     pub fn get(&self, address: &str) -> Option<Arc<TerminalHandle>> {
         self.terminals
             .lock()
-            .expect("registry")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(address)
             .cloned()
     }
@@ -116,7 +123,7 @@ impl Registry {
     pub fn list(&self) -> Vec<Arc<TerminalHandle>> {
         self.terminals
             .lock()
-            .expect("registry")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .values()
             .cloned()
             .collect()
@@ -124,7 +131,10 @@ impl Registry {
 
     /// 终端数量。
     pub fn len(&self) -> usize {
-        self.terminals.lock().expect("registry").len()
+        self.terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -133,7 +143,10 @@ impl Registry {
 
     /// 移除一个已经结束的终端。
     pub fn remove(&self, address: &str) -> bool {
-        let mut map = self.terminals.lock().expect("registry");
+        let mut map = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match map.get(address) {
             // 还活着的不许移除：那会把程序变成孤儿。
             Some(handle) if handle.state() == State::Live => false,
@@ -160,7 +173,10 @@ impl Registry {
 
     /// 回收所有已结束的终端，返回被移除的地址。
     pub fn reap(&self) -> Vec<Address> {
-        let mut map = self.terminals.lock().expect("registry");
+        let mut map = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dead: Vec<Address> = map
             .iter()
             .filter(|(_, h)| h.state() == State::Finished)
@@ -181,12 +197,17 @@ impl Registry {
             Some(address) => {
                 let id = parse_address_id(address)
                     .ok_or_else(|| format!("无效的终端地址: {address}"))?;
-                if self
-                    .terminals
-                    .lock()
-                    .expect("registry")
-                    .contains_key(address)
-                {
+                // **先预留地址。**
+                //
+                // 控制请求各自跑在自己的线程上，而地址可以来自请求。旧写法
+                // 在这里只 `contains_key`，真正的 `insert` 要等到 PTY、
+                // 终端线程都建好之后——两个并发 spawn 会同时通过检查，
+                // 第二个 `insert` 覆盖第一个 handle，而第一个 PTY 从此对
+                // `close`/`remove`/`reap` 不可达，泄漏一个活着的子进程。
+                //
+                // 预留与登记都发生在 `terminals` 这把锁里（`reserved` 只是
+                // "还没就绪"的旁注），所以不会与 `list` 的语义打架。
+                if !self.reserve_address(address) {
                     return Err(format!("终端地址已被占用: {address}"));
                 }
                 // 本地计数器也要越过它，避免后续未指定地址的 spawn 撞车。
@@ -204,6 +225,52 @@ impl Registry {
             }
         };
 
+        // 从这里开始每一步都可能失败，失败必须把预留的地址还回去，
+        // 否则这个地址会永远"被占用"而没有任何终端存在。
+        let result = self.spawn_reserved(&request, id, &address);
+        if result.is_err() {
+            self.release_address(&address);
+        }
+        result
+    }
+
+    /// 为 `Some(address)` 的 spawn 预留地址；已经有人（或已经就绪）时返回 false。
+    ///
+    /// 预留与登记共用 `terminals` 这把锁的同一份状态：`reserved` 只记录
+    /// "正在创建、还没有 handle 可用"的地址，`list`/`get` 仍然看不到它们
+    /// ——与旧行为一致（旧代码也是全部准备好之后才 insert）。
+    ///
+    /// 加锁顺序固定为 `reserved → terminals`，与 [`Registry::spawn_reserved`]
+    /// 的"转正"路径一致；别处不会同时拿这两把锁，因此不会形成 AB/BA。
+    fn reserve_address(&self, address: &str) -> bool {
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taken = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(address);
+        // 已登记 或 已被别人预留，都算冲突。
+        !taken && reserved.insert(address.to_string())
+    }
+
+    /// 归还预留（创建失败时）。
+    fn release_address(&self, address: &str) {
+        self.reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(address);
+    }
+
+    /// 真正建终端；`address` 已由 [`Registry::reserve_address`] 预留。
+    fn spawn_reserved(
+        &self,
+        request: &SpawnRequest,
+        id: u64,
+        address: &str,
+    ) -> Result<Arc<TerminalHandle>, String> {
         let size = WindowSize {
             num_lines: request.rows,
             num_cols: request.cols,
@@ -218,7 +285,6 @@ impl Registry {
         };
 
         let pty = tty::new(&options, size, 0).map_err(|e| format!("无法创建 PTY: {e}"))?;
-
         let (event_tx, _event_rx) = std::sync::mpsc::channel();
         let listener = ZedListenerShim(event_tx);
         let bounds = TermBounds {
@@ -248,7 +314,7 @@ impl Registry {
 
         let (input_tx, input_rx) = async_channel::bounded::<Input>(256);
         let handle = Arc::new(TerminalHandle::new(
-            address.clone(),
+            address.to_string(),
             Vec::new(),
             request
                 .cwd
@@ -285,10 +351,18 @@ impl Registry {
             })
             .map_err(|e| format!("无法启动终端线程: {e}"))?;
 
+        // 预留转正与释放是同一个临界区：中间不能让 `list` 看到"既不在
+        // reserved 也不在 terminals"的地址。
+        let mut reserved = self
+            .reserved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reserved.remove(address);
         self.terminals
             .lock()
-            .expect("registry")
-            .insert(address, handle.clone());
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(address.to_string(), handle.clone());
+        drop(reserved);
         Ok(handle)
     }
 }
@@ -1124,5 +1198,33 @@ mod tests {
     #[test]
     fn reaping_an_empty_registry_returns_nothing() {
         assert!(Registry::new().reap().is_empty());
+    }
+
+    /// **同一个显式地址不能被两个并发 spawn 同时拿走。**
+    ///
+    /// 回归价值：旧实现只在建 PTY 之前 `contains_key`，真正的 `insert`
+    /// 要等 PTY、终端线程都就绪——两个并发 spawn 会同时通过检查，第二个
+    /// `insert` 覆盖第一个 handle，第一个 PTY 从此对 `close`/`remove`/`reap`
+    /// 不可达，泄漏一个活着的子进程。
+    #[test]
+    fn an_explicit_address_cannot_be_reserved_twice() {
+        let registry = Registry::new();
+        assert!(registry.reserve_address("t7"), "第一次预留应当成功");
+        assert!(
+            !registry.reserve_address("t7"),
+            "第二次预留必须失败，而不是覆盖第一个终端"
+        );
+        // 失败要能归还，否则这个地址永远不可用。
+        registry.release_address("t7");
+        assert!(registry.reserve_address("t7"), "归还后应当可以重新预留");
+    }
+
+    /// 预留中的地址不出现在 `list`/`len` 里（与"全部就绪才 insert"一致）。
+    #[test]
+    fn a_reserved_address_is_not_listed_until_ready() {
+        let registry = Registry::new();
+        assert!(registry.reserve_address("t3"));
+        assert!(registry.is_empty(), "预留不等于已登记");
+        assert!(registry.get("t3").is_none());
     }
 }
