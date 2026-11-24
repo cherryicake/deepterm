@@ -1562,9 +1562,9 @@ impl TabBar {
         let on_panel_drop = self.on_panel_drop.clone();
         let panel_drop_preview = self.panel_drop_preview.clone();
         let theme = cx.theme().ui;
-        // 当前标签的胶囊底色直接取终端标签那一套（`tray.selected` /
-        // `tray.selected_edge`，悬停用 `tray.hover`）：两处标签栏因此永远
-        // 是同一块颜色，不靠两套主题令牌各自漂移。
+        // 当前标签的胶囊底色直接取终端标签那一套（`tray.selected`，悬停用
+        // `tray.hover`）：两处标签栏因此永远是同一块颜色，不靠两套主题令牌
+        // 各自漂移。
         let tray = Self::tray_colors(theme);
         let dragged_id = self
             .reorder_preview
@@ -1681,11 +1681,10 @@ impl TabBar {
     /// 渲染单个编辑器标签（含重排补间动画包装）。
     ///
     /// 视觉对齐 Winc 顶栏：当前标签是与终端标签同款的实心胶囊
-    /// （`tray.selected` + `tray.selected_edge`，圆角 13），未选中标签悬停时
-    /// 铺终端标签同款的 `tray.hover`；相邻的普通标签之间画一条短竖线，
-    /// 当前 / 悬停 / 拖动中的标签两侧不画（它们自己已经有底色，竖线会粘在
-    /// 底色上）。宽度贴合文件名，右端固定留出关闭槽，标签不会因为悬停而
-    /// 左右跳动。
+    /// （`tray.selected`，圆角 13，不画高亮描边），未选中标签悬停时铺终端
+    /// 标签同款的 `tray.hover`；相邻的普通标签之间画一条短竖线，当前 /
+    /// 悬停 / 拖动中的标签两侧不画（它们自己已经有底色，竖线会粘在底色上）。
+    /// 宽度贴合文件名，右端固定留出关闭槽，标签不会因为悬停而左右跳动。
     fn render_tab(
         &self,
         tab: &TabItem,
@@ -1723,11 +1722,9 @@ impl TabBar {
             .items_center()
             .rounded(px(EDITOR_TAB_RADIUS_PX))
             .border_1()
-            .border_color(if is_active {
-                tray.selected_edge
-            } else {
-                theme.transparent()
-            })
+            // 编辑器选中标签不画高亮描边，只靠底色浮起来；保留 1px 透明
+            // 边框占位，悬停 / 选中切换时内容不会横向跳 1px。
+            .border_color(gpui::transparent_black())
             .bg(if is_active {
                 tray.selected
             } else {
