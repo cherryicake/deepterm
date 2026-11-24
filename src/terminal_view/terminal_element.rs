@@ -5,6 +5,7 @@ use crate::sidebar_view::font_settings::{FontState, platform_default_fallbacks};
 use crate::terminal::mappings::colors::TerminalPalette;
 use crate::terminal::terminal::{IndexedCell, Terminal, TerminalBounds};
 use crate::terminal_view::box_drawing;
+use crate::terminal_view::powerline;
 use crate::terminal_view::terminal_view::TerminalView;
 use crate::theme::{ActiveTheme, TerminalTheme};
 #[cfg(test)]
@@ -49,6 +50,18 @@ fn cursor_thickness(cell_width: Pixels) -> Pixels {
     px((cell_width.as_f32() * CURSOR_THICKNESS_RATIO)
         .round()
         .max(1.0))
+}
+
+/// 该字符是否由内置图元绘制（不进字体光栅化批次）。
+///
+/// 两类字符共同点：字形必须与单元格几何**严格对齐**，字体光栅化的尺寸/
+/// 基线与 cell 无关，行高一变就错位。
+/// - 盒绘制 / 块元素（U+2500–U+259F）：相邻单元格线条要严丝合缝；
+/// - Powerline 分隔符（U+E0B0–U+E0B7）：满格形状，行高大于字形设计高度时
+///   上下留缝（提示符分段边界的「毛刺」）。
+#[inline]
+fn is_builtin_glyph(c: char) -> bool {
+    box_drawing::is_box_drawing_char(c) || powerline::is_powerline_char(c)
 }
 
 /// `DEEPTERM_DISABLE_KITTY` is a process-lifetime diagnostic switch; reading
@@ -248,7 +261,7 @@ pub struct RowRenderCache {
     pub layout: Option<RowLayoutEntry>,
     /// 选区高亮，直接以合并后的 span 形式存储（一次 quad 一个连续段）。
     pub selection_spans: Option<Vec<BackgroundSpan>>,
-    pub box_cells: Option<Vec<BoxDrawingCell>>,
+    pub builtin_cells: Option<Vec<BuiltinGlyphCell>>,
     pub background_spans: Option<Vec<BackgroundSpan>>,
     /// Last hovered URL column range used to build `layout`. When this changes,
     /// the cached layout must be invalidated so underline styles are recomputed.
@@ -266,8 +279,8 @@ pub struct RowRenderCache {
 /// 把缓存里记录的绝对行号改成当前遍历行号。
 ///
 /// 滚动复用会把某一行的缓存整体平移到另一个视口下标；`BackgroundSpan` /
-/// `BoxDrawingCell` / 选区 span 里的 `row` 只用于一致性校验和光标例外判断，
-/// 平移后必须重标，否则校验/光标会认错行。
+/// `BuiltinGlyphCell` / 选区 span 里的 `row` 只用于一致性校验和光标例外
+/// 判断，平移后必须重标，否则校验/光标会认错行。
 fn retarget_row_cache(cache: &mut RowRenderCache, row: usize) {
     if let Some(spans) = cache.background_spans.as_mut() {
         for span in spans {
@@ -279,7 +292,7 @@ fn retarget_row_cache(cache: &mut RowRenderCache, row: usize) {
             span.row = row;
         }
     }
-    if let Some(cells) = cache.box_cells.as_mut() {
+    if let Some(cells) = cache.builtin_cells.as_mut() {
         for cell in cells {
             cell.row = row;
         }
@@ -320,20 +333,33 @@ fn rotate_row_caches(
     caches
 }
 
-/// 盒子绘制字符 / 块元素单元格。
+/// 内置字形单元格：由本仓库自绘图元渲染、不走字体光栅化的字符。
 ///
-/// 对于 U+2500–U+259F 范围内的字符，不走字体光栅化流程，
-/// 而是在 `paint` 阶段用 GPUI 矩形图元直接绘制，
-/// 以保证相邻单元格的线条精确对齐（不受字体字形影响）。
+/// 目前两类，共用一个缓存管线（同一行内按列排序，行缓存/滚动平移/增量
+/// 更新/一致性校验都只有一份）：
+/// - 盒绘制 / 块元素（U+2500–U+259F）：相邻单元格的线条必须精确对齐；
+/// - Powerline 分隔符（U+E0B0–U+E0B7）：满格形状，行高大于字形设计高度时
+///   字体渲染会在分段边界留下缝隙（提示符的「毛刺」）。
 ///
 /// 注意：`row` 仅供行缓存一致校验比对（`assert_row_consistency`）；
 /// paint 阶段按行序遍历缓存，y 坐标取**遍历下标**而非此字段。
 #[derive(Clone, Debug, PartialEq)]
-pub struct BoxDrawingCell {
+pub struct BuiltinGlyphCell {
     pub col: usize,
     pub row: usize,
     pub c: char,
     pub color: Hsla, // 该字符的前景色（已处理 INVERSE 反色标志）
+}
+
+impl BuiltinGlyphCell {
+    /// 按字符所属的内置族选择绘制例程。
+    fn paint(&self, origin: Point<Pixels>, cell_w: Pixels, cell_h: Pixels, window: &mut Window) {
+        if powerline::is_powerline_char(self.c) {
+            powerline::paint_powerline(self.c, origin, cell_w, cell_h, self.color, window);
+        } else {
+            box_drawing::paint_box_drawing(self.c, origin, cell_w, cell_h, self.color, window);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -434,13 +460,13 @@ pub struct CursorLayout {
     shape: CursorShape,
     /// Shaped glyph painted over a Block cursor in the background color to
     /// produce the inverted look. `None` when the underlying cell is empty
-    /// or the char is handled by `block_box_drawing` below.
+    /// or the char is handled by `block_builtin_glyph` below.
     block_text: Option<gpui::ShapedLine>,
-    /// When the character under a Block cursor is a U+2500–U+259F box-drawing
-    /// character, we bypass the font rasterizer and re-draw the same glyph
-    /// using the inverted color via `box_drawing::paint_box_drawing`.
-    /// (char, cell_width) is enough to re-run the existing paint routine.
-    block_box_drawing: Option<(char, Hsla)>,
+    /// When the character under a Block cursor is a built-in glyph (box drawing
+    /// U+2500–U+259F, or a Powerline separator U+E0B0–U+E0B7), we bypass the
+    /// font rasterizer and re-draw the same shape using the inverted color.
+    /// Carrying the char is enough to re-run the matching paint routine.
+    block_builtin_glyph: Option<(char, Hsla)>,
 }
 
 impl CursorLayout {
@@ -453,7 +479,7 @@ impl CursorLayout {
         //
         // neovide 用 `clip_path` 做精确的平行四边形裁剪；GPUI 只有矩形
         // content mask，这里用四边形的包围盒近似（略宽松，不会漏画）。
-        if self.block_text.is_some() || self.block_box_drawing.is_some() {
+        if self.block_text.is_some() || self.block_builtin_glyph.is_some() {
             let clip = gpui::ContentMask {
                 bounds: self.quad.bounding_box(),
             };
@@ -470,19 +496,29 @@ impl CursorLayout {
                     );
                 }
 
-                // Paint inverted box-drawing glyph on top of a Block cursor.
-                // `block_width` may be wider than `cell_width` for wide chars, but
-                // box-drawing characters are never wide (U+2500–U+259F); use the
-                // cell_width implicit from `block_width` when it equals 1 cell.
-                if let Some((ch, color)) = self.block_box_drawing {
-                    box_drawing::paint_box_drawing(
-                        ch,
-                        self.destination,
-                        self.settled_width,
-                        self.settled_height,
-                        color,
-                        window,
-                    );
+                // Paint inverted built-in glyph on top of a Block cursor.
+                // These chars are never wide (box drawing / Powerline PUA), so
+                // `settled_width` equals one cell width.
+                if let Some((ch, color)) = self.block_builtin_glyph {
+                    if powerline::is_powerline_char(ch) {
+                        powerline::paint_powerline(
+                            ch,
+                            self.destination,
+                            self.settled_width,
+                            self.settled_height,
+                            color,
+                            window,
+                        );
+                    } else {
+                        box_drawing::paint_box_drawing(
+                            ch,
+                            self.destination,
+                            self.settled_width,
+                            self.settled_height,
+                            color,
+                            window,
+                        );
+                    }
                 }
             });
         }
@@ -730,7 +766,7 @@ struct RowCtx<'a> {
 struct CachedRowForCheck<'a> {
     cells: &'a [IndexedCell],
     runs: &'a [BatchedTextRun],
-    boxes: &'a [BoxDrawingCell],
+    boxes: &'a [BuiltinGlyphCell],
     backgrounds: &'a [BackgroundSpan],
     selection_spans: &'a [BackgroundSpan],
     selection_range: &'a Option<SelectionRange>,
@@ -845,7 +881,7 @@ impl TerminalElement {
         } = *cached;
         let full_entry = Self::layout_row(row_cells.iter(), None, window, ctx);
         let full_boxes =
-            Self::box_cells_for_row(row_idx, row_cells, ctx.terminal_theme, ctx.palette);
+            Self::builtin_glyph_cells_for_row(row_idx, row_cells, ctx.terminal_theme, ctx.palette);
         let full_backgrounds =
             Self::background_spans_for_row(row_idx, row_cells, ctx.terminal_theme, ctx.palette);
         let full_selection_spans = selection_spans_for_row(row_idx, row_cells, selection_range);
@@ -854,7 +890,7 @@ impl TerminalElement {
             log::warn!("row {row_idx} run mismatch");
         }
         if row_boxes != full_boxes.as_slice() {
-            log::warn!("row {row_idx} box mismatch");
+            log::warn!("row {row_idx} builtin glyph mismatch");
         }
         if row_backgrounds != full_backgrounds.as_slice() {
             log::warn!("row {row_idx} background mismatch");
@@ -909,13 +945,13 @@ impl TerminalElement {
                 .map(|(start, end)| col >= start && col < end)
                 .unwrap_or(false);
 
-            // 空格/制表/方框绘制字符不进文字批次。Unicode 占位符
+            // 空格/制表/内置字形不进文字批次。Unicode 占位符
             // （U+10EEEE）也走这一支：它本身不该被当作字画出来，图案由
             // Kitty 图像在上面覆盖（见 prepaint 里的 `plan_placeholders`）。
             if ch == '\0'
                 || ch == ' '
                 || ch == crate::terminal::kitty::unicode::PLACEHOLDER
-                || box_drawing::is_box_drawing_char(ch)
+                || is_builtin_glyph(ch)
             {
                 Self::flush_text_batch(
                     &mut batched_runs,
@@ -1047,18 +1083,18 @@ impl TerminalElement {
         }
     }
 
-    fn box_cell_for_cell(
+    fn builtin_glyph_cell(
         row_idx: usize,
         cell: &IndexedCell,
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
-    ) -> Option<BoxDrawingCell> {
+    ) -> Option<BuiltinGlyphCell> {
         let ch = cell.cell.c;
-        if !box_drawing::is_box_drawing_char(ch) {
+        if !is_builtin_glyph(ch) {
             return None;
         }
         let (fg, _) = rendered_cell_colors(&cell.cell);
-        Some(BoxDrawingCell {
+        Some(BuiltinGlyphCell {
             col: cell.point.column.0,
             row: row_idx,
             c: ch,
@@ -1221,32 +1257,33 @@ impl TerminalElement {
         backgrounds
     }
 
-    fn box_cells_for_row(
+    fn builtin_glyph_cells_for_row(
         row_idx: usize,
         cells: &[IndexedCell],
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
-    ) -> Vec<BoxDrawingCell> {
-        let mut box_cells = Vec::new();
+    ) -> Vec<BuiltinGlyphCell> {
+        let mut builtin_cells = Vec::new();
         for cell in cells {
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            if let Some(builtin_cell) =
+                Self::builtin_glyph_cell(row_idx, cell, terminal_theme, palette)
             {
-                box_cells.push(box_cell);
+                builtin_cells.push(builtin_cell);
             }
         }
-        box_cells
+        builtin_cells
     }
 
-    fn update_box_cells_in_range(
+    fn update_builtin_glyph_cells_in_range(
         row_idx: usize,
-        cached_box_cells: &[BoxDrawingCell],
+        cached_cells: &[BuiltinGlyphCell],
         cells: &[IndexedCell],
         range: (usize, usize),
         terminal_theme: &TerminalTheme,
         palette: &TerminalPalette,
-    ) -> Vec<BoxDrawingCell> {
+    ) -> Vec<BuiltinGlyphCell> {
         let (left, right) = range;
-        let mut box_cells: Vec<BoxDrawingCell> = cached_box_cells
+        let mut builtin_cells: Vec<BuiltinGlyphCell> = cached_cells
             .iter()
             .filter(|cell| cell.col < left || cell.col > right)
             .cloned()
@@ -1257,14 +1294,15 @@ impl TerminalElement {
             if col < left || col > right {
                 continue;
             }
-            if let Some(box_cell) = Self::box_cell_for_cell(row_idx, cell, terminal_theme, palette)
+            if let Some(builtin_cell) =
+                Self::builtin_glyph_cell(row_idx, cell, terminal_theme, palette)
             {
-                box_cells.push(box_cell);
+                builtin_cells.push(builtin_cell);
             }
         }
 
-        box_cells.sort_by_key(|cell| cell.col);
-        box_cells
+        builtin_cells.sort_by_key(|cell| cell.col);
+        builtin_cells
     }
 
     /// 增量重算脏区间的文本 run 与自绘下划线装饰。
@@ -1895,31 +1933,42 @@ impl Element for TerminalElement {
                 }
             }
 
-            if row_cache.box_cells.is_none() {
-                let row_boxes =
-                    Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette);
-                row_cache.box_cells = Some(row_boxes);
+            if row_cache.builtin_cells.is_none() {
+                let row_cells_builtin = Self::builtin_glyph_cells_for_row(
+                    row_idx,
+                    row_cells,
+                    &terminal_theme,
+                    &palette,
+                );
+                row_cache.builtin_cells = Some(row_cells_builtin);
             } else if is_dirty {
                 if let Some(range) = dirty_row_bounds.get(row_idx).copied().flatten() {
                     // 关键防御：缓存理论上为 Some，异常时全量重算而非 panic。
-                    let row_boxes = match row_cache.box_cells.as_ref() {
-                        Some(cached_row_boxes) => Self::update_box_cells_in_range(
+                    let row_cells_builtin = match row_cache.builtin_cells.as_ref() {
+                        Some(cached_cells) => Self::update_builtin_glyph_cells_in_range(
                             row_idx,
-                            cached_row_boxes,
+                            cached_cells,
                             row_cells,
                             range,
                             &terminal_theme,
                             &palette,
                         ),
-                        None => {
-                            Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette)
-                        }
+                        None => Self::builtin_glyph_cells_for_row(
+                            row_idx,
+                            row_cells,
+                            &terminal_theme,
+                            &palette,
+                        ),
                     };
-                    row_cache.box_cells = Some(row_boxes);
+                    row_cache.builtin_cells = Some(row_cells_builtin);
                 } else {
-                    let row_boxes =
-                        Self::box_cells_for_row(row_idx, row_cells, &terminal_theme, &palette);
-                    row_cache.box_cells = Some(row_boxes);
+                    let row_cells_builtin = Self::builtin_glyph_cells_for_row(
+                        row_idx,
+                        row_cells,
+                        &terminal_theme,
+                        &palette,
+                    );
+                    row_cache.builtin_cells = Some(row_cells_builtin);
                 }
             }
 
@@ -1976,7 +2025,7 @@ impl Element for TerminalElement {
                     Some(row_selection_spans),
                 ) = (
                     row_cache.layout.as_ref(),
-                    row_cache.box_cells.as_ref(),
+                    row_cache.builtin_cells.as_ref(),
                     row_cache.background_spans.as_ref(),
                     row_cache.selection_spans.as_ref(),
                 ) {
@@ -2249,9 +2298,9 @@ impl Element for TerminalElement {
                 // 做同样的裁剪，字符不会溢出、也不会在动画中消失。
                 let settled_width = px(target.cell.0);
                 let settled_height = px(target.cell.1);
-                let (block_text, block_box_drawing) =
+                let (block_text, block_builtin_glyph) =
                     if matches!(overlay_cursor_shape, CursorShape::Block) {
-                        if box_drawing::is_box_drawing_char(cursor_char) {
+                        if is_builtin_glyph(cursor_char) {
                             (None, Some((cursor_char, block_text_color)))
                         } else if cursor_char != '\0' && cursor_char != ' ' {
                             let char_str = cursor_char.to_string();
@@ -2284,7 +2333,7 @@ impl Element for TerminalElement {
                     color: cursor_color,
                     shape: overlay_cursor_shape,
                     block_text,
-                    block_box_drawing,
+                    block_builtin_glyph,
                 })
             }
             _ => None,
@@ -2460,7 +2509,7 @@ impl Element for TerminalElement {
         // redraw that single cell inverted. It is loop-invariant.
         let skip_cursor_box = cursor
             .as_ref()
-            .map(|c| c.block_box_drawing.is_some())
+            .map(|c| c.block_builtin_glyph.is_some())
             .unwrap_or(false);
         for (row_idx, row_cache) in row_caches.iter().enumerate() {
             // Cell background spans are painted *under* the selection so that a
@@ -2530,12 +2579,12 @@ impl Element for TerminalElement {
                 }
             }
 
-            // 绘制内置盒子绘制字符 / 块元素。
+            // 绘制内置字形（盒绘制 / 块元素 / Powerline 分隔符）。
             // 这些字符在 layout_row 阶段已从文本批次中分离出来，
-            // 此处用 GPUI 矩形图元（paint_quad）按单元格坐标精确绘制，
-            // 效果等同于 Alacritty 的 builtin_box_drawing = true。
-            if let Some(box_cells) = row_cache.box_cells.as_ref() {
-                for cell in box_cells {
+            // 此处按单元格几何精确绘制，不受字体字形与基线的影响：
+            // 行高变化时线条/色块都不会与背景块错位。
+            if let Some(builtin_cells) = row_cache.builtin_cells.as_ref() {
+                for cell in builtin_cells {
                     if skip_cursor_box && cell.col == *cursor_col && cell.row == row_idx {
                         continue;
                     }
@@ -2543,20 +2592,13 @@ impl Element for TerminalElement {
                         origin.x + *cell_width * cell.col as f32,
                         origin.y + *line_height * row_idx as f32,
                     );
-                    box_drawing::paint_box_drawing(
-                        cell.c,
-                        cell_origin,
-                        *cell_width,
-                        *line_height,
-                        cell.color,
-                        window,
-                    );
+                    cell.paint(cell_origin, *cell_width, *line_height, window);
                 }
             }
         }
 
         // 行缓存用完归还给视图（行缓存里 `row` 字段在 O2 遍历下已不参与
-        // 定位，见 `BoxDrawingCell` 注释；span 行号取遍历下标）。
+        // 定位，见 `BuiltinGlyphCell` 注释；span 行号取遍历下标）。
         let mut row_caches = std::mem::take(row_caches);
         self.view.update(cx, |view, _cx| {
             view.row_render_cache = std::mem::take(&mut row_caches);
@@ -3455,6 +3497,103 @@ mod tests {
         assert!(
             (block_h - beam_h).abs() < 0.5,
             "beam 高度应与 block 相同: {beam_h} vs {block_h}"
+        );
+    }
+
+    // ── 内置字形管线（Powerline 分隔符） ──────────────────────────────────
+
+    /// 端到端：Powerline 分隔符必须从文本批次里剔除、改由内置图元绘制。
+    ///
+    /// 这正是毛刺的根因——行高可调，而字体字形的高度固定在设计值；只要分隔符
+    /// 还走字体光栅化，cell 与字形之间就永远有缝。这里断言管线分流：分隔符
+    /// 进 `builtin_cells`，同行的普通文字仍在 `layout.runs` 里。
+    #[gpui::test]
+    fn powerline_separators_bypass_text_layout(cx: &mut gpui::TestAppContext) {
+        use crate::terminal::terminal::Terminal;
+        use crate::terminal_view::TerminalView;
+        use gpui::AppContext as _;
+
+        struct Host {
+            view: gpui::Entity<TerminalView>,
+            terminal: gpui::Entity<Terminal>,
+        }
+        impl gpui::Render for Host {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                _: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+            }
+        }
+
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let (host, cx) = cx.add_window_view(|_window, cx| {
+            let terminal = Terminal::new_headless(cx, 1_000);
+            // 一段典型的 Starship 提示符：段在 \ue0b0 处分隔，尾部是圆帽。
+            terminal.update(cx, |terminal, cx| {
+                terminal.handle_remote_data(b"ab\xee\x82\xb0cd\xee\x82\xb4", cx);
+            });
+            let view = cx.new(|cx| TerminalView::build_headless(cx, terminal.clone()));
+            Host { view, terminal }
+        });
+
+        let (view_handle, terminal) =
+            host.read_with(cx, |h, _| (h.view.clone(), h.terminal.clone()));
+        let focus_handle = view_handle.read_with(cx, |v, _| v.focus_handle_for_test());
+        let bounds = size(px(800.0), px(600.0));
+
+        cx.draw(point(px(0.0), px(0.0)), bounds, {
+            let terminal = terminal.clone();
+            let focus_handle = focus_handle.clone();
+            let view = view_handle.clone();
+            move |_, _| TerminalElement::new(terminal, focus_handle, true, 1.0, view)
+        });
+
+        // 行缓存在 paint 结束时归还给 view（prepaint 里的那份会被 `mem::take`），
+        // 所以这里从 view 读。
+        let (builtin_cells, runs, foreground) = view_handle.read_with(cx, |view, cx| {
+            let row = view.row_render_cache.first().expect("首行缓存应存在");
+            let builtin: Vec<(usize, char, Hsla)> = row
+                .builtin_cells
+                .as_ref()
+                .expect("首行应产出内置字形单元格")
+                .iter()
+                .map(|cell| (cell.col, cell.c, cell.color))
+                .collect();
+            let runs: Vec<String> = row
+                .layout
+                .as_ref()
+                .expect("首行应有文本布局")
+                .runs
+                .iter()
+                .map(|run| run.shaped_line.text.to_string())
+                .collect();
+            (builtin, runs, cx.theme().terminal.foreground)
+        });
+
+        // 第 2 列是 \ue0b0（右三角），第 5 列是 \ue0b4（右圆帽）。
+        let glyph_cols: Vec<(usize, char)> =
+            builtin_cells.iter().map(|(col, c, _)| (*col, *c)).collect();
+        assert_eq!(
+            glyph_cols,
+            vec![(2, '\u{E0B0}'), (5, '\u{E0B4}')],
+            "分隔符应全部进内置字形管线"
+        );
+
+        // 同一行的普通文字必须留在文本批次里，且不包含任何 PUA 分隔符。
+        assert_eq!(runs, vec!["ab", "cd"], "文字批次里不应残留分隔符");
+
+        // 分隔符的颜色取 cell 前景色，两者都应是默认前景（未上色）。
+        assert!(
+            builtin_cells
+                .iter()
+                .all(|(_, _, color)| *color == foreground),
+            "分隔符颜色应取 cell 前景色"
         );
     }
 }
