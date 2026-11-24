@@ -112,8 +112,8 @@ const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
 const EDITOR_TAB_HEIGHT_PX: f32 = 26.0;
 /// 标签间距；分隔竖线画在间距正中。
 const EDITOR_TAB_GAP_PX: f32 = 4.0;
-/// 标签圆角。
-const TAB_RADIUS_PX: f32 = 8.0;
+/// 标签圆角：与终端标签同款胶囊。26 高配 13 圆角，左右两端是完整的半圆。
+const EDITOR_TAB_RADIUS_PX: f32 = 13.0;
 /// 标签最小 / 最大宽度：宽度贴合文件名，太长时截短。
 const EDITOR_TAB_MIN_WIDTH_PX: f32 = 80.0;
 const EDITOR_TAB_MAX_WIDTH_PX: f32 = 180.0;
@@ -1562,6 +1562,10 @@ impl TabBar {
         let on_panel_drop = self.on_panel_drop.clone();
         let panel_drop_preview = self.panel_drop_preview.clone();
         let theme = cx.theme().ui;
+        // 当前标签的胶囊底色直接取终端标签那一套（`tray.selected` /
+        // `tray.selected_edge`）：两处标签栏因此永远是同一块颜色，不靠
+        // 两套主题令牌各自漂移。
+        let tray = Self::tray_colors(theme);
         let dragged_id = self
             .reorder_preview
             .as_ref()
@@ -1589,7 +1593,7 @@ impl TabBar {
                     self.hovered_tab_id.as_ref(),
                     dragged_id.as_ref(),
                 );
-                children.push(self.render_tab(tab, index, show_divider, cx));
+                children.push(self.render_tab(tab, index, tray, show_divider, cx));
             }
         }
 
@@ -1676,15 +1680,16 @@ impl TabBar {
 
     /// 渲染单个编辑器标签（含重排补间动画包装）。
     ///
-    /// 视觉对齐 Winc 顶栏：当前标签是实心胶囊（`tab_active_background` +
-    /// 细边），未选中标签只在悬停时铺浅色；相邻的普通标签之间画一条短竖线，
-    /// 当前 / 悬停 / 拖动中的标签两侧不画（它们自己已经有底色，竖线会粘在
-    /// 底色上）。宽度贴合文件名，右端固定留出关闭槽，标签不会因为悬停而
-    /// 左右跳动。
+    /// 视觉对齐 Winc 顶栏：当前标签是与终端标签同款的实心胶囊
+    /// （`tray.selected` + `tray.selected_edge`，圆角 13），未选中标签只在
+    /// 悬停时铺浅色；相邻的普通标签之间画一条短竖线，当前 / 悬停 / 拖动中的
+    /// 标签两侧不画（它们自己已经有底色，竖线会粘在底色上）。宽度贴合文件名，
+    /// 右端固定留出关闭槽，标签不会因为悬停而左右跳动。
     fn render_tab(
         &self,
         tab: &TabItem,
         index: usize,
+        tray: TrayColors,
         show_divider: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1715,19 +1720,22 @@ impl TabBar {
             .flex()
             .flex_shrink_0()
             .items_center()
-            .rounded(px(TAB_RADIUS_PX))
+            .rounded(px(EDITOR_TAB_RADIUS_PX))
             .border_1()
             .border_color(if is_active {
-                theme.tab_active_border
+                tray.selected_edge
             } else {
                 theme.transparent()
             })
             .bg(if is_active {
-                theme.tab_active_background
+                tray.selected
             } else {
                 gpui::transparent_black()
             })
             .when(!is_active, move |this| {
+                // 悬停仍用主题的 hover 令牌：`tray.hover` 是相对**托盘底**
+                // 提亮的一档，而编辑器标签栏透明、底下是应用背景，直接搬
+                // 过来会与背景几乎同色（见 macos26-dark：两者只差 1% 明度）。
                 this.hover(move |style| style.bg(theme.tab_hover_background))
             })
             .when(show_divider, move |this| {
@@ -1774,6 +1782,7 @@ impl TabBar {
                 is_active,
                 is_hovered,
                 theme,
+                tray,
                 self.on_tab_close.clone(),
                 cx,
             ))
@@ -2019,6 +2028,7 @@ impl TabBar {
         is_active: bool,
         is_hovered: bool,
         theme: UiTheme,
+        tray: TrayColors,
         on_tab_close: OptionalTabCallback,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2055,7 +2065,7 @@ impl TabBar {
                 .items_center()
                 .justify_center()
                 .cursor_pointer()
-                .hover(move |style| style.bg(theme.tab_hover_background))
+                .hover(move |style| style.bg(tray.hover))
                 .child(
                     svg()
                         .size(px(EDITOR_TAB_CLOSE_GLYPH_PX))
@@ -3363,6 +3373,9 @@ mod tests {
         );
         // 26 的标签放进 30 高的标签栏，上下各留 2（见 `render_compact`）。
         assert_eq!(EDITOR_TAB_HEIGHT_PX + 2.0 * 2.0, 30.0);
+        // 胶囊与终端标签同款圆角；26 高配 13，两端正好是完整半圆。
+        assert_eq!(EDITOR_TAB_RADIUS_PX, TAB_RADIUS_TRAY_PX);
+        assert_eq!(EDITOR_TAB_RADIUS_PX, EDITOR_TAB_HEIGHT_PX / 2.0);
     }
 
     #[test]
@@ -3868,9 +3881,9 @@ mod tests {
         // 注意高度**恰好**等于旧胶囊的 30px（36 - 3×2 = 30）——这是巧合，
         // 不是"没有改动"：真正变的是圆角、方块、两段文字与底色。
         assert_eq!(TRAY_TAB_HEIGHT_PX, TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0);
-        assert_ne!(
-            TAB_RADIUS_TRAY_PX, TAB_RADIUS_PX,
-            "托盘标签圆角不再复用旧胶囊的 8px"
+        assert_eq!(
+            TAB_RADIUS_TRAY_PX, EDITOR_TAB_RADIUS_PX,
+            "编辑器当前标签与终端标签共用同款胶囊圆角"
         );
 
         // 预览保留程序方块：插进标签栏后显示什么，拖动中就显示什么。

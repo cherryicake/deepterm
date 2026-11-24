@@ -1532,7 +1532,8 @@ impl AppWindow {
         // 两个源共用一个动画元素（key = title_pad_epoch），翻转时从「上一目标」滑向「新目标」。
         // 编辑器的 tab 栏左内边距同步驱动：侧边栏显隐时与侧边栏宽度动画同时长/同缓动，
         // 保证 tab 标签随编辑器整体平滑移动而不是先瞬时弹开再滑回。
-        let tab_pad_open = 6.0;
+        // 打开态与标签栏顶部留白一致（2px），左右边界不再比上下更宽。
+        let tab_pad_open = 2.0;
         let tab_pad_closed = if cfg!(target_os = "macos") && !is_fullscreen {
             124.0
         } else if cfg!(target_os = "macos") {

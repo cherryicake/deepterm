@@ -880,8 +880,8 @@ impl Editor {
             app_window: None,
             window_handle: Some(_window.window_handle()),
             tab_bar_pad_epoch: 0,
-            tab_bar_pad_start: 6.0,
-            tab_bar_pad_end: 6.0,
+            tab_bar_pad_start: 2.0,
+            tab_bar_pad_end: 2.0,
             tab_bar_pad_duration_ms: 0,
             open_anim_epoch: 0,
             panel_anim_epoch: 0,
@@ -7700,7 +7700,7 @@ impl Render for Editor {
                 .child(inner)
                 .into_any_element()
         } else {
-            let base = div().h(px(30.0)).w_full().px(px(6.0)).child(inner);
+            let base = div().h(px(30.0)).w_full().px(px(2.0)).child(inner);
             let epoch = self.tab_bar_pad_epoch;
             let start = self.tab_bar_pad_start;
             let end = self.tab_bar_pad_end;
@@ -10167,7 +10167,7 @@ mod tests {
             e.panel_anim_ms = 300;
             e.tab_bar_pad_epoch = 5;
             e.tab_bar_pad_start = 124.0;
-            e.tab_bar_pad_end = 6.0;
+            e.tab_bar_pad_end = 2.0;
             e.tab_bar_pad_duration_ms = 300;
         });
 
