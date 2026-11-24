@@ -9,6 +9,18 @@ use crate::file_manager::filesystem::{FileSystem, LocalFileSystem, RemoteFileSys
 use crate::sidebar_view::file_tree::SidebarFileTree;
 use crate::ssh::SshConnectionConfig;
 
+/// 一次「打开路径」请求的载荷（来自终端 Cmd+Click、搜索跳转等）。
+pub(crate) struct OpenPathRequest {
+    pub path: String,
+    /// 行（1-based），来自 `path:line:col` 形式。
+    pub line: Option<u32>,
+    /// 列（1-based）。
+    pub col: Option<u32>,
+    pub ssh_config: Option<SshConnectionConfig>,
+    /// 发起方的终端 cwd：用于决定文件树要不要跟着切根。
+    pub terminal_cwd: Option<String>,
+}
+
 /// Open a terminal-clicked path.
 ///
 /// 不变式：文件树 root 恒等于发起终端的工作目录（`terminal_cwd`）。
@@ -20,14 +32,17 @@ use crate::ssh::SshConnectionConfig;
 pub(crate) fn handle_open_path(
     editor: Entity<Editor>,
     sidebar: Entity<MacosSidebar>,
-    path: String,
-    line: Option<u32>,
-    col: Option<u32>,
-    ssh_config: Option<SshConnectionConfig>,
-    terminal_cwd: Option<String>,
+    request: OpenPathRequest,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let OpenPathRequest {
+        path,
+        line,
+        col,
+        ssh_config,
+        terminal_cwd,
+    } = request;
     if let Some(ssh_config) = ssh_config {
         let backend = Arc::new(RemoteFileSystem::new(ssh_config.clone())) as Arc<dyn FileSystem>;
         let remote_path = PathBuf::from(&path);

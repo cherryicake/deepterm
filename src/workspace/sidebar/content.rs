@@ -203,12 +203,14 @@ impl MacosSidebar {
             .child(self.render_tab_group_row(
                 cx,
                 theme,
-                DEFAULT_TAB_GROUP_ID.to_string(),
-                default_label,
-                self.default_tab_group_collapsed,
-                None,
-                false,
-                Icon::Macbook,
+                super::tab_groups::TabGroupRow {
+                    group_id: DEFAULT_TAB_GROUP_ID.to_string(),
+                    label: default_label,
+                    collapsed: self.default_tab_group_collapsed,
+                    editing_input: None,
+                    show_more_action: false,
+                    icon: Icon::Macbook,
+                },
             ))
             .child(Self::render_collapsible_content(
                 self.render_tab_group_tabs(DEFAULT_TAB_GROUP_ID, &default_tabs, theme, cx),

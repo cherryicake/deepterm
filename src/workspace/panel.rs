@@ -990,7 +990,7 @@ impl Panel {
                     // 旧模式只在用户曾显式选择过时恢复。持久守护进程不可用
                     // 时退回进程内 SSH 仍是同一传输语义，因此允许；但必须
                     // 继续打上 legacy 标记，否则下次保存会悄悄切回远端 core。
-                    let view = TerminalView::new_persistent_legacy_ssh(
+                    TerminalView::new_persistent_legacy_ssh(
                         cx,
                         &config,
                         remote_cwd.clone(),
@@ -1005,8 +1005,7 @@ impl Panel {
                             this.adopt_legacy_ssh_session(config.clone(), remote_cwd.clone());
                         });
                         view
-                    });
-                    view
+                    })
                 } else {
                     // 默认路径失败必须可见地失败，不能静默启动旧 SSH：
                     // 那会让用户误以为远端任务仍由远端 core 保活。

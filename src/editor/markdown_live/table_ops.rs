@@ -417,6 +417,8 @@ pub fn insert_column(model: &mut EditorModel, before: bool) -> bool {
     };
     let at = if before { col } else { col + 1 };
     let mut edits: Vec<(usize, String)> = Vec::new();
+    // 行号要随编辑一起记录（`edits` 的第二列是行下标），因此这里保留索引循环。
+    #[allow(clippy::needless_range_loop)]
     for i in block.0..=block.1 {
         let line = &lines[i];
         // 分隔行用 `----`（Typora 的最小宽度），数据/表头行为空。
@@ -1063,6 +1065,8 @@ pub fn merge_cross_cell_selection(model: &mut EditorModel, typed: &str) -> bool 
     //  - 同行跨格：首尾之间清空（含尾格），首格写合并文本。
     let mut edits: Vec<(usize, String)> = Vec::new();
     let delim = delimiter_row(&lines, block);
+    // 行号参与 `Some(l) == delim` 判定与 `edits` 记录，不能退化成纯迭代。
+    #[allow(clippy::needless_range_loop)]
     for l in start.line..=end.line {
         // 分隔行是结构不是数据行：不参与合并/清空。
         if Some(l) == delim {

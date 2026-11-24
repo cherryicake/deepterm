@@ -1225,7 +1225,7 @@ mod tests {
         );
         // 后台补探才是允许落缓存的路径：探完 chip 那边就能从占位转成
         // 确定答案（这里是「确定没有」）。
-        probe_commands_pending(&[name.clone()], None);
+        probe_commands_pending(std::slice::from_ref(&name), None);
         assert_eq!(command_availability_cached(&name, None), Some(false));
     }
 }

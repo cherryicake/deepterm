@@ -74,6 +74,7 @@ pub fn runtime_dir() -> PathBuf {
             .map(|dir| dir.join(SOCKET_FILE_NAME).to_string_lossy().len())
             .unwrap_or_else(|_| would_be.to_string_lossy().len());
         if resolved_len > MAX_SOCKET_PATH {
+            // SAFETY: `getuid` 无参数、无副作用，任何线程调用都安全。
             let uid = unsafe { libc::getuid() };
             let short = PathBuf::from(format!("/tmp/deepterm-{uid}"));
             log::warn!(
@@ -112,6 +113,7 @@ pub fn verify_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
             format!("{} 不是安全的目录（软链或非目录）", dir.display()),
         ));
     }
+    // SAFETY: `getuid` 无参数、无副作用，任何线程调用都安全（只读内核凭证表）。
     let uid = unsafe { libc::getuid() };
     if metadata.uid() != uid {
         return Err(std::io::Error::new(
@@ -450,7 +452,7 @@ impl RuntimeDirGuard {
     pub fn new(dir: impl AsRef<std::path::Path>) -> Self {
         let lock = env_lock();
         let previous = std::env::var_os(RUNTIME_DIR_ENV);
-        // SAFETY：调用方持有 `env_lock()`，本进程内没有别人同时改这个变量。
+        // SAFETY:调用方持有 `env_lock()`，本进程内没有别人同时改这个变量。
         unsafe { std::env::set_var(RUNTIME_DIR_ENV, dir.as_ref()) };
         Self {
             previous,
@@ -462,7 +464,7 @@ impl RuntimeDirGuard {
 #[cfg(test)]
 impl Drop for RuntimeDirGuard {
     fn drop(&mut self) {
-        // SAFETY：仍持有 `env_lock()`。
+        // SAFETY:仍持有 `env_lock()`。
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(RUNTIME_DIR_ENV, value),
@@ -490,7 +492,7 @@ impl EnvGuard {
     pub fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
         let lock = env_lock();
         let previous = std::env::var_os(name);
-        // SAFETY：调用方持有 `env_lock()`。
+        // SAFETY:调用方持有 `env_lock()`。
         unsafe { std::env::set_var(name, value.as_ref()) };
         Self {
             name,
@@ -521,7 +523,7 @@ impl IsolatedTestEnv {
         let lock = env_lock();
         let previous_daemon = std::env::var_os(client::DAEMON_ENV);
         let previous_dir = std::env::var_os(RUNTIME_DIR_ENV);
-        // SAFETY：持有 `env_lock()`，本进程内没有别人同时改这两个变量。
+        // SAFETY:持有 `env_lock()`，本进程内没有别人同时改这两个变量。
         unsafe {
             std::env::set_var(RUNTIME_DIR_ENV, dir.as_ref());
             std::env::set_var(client::DAEMON_ENV, "/nonexistent/deepcore-for-tests");
@@ -538,7 +540,7 @@ impl IsolatedTestEnv {
 #[cfg(test)]
 impl Drop for IsolatedTestEnv {
     fn drop(&mut self) {
-        // SAFETY：仍持有 `_lock`。
+        // SAFETY:仍持有 `_lock`。
         unsafe {
             match self.previous_dir.take() {
                 Some(value) => std::env::set_var(RUNTIME_DIR_ENV, value),
@@ -555,7 +557,7 @@ impl Drop for IsolatedTestEnv {
 #[cfg(test)]
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY：仍持有 `_lock`。
+        // SAFETY:仍持有 `_lock`。
         unsafe {
             match self.previous.take() {
                 Some(value) => std::env::set_var(self.name, value),

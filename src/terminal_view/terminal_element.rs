@@ -709,6 +709,33 @@ pub struct TerminalElement {
     view: Entity<TerminalView>,
 }
 
+/// 单行布局所需的渲染上下文（字体、主题、调色板）。
+///
+/// 每帧对每个可见行都要用同一份；打包成一个结构体让 `layout_row` 与调试断言
+/// 的签名从 7~13 个参数降到可读的规模，也避免同一批参数在四处调用点重复罗列。
+#[derive(Clone, Copy)]
+struct RowCtx<'a> {
+    text_style: &'a TextStyle,
+    font_size: Pixels,
+    cell_width: Pixels,
+    terminal_theme: &'a TerminalTheme,
+    palette: &'a TerminalPalette,
+}
+
+/// 调试一致校验要重算的「本行缓存结果」。
+///
+/// 一次性把五行产物打包借用，避免 `assert_row_consistency` 罗列七八个切片参数
+/// ——它只在 `debug_assertions` 下存在，但签名可读性同样重要。
+#[cfg(debug_assertions)]
+struct CachedRowForCheck<'a> {
+    cells: &'a [IndexedCell],
+    runs: &'a [BatchedTextRun],
+    boxes: &'a [BoxDrawingCell],
+    backgrounds: &'a [BackgroundSpan],
+    selection_spans: &'a [BackgroundSpan],
+    selection_range: &'a Option<SelectionRange>,
+}
+
 impl TerminalElement {
     fn flush_text_batch(
         batched_runs: &mut Vec<BatchedTextRun>,
@@ -804,32 +831,23 @@ impl TerminalElement {
     #[cfg(debug_assertions)]
     fn assert_row_consistency(
         row_idx: usize,
-        row_cells: &[IndexedCell],
-        row_runs: &[BatchedTextRun],
-        row_boxes: &[BoxDrawingCell],
-        row_backgrounds: &[BackgroundSpan],
-        row_selection_spans: &[BackgroundSpan],
+        cached: &CachedRowForCheck<'_>,
         window: &mut Window,
-        text_style: &TextStyle,
-        font_size: Pixels,
-        cell_width: Pixels,
-        terminal_theme: &TerminalTheme,
-        palette: &TerminalPalette,
-        selection_range: &Option<SelectionRange>,
+        ctx: RowCtx<'_>,
     ) {
-        let full_entry = Self::layout_row(
-            row_cells.iter(),
-            None,
-            window,
-            text_style,
-            font_size,
-            cell_width,
-            terminal_theme,
-            palette,
-        );
-        let full_boxes = Self::box_cells_for_row(row_idx, row_cells, terminal_theme, palette);
+        let CachedRowForCheck {
+            cells: row_cells,
+            runs: row_runs,
+            boxes: row_boxes,
+            backgrounds: row_backgrounds,
+            selection_spans: row_selection_spans,
+            selection_range,
+        } = *cached;
+        let full_entry = Self::layout_row(row_cells.iter(), None, window, ctx);
+        let full_boxes =
+            Self::box_cells_for_row(row_idx, row_cells, ctx.terminal_theme, ctx.palette);
         let full_backgrounds =
-            Self::background_spans_for_row(row_idx, row_cells, terminal_theme, palette);
+            Self::background_spans_for_row(row_idx, row_cells, ctx.terminal_theme, ctx.palette);
         let full_selection_spans = selection_spans_for_row(row_idx, row_cells, selection_range);
 
         if Self::run_signature(row_runs) != Self::run_signature(&full_entry.runs) {
@@ -867,12 +885,15 @@ impl TerminalElement {
         cells: impl IntoIterator<Item = &'a IndexedCell>,
         hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
-        text_style: &TextStyle,
-        font_size: Pixels,
-        cell_width: Pixels,
-        terminal_theme: &TerminalTheme,
-        palette: &TerminalPalette,
+        ctx: RowCtx<'_>,
     ) -> RowLayoutEntry {
+        let RowCtx {
+            text_style,
+            font_size,
+            cell_width,
+            terminal_theme,
+            palette,
+        } = ctx;
         let mut batched_runs: Vec<BatchedTextRun> = Vec::new();
         let mut current_batch: Option<(usize, String, TextRun, usize)> = None;
         // Style key of the cell that started `current_batch`. Kept in sync so
@@ -1258,12 +1279,15 @@ impl TerminalElement {
         range: (usize, usize),
         hovered_url_cols: Option<(usize, usize)>,
         window: &mut Window,
-        text_style: &TextStyle,
-        font_size: Pixels,
-        cell_width: Pixels,
-        terminal_theme: &TerminalTheme,
-        palette: &TerminalPalette,
+        ctx: RowCtx<'_>,
     ) -> Option<(usize, usize, Vec<BatchedTextRun>, Vec<DecorationSpan>)> {
+        let RowCtx {
+            text_style,
+            font_size,
+            cell_width,
+            terminal_theme,
+            palette,
+        } = ctx;
         // `cached_runs` is emitted in cell order and kept sorted by `start_col`
         // by every merge below, so the connected segment around the dirty
         // range can be found with two monotonic cursors. The previous
@@ -1326,11 +1350,13 @@ impl TerminalElement {
             dirty_cells,
             hovered_url_cols,
             window,
-            text_style,
-            font_size,
-            cell_width,
-            terminal_theme,
-            palette,
+            RowCtx {
+                text_style,
+                font_size,
+                cell_width,
+                terminal_theme,
+                palette,
+            },
         );
 
         // Reuse the untouched prefix/suffix instead of filtering every cached
@@ -1809,11 +1835,13 @@ impl Element for TerminalElement {
                             range,
                             hovered_url_cols,
                             window,
-                            &text_style,
-                            font_size,
-                            cell_width,
-                            &terminal_theme,
-                            &palette,
+                            RowCtx {
+                                text_style: &text_style,
+                                font_size,
+                                cell_width,
+                                terminal_theme: &terminal_theme,
+                                palette: &palette,
+                            },
                         )
                     {
                         partial_run_update_count += 1;
@@ -1832,11 +1860,13 @@ impl Element for TerminalElement {
                             row_cells.iter(),
                             hovered_url_cols,
                             window,
-                            &text_style,
-                            font_size,
-                            cell_width,
-                            &terminal_theme,
-                            &palette,
+                            RowCtx {
+                                text_style: &text_style,
+                                font_size,
+                                cell_width,
+                                terminal_theme: &terminal_theme,
+                                palette: &palette,
+                            },
                         )
                     }
                 } else {
@@ -1844,11 +1874,13 @@ impl Element for TerminalElement {
                         row_cells.iter(),
                         hovered_url_cols,
                         window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                        &palette,
+                        RowCtx {
+                            text_style: &text_style,
+                            font_size,
+                            cell_width,
+                            terminal_theme: &terminal_theme,
+                            palette: &palette,
+                        },
                     )
                 };
                 row_cache.layout = Some(entry);
@@ -1950,18 +1982,22 @@ impl Element for TerminalElement {
                 ) {
                     Self::assert_row_consistency(
                         row_idx,
-                        row_cells,
-                        &layout.runs,
-                        row_boxes,
-                        row_backgrounds,
-                        row_selection_spans,
+                        &CachedRowForCheck {
+                            cells: row_cells,
+                            runs: &layout.runs,
+                            boxes: row_boxes,
+                            backgrounds: row_backgrounds,
+                            selection_spans: row_selection_spans,
+                            selection_range: &selection_range,
+                        },
                         window,
-                        &text_style,
-                        font_size,
-                        cell_width,
-                        &terminal_theme,
-                        &palette,
-                        &selection_range,
+                        RowCtx {
+                            text_style: &text_style,
+                            font_size,
+                            cell_width,
+                            terminal_theme: &terminal_theme,
+                            palette: &palette,
+                        },
                     );
                 }
             }
@@ -2660,6 +2696,12 @@ impl Element for TerminalElement {
             cx,
         );
     }
+}
+
+/// 光标四边形的静止宽度（右缘 − 左缘）。
+#[cfg(test)]
+fn origin_width(quad: &crate::components::cursor_animation::CursorQuad) -> f32 {
+    quad.corners[1].0 - quad.corners[0].0
 }
 
 #[cfg(test)]
@@ -3415,10 +3457,4 @@ mod tests {
             "beam 高度应与 block 相同: {beam_h} vs {block_h}"
         );
     }
-}
-
-/// 光标四边形的静止宽度（右缘 − 左缘）。
-#[cfg(test)]
-fn origin_width(quad: &crate::components::cursor_animation::CursorQuad) -> f32 {
-    quad.corners[1].0 - quad.corners[0].0
 }

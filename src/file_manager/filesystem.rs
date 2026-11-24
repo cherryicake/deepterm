@@ -135,6 +135,11 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         // 目标存在时返回 EEXIST，而不是静默覆盖。
+        //
+        // SAFETY: `from_c`/`to_c` 是本栈上的 `CString`，保证 NUL 结尾且
+        // 生命周期覆盖整个调用；`renameatx_np` 只读取这两个指针，不保留它们，
+        // 也不写我们传的其它参数（`AT_FDCWD` 是常量）。返回 -1 时错误码由
+        // `last_os_error` 取，不需要额外的 out 参数。
         let ret = unsafe {
             libc::renameatx_np(
                 libc::AT_FDCWD,
@@ -147,7 +152,7 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
         if ret == 0 {
             return Ok(());
         }
-        return Err(std::io::Error::last_os_error());
+        Err(std::io::Error::last_os_error())
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -157,6 +162,8 @@ fn rename_no_replace(from: &Path, to: &Path) -> std::io::Result<()> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
         let to_c = std::ffi::CString::new(to.as_os_str().as_bytes())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: 同上面 macOS 分支——两个 `CString` 以 NUL 结尾、生命周期
+        // 覆盖调用，`renameat2` 不保留指针；失败时错误码经 `last_os_error` 取。
         let ret = unsafe {
             libc::renameat2(
                 libc::AT_FDCWD,

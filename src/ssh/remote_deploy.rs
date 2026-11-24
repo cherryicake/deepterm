@@ -202,20 +202,20 @@ pub fn start_remote_core(
         "if [ -S {sock} ]; then echo ALIVE; else echo NONE; fi",
         sock = sock
     );
-    if let Ok((_, out, _)) = session.exec_capture(&probe, CAPTURE_TIMEOUT) {
-        if out.contains("ALIVE") {
-            log::info!("远端 core 已在运行");
-            // 但要确认它真的能应答，而不是一个残留的 socket 文件。
-            if let Ok((Some(0), _, _)) = session.exec_capture(
-                &format!(
-                    "DEEPTERM_RUNTIME_DIR=$(dirname {home}) {bin} --ping 2>/dev/null && echo OK",
-                    home = shell_quote(&home_quoted),
-                    bin = bin
-                ),
-                CAPTURE_TIMEOUT,
-            ) {
-                return Ok(format!("$HOME/{REMOTE_SOCKET_REL}"));
-            }
+    if let Ok((_, out, _)) = session.exec_capture(&probe, CAPTURE_TIMEOUT)
+        && out.contains("ALIVE")
+    {
+        log::info!("远端 core 已在运行");
+        // 但要确认它真的能应答，而不是一个残留的 socket 文件。
+        if let Ok((Some(0), _, _)) = session.exec_capture(
+            &format!(
+                "DEEPTERM_RUNTIME_DIR=$(dirname {home}) {bin} --ping 2>/dev/null && echo OK",
+                home = shell_quote(&home_quoted),
+                bin = bin
+            ),
+            CAPTURE_TIMEOUT,
+        ) {
+            return Ok(format!("$HOME/{REMOTE_SOCKET_REL}"));
         }
     }
 
@@ -342,6 +342,7 @@ mod tests {
     /// 探针超时必须是个有限值：远端卡住时不能把 UI 也拖住。
     #[test]
     fn the_probe_has_a_bounded_timeout() {
-        assert!(PROBE_TIMEOUT_SECS > 0 && PROBE_TIMEOUT_SECS <= 60);
+        // const 块：超限时在**编译期**失败，而不是等到跑测试才发现。
+        const { assert!(PROBE_TIMEOUT_SECS > 0 && PROBE_TIMEOUT_SECS <= 60) };
     }
 }

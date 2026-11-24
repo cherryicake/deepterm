@@ -10,13 +10,21 @@ pub enum FolderDialogMode {
     Rename { old_name: String },
 }
 
+/// 取消回调：不接收任何输入，只做副作用（关窗/清状态）。
+type CancelCallback = Box<dyn Fn(&mut App) + 'static>;
+
+/// 确认回调：接收用户输入的名字。
+type ConfirmCallback = Box<dyn Fn(String, &mut App) + 'static>;
+
 pub struct FolderNameDialog {
     focus_handle: FocusHandle,
     input: Entity<InputState>,
     mode: FolderDialogMode,
     error_message: Option<String>,
-    on_cancel: Option<Box<dyn Fn(&mut App) + 'static>>,
-    on_confirm: Option<Box<dyn Fn(String, &mut App) + 'static>>,
+    /// 点「取消」或按 Esc 时的回调。
+    on_cancel: Option<CancelCallback>,
+    /// 点「确定」时的回调，参数是最终文件夹名。
+    on_confirm: Option<ConfirmCallback>,
 }
 
 impl FolderNameDialog {

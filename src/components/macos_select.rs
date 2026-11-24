@@ -528,10 +528,10 @@ impl Render for MacosSelect {
                                     // 四周内边距统一：首个选项到弹窗顶部与末个选项
                                     // 到弹窗底部的间距保持一致。
                                     .p(px(SELECT_POPUP_PAD))
-                                    .when(dropdown_width.is_some(), |d| {
+                                    .when_some(dropdown_width, |d, width| {
                                         // 以触发器宽度为下限，弹窗可随最宽选项自然变宽，
                                         // 避免触发器收紧后长选项文字被裁剪。
-                                        d.min_w(dropdown_width.unwrap())
+                                        d.min_w(width)
                                     })
                                     .flex()
                                     .flex_col()

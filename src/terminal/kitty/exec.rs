@@ -245,6 +245,27 @@ pub struct ImageStore {
 /// 共享的图像存储句柄。
 pub type SharedStorage = std::sync::Arc<std::sync::Mutex<Storage>>;
 
+/// 一条 kitty 传输指令解析出的参数：`(介质, 像素格式, 压缩, 宽, 高)`。
+///
+/// 宽高为 `None` 时由后续解码按实际负载推断（压缩流与 PNG 常见）。
+type TransmissionParams = (Medium, Format, Compression, Option<u32>, Option<u32>);
+
+/// 一次负载读取的规格：介质、压缩、切片范围与像素尺寸。
+///
+/// 四个 `*_payload` 函数都只关心这些字段，逐个传会到 8~9 个参数；
+/// 打包后每个函数只多一个 `&PayloadSpec`，新增字段也不必改整条链。
+struct PayloadSpec {
+    medium: Medium,
+    compression: Compression,
+    /// 文件/shm 内的字节偏移（kitty `O=`）。
+    offset: u32,
+    /// 请求长度（kitty `S=`），0 表示读到末尾。
+    size: u32,
+    format: Format,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
 impl ImageStore {
     /// 新建执行器。`limit_bytes` 为 0 表示禁用整个协议。
     pub fn new(limit_bytes: usize) -> Self {
@@ -449,10 +470,7 @@ impl ImageStore {
     }
 
     /// 解析传输参数。
-    fn transmission_params(
-        &self,
-        cmd: &Command,
-    ) -> Result<(Medium, Format, Compression, Option<u32>, Option<u32>), ExecutionError> {
+    fn transmission_params(&self, cmd: &Command) -> Result<TransmissionParams, ExecutionError> {
         let medium = match cmd.control.byte(b't') {
             None => Medium::Direct,
             Some(b'd') => Medium::Direct,
@@ -521,16 +539,10 @@ impl ImageStore {
     fn payload_for_medium(
         &self,
         encoded: &[u8],
-        medium: Medium,
-        compression: Compression,
-        offset: u32,
-        size: u32,
-        format: Format,
-        width: Option<u32>,
-        height: Option<u32>,
+        spec: &PayloadSpec,
     ) -> Result<Vec<u8>, ExecutionError> {
-        if medium == Medium::Direct {
-            return Self::payload_bytes(encoded, compression);
+        if spec.medium == Medium::Direct {
+            return Self::payload_bytes(encoded, spec.compression);
         }
 
         // 路径/共享内存名本身是 base64 文本；压缩键只作用于**内容**。
@@ -540,30 +552,13 @@ impl ImageStore {
         }
         let path = std::str::from_utf8(&raw_path).map_err(|_| ExecutionError::InvalidData)?;
 
-        let bytes = match medium {
-            Medium::File | Medium::TemporaryFile => self.read_file_payload(
-                path,
-                medium,
-                offset,
-                size,
-                format,
-                width,
-                height,
-                compression,
-            )?,
-            Medium::SharedMemory => self.read_shared_memory_payload(
-                path,
-                offset,
-                size,
-                format,
-                width,
-                height,
-                compression,
-            )?,
+        let bytes = match spec.medium {
+            Medium::File | Medium::TemporaryFile => self.read_file_payload(path, spec)?,
+            Medium::SharedMemory => self.read_shared_memory_payload(path, spec)?,
             Medium::Direct => unreachable!(),
         };
 
-        match compression {
+        match spec.compression {
             Compression::None => Ok(bytes),
             Compression::Zlib => image::decompress_zlib(&bytes).map_err(ExecutionError::Decode),
         }
@@ -574,17 +569,16 @@ impl ImageStore {
     /// 之前这里直接 `fs::read` 整个文件，忽略 `O=`/`S=`：客户端传“文件内
     /// 偏移 + 长度”时会读到噪声，PNG 直接坏掉。现在按 kitty 规范先 seek、
     /// 再按长度读取，`t=t` 仍在读后删除临时文件。
-    fn read_file_payload(
-        &self,
-        path: &str,
-        medium: Medium,
-        offset: u32,
-        size: u32,
-        format: Format,
-        width: Option<u32>,
-        height: Option<u32>,
-        compression: Compression,
-    ) -> Result<Vec<u8>, ExecutionError> {
+    fn read_file_payload(&self, path: &str, spec: &PayloadSpec) -> Result<Vec<u8>, ExecutionError> {
+        let &PayloadSpec {
+            medium,
+            compression,
+            offset,
+            size,
+            format,
+            width,
+            height,
+        } = spec;
         use std::io::{Read as _, Seek as _, SeekFrom};
 
         let fs_path = std::path::Path::new(path);
@@ -712,14 +706,18 @@ impl ImageStore {
     fn read_shared_memory_payload(
         &self,
         name: &str,
-        offset: u32,
-        size: u32,
-        format: Format,
-        width: Option<u32>,
-        height: Option<u32>,
-        compression: Compression,
+        spec: &PayloadSpec,
     ) -> Result<Vec<u8>, ExecutionError> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let &PayloadSpec {
+            compression,
+            offset,
+            size,
+            format,
+            width,
+            height,
+            ..
+        } = spec;
 
         let valid =
             !name.is_empty() && name != "/" && name.len() <= 255 && !name.as_bytes().contains(&0);
@@ -727,15 +725,15 @@ impl ImageStore {
             return Err(ExecutionError::InvalidData);
         }
         let c_name = std::ffi::CString::new(name).map_err(|_| ExecutionError::InvalidData)?;
-        // SAFETY：c_name 是合法 NUL 结尾字符串；shm_open 不持有它。
+        // SAFETY:c_name 是合法 NUL 结尾字符串；shm_open 不持有它。
         let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_RDONLY, 0) };
         if fd < 0 {
             return Err(ExecutionError::InvalidData);
         }
-        // SAFETY：fd 由 shm_open 返回且非负，所有权移交给 File。
+        // SAFETY:fd 由 shm_open 返回且非负，所有权移交给 File。
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         // 按 kitty 要求读取后 unlink；先 unlink 不影响到已打开句柄的读取。
-        // SAFETY：c_name 生命周期覆盖调用。
+        // SAFETY:c_name 生命周期覆盖调用。
         unsafe {
             libc::shm_unlink(c_name.as_ptr());
         }
@@ -750,7 +748,7 @@ impl ImageStore {
         let range = Self::payload_range(len, offset, size, format, width, height, compression)?;
         // macOS 的 shm fd 不可 seek、也不支持普通 read/write；Ghostty 用
         // mmap 读整段再切片。这里照做，兼容 Linux/macOS。
-        // SAFETY：mmap 的参数均来自已校验的 shm 句柄与长度；映射只读。
+        // SAFETY:mmap 的参数均来自已校验的 shm 句柄与长度；映射只读。
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -764,10 +762,10 @@ impl ImageStore {
         if ptr == libc::MAP_FAILED {
             return Err(ExecutionError::InvalidData);
         }
-        // SAFETY：mmap 成功返回 len 字节只读映射。
+        // SAFETY:mmap 成功返回 len 字节只读映射。
         let mapped = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
         let bytes = mapped[range].to_vec();
-        // SAFETY：ptr/len 与上面 mmap 相同。
+        // SAFETY:ptr/len 与上面 mmap 相同。
         unsafe {
             libc::munmap(ptr, len);
         }
@@ -778,12 +776,7 @@ impl ImageStore {
     fn read_shared_memory_payload(
         &self,
         _name: &str,
-        _offset: u32,
-        _size: u32,
-        _format: Format,
-        _width: Option<u32>,
-        _height: Option<u32>,
-        _compression: Compression,
+        _spec: &PayloadSpec,
     ) -> Result<Vec<u8>, ExecutionError> {
         Err(ExecutionError::UnsupportedMedium)
     }
@@ -901,13 +894,15 @@ impl ImageStore {
                 loading.push_chunk(&cmd.encoded)?;
                 let payload = self.payload_for_medium(
                     &loading.encoded,
-                    loading.medium,
-                    loading.compression,
-                    loading.offset,
-                    loading.size,
-                    loading.format,
-                    loading.width,
-                    loading.height,
+                    &PayloadSpec {
+                        medium: loading.medium,
+                        compression: loading.compression,
+                        offset: loading.offset,
+                        size: loading.size,
+                        format: loading.format,
+                        width: loading.width,
+                        height: loading.height,
+                    },
                 )?;
                 let tuple = (
                     loading.id,
@@ -927,13 +922,15 @@ impl ImageStore {
                     id,
                     self.payload_for_medium(
                         &cmd.encoded,
-                        medium,
-                        compression,
-                        offset,
-                        size,
-                        format,
-                        width,
-                        height,
+                        &PayloadSpec {
+                            medium,
+                            compression,
+                            offset,
+                            size,
+                            format,
+                            width,
+                            height,
+                        },
                     )?,
                     format,
                     width,
@@ -1291,14 +1288,18 @@ impl ImageStore {
         });
 
         animation::compose_rect(
-            &mut canvas,
-            image_width,
-            image_height,
-            &frame_img.rgba,
-            frame_img.width,
-            frame_img.height,
-            spec.x,
-            spec.y,
+            animation::Canvas {
+                data: &mut canvas,
+                width: image_width,
+                height: image_height,
+            },
+            animation::Rect {
+                data: &frame_img.rgba,
+                width: frame_img.width,
+                height: frame_img.height,
+                x: spec.x,
+                y: spec.y,
+            },
             spec.composition_mode,
         );
 
@@ -1355,14 +1356,18 @@ impl ImageStore {
                 && let Some(frame) = anim.frames.get_mut(index)
             {
                 animation::compose_rect(
-                    &mut frame.data,
-                    width,
-                    height,
-                    &frame_img.rgba,
-                    frame_img.width,
-                    frame_img.height,
-                    spec.x,
-                    spec.y,
+                    animation::Canvas {
+                        data: &mut frame.data,
+                        width,
+                        height,
+                    },
+                    animation::Rect {
+                        data: &frame_img.rgba,
+                        width: frame_img.width,
+                        height: frame_img.height,
+                        x: spec.x,
+                        y: spec.y,
+                    },
                     spec.composition_mode,
                 );
             }
@@ -1557,14 +1562,19 @@ impl ImageStore {
             if dest_is_root {
                 animation::compose_canvas_rect(
                     &mut stored.image.rgba,
-                    &src,
-                    img_width,
-                    w as u32,
-                    h as u32,
-                    left_edge,
-                    top_edge,
-                    x,
-                    y,
+                    animation::CanvasView {
+                        data: &src,
+                        width: img_width,
+                        height: img_height,
+                    },
+                    animation::ComposeRect {
+                        width: w as u32,
+                        height: h as u32,
+                        src_x: left_edge,
+                        src_y: top_edge,
+                        dst_x: x,
+                        dst_y: y,
+                    },
                     mode,
                 );
             } else if let Some(index) = dest_index {
@@ -1575,14 +1585,19 @@ impl ImageStore {
                 if let Some(frame) = anim.frames.get_mut(index) {
                     animation::compose_canvas_rect(
                         &mut frame.data,
-                        &src,
-                        img_width,
-                        w as u32,
-                        h as u32,
-                        left_edge,
-                        top_edge,
-                        x,
-                        y,
+                        animation::CanvasView {
+                            data: &src,
+                            width: img_width,
+                            height: img_height,
+                        },
+                        animation::ComposeRect {
+                            width: w as u32,
+                            height: h as u32,
+                            src_x: left_edge,
+                            src_y: top_edge,
+                            dst_x: x,
+                            dst_y: y,
+                        },
                         mode,
                     );
                 }
@@ -2097,10 +2112,10 @@ mod tests {
         let mut store = ImageStore::new(1024 * 1024);
         let name = format!("deepterm-test-shm-{}", std::process::id());
         let c_name = std::ffi::CString::new(name.clone()).unwrap();
-        // SAFETY：测试内创建/销毁自己的共享内存对象。
+        // SAFETY:测试内创建/销毁自己的共享内存对象。
         let fd = unsafe { libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600) };
         assert!(fd >= 0, "shm_open failed");
-        // SAFETY：fd 非负且归本测试所有。
+        // SAFETY:fd 非负且归本测试所有。
         let file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.set_len(4096).unwrap();
         // macOS 的 shm fd 不支持 write，用 mmap 写入测试数据。
@@ -2115,6 +2130,8 @@ mod tests {
             )
         };
         assert!(ptr != libc::MAP_FAILED, "mmap write failed");
+        // SAFETY: `ptr` 是上面 4096 字节可写映射的起点（已断言非 MAP_FAILED），
+        // 写 4 字节不越界；`msync`/`munmap` 用的是同一段映射与长度。
         unsafe {
             std::ptr::copy_nonoverlapping([1u8, 2, 3, 4].as_ptr(), ptr.cast::<u8>(), 4);
             libc::msync(ptr, 4096, libc::MS_SYNC);
@@ -2138,6 +2155,8 @@ mod tests {
         );
         drop(guard);
         // 生产代码读后已 unlink；这里兜底清理。
+        // SAFETY: `c_name` 是 NUL 结尾的 CString 且仍在本作用域内；`shm_unlink`
+        // 只按名字删除，不保留指针。名字来自本测试自己创建的对象。
         unsafe {
             libc::shm_unlink(c_name.as_ptr());
         }
@@ -2449,7 +2468,7 @@ mod tests {
         assert!(store.lock_storage().remove_placement(1, 1));
         let guard = store.lock_storage();
         assert!(
-            guard.get(1).unwrap().placements.get(&2).is_none(),
+            !guard.get(1).unwrap().placements.contains_key(&2),
             "父放置删除后子放置必须一起删除"
         );
     }
@@ -2567,7 +2586,7 @@ mod tests {
         // 传输后再显式放置，方便带上 c=/r=。
         run(&mut store, &cmd, (0, 0)).unwrap();
 
-        cmd = format!("a=p,i=1");
+        cmd = "a=p,i=1".to_string();
         if let Some(c) = cols {
             cmd.push_str(&format!(",c={c}"));
         }

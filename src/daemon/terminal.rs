@@ -70,6 +70,10 @@ pub type Chunk = Arc<[u8]>;
 pub struct TerminalHandle {
     pub address: Address,
     /// 启动时用的 shell 与参数，仅用于展示与调试。
+    ///
+    /// 第 0 项就是 `spawn` 请求里的 shell 程序路径；[`Self::shell_name`]
+    /// 从它取 basename 填进 [`TerminalMeta::shell`]，客户端据此在重启后
+    /// 仍能显示 `host · zsh`（见该字段的文档）。
     pub argv: Vec<String>,
     pub cwd: Option<String>,
     /// 创建时刻（毫秒时间戳）。
@@ -163,12 +167,25 @@ struct TerminalState {
 impl TerminalHandle {
     /// 当前状态。
     pub fn state(&self) -> State {
-        self.state.lock().expect("terminal state").state
+        self.state_unpoisoned().state
     }
 
     /// 退出码（未退出为 `None`）。
     pub fn exit_code(&self) -> Option<i32> {
-        self.state.lock().expect("terminal state").exit_code
+        self.state_unpoisoned().exit_code
+    }
+
+    /// 取终端状态锁；锁被投毒时恢复内部数据而不是 panic。
+    ///
+    /// 守护进程持有用户的**全部**终端，一旦某个持锁路径 panic 过（例如读线程
+    /// 与 `mark_finished` 竞争），`expect` 会让此后每一次 `terminal.list` /
+    /// 状态查询都继续 panic——所有终端的控制通道一起失效。状态值本身只是
+    /// 四个字节的枚举加一个 `Option<i32>`，读到一份可能略旧的数据远好过
+    /// 整个守护进程不可用。
+    fn state_unpoisoned(&self) -> std::sync::MutexGuard<'_, TerminalState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// 累计输出字节数。
@@ -406,6 +423,20 @@ pub struct TerminalMeta {
     /// 前台进程名（`None` = 前台就是 shell）。
     #[serde(default)]
     pub foreground: Option<String>,
+    /// 这条终端启动时用的 shell 程序名（`zsh` / `bash`）。
+    ///
+    /// # 为什么必须由守护进程报
+    ///
+    /// 客户端不是 PTY 的创建者，`spawn` 的 shell 只在 holder 手里。GUI 侧
+    /// 唯一能拿到 shell 名的途径是 `OSC 1337;Proc=`——那是 shell 集成**在
+    /// 运行时**发出来的字节。重开 GUI 后 attach 只重放整屏快照，不回放历史
+    /// OSC，于是这条路径断了：空闲标签的 `shell_name()` 变成 `None`，
+    /// 标签只剩主机名（跑着程序时则由 [`Self::foreground`] 补上）。
+    ///
+    /// 与 [`Self::foreground`] 互斥：`foreground` 为 `None` 表示"前台就是
+    /// 这个 shell"，此时标签该显示它。
+    #[serde(default)]
+    pub shell: Option<String>,
     /// 前台进程的完整 argv，供 agent 识别与图标匹配。
     #[serde(default)]
     pub argv: Option<Vec<String>>,
@@ -543,14 +574,20 @@ pub fn probe_terminal_meta(
     handle: &TerminalHandle,
 ) -> Option<TerminalMeta> {
     let fd = master_fd?;
-    // SAFETY：`tcgetpgrp` 只读查询，fd 由调用方保证是存活的 PTY master。
+    // SAFETY:`tcgetpgrp` 只读查询，fd 由调用方保证是存活的 PTY master。
     let pgid = unsafe { libc::tcgetpgrp(fd) };
     if pgid < 0 {
         return None;
     }
     // 前台就是 shell 自己：标签该显示 shell 名，不算"在跑程序"。
+    //
+    // `foreground: None` 是有效结论（"没有程序在跑"），但 `shell` 仍要填：
+    // 客户端要靠它把标签渲染成 `host · zsh`，而不是只剩一个主机名。
     if handle.shell_pgid() == Some(pgid) {
-        return Some(TerminalMeta::default());
+        return Some(TerminalMeta {
+            shell: handle.shell_name().map(str::to_owned),
+            ..Default::default()
+        });
     }
     // 一次读到 argv，名字从同一份里取——**不要读两遍**。
     //
@@ -568,6 +605,7 @@ pub fn probe_terminal_meta(
     let agent = CLIAgent::detect_from_argv_with(&argv, &std::collections::HashMap::new());
     Some(TerminalMeta {
         foreground,
+        shell: handle.shell_name().map(str::to_owned),
         argv: Some(argv),
         agent,
         agent_session: None,
@@ -966,7 +1004,9 @@ impl TerminalHandle {
     /// 标记终端已结束，并通知所有挂接者。
     pub fn mark_finished(&self, exit_code: Option<i32>) {
         {
-            let mut st = self.state.lock().expect("terminal state");
+            // 与 `state()`/`exit_code()` 同一套恢复语义：状态写入不会因为
+            // 别的路径曾 panic 过而永远失败。
+            let mut st = self.state_unpoisoned();
             st.state = State::Finished;
             st.exit_code = exit_code;
         }
@@ -1018,6 +1058,17 @@ impl TerminalHandle {
     /// shell 自己的进程组 id（见 [`Self::shell_pgid`]）。
     pub fn shell_pgid(&self) -> Option<i32> {
         self.shell_pgid
+    }
+
+    /// 这条终端启动时的 shell 程序名（`zsh` / `bash`）。
+    ///
+    /// 取 [`Self::argv`] 第 0 项的 basename。客户端拿不到这个值——`spawn`
+    /// 的 shell 只有持有 PTY 的这一侧知道，所以它随 [`TerminalMeta::shell`]
+    /// 推给 GUI。
+    pub fn shell_name(&self) -> Option<&str> {
+        let program = self.argv.first()?;
+        let base = program.rsplit(['/', '\\']).next().unwrap_or(program);
+        Some(base.trim_start_matches('-')).filter(|name| !name.is_empty())
     }
 
     /// 把元信息推给所有挂接者。
@@ -1659,6 +1710,37 @@ mod tests {
         assert_eq!(got, meta);
     }
 
+    /// shell 名从 spawn 的 argv 第 0 项取 basename。
+    ///
+    /// 客户端不是 PTY 的创建者，拿不到 `shell`；GUI 重启后空闲标签能不能
+    /// 显示 `host · zsh` 全看这里。路径形态（含登录 shell 的前导 `-`）都要
+    /// 归一成标签上该显示的名字。
+    #[test]
+    fn shell_name_is_the_basename_of_the_spawn_program() {
+        let mut handle = TerminalHandle::new_for_tests("t1", test_term());
+        assert_eq!(handle.shell_name(), Some("bash"), "默认测试句柄是 bash");
+
+        handle.argv = vec!["/usr/bin/zsh".into(), "-l".into()];
+        assert_eq!(handle.shell_name(), Some("zsh"), "要去掉目录");
+
+        handle.argv = vec!["-zsh".into()];
+        assert_eq!(
+            handle.shell_name(),
+            Some("zsh"),
+            "登录 shell 的前导 - 要去掉"
+        );
+
+        handle.argv = vec![r"C:\Program Files\Git\bin\bash.exe".into()];
+        assert_eq!(
+            handle.shell_name(),
+            Some("bash.exe"),
+            "Windows 路径按反斜杠切分；扩展名由标签侧的程序表处理"
+        );
+
+        handle.argv.clear();
+        assert_eq!(handle.shell_name(), None, "没有 argv 就没有 shell 名");
+    }
+
     /// **agent 状态也必须是快照的一部分。**
     ///
     /// 回归价值：只补 `foreground`/`argv` 时，重开 GUI 后 Tab 能显示程序名，
@@ -1672,6 +1754,7 @@ mod tests {
         let handle = TerminalHandle::new_for_tests("t1", term);
         let meta = TerminalMeta {
             foreground: Some("codex".into()),
+            shell: Some("zsh".into()),
             argv: Some(vec!["codex".into()]),
             agent: Some(CLIAgent::Codex),
             agent_session: Some(AgentSessionState {
@@ -1699,6 +1782,7 @@ mod tests {
     fn terminal_meta_json_round_trip_keeps_agent_fields() {
         let meta = TerminalMeta {
             foreground: Some("opencode".into()),
+            shell: Some("bash".into()),
             argv: Some(vec!["opencode".into(), "run".into()]),
             agent: Some(CLIAgent::OpenCode),
             agent_session: Some(AgentSessionState {
@@ -1712,6 +1796,11 @@ mod tests {
         let encoded = serde_json::to_vec(&meta).expect("meta should serialize");
         let decoded: TerminalMeta = serde_json::from_slice(&encoded).expect("meta should parse");
         assert_eq!(decoded, meta);
+        assert_eq!(
+            decoded.shell.as_deref(),
+            Some("bash"),
+            "shell 名要跨 JSON 边界保留：GUI 重启后空闲标签靠它显示 host · bash"
+        );
     }
 
     /// hook 事件在没有 GUI 连接时也要被 holder 记住。
@@ -1741,14 +1830,29 @@ mod tests {
     }
 
     /// 前台确认回到 shell 时，不能把上一次 agent 的状态点继续挂着。
+    ///
+    /// 同时守「shell 名必须穿过合成保留下来」：`compose_terminal_meta` 在前台
+    /// 是 shell 时清 agent / session，但 shell 名是标签回落要用的信息，不能
+    /// 被一起抹掉——否则重启后的空闲标签只剩主机名。
     #[test]
     fn composition_clears_agent_state_when_the_shell_is_in_front() {
         let mut hook = AgentHookState::default();
         hook.observe(
             br#"777;notify;deepterm://cli-agent;{"agent":"opencode","event":"prompt-submit"}"#,
         );
-        let meta = compose_terminal_meta(TerminalMeta::default(), &hook);
-        assert_eq!(meta, TerminalMeta::default());
+        let probe = TerminalMeta {
+            shell: Some("zsh".into()),
+            ..Default::default()
+        };
+        let meta = compose_terminal_meta(probe, &hook);
+        assert_eq!(
+            meta,
+            TerminalMeta {
+                shell: Some("zsh".into()),
+                ..Default::default()
+            },
+            "agent 状态要清，但 shell 名必须保留"
+        );
     }
 
     /// 前台换成**另一个程序**时，hook 里残留的 agent 身份不能被沿用。
@@ -1771,6 +1875,7 @@ mod tests {
         // claude 已退出，前台是 nvim：探测认不出 agent（如实为 None）。
         let probe = TerminalMeta {
             foreground: Some("nvim".into()),
+            shell: Some("zsh".into()),
             argv: Some(vec!["nvim".into(), "src/main.rs".into()]),
             agent: None,
             agent_session: None,
@@ -1803,6 +1908,7 @@ mod tests {
         // 前台确实有程序，但探测认不出它是 agent（wrapper / 被改名的二进制）。
         let probe = TerminalMeta {
             foreground: Some("my-claude-wrapper".into()),
+            shell: Some("zsh".into()),
             argv: Some(vec!["my-claude-wrapper".into()]),
             agent: None,
             agent_session: None,

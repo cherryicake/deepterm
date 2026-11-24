@@ -349,21 +349,18 @@ impl SidebarFileTree {
             .get_cached(path.parent().unwrap_or(&self.root_path))
             .and_then(|entries| entries.iter().find(|e| e.path == path))
             .map(|e| e.kind.clone());
-        loop {
-            let Some(parent) = cur.parent().map(Path::to_path_buf) else {
-                break;
-            };
-            if parent.starts_with(&self.root_path) {
-                if parent != cur {
-                    ancestors.push(parent.clone());
-                }
-                if parent == self.root_path {
-                    break;
-                }
-                cur = parent;
-            } else {
+        // 向上收集祖先，直到根路径；用 `while let` 表达「有父就继续」。
+        while let Some(parent) = cur.parent().map(Path::to_path_buf) {
+            if !parent.starts_with(&self.root_path) {
                 break;
             }
+            if parent != cur {
+                ancestors.push(parent.clone());
+            }
+            if parent == self.root_path {
+                break;
+            }
+            cur = parent;
         }
         ancestors.reverse();
         // Expand the target itself only when it is known to be a directory,

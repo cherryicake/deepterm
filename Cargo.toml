@@ -307,3 +307,58 @@ harness = false
 [[bench]]
 name = "markdown_live"
 harness = false
+
+# ── Lint 门槛 ────────────────────────────────────────────────────────────────
+#
+# 这些不是「一次性清理」的记录，而是防止回归的护栏：清理前全仓有 172 条
+# clippy 警告（含 70 个参数过多的函数、26 处没有 SAFETY 注释的 `unsafe` 块、
+# 8 处模块同名、19 处复杂类型）。已清零的类别设为 `deny`，新代码就不能再往
+# 同一个坑里掉。
+[lints.clippy]
+# 一个函数超过 7 个参数通常意味着参数该打包成结构体（本轮已用
+# `RowCtx` / `TransferCtx` / `AttachableParts` / `CellBox` / `PayloadSpec`
+# 等消掉 62 处）。余下 8 处是历史遗留（UI 构建、绘制辅助、脚本式传输函数），
+# 逐个改会伤可读性，因此暂时只报不拦；新增的同类函数会在 CI 里直接看到。
+too_many_arguments = "warn"
+# 下面这些已全部清零，设成 deny 防止回归。
+module_inception = "deny"
+type_complexity = "deny"
+single_range_in_vec_init = "deny"
+if_same_then_else = "deny"
+only_used_in_recursion = "deny"
+items_after_test_module = "deny"
+unnecessary_get_then_check = "deny"
+needless_borrow = "deny"
+needless_return = "deny"
+manual_contains = "deny"
+manual_repeat_n = "deny"
+derivable_impls = "deny"
+redundant_locals = "deny"
+needless_update = "deny"
+unnecessary_map_or = "deny"
+while_let_loop = "deny"
+single_match = "deny"
+useless_format = "deny"
+needless_lifetimes = "deny"
+clone_on_copy = "deny"
+chunks_exact_to_as_chunks = "deny"
+doc_lazy_continuation = "deny"
+assertions_on_constants = "deny"
+
+# ── 发布构建 ────────────────────────────────────────────────────────────────
+#
+# 打包脚本用的是 `cargo build --release`，此前没有显式 profile，等于用默认
+# （thin-local LTO 关闭、16 个 codegen unit、不 strip）。启动时间与体积都吃亏。
+#
+# **不要设 `panic = "abort"`**：`file_manager/upload_download.rs` 的上传 worker
+# 与 `ssh/lsp_channel.rs` 的 channel 析构依赖 `catch_unwind` 把 panic 降级成
+# 错误结果；abort 会让进程直接死掉——那正是这两处防御要避免的场景。
+[profile.release]
+# thin LTO：跨 crate 内联（gpui 的 hot path 大多在依赖里），编译时间可控。
+lto = "thin"
+# 单一 codegen unit：release 才有的最佳优化，代价是全量重编（打包脚本本来
+# 就是干净构建）。
+codegen-units = 1
+# 调试符号不随产物分发（体积明显变小）。代价是崩溃栈只有地址；需要符号化时
+# 用 `cargo build --release` 重编一次带 debuginfo 的版本，或临时注释本行。
+strip = "debuginfo"

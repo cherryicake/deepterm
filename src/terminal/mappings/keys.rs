@@ -7,7 +7,11 @@ use gpui::Keystroke;
 ///
 /// Kitty 键盘协议激活时优先走 [`kitty_sequence_for`]（CSI u 编码），
 /// 未覆盖的键（未修饰的字符 / 常规功能键）回退到 legacy xterm 编码。
-pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode, _vi_mode: bool) -> Option<Vec<u8>> {
+///
+/// 签名里**没有** vi 模式参数：编码只取决于按键与 `TermMode`。早先的
+/// `vi_mode: bool` 从未被实现使用（所有调用点都传 `false`），留在签名里
+/// 只会让人以为 vi 模式会影响编码。
+pub fn to_esc_str(keystroke: &Keystroke, mode: &TermMode) -> Option<Vec<u8>> {
     if let Some(bytes) = kitty_sequence_for(keystroke, mode) {
         return Some(bytes);
     }
@@ -337,7 +341,7 @@ mod tests {
     }
 
     fn esc(key: &str) -> String {
-        let bytes = to_esc_str(&keystroke(key), &TermMode::empty(), false)
+        let bytes = to_esc_str(&keystroke(key), &TermMode::empty())
             .unwrap_or_else(|| panic!("{key} 未产生序列"));
         String::from_utf8(bytes).unwrap()
     }
@@ -378,11 +382,11 @@ mod tests {
     #[test]
     fn cursor_keys_follow_application_mode() {
         let mode = TermMode::APP_CURSOR;
-        let up = to_esc_str(&keystroke("up"), &mode, false).unwrap();
+        let up = to_esc_str(&keystroke("up"), &mode).unwrap();
         assert_eq!(String::from_utf8(up).unwrap(), "\u{1b}OA");
 
         // F1-F4 与 APP_CURSOR 无关，始终是 SS3
-        let f1 = to_esc_str(&keystroke("f1"), &mode, false).unwrap();
+        let f1 = to_esc_str(&keystroke("f1"), &mode).unwrap();
         assert_eq!(String::from_utf8(f1).unwrap(), "\u{1b}OP");
     }
 
@@ -398,7 +402,7 @@ mod tests {
             key: "f1".into(),
             key_char: None,
         };
-        let out = to_esc_str(&ks, &TermMode::empty(), false).unwrap();
+        let out = to_esc_str(&ks, &TermMode::empty()).unwrap();
         // shift(1) + alt(2) + control(4) + 1 = 8
         assert_eq!(String::from_utf8(out).unwrap(), "\u{1b}[1;8P");
     }
@@ -406,7 +410,7 @@ mod tests {
     // ── Kitty keyboard protocol ───────────────────────────────────────────────────
 
     fn kitty_esc(key: &str, mode: TermMode) -> Option<String> {
-        to_esc_str(&keystroke(key), &mode, false).map(|b| String::from_utf8(b).unwrap())
+        to_esc_str(&keystroke(key), &mode).map(|b| String::from_utf8(b).unwrap())
     }
 
     fn disambiguate() -> TermMode {
@@ -487,12 +491,12 @@ mod tests {
             key: "a".into(),
             key_char: Some("A".into()),
         };
-        let out = to_esc_str(&ks, &mode, false).unwrap();
+        let out = to_esc_str(&ks, &mode).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\u{1b}[97:65;6;65u");
 
         // 关闭 alternate 后不携带 :65
         mode.remove(TermMode::REPORT_ALTERNATE_KEYS);
-        let out = to_esc_str(&ks, &mode, false).unwrap();
+        let out = to_esc_str(&ks, &mode).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\u{1b}[97;6;65u");
     }
 
@@ -505,7 +509,7 @@ mod tests {
             key: "a".into(),
             key_char: Some("a".into()),
         };
-        let out = to_esc_str(&ks, &mode, false).unwrap();
+        let out = to_esc_str(&ks, &mode).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "\u{1b}[97u");
 
         // Enter 也要 CSI u

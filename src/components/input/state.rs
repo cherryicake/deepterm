@@ -1603,7 +1603,7 @@ impl InputState {
             .expanded_git_hunks
             .iter()
             .copied()
-            .filter(|&ix| self.git_hunks.get(ix).is_some_and(&touched))
+            .filter(|&ix| self.git_hunks.get(ix).is_some_and(touched))
             .collect();
         for ix in stale {
             self.expanded_git_hunks.remove(&ix);

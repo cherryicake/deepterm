@@ -10,7 +10,7 @@ use crate::file_manager::utils::{
     resolve_remote_conflict, resolve_remote_conflict_with_names, snapshot_remote_dir_names,
     temporary_local_path, temporary_remote_path, walk_remote_dir,
 };
-use crate::file_manager::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver, TransferCtx};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::TRANSFER_CANCELLED_MSG;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
@@ -21,10 +21,10 @@ pub fn upload_local_to_remote(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     rename_to: Option<&str>,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
+    let (cancelled, progress) = (ctx.cancelled, ctx.progress);
     check_cancelled(cancelled)?;
     let metadata = fs::metadata(source_path)
         .with_context(|| format!("无法检查源文件 {}", source_path.display()))?;
@@ -75,7 +75,6 @@ pub fn upload_local_to_remote(
                     &destination_root,
                     conflict_policy,
                     cancelled,
-                    progress,
                     resolver,
                     sink,
                 );
@@ -90,14 +89,15 @@ pub fn upload_local_to_remote(
 
 /// 目录树上传编排（单目录层）：枚举本地条目、串行解决冲突、投递文件、
 /// 递归子目录。文件传输本身由 [`ParallelUploadPool`] 的 worker 并行完成。
-#[allow(clippy::too_many_arguments)]
+///
+/// 进度计数器不在这里出现：它由 [`ParallelUploadPool::new`] 持有并传给
+/// worker，编排层只投递任务、不写进度。
 fn upload_local_dir_orchestrating(
     session: &mut sftp_fs::BlockingSftpSession,
     source_dir: &Path,
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
     resolver: Option<&dyn ConflictResolver>,
     sink: &ParallelUploadJobSink,
 ) -> anyhow::Result<TransferSummary> {
@@ -155,7 +155,6 @@ fn upload_local_dir_orchestrating(
                         &path,
                         conflict_policy,
                         cancelled,
-                        progress,
                         resolver,
                         sink,
                     )?);
@@ -477,10 +476,10 @@ pub fn download_remote_to_local(
     destination_dir: &Path,
     conflict_policy: ConflictPolicy,
     rename_to: Option<&str>,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
+    let (cancelled, progress) = (ctx.cancelled, ctx.progress);
     check_cancelled(cancelled)?;
     fs::create_dir_all(destination_dir)?;
     let file_name = remote_file_name(remote_path)?;

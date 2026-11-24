@@ -267,9 +267,9 @@ impl gpui::Render for Host {
     }
 }
 
-fn editor_ctx<'a>(
-    cx: &'a mut gpui::TestAppContext,
-) -> (gpui::Entity<super::Editor>, &'a mut gpui::VisualTestContext) {
+fn editor_ctx(
+    cx: &mut gpui::TestAppContext,
+) -> (gpui::Entity<super::Editor>, &mut gpui::VisualTestContext) {
     cx.update(|cx| {
         crate::settings::SettingsStore::init_for_test(cx);
         crate::theme::init(cx);
@@ -485,12 +485,12 @@ fn ordinary_clicks_do_not_trigger_goto_definition() {
         ),
         (
             "secondary right click",
-            mouse_down(gpui::MouseButton::Right, 1, secondary.clone()),
+            mouse_down(gpui::MouseButton::Right, 1, secondary),
             "右键是上下文菜单",
         ),
         (
             "secondary double click",
-            mouse_down(gpui::MouseButton::Left, 2, secondary.clone()),
+            mouse_down(gpui::MouseButton::Left, 2, secondary),
             "双击选词，不该跳转",
         ),
         (

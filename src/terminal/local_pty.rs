@@ -65,47 +65,99 @@ const PTY_CHILD_EVENT_TOKEN: usize = 1;
 #[cfg(windows)]
 use alacritty_terminal::tty::{PTY_CHILD_EVENT_TOKEN, PTY_READ_WRITE_TOKEN};
 
-/// 把整段字节写进 PTY，容忍 Windows 侧的暂时性「写不进」。
+/// PTY 写入的**非阻塞**缓冲：把「暂时写不进」留给下一轮事件循环，而不是
+/// 在 gather 线程上睡等。
 ///
-/// alacritty 的 `UnblockedWriter` 背后是 1 MiB 的 piper 缓冲（后台写线程负责
-/// 排空）。缓冲满时 `write` 返回 `Ok(0)` 而非 `WouldBlock`，`write_all` 会直接
-/// 以 `WriteZero` 失败——输入/应答就此静默丢失。这两种信号都只是"暂时"，稍等
-/// 缓冲被排空即可继续，因此做有界重试而不是放弃。
+/// `UnblockedWriter` 背后是 1 MiB 的 piper 缓冲（后台写线程负责排空）。缓冲满
+/// 时 `write` 返回 `Ok(0)` 而非 `WouldBlock`，`write_all` 会直接以 `WriteZero`
+/// 失败——输入/应答就此静默丢失。这两种信号都只是"暂时"，稍后缓冲被排空即可
+/// 继续。
 ///
-/// `deadline` 取 5 秒：正常负载下管道近似为空、第一次就全部写完；只有病态
-/// 洪泛（粘贴数兆）才可能排队，5 秒足够排空 1 MiB 缓冲的任意现实负载，同时
-/// 保证读线程不会因一个卡死的子进程而永久挂起。
-fn write_all_retry(writer: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+/// 关键点是**不能在这里 `sleep`**：本函数跑在 gather 线程上，而该线程同时负责
+/// `poller.wait` 读 PTY 输出。之前用「睡 1ms 重试、最多 5 秒」实现，粘贴数兆
+/// 或 TUI 洪泛时终端会整块卡住数秒——输出读不到、界面像死了。现在改成保留未写
+/// 完的余量，由事件循环用更短的超时轮询重试，读取始终穿插进行。
+///
+/// `MAX_WAIT` 仍保留：病态情况下（子进程完全不读输入）不能让余量无限期占着
+/// 内存，超时后按错误上报，与旧行为一致。
+struct PendingWrite {
+    bytes: Vec<u8>,
+    /// 已写出的前缀长度（避免每轮都从 `Vec` 头部搬移）。
+    written: usize,
+    /// 余量第一次出现阻塞的时刻；`None` 表示当前无待写数据。
+    blocked_since: Option<std::time::Instant>,
+}
+
+impl PendingWrite {
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-    let deadline = std::time::Instant::now() + MAX_WAIT;
-    let mut written = 0;
-    while written < bytes.len() {
-        match writer.write(&bytes[written..]) {
-            Ok(0) => {
-                if std::time::Instant::now() >= deadline {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "PTY 写缓冲持续满，放弃本次写入",
-                    ));
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Ok(n) => written += n,
+
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            written: 0,
+            blocked_since: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.written >= self.bytes.len()
+    }
+
+    /// 追加待写字节。调用方须先 `flush` 过，保证顺序。
+    fn push(&mut self, data: &[u8]) {
+        if self.is_empty() {
+            self.bytes.clear();
+            self.written = 0;
+        }
+        self.bytes.extend_from_slice(data);
+        self.blocked_since
+            .get_or_insert_with(std::time::Instant::now);
+    }
+
+    /// 做**一次**写尝试。只有真正的错误才返回 `Err`；缓冲满/中断都留给下一轮。
+    fn flush(&mut self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        if self.is_empty() {
+            self.bytes.clear();
+            self.written = 0;
+            self.blocked_since = None;
+            return Ok(());
+        }
+        match writer.write(&self.bytes[self.written..]) {
+            Ok(0) => {}
+            Ok(n) => self.written += n,
             Err(err)
                 if matches!(
                     err.kind(),
                     std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if std::time::Instant::now() >= deadline {
-                    return Err(err);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
+                ) => {}
             Err(err) => return Err(err),
         }
+        if self.is_empty() {
+            self.bytes.clear();
+            self.written = 0;
+            self.blocked_since = None;
+            return Ok(());
+        }
+        if let Some(since) = self.blocked_since
+            && since.elapsed() >= Self::MAX_WAIT
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "PTY 写缓冲持续满，放弃本次写入",
+            ));
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// 下一轮 `poller.wait` 该等多久：有待写余量时用短超时尽快重试，
+    /// 空闲时用常规节拍（100ms，与全局设计一致）。
+    fn wait_timeout(&self) -> std::time::Duration {
+        if self.is_empty() {
+            std::time::Duration::from_millis(100)
+        } else {
+            std::time::Duration::from_millis(2)
+        }
+    }
 }
 
 /// 全量透传的扫描器：不做任何识别，字节原样交给 vte。
@@ -290,7 +342,7 @@ impl Drop for LocalReader {
     fn drop(&mut self) {
         self.sender.shutdown();
         // 先等 gather 退出（它会 drop `msg_tx`），再等 parser 看到断开/关停。
-        // 两个线程都可能在 `write_all_retry` 或锁上短暂停留；正常路径是
+        // 两个线程都可能在写余量或锁上短暂停留；正常路径是
         // 毫秒级，最坏由 `shutdown` 标志 + 通道 timeout 兜底。
         if let Some(thread) = self.gather_thread.take() {
             let _ = thread.join();
@@ -337,11 +389,14 @@ impl LocalReader {
 
         let poller = Arc::new(Poller::new()?);
 
-        // SAFETY（中文）：`pty` 被 move 进 gather 线程闭包并存活至线程结束，
+        // SAFETY:`pty` 被 move 进 gather 线程闭包并存活至线程结束，
         // 注册到 poller 的 file/signals 因此始终有效；线程退出前会 deregister。
         //
         // 只注册可读：PTY 主设备写侧恒可写，若一并注册可写会在电平触发下
         // 每次 `wait` 立即返回，形成忙循环。写入走 `pty.writer()` 直接写。
+        //
+        // SAFETY: `pty` 被 move 进 gather 线程闭包并存活至线程结束，注册到
+        // poller 的 file/signals 因此始终有效；线程退出前会 deregister。
         unsafe {
             pty.register(
                 &poller,
@@ -378,34 +433,34 @@ impl LocalReader {
         let parse_thread = std::thread::Builder::new()
             .name("local-pty-parser".to_string())
             .spawn(move || {
-                parse_loop(
+                parse_loop(ParseIo {
                     term,
                     listener,
-                    notice_tx,
+                    notice: notice_tx,
                     msg_rx,
                     free_tx,
                     reply_tx,
                     scanner,
-                    parse_poller,
-                    parse_shutdown,
-                );
+                    poller: parse_poller,
+                    shutdown: parse_shutdown,
+                });
             })?;
 
         let gather_shutdown = shutdown.clone();
         let gather_thread = std::thread::Builder::new()
             .name("local-pty-gather".to_string())
             .spawn(move || {
-                gather_loop(
+                gather_loop(GatherIo {
                     pty,
                     poller,
-                    rx,
-                    msg_tx,
+                    msg_rx: rx,
+                    data_tx: msg_tx,
                     free_rx,
-                    gather_free_tx,
+                    free_tx: gather_free_tx,
                     reply_rx,
-                    gather_notice,
-                    gather_shutdown,
-                );
+                    notice: gather_notice,
+                    shutdown: gather_shutdown,
+                });
             })?;
 
         Ok(LocalReaderParts {
@@ -445,30 +500,75 @@ enum ParseMsg {
     Error(String),
 }
 
+/// gather 线程的输入：PTY、轮询器，以及四条通道。
+///
+/// 通道成对出现（`msg_tx`/`free_rx`/… 各自连接 parse 线程），单独拆开传容易
+/// 把方向搞反；打包后新建一个线程只需构造一次。
+struct GatherIo {
+    pty: Pty,
+    poller: Arc<Poller>,
+    /// 控制指令（输入/尺寸/退出）。
+    msg_rx: async_channel::Receiver<LocalMsg>,
+    /// 数据块 → parse 线程。
+    data_tx: std::sync::mpsc::SyncSender<ParseMsg>,
+    /// parse 线程还回来的空缓冲。
+    free_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// 本线程归还空缓冲。
+    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// parse 线程算好的应答（尺寸上报等），由本线程写回 PTY。
+    reply_rx: async_channel::Receiver<Vec<u8>>,
+    /// 应用层通知（OSC / 错误）。
+    notice: async_channel::Sender<LocalNotice>,
+    /// 关停标志。
+    shutdown: Arc<AtomicBool>,
+}
+
+/// parse 线程的输入：网格、扫描器，以及四条通道。
+struct ParseIo {
+    term: Arc<FairMutex<Term<ZedListener>>>,
+    listener: ZedListener,
+    notice: async_channel::Sender<LocalNotice>,
+    /// 来自 gather 的解析任务。
+    msg_rx: std::sync::mpsc::Receiver<ParseMsg>,
+    /// 归还空缓冲给 gather。
+    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    /// 需要写回 PTY 的应答。
+    reply_tx: async_channel::Sender<Vec<u8>>,
+    /// 应用层 OSC 扫描器。
+    scanner: Box<dyn PtyScanner>,
+    /// 用于唤醒阻塞中的 gather 线程。
+    poller: Arc<Poller>,
+    /// 关停标志。
+    shutdown: Arc<AtomicBool>,
+}
+
 /// gather 线程：只碰 `Pty`/`Poller`，不碰 `Term`/vte。
 ///
 /// 这样 PTY 的阻塞读永远不需要等网格锁，parse 线程持锁解析时也永远不需要
 /// 等 PTY 读——两级流水真正并行。
-fn gather_loop(
-    mut pty: Pty,
-    poller: Arc<Poller>,
-    rx: async_channel::Receiver<LocalMsg>,
-    msg_tx: std::sync::mpsc::SyncSender<ParseMsg>,
-    free_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
-    reply_rx: async_channel::Receiver<Vec<u8>>,
-    notice: async_channel::Sender<LocalNotice>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn gather_loop(io: GatherIo) {
+    let GatherIo {
+        mut pty,
+        poller,
+        msg_rx: rx,
+        data_tx: msg_tx,
+        free_rx,
+        free_tx,
+        reply_rx,
+        notice,
+        shutdown,
+    } = io;
     let mut events =
         Events::with_capacity(std::num::NonZeroUsize::new(4).expect("事件容量恒为非零"));
+    // 未写完的 PTY 输入/应答：不在本线程睡等，留给下一轮 loop 重试。
+    let mut pending_write = PendingWrite::new();
 
     'event_loop: loop {
         if shutdown.load(Ordering::SeqCst) {
             break 'event_loop;
         }
         events.clear();
-        if let Err(err) = poller.wait(&mut events, Some(std::time::Duration::from_millis(100))) {
+        if let Err(err) = poller.wait(&mut events, Some(pending_write.wait_timeout())) {
             let message = format!("poll failed: {err}");
             let _ = notice.try_send(LocalNotice::Error(message.clone()));
             let _ = msg_tx.try_send(ParseMsg::Error(message));
@@ -485,7 +585,14 @@ fn gather_loop(
             }
             match msg {
                 LocalMsg::Input(bytes) => {
-                    if let Err(err) = write_all_retry(pty.writer(), &bytes) {
+                    // 先冲掉上一轮没写完的余量，保证输入字节的先后顺序。
+                    if let Err(err) = pending_write.flush(pty.writer()) {
+                        let _ =
+                            msg_tx.try_send(ParseMsg::Error(format!("pty write failed: {err}")));
+                        break 'event_loop;
+                    }
+                    pending_write.push(&bytes);
+                    if let Err(err) = pending_write.flush(pty.writer()) {
                         let _ =
                             msg_tx.try_send(ParseMsg::Error(format!("pty write failed: {err}")));
                         break 'event_loop;
@@ -559,10 +666,21 @@ fn gather_loop(
 
         // 扫描器的应答（尺寸上报等）由 parse 线程算好，gather 负责写回。
         while let Ok(replies) = reply_rx.try_recv() {
-            if let Err(err) = write_all_retry(pty.writer(), &replies) {
+            if let Err(err) = pending_write.flush(pty.writer()) {
                 let _ = msg_tx.try_send(ParseMsg::Error(format!("pty reply write failed: {err}")));
                 break 'event_loop;
             }
+            pending_write.push(&replies);
+            if let Err(err) = pending_write.flush(pty.writer()) {
+                let _ = msg_tx.try_send(ParseMsg::Error(format!("pty reply write failed: {err}")));
+                break 'event_loop;
+            }
+        }
+
+        // 本轮末尾再试一次余量：上面的读事件可能刚好腾空了 piper 缓冲。
+        if let Err(err) = pending_write.flush(pty.writer()) {
+            let _ = msg_tx.try_send(ParseMsg::Error(format!("pty write failed: {err}")));
+            break 'event_loop;
         }
     }
 
@@ -662,17 +780,18 @@ fn gather_read(
 }
 
 /// parse 线程：持 lease + 网格锁，把 gather 送来的块交给 vte/扫描器。
-fn parse_loop(
-    term: Arc<FairMutex<Term<ZedListener>>>,
-    listener: ZedListener,
-    notice: async_channel::Sender<LocalNotice>,
-    msg_rx: std::sync::mpsc::Receiver<ParseMsg>,
-    free_tx: std::sync::mpsc::SyncSender<Vec<u8>>,
-    reply_tx: async_channel::Sender<Vec<u8>>,
-    mut scanner: Box<dyn PtyScanner>,
-    poller: Arc<Poller>,
-    shutdown: Arc<AtomicBool>,
-) {
+fn parse_loop(io: ParseIo) {
+    let ParseIo {
+        term,
+        listener,
+        notice,
+        msg_rx,
+        free_tx,
+        reply_tx,
+        mut scanner,
+        poller,
+        shutdown,
+    } = io;
     let mut processor = Processor::<StdSyncHandler>::new();
     let mut pending: Vec<u8> = Vec::new();
     // 从什么时候起解析器停在同步更新（`?2026h`）里。
@@ -844,7 +963,7 @@ fn parse_batch(
         // 若真的发生重入会 panic（而不是未定义行为），比裸指针安全。
         let ctx = std::cell::RefCell::new(ScanCtx {
             processor: &mut *processor,
-            terminal: &mut *terminal,
+            terminal: &mut terminal,
         });
         let mut emit = |bytes: &[u8]| ctx.borrow_mut().emit(bytes);
         let mut grid = || {
@@ -920,6 +1039,105 @@ mod sink_tests {
             rx.try_recv().is_err(),
             "第二条应被丢弃，而不是挤掉已入队的通知"
         );
+    }
+
+    /// 写缓冲满时**不阻塞**：一次 `flush` 只做一次写尝试，余量留给下一轮。
+    ///
+    /// 回归：旧实现 `sleep(1ms)` 重试最多 5 秒，而它跑在负责读 PTY 输出的
+    /// gather 线程上——粘贴大段文本或 TUI 洪泛时终端会整块卡住数秒。
+    #[test]
+    fn pending_write_never_blocks_and_resumes_in_order() {
+        use std::time::{Duration, Instant};
+
+        /// 预算内正常写，预算耗尽即返回 `Ok(0)`（模拟 piper 缓冲满）。
+        struct BudgetWriter {
+            accepted: Vec<u8>,
+            budget: usize,
+        }
+        impl std::io::Write for BudgetWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.budget == 0 {
+                    return Ok(0); // 与 UnblockedWriter 缓冲满时的信号一致
+                }
+                let n = buf.len().min(self.budget);
+                self.accepted.extend_from_slice(&buf[..n]);
+                self.budget -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pending = PendingWrite::new();
+        let mut writer = BudgetWriter {
+            accepted: Vec::new(),
+            budget: 2,
+        };
+
+        pending.push(b"hello");
+        let started = Instant::now();
+        pending.flush(&mut writer).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "flush 不得等待：必须立刻返回，余量留给下一轮"
+        );
+        assert_eq!(&writer.accepted, b"he", "只写出了预算内的前缀");
+        assert!(!pending.is_empty(), "仍有待写余量");
+        assert!(
+            pending.wait_timeout() < Duration::from_millis(100),
+            "有待写余量时 poller 必须用短超时尽快重试"
+        );
+
+        // 下一轮：预算恢复，余量从断点继续（不重复、不乱序）。
+        writer.budget = 16;
+        pending.flush(&mut writer).unwrap();
+        assert!(pending.is_empty());
+        assert_eq!(&writer.accepted, b"hello", "续写必须接着断点，保持顺序");
+        assert_eq!(
+            pending.wait_timeout(),
+            Duration::from_millis(100),
+            "空闲时恢复常规节拍"
+        );
+    }
+
+    /// 追加新数据前必须先冲掉旧余量，否则字节会乱序。
+    #[test]
+    fn pending_write_keeps_fifo_across_pushes() {
+        let mut pending = PendingWrite::new();
+        let mut out: Vec<u8> = Vec::new();
+        pending.push(b"abc");
+        pending.flush(&mut out).unwrap();
+        pending.push(b"def");
+        pending.flush(&mut out).unwrap();
+        assert_eq!(out, b"abcdef");
+    }
+
+    /// 子进程长期不读输入时，超时后按错误上报而不是无限期占内存。
+    #[test]
+    fn pending_write_gives_up_after_max_wait() {
+        use std::time::Duration;
+
+        struct NeverWrites;
+        impl std::io::Write for NeverWrites {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut pending = PendingWrite::new();
+        pending.push(b"stuck");
+        // 把起点回拨到超时之前，避免测试真的等 5 秒。
+        pending.blocked_since = Some(
+            std::time::Instant::now()
+                .checked_sub(PendingWrite::MAX_WAIT + Duration::from_millis(1))
+                .expect("Instant 可回拨"),
+        );
+        let err = pending.flush(&mut NeverWrites).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WriteZero);
     }
 }
 

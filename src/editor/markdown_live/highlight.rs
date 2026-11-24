@@ -255,7 +255,7 @@ mod tests {
         );
         // Oldest keys were evicted: re-requesting the very first content
         // recomputes (a cache miss is indistinguishable from a correct hit).
-        let first = hl.runs_for("rust", &format!("let x_0 = 0; // 0"), &base(), &theme);
+        let first = hl.runs_for("rust", "let x_0 = 0; // 0", &base(), &theme);
         assert!(!first.is_empty());
         assert!(hl.len() <= MAX_ENTRIES);
         // clear() resets both structures.

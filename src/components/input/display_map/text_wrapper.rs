@@ -650,6 +650,9 @@ impl LineLayout {
 }
 
 #[cfg(test)]
+// 测试里大量「单元素 range 数组」喂给接收 `&[Range<T>]` 的 API（折行区间、
+// 折叠区间），单个元素是刻意的边界用例，不是漏写。
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
     use gpui::{Boundary, FontFeatures, FontStyle, FontWeight, px};

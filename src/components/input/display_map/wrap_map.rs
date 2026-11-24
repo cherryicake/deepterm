@@ -275,7 +275,7 @@ mod tests {
     /// every step.
     #[gpui::test]
     fn incremental_prefix_matches_full(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| crate::theme::init(cx));
+        cx.update(crate::theme::init);
         let _handle = cx.open_window(gpui::size(px(1200.), px(800.)), |_, cx| {
             run_parity(cx);
             ParityHost

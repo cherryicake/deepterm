@@ -77,11 +77,11 @@ extern "C" fn request_shutdown(_signal: libc::c_int) {
 /// 装好退出信号的处理器。
 #[cfg(unix)]
 fn install_signal_handlers() {
-    // SAFETY：处理函数只做一次原子写，是 async-signal-safe 的；
-    // `signal` 的旧值不需要保存。
     // `sighandler_t` 在 unix 上是 `usize`，不能直接从函数项转——先取
     // 函数指针再转整数，跨平台（含 macOS 的 `Option<fn>` 表示）都正确。
     let handler = request_shutdown as extern "C" fn(libc::c_int) as usize;
+    // SAFETY: 处理函数只做一次原子写，是 async-signal-safe 的；`signal` 的
+    // 旧值不需要保存（进程退出即弃）。
     unsafe {
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGINT, handler);
@@ -385,7 +385,7 @@ fn claim_pid_file(pid_file: &std::path::Path, pid: &str) -> std::io::Result<bool
 /// 信号 0 只做存在性检查，不投递信号。
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    // SAFETY：`kill` 只做存在性检查，不投递信号。
+    // SAFETY:`kill` 只做存在性检查，不投递信号。
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 

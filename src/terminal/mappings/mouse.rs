@@ -91,8 +91,7 @@ pub fn scroll_report(
     scroll_lines: i32,
     e: &ScrollWheelEvent,
     mode: TermMode,
-    sgr_pixels: bool,
-    scale: f32,
+    pixels: PixelCoords,
 ) -> Option<impl Iterator<Item = Vec<u8>>> {
     if mode.intersects(TermMode::MOUSE_MODE) {
         mouse_report(
@@ -101,8 +100,8 @@ pub fn scroll_report(
             AlacMouseButton::from_scroll(e),
             true,
             e.modifiers,
-            MouseFormat::from_mode(mode, sgr_pixels),
-            scale,
+            MouseFormat::from_mode(mode, pixels.is_enabled()),
+            pixels.scale(),
         )
         .map(|report| std::iter::repeat_n(report, scroll_lines.unsigned_abs() as usize))
     } else {
@@ -122,6 +121,40 @@ pub fn alt_scroll(scroll_lines: i32) -> Vec<u8> {
     content
 }
 
+/// 像素坐标上报参数（SGR-Pixels 是否启用 + 逻辑点到物理像素的缩放）。
+///
+/// 两者总是同时传入且只在 `sgr_pixels` 为真时用到 `scale`，因此打包成一个
+/// 枚举：`Disabled` 表示走字符单元坐标，`Enabled(scale)` 表示按像素上报。
+#[derive(Clone, Copy)]
+pub enum PixelCoords {
+    /// 上报字符单元坐标（常规 SGR/X10 模式）。
+    Disabled,
+    /// 上报物理像素坐标，`scale` 是逻辑点到物理像素的倍率。
+    Enabled { scale: f32 },
+}
+
+impl PixelCoords {
+    pub fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
+    }
+
+    pub fn scale(self) -> f32 {
+        match self {
+            Self::Disabled => 1.0,
+            Self::Enabled { scale } => scale,
+        }
+    }
+
+    /// 从「终端是否启用 SGR-Pixels」+ 当前缩放构造。
+    pub fn from_flag(sgr_pixels: bool, scale: f32) -> Self {
+        if sgr_pixels {
+            Self::Enabled { scale }
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
 pub fn mouse_button_report(
     point: AlacPoint,
     pixel_pos: Point<Pixels>,
@@ -129,8 +162,7 @@ pub fn mouse_button_report(
     modifiers: Modifiers,
     pressed: bool,
     mode: TermMode,
-    sgr_pixels: bool,
-    scale: f32,
+    pixels: PixelCoords,
 ) -> Option<Vec<u8>> {
     let button = AlacMouseButton::from_button(button);
     if !button.is_other() && mode.intersects(TermMode::MOUSE_MODE) {
@@ -140,8 +172,8 @@ pub fn mouse_button_report(
             button,
             pressed,
             modifiers,
-            MouseFormat::from_mode(mode, sgr_pixels),
-            scale,
+            MouseFormat::from_mode(mode, pixels.is_enabled()),
+            pixels.scale(),
         )
     } else {
         None
@@ -154,8 +186,7 @@ pub fn mouse_moved_report(
     button: Option<MouseButton>,
     modifiers: Modifiers,
     mode: TermMode,
-    sgr_pixels: bool,
-    scale: f32,
+    pixels: PixelCoords,
 ) -> Option<Vec<u8>> {
     let button = AlacMouseButton::from_move_button(button);
 
@@ -169,8 +200,8 @@ pub fn mouse_moved_report(
                 button,
                 true,
                 modifiers,
-                MouseFormat::from_mode(mode, sgr_pixels),
-                scale,
+                MouseFormat::from_mode(mode, pixels.is_enabled()),
+                pixels.scale(),
             )
         }
     } else {
@@ -486,8 +517,7 @@ mod tests {
             Modifiers::default(),
             true,
             TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE,
-            true,
-            2.0,
+            PixelCoords::Enabled { scale: 2.0 },
         )
         .expect("1016 激活时应产生报文");
 

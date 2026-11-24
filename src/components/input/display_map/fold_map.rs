@@ -413,7 +413,7 @@ impl FoldMap {
 
         // Scan all wrap rows and filter out hidden ones.
         let mut display_row = 0;
-        let mut hidden_iter = merged_hidden.chunks_exact(2);
+        let mut hidden_iter = merged_hidden.as_chunks::<2>().0.iter();
         let mut current_hidden = hidden_iter.next();
 
         for wrap_row in 0..wrap_row_count {
@@ -458,14 +458,14 @@ impl FoldMap {
                 continue;
             }
             let end = fold.end.row.min(line_count.saturating_sub(1));
-            for line in start..=end {
-                hidden[line] = true;
-            }
+            // 用切片 fill 代替逐行索引：区间边界已经由上面的检查保证。
+            hidden[start..=end].fill(true);
         }
 
         let mut display_row = 0;
-        for wrap_row in 0..line_count {
-            if !hidden[wrap_row] {
+        // 同时需要行号（写进映射表）与是否可见，索引循环最直白。
+        for (wrap_row, is_hidden) in hidden.iter().enumerate() {
+            if !is_hidden {
                 self.visible_wrap_rows.push(wrap_row);
                 self.wrap_row_to_display_row[wrap_row] = Some(display_row);
                 display_row += 1;
@@ -476,6 +476,9 @@ impl FoldMap {
 }
 
 #[cfg(test)]
+// 测试里大量「单元素 range 数组」喂给接收 `&[Range<T>]` 的 API（折行区间、
+// 折叠区间），单个元素是刻意的边界用例，不是漏写。
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 

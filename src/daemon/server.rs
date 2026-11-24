@@ -201,26 +201,40 @@ pub fn handle_spawn(registry: &Registry, request: &Value) -> Value {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    let shell = match shell_program {
+    // 三个分支都必须把**实际执行的程序**记下来：holder 用它回答"这条终端
+    // 的 shell 叫什么"（`TerminalMeta::shell`），GUI 重启后标签靠它在空闲时
+    // 显示 `host · zsh`。`configure_local_shell_integration` 会改写 args、
+    // 但不会换程序，所以程序名就是这里传进去的那一份。
+    let (shell, shell_program) = match shell_program {
         Some(program) if is_remote => {
             // 远程：原样执行调用方给的命令，不做任何 shell 改写。
-            alacritty_terminal::tty::Shell::new(program, args)
+            let shell = alacritty_terminal::tty::Shell::new(program.clone(), args);
+            (shell, Some(program))
         }
         Some(program) => {
-            crate::terminal::terminal::configure_local_shell_integration(program, args, &mut env)
+            let shell = crate::terminal::terminal::configure_local_shell_integration(
+                program.clone(),
+                args,
+                &mut env,
+            );
+            (shell, Some(program))
         }
         // 没指定 shell 就用本机默认的。
         None => match default_shell_program() {
-            Some(program) => crate::terminal::terminal::configure_local_shell_integration(
-                program,
-                Vec::new(),
-                &mut env,
-            ),
+            Some(program) => {
+                let shell = crate::terminal::terminal::configure_local_shell_integration(
+                    program.clone(),
+                    Vec::new(),
+                    &mut env,
+                );
+                (shell, Some(program))
+            }
             None => return json!({"ok": false, "error": "找不到可用的 shell"}),
         },
     };
 
     let mut spawn = SpawnRequest::new(shell);
+    spawn.shell_program = shell_program;
     spawn.cwd = cwd;
     spawn.env = env;
     spawn.cols = cols;

@@ -687,7 +687,8 @@ impl EditorModel {
             .iter()
             .map(|(s, e)| if e < s { (*e, *s) } else { (*s, *e) })
             .collect();
-        order.sort_by(|a, b| b.0.cmp(&a.0));
+        // 逆序（从后往前应用），保持前面偏移量有效。
+        order.sort_by_key(|r| std::cmp::Reverse(r.0));
         self.push_undo(false);
         self.anchor = None;
         for (s, e) in order {
@@ -712,7 +713,8 @@ impl EditorModel {
                 (s, e, t.replace('\r', ""))
             })
             .collect();
-        order.sort_by(|a, b| b.0.cmp(&a.0));
+        // 逆序（从后往前应用），保持前面偏移量有效。
+        order.sort_by_key(|r| std::cmp::Reverse(r.0));
         self.push_undo(false);
         self.anchor = None;
         for (s, e, text) in order {

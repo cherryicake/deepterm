@@ -85,16 +85,14 @@ pub struct SimpleHighlighter {
     query_timeout: Option<Duration>,
 }
 
-// All fields are `Send` (`Parser`/`Query`/`Tree` are marked `Send` by
-// tree-sitter; `Rope` is `Send + Sync`), so the highlighter can be moved
-// into background parse tasks.
-//
-// # SAFETY（中文安全说明）
-// 此 `unsafe impl` 断言上述字段在当前依赖版本下均为 `Send`。
-// 若升级 `tree-sitter`/`ropey` 后其类型变为非 `Send`，此处将构成 UB。
-// 升级相关依赖时必须重新确认字段的 `Send` 性，并在 CI 中运行
-// `cargo test syntax` 验证无数据竞争。
-unsafe impl Send for SimpleHighlighter {}
+/// 高亮器的字段**全部自动 `Send`**（`Parser`/`Query`/`Tree` 由 tree-sitter
+/// 声明为 `Send`，`Rope` 是 `Send + Sync`，`InjectionLayer` 只含这些类型），
+/// 因此这里不需要 `unsafe impl`——由编译器自己检查，依赖升级后若某个字段变成
+/// 非 `Send` 会直接编译失败，而不是悄悄留下一个失效的安全断言。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<SimpleHighlighter>();
+};
 
 fn clip_offset(rope: &Rope, offset: usize, bias: Bias) -> usize {
     if offset > rope.len() {

@@ -397,8 +397,11 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &crate::file_manager::TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter,
+                    },
                     resolver,
                 )?;
                 if operation == TransferOperation::Move {
@@ -423,8 +426,11 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &crate::file_manager::TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter,
+                    },
                     resolver,
                 )?;
                 if operation == TransferOperation::Move {
@@ -452,8 +458,11 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &crate::file_manager::TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter,
+                    },
                     resolver,
                 )
             }
@@ -473,8 +482,11 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &crate::file_manager::TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter,
+                    },
                     resolver,
                 )
             }
@@ -495,10 +507,12 @@ impl TransferManager {
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &crate::file_manager::TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter,
+                    },
                     resolver,
-                    reporter,
                 )?;
                 if operation == TransferOperation::Move {
                     Self::remove_source_if_complete(&summary, || {

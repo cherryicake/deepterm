@@ -14,7 +14,7 @@ mod open_path;
 mod resize;
 mod tab_groups;
 
-pub(crate) use open_path::handle_open_path;
+pub(crate) use open_path::{OpenPathRequest, handle_open_path};
 use resize::SidebarResizeElement;
 
 use std::collections::HashMap;
@@ -93,6 +93,7 @@ pub struct SidebarTabItem {
     /// herdr 的侧边栏（`mods/tabs/main.js`）除了图标与名字，还有：
     /// - `working` → 12px 转圈；
     /// - `blocked` / `done` → 6px 实心点。
+    ///
     /// 顶部标签栏那边只有状态点，没有转圈——两处的指示密度本来就不同。
     pub agent_status: Option<crate::agent::AgentStatus>,
     pub active: bool,

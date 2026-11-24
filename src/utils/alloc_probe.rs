@@ -84,7 +84,7 @@ mod ffi {
 
     /// 返回当前进程 `phys_footprint`（字节）。失败时返回 `None`。
     pub fn phys_footprint() -> Option<u64> {
-        // SAFETY：task_info 是纯查询 API；传入了正确的结构指针与计数。
+        // SAFETY:task_info 是纯查询 API；传入了正确的结构指针与计数。
         // mach_task_self() 返回当前任务的 send right，生命周期为进程级。
         let mut info = TaskVmInfo::default();
         let kr = unsafe {
@@ -133,6 +133,9 @@ thread_local! {
 }
 
 /// 一个统计周期内的分配统计（单线程）。
+///
+/// 全字段是 `u64`，本来就能自动 `Send`——早期版本里带裸指针时才需要
+/// `unsafe impl`，现在那个断言已经多余（留着反而会在将来加字段时变成假保证）。
 #[derive(Default, Debug, Clone, Copy)]
 pub struct AllocStats {
     pub allocations: u64,
@@ -142,11 +145,6 @@ pub struct AllocStats {
     /// 观测期间 [`AllocStats::bytes`] 的历史峰值（绝对值）。
     pub live_bytes_high_water: u64,
 }
-
-// SAFETY：跨线程读裸指针 —— 但该指针只在 [`AllocObserver::scope`] 闭包
-// 运行期间有效，而闭包由调用线程同步执行；GlobalAlloc 的多线程请求
-// 通过 thread_local 判定只统计本线程，其余线程拿到的永远是 None。
-unsafe impl Send for AllocStats {}
 
 thread_local! {
     static LIVE_BYTES: Cell<u64> = const { Cell::new(0) };
@@ -163,14 +161,14 @@ pub struct CountingAllocator<A> {
 
 unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY：GlobalAlloc::alloc 的契约由 inner（被装饰的分配器）保证；
+        // SAFETY:GlobalAlloc::alloc 的契约由 inner（被装饰的分配器）保证；
         // unsafe_op_in_unsafe_fn 需要 edition 2024 显式块。
         let ptr = unsafe { self.inner.alloc(layout) };
         let size = layout.size() as u64;
         LIVE_BYTES.with(|live| live.set(live.get().wrapping_add(size)));
         ALLOC_STATS.with(|cell| {
             if let Some(stats) = cell.get() {
-                // SAFETY：stats 指向 scope 栈上的统计结构，scope 闭包
+                // SAFETY:stats 指向 scope 栈上的统计结构，scope 闭包
                 // 同步返回前其生命周期一直有效（见 ALLOC_STATS 的 SAFETY 注释）。
                 let stats = unsafe { &mut *stats };
                 stats.allocations += 1;
@@ -191,20 +189,20 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for CountingAllocator<A> {
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         LIVE_BYTES.with(|live| live.set(live.get().wrapping_sub(layout.size() as u64)));
-        // SAFETY：同 alloc，dealloc 契约由 inner 保证。
+        // SAFETY:同 alloc，dealloc 契约由 inner 保证。
         unsafe { self.inner.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // 先按 dealloc 语义扣减旧值，再按 alloc 语义累加新值。
         LIVE_BYTES.with(|live| live.set(live.get().wrapping_sub(layout.size() as u64)));
-        // SAFETY：同 alloc，realloc 契约由 inner 保证。
+        // SAFETY:同 alloc，realloc 契约由 inner 保证。
         let new_ptr = unsafe { self.inner.realloc(ptr, layout, new_size) };
         let size = new_size as u64;
         LIVE_BYTES.with(|live| live.set(live.get().wrapping_add(size)));
         ALLOC_STATS.with(|cell| {
             if let Some(stats) = cell.get() {
-                // SAFETY：同 alloc。
+                // SAFETY:同 alloc。
                 let stats = unsafe { &mut *stats };
                 stats.allocations += 1;
                 stats.bytes += size;

@@ -40,6 +40,11 @@ const REMOTE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const BRANCH_INFO_TTL: Duration = Duration::from_secs(30);
 
 /// Git panel events
+///
+/// 体积：`SshConnectionConfig` 有 248 字节，直接内嵌会让这个枚举涨到 272 字节
+/// ——每次 emit/克隆/`match` 都要搬这么多。`OpenFile` 里的字段装箱后枚举降到
+/// 40 字节，与 [`crate::workspace::sidebar::SidebarEvent::PathRemoved`] 的
+/// 处理方式保持一致（那边同样是 `Option<Box<SshConnectionConfig>>`）。
 pub enum GitPanelEvent {
     /// Instant open: content loads asynchronously in DiffView.
     /// `staged` 为 true 时打开已暂存 diff（HEAD↔暂存区，只读）。
@@ -51,7 +56,7 @@ pub enum GitPanelEvent {
     /// 在文件树/编辑器中打开该文件（右键菜单“打开文件”）。
     OpenFile {
         path: std::path::PathBuf,
-        ssh_config: Option<SshConnectionConfig>,
+        ssh_config: Option<Box<SshConnectionConfig>>,
     },
     /// Emitted after `git add` succeeds; the HEAD → worktree diff must be recomputed.
     StageFile { path: String },
@@ -756,7 +761,7 @@ impl GitPanel {
         let full = repo.resolve_path(&entry.path);
         cx.emit(GitPanelEvent::OpenFile {
             path: std::path::PathBuf::from(full),
-            ssh_config: repo.ssh_config(),
+            ssh_config: repo.ssh_config().map(Box::new),
         });
     }
 
@@ -2505,7 +2510,7 @@ mod tests {
     #[gpui::test]
     fn git_panel_defers_git_file_watches_until_repo_confirmed(cx: &mut gpui::TestAppContext) {
         // set_workspace_path 内部经 WatcherContext 取全局 watcher，先初始化。
-        cx.update(|cx| crate::file_manager::watcher::init(cx));
+        cx.update(crate::file_manager::watcher::init);
         let panel = cx.new(GitPanel::new);
         let mut config = SshConnectionConfig::local();
         config.host = "127.0.0.1".to_string();
@@ -2603,7 +2608,7 @@ mod tests {
     fn commit_style_input_soft_wraps(cx: &mut gpui::TestAppContext) {
         use crate::components::input::InputState;
 
-        cx.update(|cx| crate::theme::init(cx));
+        cx.update(crate::theme::init);
         let long =
             "这是一段很长的提交信息应该在到达盒子右缘时自动折行而不是横向滚出视野 ".repeat(6);
         let window = cx.open_window(gpui::size(px(400.), px(200.)), |window, cx| {

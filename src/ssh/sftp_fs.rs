@@ -652,10 +652,12 @@ impl BlockingSftpSession {
 
         let transferred =
             crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
-                bulk.clone(),
-                source_path,
-                bulk,
-                &temporary_path,
+                CopyEndpoints {
+                    src_raw: &bulk,
+                    src_path: source_path,
+                    dst_raw: &bulk,
+                    dst_path: &temporary_path,
+                },
                 size,
                 config,
                 cancelled,
@@ -700,10 +702,12 @@ impl BlockingSftpSession {
         let config = ParallelTransferConfig::from_env();
 
         crate::ssh::shared_runtime::shared_ssh_runtime().block_on(pipelined_copy_between(
-            source_raw,
-            source_path,
-            dest_raw,
-            destination_path,
+            CopyEndpoints {
+                src_raw: &source_raw,
+                src_path: source_path,
+                dst_raw: &dest_raw,
+                dst_path: destination_path,
+            },
             size,
             config,
             cancelled,
@@ -1789,29 +1793,46 @@ impl ParallelTransferConfig {
 /// `size` 为源文件的大小字节数；`progress` 累加已成功写入字节；`cancelled`
 /// 被设置时立刻 bail 出 `TRANSFER_CANCELLED_MSG`（可能留下半传输的临时文件，
 /// 由调用方清理）。
+/// 一次管道化拷贝的两端：session + 远端路径。
+///
+/// 源与目标形状相同、总是一起出现（同一台主机时两侧 session 还是同一个
+/// `Arc`），打包后 `pipelined_copy_between` 从 8 个参数降到 4 个，也排除了
+/// 「两个路径传反」这类错误。
+pub(crate) struct CopyEndpoints<'a> {
+    src_raw: &'a Arc<RawSftpSession>,
+    src_path: &'a str,
+    dst_raw: &'a Arc<RawSftpSession>,
+    dst_path: &'a str,
+}
+
 pub(crate) async fn pipelined_copy_between(
-    source_raw: Arc<RawSftpSession>,
-    source_path: &str,
-    dest_raw: Arc<RawSftpSession>,
-    dest_path: &str,
+    endpoints: CopyEndpoints<'_>,
     size: u64,
     config: ParallelTransferConfig,
     cancelled: &AtomicBool,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<u64> {
-    let src_handle = open_handle(&source_raw, source_path, OpenFlags::READ).await?;
+    let CopyEndpoints {
+        src_raw,
+        src_path,
+        dst_raw,
+        dst_path,
+    } = endpoints;
+    let src_handle = open_handle(src_raw, src_path, OpenFlags::READ).await?;
     let dst_handle = open_handle(
-        &dest_raw,
-        dest_path,
+        dst_raw,
+        dst_path,
         OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
     )
     .await?;
 
     let result = pipelined_copy(
-        &source_raw,
-        &src_handle,
-        &dest_raw,
-        &dst_handle,
+        CopyHandles {
+            src_raw,
+            src_handle: &src_handle,
+            dst_raw,
+            dst_handle: &dst_handle,
+        },
         size,
         config,
         cancelled,
@@ -1820,8 +1841,8 @@ pub(crate) async fn pipelined_copy_between(
     .await;
 
     // 无论成功失败都尝试关闭句柄，避免泄漏
-    let _ = source_raw.close(src_handle).await;
-    let _ = dest_raw.close(dst_handle).await;
+    let _ = src_raw.close(src_handle).await;
+    let _ = dst_raw.close(dst_handle).await;
 
     result
 }
@@ -1846,16 +1867,27 @@ async fn open_handle(raw: &RawSftpSession, path: &str, flags: OpenFlags) -> anyh
 ///
 /// 正确性要点：每块数据携带显式 offset，写入端按 offset 调用 `write`，
 /// 服务器即使乱序处理也会落到正确位置。
+/// [`pipelined_copy`] 的两端：session 引用 + 已打开的远端句柄。
+struct CopyHandles<'a> {
+    src_raw: &'a RawSftpSession,
+    src_handle: &'a str,
+    dst_raw: &'a RawSftpSession,
+    dst_handle: &'a str,
+}
+
 async fn pipelined_copy(
-    src_raw: &RawSftpSession,
-    src_handle: &str,
-    dst_raw: &RawSftpSession,
-    dst_handle: &str,
+    endpoints: CopyHandles<'_>,
     size: u64,
     config: ParallelTransferConfig,
     cancelled: &AtomicBool,
     progress: Option<&AtomicU64>,
 ) -> anyhow::Result<u64> {
+    let CopyHandles {
+        src_raw,
+        src_handle,
+        dst_raw,
+        dst_handle,
+    } = endpoints;
     if size == 0 {
         return Ok(0);
     }

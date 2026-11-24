@@ -232,6 +232,7 @@ while True:
 
 /// `kill(pid, 0)` 探测进程是否存活。
 fn process_alive(pid: u32) -> bool {
+    // SAFETY: 信号 0 只做存在性检查，不投递给目标进程，任何线程调用都安全。
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
@@ -357,10 +358,10 @@ time.sleep(1)
         let mut seen = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while seen.len() < 5 && std::time::Instant::now() < deadline {
-            if let Ok(Message::Notification { params, .. }) = rx.recv().await {
-                if let Some(i) = params.get("i").and_then(|v| v.as_u64()) {
-                    seen.push(i);
-                }
+            if let Ok(Message::Notification { params, .. }) = rx.recv().await
+                && let Some(i) = params.get("i").and_then(|v| v.as_u64())
+            {
+                seen.push(i);
             }
         }
         assert_eq!(

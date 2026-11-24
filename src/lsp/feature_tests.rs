@@ -43,6 +43,41 @@ where
     }
 }
 
+/// 等到**有结果**为止（`Ok(None)` 也算「还没准备好」并重试）。
+///
+/// [`retry_until_ready`] 只重试 `Err`，而 `textDocument/definition` 在
+/// rust-analyzer 尚未完成索引时返回的是 `Ok(None)`——服务器正常应答、只是
+/// 还不知道答案。用前者会立刻走到断言失败，表现为**偶发**的
+/// 「no definition found for `add`」（机器忙、cargo check 同时跑时必现）。
+async fn wait_until_some<T, Fut>(
+    client: &LspClient,
+    mut f: impl FnMut() -> Fut,
+    what: &str,
+    timeout: Duration,
+) -> Option<T>
+where
+    Fut: std::future::Future<Output = Result<Option<T>, anyhow::Error>>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match f().await {
+            Ok(Some(v)) => return Some(v),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                smol::Timer::after(Duration::from_millis(300)).await;
+            }
+            Ok(None) => {
+                eprintln!("{what}: 仍无结果（{timeout:?} 后放弃）");
+                return None;
+            }
+            Err(e) if client.is_closed() => panic!("{what}: server closed: {e}"),
+            Err(_) if std::time::Instant::now() < deadline => {
+                smol::Timer::after(Duration::from_millis(300)).await;
+            }
+            Err(e) => panic!("{what}: still failing after {timeout:?}: {e}"),
+        }
+    }
+}
+
 /// 服务器是否**真的可用**（判退出码，理由见 `integration_tests::has_server`）。
 ///
 /// rustup 的代理存根能启动但会以非零退出——只判`status().is_ok()` 会把
@@ -213,7 +248,7 @@ fn rust_analyzer_feature_requests() {
         );
         // --- 跳转定义：从 `add(1, 2)` 跳到 `fn add` ---
         let use_pos = lsp_types::Position::new(5, 15); // `add` in `add(1, 2)`
-        let goto = retry_until_ready(
+        let goto = wait_until_some(
             &client,
             || client.goto_definition(&uri, use_pos),
             "definition",

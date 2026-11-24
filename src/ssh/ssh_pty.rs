@@ -79,6 +79,17 @@ pub struct SshPtyTerminal {
     sender: EventLoopSender,
 }
 
+/// `ssh` 子进程的启动参数：`(程序, 参数, 环境变量, 代理命令处理结果)`。
+///
+/// 环境变量里可能带 `SSHPASS`（密码认证走 `sshpass -e`），属于**凭据**：
+/// 只交给子进程环境，不落盘、不写日志、不回报给 UI。
+pub type SshCommandSpec = (
+    String,
+    Vec<String>,
+    std::collections::HashMap<String, String>,
+    ProxyCommandOutcome,
+);
+
 impl SshPtyTerminal {
     /// 创建新的 SSH PTY 终端
     ///
@@ -98,12 +109,7 @@ impl SshPtyTerminal {
     pub fn build_ssh_command(
         config: &SshConnectionConfig,
         initial_cwd: Option<&str>,
-    ) -> anyhow::Result<(
-        String,
-        Vec<String>,
-        std::collections::HashMap<String, String>,
-        ProxyCommandOutcome,
-    )> {
+    ) -> anyhow::Result<SshCommandSpec> {
         let resolved_auth = resolve_auth_method(&config.auth_method)?;
 
         // StrictHostKeyChecking 与 russh 路径共用同一策略，避免同一开关在
@@ -302,12 +308,7 @@ mod tests {
         fn build(
             config: &SshConnectionConfig,
             cwd: Option<&str>,
-        ) -> anyhow::Result<(
-            String,
-            Vec<String>,
-            std::collections::HashMap<String, String>,
-            ProxyCommandOutcome,
-        )> {
+        ) -> anyhow::Result<SshCommandSpec> {
             SshPtyTerminal::build_ssh_command(config, cwd)
         }
     }

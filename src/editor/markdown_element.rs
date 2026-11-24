@@ -395,11 +395,11 @@ impl MarkdownElementBuilder {
                             checked,
                         ),
                         None => {
-                            if let Some(Some(n)) = self.list_stack.last().cloned() {
-                                let s = format!("{}.", n);
-                                if let Some(last) = self.list_stack.last_mut() {
-                                    *last.as_mut().unwrap() += 1;
-                                }
+                            // 有序列表：先读当前编号再自增。`last_mut` 已经拿到
+                            // `&mut Option<usize>`，无需再 `unwrap` 一次。
+                            if let Some(Some(last)) = self.list_stack.last_mut() {
+                                let s = format!("{}.", *last);
+                                *last += 1;
                                 (s, false, false)
                             } else {
                                 ("•".to_string(), false, false)
@@ -415,7 +415,6 @@ impl MarkdownElementBuilder {
                             strikethrough: Some(gpui::StrikethroughStyle {
                                 thickness: px(1.),
                                 color: Some(cx.theme().ui.text_muted.opacity(0.6)),
-                                ..Default::default()
                             }),
                             ..Default::default()
                         });

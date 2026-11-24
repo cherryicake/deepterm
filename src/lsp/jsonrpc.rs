@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result, anyhow};
 use async_channel::{Receiver, Sender, bounded, unbounded};
@@ -332,6 +332,13 @@ pub struct Connection {
     replies: Sender<OutgoingReply>,
     pending: Pending,
     next_id: AtomicU32,
+    /// 订阅句柄的 id 发号器。
+    ///
+    /// **单调递增**，不能用 `subscribers.len() + 1`：退订会在表里留下空洞，
+    /// 按长度发号会与仍存活的订阅撞号（A=1、B=2、drop A、新订阅又得 2）。
+    /// 撞号的两个句柄任一被 drop，`retain` 都会把两条一起删掉——某个标签
+    /// 从此收不到 `publishDiagnostics`，且没有任何报错。
+    next_sub_id: AtomicU64,
     /// 服务器主动通知的**订阅者列表**（广播）。
     ///
     /// 每个订阅者一份独立队列，`dispatch` 向**全部**订阅者各投一份。
@@ -509,6 +516,7 @@ impl Connection {
             replies: replies_tx,
             pending: pending.clone(),
             next_id: AtomicU32::new(1),
+            next_sub_id: AtomicU64::new(1),
             subscribers: subscribers.clone(),
             process: Arc::new(Mutex::new(process)),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -613,10 +621,13 @@ impl Connection {
     ///    通知；此时若不过滤，`target/` 里 `cargo check` 写的每个中间文件都会
     ///    触发一次 reload，自持循环就是这么来的。
     pub fn should_notify_watched_file(&self, path: &std::path::Path) -> bool {
-        let globs = self.watched_globs.lock().clone();
+        // 先短路注册项查询：这条路径由每个文件系统事件调用，克隆一份
+        // `Vec<String>` 会在 `cargo check` 写 target/ 的风暴里变成每秒数百次分配。
+        let globs = self.watched_globs.lock();
         if !globs.is_empty() {
             return globs.iter().any(|g| crate::lsp::glob::glob_match(g, path));
         }
+        drop(globs);
         !crate::lsp::glob::is_build_artifact(path)
     }
 
@@ -628,19 +639,7 @@ impl Connection {
     /// 句柄 drop 即退订（见 [`NotificationSub`]），标签关闭时必须让它离开
     /// 作用域，否则订阅者会泄漏。
     pub fn subscribe(&self) -> NotificationSub {
-        let (tx, rx) = bounded(NOTIFY_QUEUE_CAPACITY);
-        let mut subs = self.subscribers.lock();
-        let id = subs.len() as u64 + 1;
-        subs.push(Subscription {
-            id,
-            tx,
-            rx: rx.clone(),
-        });
-        NotificationSub {
-            rx,
-            registry: Arc::clone(&self.subscribers),
-            id,
-        }
+        subscribe_in(&self.subscribers, &self.next_sub_id)
     }
 
     /// 发送一个请求并等待应答。
@@ -667,18 +666,20 @@ impl Connection {
             return Err(anyhow!("language server is closed"));
         }
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        // 每个挂起请求一个 slot：响应到达后即关闭，因此 `recv` 拿到的一定
-        // 是本 id 的应答。
-        let (tx, rx) = bounded(1);
-        self.pending.lock().insert(id, tx);
-
         let outgoing = OutgoingRequest {
             jsonrpc: "2.0",
             id,
             method,
             params,
         };
+        // 序列化放在登记 pending **之前**：`?` 提前返回时不会在表里留下一条
+        // 永远等不到清理的条目（写失败分支有显式 remove，这条路径没有）。
         let payload = serde_json::to_vec(&outgoing).context("failed to serialize request")?;
+
+        // 每个挂起请求一个 slot：响应到达后即关闭，因此 `recv` 拿到的一定
+        // 是本 id 的应答。
+        let (tx, rx) = bounded(1);
+        self.pending.lock().insert(id, tx);
 
         // 写入失败要从 pending 表摘掉，否则请求会挂死。
         if let Err(e) = self.write_frame(&payload).await {
@@ -886,6 +887,9 @@ impl Connection {
             replies: self.replies.clone(),
             pending: Arc::clone(&self.pending),
             next_id: AtomicU32::new(self.next_id.load(Ordering::SeqCst)),
+            // 发号器必须共享语义一致：这份副本只用于关闭握手，不会再开订阅，
+            // 复制当前值即可（不会与主连接发号冲突）。
+            next_sub_id: AtomicU64::new(self.next_sub_id.load(Ordering::SeqCst)),
             subscribers: Arc::clone(&self.subscribers),
             process: Arc::clone(&self.process),
             closed: Arc::clone(&self.closed),
@@ -1261,6 +1265,29 @@ struct Subscription {
     id: u64,
     tx: Sender<Message>,
     rx: Receiver<Message>,
+}
+
+/// 从 `next_id` 取号并登记一个订阅。
+///
+/// 抽成自由函数是为了能直接单测**发号单调性**：id 必须来自独立的计数器，
+/// 不能按 `subscribers.len()` 推导——退订会在表里留空洞，按长度发号会让新
+/// 订阅拿到与存活订阅相同的 id，两个句柄任一被 drop 都会把对方一起删掉。
+fn subscribe_in(
+    subscribers: &Arc<Mutex<Vec<Subscription>>>,
+    next_id: &std::sync::atomic::AtomicU64,
+) -> NotificationSub {
+    let (tx, rx) = bounded(NOTIFY_QUEUE_CAPACITY);
+    let id = next_id.fetch_add(1, Ordering::Relaxed);
+    subscribers.lock().push(Subscription {
+        id,
+        tx,
+        rx: rx.clone(),
+    });
+    NotificationSub {
+        rx,
+        registry: Arc::clone(subscribers),
+        id,
+    }
 }
 
 /// 一个标签的通知订阅句柄。**drop 即退订**。
@@ -1800,6 +1827,33 @@ mod tests {
             0,
             "句柄 drop 后必须退订，否则订阅者泄漏"
         );
+    }
+
+    #[test]
+    fn dropped_subscription_does_not_unsubscribe_a_live_one() {
+        // 回归：id 曾按 `subs.len() + 1` 分配，退订留空洞后会与存活订阅撞号，
+        // 于是 drop 任一者都会把两条一起 `retain` 掉——某个标签从此收不到诊断，
+        // 且没有任何报错。
+        let registry: Arc<Mutex<Vec<Subscription>>> = Arc::new(Mutex::new(Vec::new()));
+        let next_id = AtomicU64::new(1);
+
+        let first = subscribe_in(&registry, &next_id);
+        let keep = subscribe_in(&registry, &next_id);
+        assert_eq!(registry.lock().len(), 2);
+
+        // 退订第一个：表里出现空洞，此时 `len() == 1`。
+        drop(first);
+        assert_eq!(registry.lock().len(), 1);
+
+        // 再订阅一个：id 必须与仍存活的那个不同（按长度发号会拿到同一个）。
+        let third = subscribe_in(&registry, &next_id);
+        assert_ne!(keep.id, third.id, "发号必须单调，不能复用存活订阅的 id");
+        assert_eq!(registry.lock().len(), 2);
+
+        // drop 新订阅只应摘掉它自己，活着的那个必须留下。
+        drop(third);
+        assert_eq!(registry.lock().len(), 1, "存活订阅不得被误删");
+        assert!(registry.lock().iter().any(|s| s.id == keep.id));
     }
 
     #[test]

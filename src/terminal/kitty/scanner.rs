@@ -760,14 +760,15 @@ mod tests {
         (emitted, pendings)
     }
 
+    /// 收到的 OSC 内容（跨线程共享，测试在主线程读）。
+    type CollectedOsc = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+    /// 每条 OSC 的**序列时刻**光标（行, 列）。
+    type CollectedOscCursors = std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>>;
+
     /// 带 OSC 收集器的扫描器。
     ///
     /// 返回 `(扫描器, 收到的 OSC 内容, 每条 OSC 的序列时刻光标)`。
-    fn scanner_with_osc_collector() -> (
-        KittyGraphicsScanner,
-        std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
-        std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>>,
-    ) {
+    fn scanner_with_osc_collector() -> (KittyGraphicsScanner, CollectedOsc, CollectedOscCursors) {
         let collected: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let cursors: std::sync::Arc<std::sync::Mutex<Vec<(i32, u32)>>> =

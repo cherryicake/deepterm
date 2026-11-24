@@ -739,11 +739,13 @@ impl AppWindow {
                     crate::workspace::sidebar::handle_open_path(
                         this.editor.clone(),
                         this.sidebar.clone(),
-                        path.clone(),
-                        *line,
-                        *col,
-                        ssh_config.as_deref().cloned(),
-                        terminal_cwd.clone(),
+                        crate::workspace::sidebar::OpenPathRequest {
+                            path: path.clone(),
+                            line: *line,
+                            col: *col,
+                            ssh_config: ssh_config.as_deref().cloned(),
+                            terminal_cwd: terminal_cwd.clone(),
+                        },
                         window,
                         cx,
                     );

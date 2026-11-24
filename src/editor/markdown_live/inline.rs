@@ -146,17 +146,11 @@ impl Inline {
             match (left, right) {
                 // Prefer the content that immediately abuts this delimiter: a
                 // closing marker has its content on the left, an opening one on
-                // the right.
+                // the right. Neither abuts (can't happen for a well-formed
+                // span list, but be deterministic) → take the right one.
                 (Some(l), Some(r)) => {
                     let l_gap = self.spans[l].range.end == self.spans[idx].range.start;
-                    let r_gap = self.spans[idx].range.end == self.spans[r].range.start;
-                    if l_gap {
-                        l
-                    } else if r_gap {
-                        r
-                    } else {
-                        r
-                    }
+                    if l_gap { l } else { r }
                 }
                 (Some(l), None) => l,
                 (None, Some(r)) => r,
@@ -1356,9 +1350,9 @@ mod tests {
         );
         let refs = collect_refdefs(&lines, &|i| i == 3);
         assert_eq!(refs.get("a").map(|l| l.as_str()), Some("/one"));
-        assert!(refs.get("code").is_none());
-        assert!(refs.get("empty").is_none());
-        assert!(refs.get("fn").is_none());
+        assert!(!refs.contains_key("code"));
+        assert!(!refs.contains_key("empty"));
+        assert!(!refs.contains_key("fn"));
     }
 
     #[test]

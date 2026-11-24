@@ -463,15 +463,14 @@ impl Relay {
                                 }
                             }
                             std::thread::spawn(move || {
-                                match (client.try_clone(), server.try_clone()) {
-                                    (Ok(mut upload_from), Ok(mut upload_to)) => {
-                                        std::thread::spawn(move || {
-                                            let _ = io::copy(&mut upload_from, &mut upload_to);
-                                            let _ = upload_to.shutdown(Shutdown::Write);
-                                        });
-                                        let _ = io::copy(&mut server, &mut client);
-                                    }
-                                    _ => {}
+                                if let (Ok(mut upload_from), Ok(mut upload_to)) =
+                                    (client.try_clone(), server.try_clone())
+                                {
+                                    std::thread::spawn(move || {
+                                        let _ = io::copy(&mut upload_from, &mut upload_to);
+                                        let _ = upload_to.shutdown(Shutdown::Write);
+                                    });
+                                    let _ = io::copy(&mut server, &mut client);
                                 }
                                 let _ = client.shutdown(Shutdown::Both);
                                 let _ = server.shutdown(Shutdown::Both);

@@ -292,11 +292,11 @@ mod tests {
     #[test]
     fn test_code_editor() {
         let mode = InputMode::code_editor("rust");
-        assert_eq!(mode.is_code_editor(), true);
-        assert_eq!(mode.is_multi_line(), true);
-        assert_eq!(mode.is_single_line(), false);
-        assert_eq!(mode.line_number(), true);
-        assert_eq!(mode.is_folding(), true);
+        assert!(mode.is_code_editor());
+        assert!(mode.is_multi_line());
+        assert!(!mode.is_single_line());
+        assert!(mode.line_number());
+        assert!(mode.is_folding());
 
         let mode = InputMode::CodeEditor {
             multi_line: false,
@@ -308,11 +308,11 @@ mod tests {
             diagnostics: DiagnosticSet::new(&Rope::new()),
             parse_task: Default::default(),
         };
-        assert_eq!(mode.is_code_editor(), true);
-        assert_eq!(mode.is_multi_line(), false);
-        assert_eq!(mode.is_single_line(), true);
-        assert_eq!(mode.line_number(), false);
-        assert_eq!(mode.is_folding(), false);
+        assert!(mode.is_code_editor());
+        assert!(!mode.is_multi_line());
+        assert!(mode.is_single_line());
+        assert!(!mode.line_number());
+        assert!(!mode.is_folding());
     }
 
     #[test]
@@ -321,26 +321,26 @@ mod tests {
             multi_line: true,
             rows: 5,
         };
-        assert_eq!(mode.is_code_editor(), false);
-        assert_eq!(mode.is_multi_line(), true);
-        assert_eq!(mode.is_single_line(), false);
-        assert_eq!(mode.line_number(), false);
+        assert!(!mode.is_code_editor());
+        assert!(mode.is_multi_line());
+        assert!(!mode.is_single_line());
+        assert!(!mode.line_number());
         assert_eq!(mode.rows(), 5);
 
         let mode = InputMode::plain_text();
-        assert_eq!(mode.is_code_editor(), false);
-        assert_eq!(mode.is_multi_line(), false);
-        assert_eq!(mode.is_single_line(), true);
-        assert_eq!(mode.line_number(), false);
+        assert!(!mode.is_code_editor());
+        assert!(!mode.is_multi_line());
+        assert!(mode.is_single_line());
+        assert!(!mode.line_number());
     }
 
     #[test]
     fn test_auto_grow() {
         let mut mode = InputMode::auto_grow(2, 5);
-        assert_eq!(mode.is_code_editor(), false);
-        assert_eq!(mode.is_multi_line(), true);
-        assert_eq!(mode.is_single_line(), false);
-        assert_eq!(mode.line_number(), false);
+        assert!(!mode.is_code_editor());
+        assert!(mode.is_multi_line());
+        assert!(!mode.is_single_line());
+        assert!(!mode.line_number());
         assert_eq!(mode.rows(), 2);
 
         // 低于下界回夹到 `min`，高于上界回夹到 `max`。

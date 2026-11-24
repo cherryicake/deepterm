@@ -83,16 +83,33 @@ impl TransferHoverAction {
 /// Render the full transfer popover panel, including the header with a
 /// "clear all completed" action and the task list. Returns `None` when no
 /// task exists so callers can decide whether to show the trigger button.
+/// 传输面板的交互相应（悬停 / 取消 / 移除 / 清空 / 定位）。
+///
+/// 五个回调同属一份「面板事件出口」，并且都要被 `Clone` 进去分发给每个列表项；
+/// 打包后两个渲染函数的签名不再随新增动作而膨胀。
+/// 指向某个任务的回调（`(任务 id, &mut App)`）。
+type TaskCallback = std::rc::Rc<dyn Fn(usize, &mut App)>;
+
+/// 悬停回调：`(任务 id, 悬停部位)`，`None` 表示离开了列表项。
+type HoverCallback = std::rc::Rc<dyn Fn(Option<(usize, TransferHoverAction)>, &mut App)>;
+
+#[derive(Clone)]
+pub struct TransferCallbacks {
+    pub on_hover: HoverCallback,
+    pub on_cancel: TaskCallback,
+    pub on_remove: TaskCallback,
+    pub on_clear_finished: std::rc::Rc<dyn Fn(&mut App)>,
+    pub on_reveal: TaskCallback,
+}
+
 pub fn render_transfer_panel(
     tasks: &[TransferTaskState],
     theme: UiTheme,
     hover_hint: Option<(usize, TransferHoverAction)>,
-    on_hover: impl Fn(Option<(usize, TransferHoverAction)>, &mut App) + 'static + Clone,
-    on_cancel: impl Fn(usize, &mut App) + 'static + Clone,
-    on_remove: impl Fn(usize, &mut App) + 'static + Clone,
-    on_clear_finished: impl Fn(&mut App) + 'static + Clone,
-    on_reveal: impl Fn(usize, &mut App) + 'static + Clone,
+    callbacks: &TransferCallbacks,
 ) -> Option<Div> {
+    // 面板本身只用到「清空已完成」；其余回调转交给每个列表项。
+    let on_clear_finished = callbacks.on_clear_finished.clone();
     if tasks.is_empty() {
         return None;
     }
@@ -156,14 +173,7 @@ pub fn render_transfer_panel(
             .filter(|(id, _)| *id == task.id)
             .map(|(_, action)| action);
         list = list.child(render_transfer_list_item(
-            task,
-            theme,
-            is_last,
-            task_hover,
-            on_hover.clone(),
-            on_cancel.clone(),
-            on_remove.clone(),
-            on_reveal.clone(),
+            task, theme, is_last, task_hover, callbacks,
         ));
     }
 
@@ -187,11 +197,15 @@ fn render_transfer_list_item(
     theme: UiTheme,
     is_last: bool,
     hover: Option<TransferHoverAction>,
-    on_hover: impl Fn(Option<(usize, TransferHoverAction)>, &mut App) + 'static + Clone,
-    on_cancel: impl Fn(usize, &mut App) + 'static + Clone,
-    on_remove: impl Fn(usize, &mut App) + 'static + Clone,
-    on_reveal: impl Fn(usize, &mut App) + 'static + Clone,
+    callbacks: &TransferCallbacks,
 ) -> Div {
+    let TransferCallbacks {
+        on_hover,
+        on_cancel,
+        on_remove,
+        on_reveal,
+        ..
+    } = callbacks;
     let task_id = task.id;
     let transferred = task.bytes_transferred.load(Ordering::Relaxed);
     let is_running = matches!(task.status, TransferTaskStatus::Running);

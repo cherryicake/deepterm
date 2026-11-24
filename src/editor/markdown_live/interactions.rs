@@ -448,11 +448,11 @@ pub fn table_cell_at(
         l -= 1;
     }
     let start = l;
-    for i in start..line {
-        if table_delimiter_cols(&lines[i]).is_none() {
-            row += 1;
-        }
-    }
+    // 用切片迭代而不是索引：`lines[start..line]` 已经保证边界安全。
+    row += lines[start..line]
+        .iter()
+        .filter(|l| table_delimiter_cols(l).is_none())
+        .count();
     let range = cell_content_cols(text, ci)?;
     Some((row, ci, range))
 }

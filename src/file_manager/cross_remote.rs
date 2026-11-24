@@ -9,7 +9,7 @@ use crate::file_manager::utils::{
     remove_remote_source, resolve_remote_conflict, shell_single_quote, temporary_remote_path,
     walk_remote_dir,
 };
-use crate::file_manager::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver, TransferCtx};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::keychain::{ResolvedAuthMethod, resolve_auth_method};
 use crate::ssh::sftp_fs::{self, BlockingSftpSession, RemoteFileKind};
@@ -219,11 +219,12 @@ pub fn copy_remote_to_different_remote(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     rename_to: Option<&str>,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
-    reporter: Option<&dyn TransferStatusReporter>,
 ) -> anyhow::Result<TransferSummary> {
+    let cancelled = ctx.cancelled;
+    let progress = ctx.progress;
+    let reporter = ctx.reporter;
     check_cancelled(cancelled)?;
     let file_name = remote_file_name(remote_path)?;
 
@@ -314,9 +315,7 @@ pub fn copy_remote_to_different_remote(
                         destination_config,
                         &destination_path,
                         is_directory,
-                        cancelled,
-                        progress,
-                        reporter,
+                        ctx,
                     )
                 }
                 RemoteToRemoteStrategy::AgentForwardScp => {
@@ -325,15 +324,15 @@ pub fn copy_remote_to_different_remote(
                 RemoteToRemoteStrategy::TempKeyScp { key_path } if direct_paths_are_safe => {
                     copy_via_remote_scp(
                         source_session,
-                        source_config,
-                        remote_path,
-                        destination_config,
-                        &destination_path,
+                        ScpEndpoints {
+                            source_config,
+                            remote_path,
+                            destination_config,
+                            destination_path: &destination_path,
+                        },
                         key_path,
                         is_directory,
-                        cancelled,
-                        progress,
-                        reporter,
+                        ctx,
                     )
                 }
                 RemoteToRemoteStrategy::TempKeyScp { .. } => {
@@ -358,8 +357,7 @@ pub fn copy_remote_to_different_remote(
                                 destination_session,
                                 &destination_path,
                                 conflict_policy,
-                                cancelled,
-                                progress,
+                                ctx,
                                 resolver,
                             )
                         } else {
@@ -614,11 +612,10 @@ fn copy_via_agent_forward_scp(
     destination_config: &SshConnectionConfig,
     destination_path: &str,
     is_directory: bool,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
-    reporter: Option<&dyn TransferStatusReporter>,
+    ctx: &TransferCtx<'_>,
 ) -> anyhow::Result<TransferSummary> {
-    check_cancelled(cancelled)?;
+    check_cancelled(ctx.cancelled)?;
+    let (cancelled, progress, reporter) = (ctx.cancelled, ctx.progress, ctx.reporter);
 
     let dest_host = format!(
         "{}@{}",
@@ -908,19 +905,32 @@ fn remote_total_files(session: &mut BlockingSftpSession, path: &str) -> usize {
     walk(session, path).unwrap_or(0)
 }
 
+/// 一次远端到远端 scp 的两端。
+///
+/// 源与目标各含「机器 + 路径」，两者形状相同、总是一起出现；打包后
+/// `copy_via_remote_scp` 的参数从 8 个降到 4 个，也不易把两个 path 传反。
+struct ScpEndpoints<'a> {
+    source_config: &'a SshConnectionConfig,
+    remote_path: &'a str,
+    destination_config: &'a SshConnectionConfig,
+    destination_path: &'a str,
+}
+
 fn copy_via_remote_scp(
     source_session: &mut BlockingSftpSession,
-    source_config: &SshConnectionConfig,
-    remote_path: &str,
-    destination_config: &SshConnectionConfig,
-    destination_path: &str,
+    endpoints: ScpEndpoints<'_>,
     key_path: &std::path::Path,
     is_directory: bool,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
-    reporter: Option<&dyn TransferStatusReporter>,
+    ctx: &TransferCtx<'_>,
 ) -> anyhow::Result<TransferSummary> {
-    check_cancelled(cancelled)?;
+    let ScpEndpoints {
+        source_config,
+        remote_path,
+        destination_config,
+        destination_path,
+    } = endpoints;
+    check_cancelled(ctx.cancelled)?;
+    let (cancelled, progress, reporter) = (ctx.cancelled, ctx.progress, ctx.reporter);
 
     log::debug!("远程 scp 使用本地密钥: {}", key_path.display());
 
@@ -1157,8 +1167,7 @@ pub fn copy_remote_dir_between_sessions(
     destination_session: &mut BlockingSftpSession,
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
     walk_remote_dir(
@@ -1169,8 +1178,8 @@ pub fn copy_remote_dir_between_sessions(
         remote_dir,
         &destination_dir.to_string(),
         conflict_policy,
-        cancelled,
-        progress,
+        ctx.cancelled,
+        ctx.progress,
         resolver,
     )
 }

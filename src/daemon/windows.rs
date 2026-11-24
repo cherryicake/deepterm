@@ -69,10 +69,18 @@ pub struct Stream {
     handle: HANDLE,
 }
 
-// SAFETY：`HANDLE` 只是一个不透明指针，管道句柄可以跨线程使用
-// （Win32 文档允许，只要不同时对同一句柄做重叠 IO——这里都是同步读写，
-// 且由 `&mut self` 保证独占）。
-unsafe impl Send for Stream {}
+// 不需要 `unsafe impl Send`：`HANDLE` 在 windows crate 里是
+// `#[repr(transparent)] Copy` 的 `isize` 包装，本身 `Send + Sync`，
+// 因此 `Stream` 自动 `Send`。之前手写的断言让编译器不再替我们检查，
+// 将来给 `Stream` 加非 `Send` 字段时不会有任何提示。
+//
+// 保留下面的编译期断言，把「管道句柄可以跨线程使用」这个前提钉在代码里：
+// Win32 文档允许跨线程使用句柄，只要不同时对同一句柄做重叠 IO——本类型
+// 都是同步读写，且由 `&mut self` 保证独占。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Stream>();
+};
 
 impl Stream {
     fn from_handle(handle: HANDLE) -> Self {
@@ -88,7 +96,7 @@ impl Stream {
         use windows::Win32::System::Threading::{DuplicateHandle, GetCurrentProcess};
 
         let mut out = HANDLE::default();
-        // SAFETY：源句柄有效；目标进程是当前进程；`out` 是有效出参。
+        // SAFETY:源句柄有效；目标进程是当前进程；`out` 是有效出参。
         unsafe {
             DuplicateHandle(
                 GetCurrentProcess(),
@@ -110,7 +118,7 @@ impl Stream {
         // 管道忙（对面还没 `ConnectNamedPipe`）时短暂等一下，与 Unix socket
         // 的 `ECONNREFUSED` 重试是同一类处理。
         for _ in 0..50 {
-            // SAFETY：`name` 以 NUL 结尾且存活到调用结束。
+            // SAFETY:`name` 以 NUL 结尾且存活到调用结束。
             let handle = unsafe {
                 CreateFileW(
                     PCWSTR(name.as_ptr()),
@@ -132,6 +140,9 @@ impl Stream {
                         return Err(err);
                     }
                     // 等对面把管道准备好（100ms），超时继续重试。
+                    //
+                    // SAFETY: `name` 是本函数内的 NUL 结尾宽字符串（`wide` 生成），
+                    // 生命周期覆盖调用；`WaitNamedPipeW` 不保留该指针。
                     let _ = unsafe { WaitNamedPipeW(PCWSTR(name.as_ptr()), 100) };
                 }
             }
@@ -146,12 +157,14 @@ impl Stream {
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read = 0u32;
-        // SAFETY：`buf` 是本次调用独占的可变切片；`read` 是有效出参；
+        // SAFETY:`buf` 是本次调用独占的可变切片；`read` 是有效出参；
         // 句柄由 `self` 持有且未关闭。
         //
         // 注意 `windows` 0.52 的 `ReadFile` 收的是 `Option<&mut [u8]>`
         // 而不是裸指针——签名对不上会在 Windows 上编译失败，而这里
         // （Linux）根本编译不到这段。
+        // SAFETY: `buf` 是本次调用独占的可变切片，`read` 是有效出参，句柄由
+        // `self` 持有且未关闭（见上方说明）。
         unsafe { ReadFile(self.handle, Some(buf), Some(&mut read), None) }
             .map_err(io::Error::from)?;
         Ok(read as usize)
@@ -161,7 +174,7 @@ impl Read for Stream {
 impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut written = 0u32;
-        // SAFETY：`buf` 在调用期间有效；`written` 是有效出参；句柄未关闭。
+        // SAFETY:`buf` 在调用期间有效；`written` 是有效出参；句柄未关闭。
         unsafe { WriteFile(self.handle, Some(buf), Some(&mut written), None) }
             .map_err(io::Error::from)?;
         Ok(written as usize)
@@ -176,7 +189,7 @@ impl Write for Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if self.handle != INVALID_HANDLE_VALUE {
-            // SAFETY：句柄来自 `CreateFileW` / `CreateNamedPipeW`，未重复关闭。
+            // SAFETY:句柄来自 `CreateFileW` / `CreateNamedPipeW`，未重复关闭。
             let _ = unsafe { CloseHandle(self.handle) };
         }
     }
@@ -202,7 +215,7 @@ impl Listener {
     /// 等一个客户端连上来。
     pub fn accept(&self) -> io::Result<Stream> {
         let name = wide(&self.path);
-        // SAFETY：`name` 以 NUL 结尾且存活到调用结束；其余参数都是常量。
+        // SAFETY:`name` 以 NUL 结尾且存活到调用结束；其余参数都是常量。
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
@@ -221,13 +234,13 @@ impl Listener {
             return Err(io::Error::last_os_error());
         }
 
-        // SAFETY：句柄刚由 `CreateNamedPipeW` 创建，有效且未关闭。
+        // SAFETY:句柄刚由 `CreateNamedPipeW` 创建，有效且未关闭。
         let connected = unsafe { ConnectNamedPipe(handle, None) };
         if let Err(e) = connected {
             let err = io::Error::from(e);
             let already = err.raw_os_error() == Some(ERROR_PIPE_CONNECTED.0 as i32);
             if !already {
-                // SAFETY：句柄有效，尚未交给 `Stream`。
+                // SAFETY:句柄有效，尚未交给 `Stream`。
                 let _ = unsafe { DisconnectNamedPipe(handle) };
                 let _ = unsafe { CloseHandle(handle) };
                 return Err(err);

@@ -6,7 +6,7 @@ use crate::file_manager::utils::{
     prevent_remote_recursive_copy, remote_file_name, remove_remote_source, resolve_remote_conflict,
     walk_remote_dir,
 };
-use crate::file_manager::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver, TransferCtx};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
@@ -16,10 +16,10 @@ pub fn copy_remote_to_same_remote(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     rename_to: Option<&str>,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
+    let (cancelled, progress) = (ctx.cancelled, ctx.progress);
     check_cancelled(cancelled)?;
     let file_name = remote_file_name(remote_path)?;
     let effective_name = rename_to.unwrap_or(&file_name);
@@ -99,10 +99,10 @@ pub fn move_remote_to_same_remote(
     destination_dir: &str,
     conflict_policy: ConflictPolicy,
     rename_to: Option<&str>,
-    cancelled: &Arc<AtomicBool>,
-    progress: Option<&AtomicU64>,
+    ctx: &TransferCtx<'_>,
     resolver: Option<&dyn ConflictResolver>,
 ) -> anyhow::Result<TransferSummary> {
+    let (cancelled, progress) = (ctx.cancelled, ctx.progress);
     check_cancelled(cancelled)?;
     let file_name = remote_file_name(remote_path)?;
 
@@ -147,8 +147,11 @@ pub fn move_remote_to_same_remote(
                     destination_dir,
                     conflict_policy,
                     rename_to,
-                    cancelled,
-                    progress,
+                    &TransferCtx {
+                        cancelled,
+                        progress,
+                        reporter: None,
+                    },
                     resolver,
                 )?;
                 // 只有在没有任何条目被跳过时才删源，避免把未复制成功的内容连源一起删掉。

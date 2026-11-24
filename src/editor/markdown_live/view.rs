@@ -78,6 +78,12 @@ pub enum LiveViewEvent {
     LinkClick(String),
 }
 
+/// 状态条字数缓存：`(text_version, selection, 非空白字符数, 行数, 选区字符数)`。
+///
+/// 键是 `(text_version, selection)`——文本或选区任一变化都要重算，其余情况
+/// 直接命中。缓存的是统计结果而不是渲染产物，所以可以跨帧复用。
+type StatCache = (u64, Option<(Pos, Pos)>, usize, usize, Option<usize>);
+
 pub struct LiveMarkdownView {
     buffer: LiveBuffer,
     focus: FocusHandle,
@@ -264,9 +270,8 @@ pub struct LiveMarkdownView {
     virt_lo: usize,
     virt_hi: usize,
     virt_top_off: usize,
-    /// 状态条字数缓存 `(text_version, selection, chars, lines, sel_chars)`：
-    /// 全文档字符统计每帧 O(n)，命中缓存后为 O(1)。
-    stat_cache: Option<(u64, Option<(Pos, Pos)>, usize, usize, Option<usize>)>,
+    /// 状态条字数缓存：全文档字符统计每帧 O(n)，命中缓存后为 O(1)。
+    stat_cache: Option<StatCache>,
     /// 已发出的 `Change` 对应的 `text_version`：`edit` 不再直接发射，
     /// 统一由 `after_edit`/`set_text` 按版本去重后发射，避免每键两次同步。
     emitted_version: u64,
@@ -1291,16 +1296,21 @@ impl LiveMarkdownView {
         // each side because a neighbouring line's classification can depend on
         // the edited text (one-line lookahead).
         if text_changed {
+            // 逐行比较 `plan_input_lines` 与当前行的 `Arc` 指针；行号仍需参与
+            // `dirty(i, ..)`（它记录的是行下标范围），因此这里保留索引循环，
+            // 但把「取行 + 比较」收进一个闭包，避免两处重复同一段逻辑。
+            let changed_at = |i: usize| {
+                !self
+                    .plan_input_lines
+                    .get(i)
+                    .is_some_and(|l| Arc::ptr_eq(l, &lines[i]))
+            };
             match dirty_range {
                 Some(r) => {
                     let start = r.start.saturating_sub(1);
                     let end = (r.end + 1).min(lines.len());
                     for i in start..end {
-                        if !self
-                            .plan_input_lines
-                            .get(i)
-                            .is_some_and(|l| Arc::ptr_eq(l, &lines[i]))
-                        {
+                        if changed_at(i) {
                             dirty(i, &mut lo, &mut hi);
                         }
                     }
@@ -1308,11 +1318,7 @@ impl LiveMarkdownView {
                 // Unknown range (undo/redo/whole-document replace): compare all.
                 None => {
                     for i in 0..lines.len() {
-                        if !self
-                            .plan_input_lines
-                            .get(i)
-                            .is_some_and(|l| Arc::ptr_eq(l, &lines[i]))
-                        {
+                        if changed_at(i) {
                             dirty(i, &mut lo, &mut hi);
                         }
                     }
@@ -6684,6 +6690,12 @@ impl Render for LiveMarkdownView {
                             // Preview parity: the read-only card scrolls long
                             // Nowrap lines horizontally instead of clipping them.
                             .overflow_x_scroll()
+                            // 与上面两个分支一致：必须限制到 x 轴。gpui 的滚动
+                            // 监听在「只开 x 轴且未限制轴」时会把纵向增量喂给 x
+                            // 轴；本容器没有横向溢出能力时，这次「消费」什么也
+                            // 滚不动，但事件已不再冒泡到文档——于是触控板横向
+                            // 滑动（自带 y 分量）会把文档纵向滚走。
+                            .restrict_scroll_to_axis()
                     };
                     if lang.is_some() {
                         inner = inner.pt(px(24.0));
@@ -8456,6 +8468,14 @@ impl Render for LiveMarkdownView {
                                             .flex_1()
                                             .min_h_0()
                                             .overflow_y_scroll()
+                                            // **必须限制到 y 轴。** gpui 的滚动监听
+                                            // （`div.rs` 的 `paint_scroll_listener`）
+                                            // 在「只开一个轴且未限制轴」时会把**另一个
+                                            // 轴**的增量喂给本轴：这里只开 y，于是触控板
+                                            // 横扫的 x 分量被当成纵向增量——用户看到的是
+                                            // 「左右滑动文档内容却上下滚」。开了限制后，
+                                            // 手势按起始主导轴锁定，横滑不再纵向滚动。
+                                            .restrict_scroll_to_axis()
                                             .track_scroll(&self.scroll)
                                             // 每行一个包装：默认居中在 780px
                                             // 阅读窄栏里，「全宽」块（`wide_rows`）
@@ -10383,7 +10403,7 @@ mod live_frame_tests {
             // block scrolled into the rendered window (jump the cursor onto
             // it); absence is decided at classification level (a grid/card
             // cannot render for rows that were never classified as such).
-            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(doc);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -10717,7 +10737,7 @@ mod live_showcase_tests {
     #[test]
     fn outline_collects_headings_in_order() {
         let doc = "# A\n\ntext\n\n## B\n\n### C\n\n## D\n";
-        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
+        let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(doc);
         let rows: Vec<Rc<PlannedRow>> = plan_document(
             &lines,
             Reveal {
@@ -10762,7 +10782,7 @@ mod live_showcase_tests {
                 "| left | center | right |\n| :--- | :---: | ---: |\n| a | b | c |\n",
             ),
         ] {
-            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(doc);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -12975,7 +12995,7 @@ mod setext_parity_tests {
                     _ => {}
                 }
             }
-            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(&doc);
+            let lines: Vec<Line> = crate::editor::markdown_live::model::lines_from_text(doc);
             let rows = plan_document(
                 &lines,
                 Reveal {
@@ -13589,8 +13609,8 @@ mod hscroll_and_wide_tests {
         }
     }
 
-    fn setup<'a>(
-        cx: &'a mut gpui::TestAppContext,
+    fn setup(
+        cx: &mut gpui::TestAppContext,
         window: gpui::Size<Pixels>,
         doc: &str,
     ) -> (gpui::Entity<LiveMarkdownView>, gpui::VisualTestContext) {
@@ -14289,6 +14309,96 @@ mod hscroll_and_wide_tests {
         assert!(
             (h_after - h_before).abs() < 1.0,
             "纵向滚轮不得改动表格横向偏移（offset.x {h_before} → {h_after}）"
+        );
+    }
+
+    /// 触控板横向滑动不得把文档纵向滚走。
+    ///
+    /// 回归：文档滚动容器（`live-markdown-content`）只开了 `overflow_y_scroll`
+    /// 而没有 `restrict_scroll_to_axis()`。gpui 的滚动监听在「只开一个轴且
+    /// 未限制轴」时会把另一个轴的增量喂给本轴（`div.rs::paint_scroll_listener`），
+    /// 于是触控板横扫的 x 分量被当成纵向增量——用户看到「左右滑动，内容却
+    /// 上下滚」。真实横扫不可能完全笔直，所以这个 bug 几乎必现。
+    #[gpui::test]
+    fn horizontal_trackpad_swipe_does_not_scroll_document(cx: &mut gpui::TestAppContext) {
+        // 足够长的文档（可纵滚）+ 长代码行（触发内层横滚容器）。
+        let mut doc = String::from("```\n");
+        doc.push_str(&"let x = 1; ".repeat(60));
+        doc.push_str("\n```\n\n");
+        for i in 0..80 {
+            doc.push_str(&format!("正文行 {i}\n\n"));
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(500.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let content = vc
+            .debug_bounds("live-markdown-content")
+            .expect("文档滚动容器");
+        let v_before = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        assert!(
+            v_before.abs() < 1.0,
+            "setup：文档应从顶部开始（offset.y={v_before}）"
+        );
+
+        // 模拟触控板横扫：x 主导，但带一点 y（真实手势不可能完全笔直）。
+        let at = point(content.center().x, content.top() + px(40.));
+        vc.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(-30.), px(-3.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Started,
+        });
+        vc.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(-60.), px(-4.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let v_after = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        assert!(
+            (v_after - v_before).abs() < 1.0,
+            "横向滑动不得纵向滚动文档（offset.y {v_before} → {v_after}）"
+        );
+    }
+
+    /// 纯纵向滑动仍然正常滚动（轴锁定不能把正常滚动也锁死）。
+    #[gpui::test]
+    fn vertical_scroll_still_works_after_axis_lock(cx: &mut gpui::TestAppContext) {
+        let mut doc = String::new();
+        for i in 0..120 {
+            doc.push_str(&format!("正文行 {i}\n\n"));
+        }
+        let (view, mut vc) = setup(cx, size(px(700.), px(500.)), &doc);
+        for _ in 0..3 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let content = vc
+            .debug_bounds("live-markdown-content")
+            .expect("文档滚动容器");
+        let v_before = view.read_with(&vc, |v, _| v.scroll_offset_y());
+
+        let at = point(content.center().x, content.top() + px(40.));
+        vc.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(point(px(1.), px(-60.))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Started,
+        });
+        for _ in 0..2 {
+            vc.refresh().unwrap();
+            vc.run_until_parked();
+        }
+        let v_after = view.read_with(&vc, |v, _| v.scroll_offset_y());
+        assert!(
+            v_after < v_before - 1.0,
+            "纵向滑动必须仍能滚文档（offset.y {v_before} → {v_after}）"
         );
     }
 

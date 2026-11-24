@@ -1,4 +1,8 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
+
 use crate::file_manager::FileEndpoint;
+use crate::file_manager::TransferStatusReporter;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferOperation {
@@ -81,6 +85,20 @@ impl TransferRequest {
             }
         })
     }
+}
+
+/// 一次远端传输的公共选项。
+///
+/// 这几个值在 `copy_remote_to_different_remote` → 策略分派 → 具体实现之间
+/// 逐层透传了四层，参数表因此膨胀到 10 个。打包后各层只多一个 `&TransferCtx`，
+/// 新增选项也不必再改整条调用链。
+pub struct TransferCtx<'a> {
+    /// 取消标志（UI 线程置位、传输线程轮询）。
+    pub cancelled: &'a Arc<AtomicBool>,
+    /// 字节进度计数器（UI 共享）。
+    pub progress: Option<&'a AtomicU64>,
+    /// 状态文本回传（面板上的「直连(密钥)...」之类）。
+    pub reporter: Option<&'a dyn TransferStatusReporter>,
 }
 
 #[cfg(test)]

@@ -270,26 +270,60 @@ pub fn fill_background(data: &mut [u8], bg: Background) {
         data.fill(0);
         return;
     }
-    for px in data.chunks_exact_mut(4) {
+    for px in data.as_chunks_mut::<4>().0 {
         px.copy_from_slice(&[bg.r, bg.g, bg.b, bg.a]);
     }
+}
+
+/// 一块**可写** RGBA 画布（像素缓冲 + 逻辑尺寸）。
+///
+/// 合成函数需要「缓冲 + 宽 + 高」三件套，而它们在调用点总是同期出现；
+/// 打包后签名从 9 个参数降到 4 个，也不易把宽高顺序写反。
+pub struct Canvas<'a> {
+    pub data: &'a mut [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 一块**只读** RGBA 画布，用作合成的源。
+///
+/// 与 [`Canvas`] 分开而不是加生命周期标志：源永远只读，目标永远可写，
+/// 类型区分能防止把同图自合成的两块缓冲同时借成 `&mut`。
+#[derive(Clone, Copy)]
+pub struct CanvasView<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 一块 RGBA 源矩形：缓冲 + 尺寸 + 落点。
+#[derive(Clone, Copy)]
+pub struct Rect<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    /// 左上角在目标画布上的坐标。
+    pub x: u32,
+    pub y: u32,
 }
 
 /// 把 `src` 矩形（`src_width × src_height` RGBA 像素）以左上角对齐到
 /// `(x, y)` 合成到 `dst` 画布（`dst_width × dst_height` RGBA 像素）上。
 ///
 /// 超出画布的部分**静默裁剪**，对齐 kitty 的 `a=f` 行为。
-pub fn compose_rect(
-    dst: &mut [u8],
-    dst_width: u32,
-    dst_height: u32,
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    x: u32,
-    y: u32,
-    mode: CompositionMode,
-) {
+pub fn compose_rect(dst: Canvas<'_>, src: Rect<'_>, mode: CompositionMode) {
+    let Canvas {
+        data: dst,
+        width: dst_width,
+        height: dst_height,
+    } = dst;
+    let Rect {
+        data: src,
+        width: src_width,
+        height: src_height,
+        x,
+        y,
+    } = src;
     if x >= dst_width || y >= dst_height {
         return;
     }
@@ -306,6 +340,17 @@ pub fn compose_rect(
     }
 }
 
+/// `a=c` 合成的矩形参数：尺寸 + 源左上角 + 目标左上角。
+#[derive(Clone, Copy)]
+pub struct ComposeRect {
+    pub width: u32,
+    pub height: u32,
+    pub src_x: u32,
+    pub src_y: u32,
+    pub dst_x: u32,
+    pub dst_y: u32,
+}
+
 /// 在两块**同宽**（stride 均为 `canvas_width`）的整幅 RGBA 画布之间合成一个
 /// `width × height` 矩形：从 `src` 的 `(src_x, src_y)` 读到 `dst` 的 `(dst_x, dst_y)`。
 ///
@@ -313,16 +358,29 @@ pub fn compose_rect(
 /// 与 `a=f` 不同。两个矩形不相交时，同帧自合成也是良定义的。
 pub fn compose_canvas_rect(
     dst: &mut [u8],
-    src: &[u8],
-    canvas_width: u32,
-    width: u32,
-    height: u32,
-    src_x: u32,
-    src_y: u32,
-    dst_x: u32,
-    dst_y: u32,
+    src: CanvasView<'_>,
+    rect: ComposeRect,
     mode: CompositionMode,
 ) {
+    let ComposeRect {
+        width,
+        height,
+        src_x,
+        src_y,
+        dst_x,
+        dst_y,
+    } = rect;
+    // 源与目标共用同一张画布的尺寸（`a=c` 只允许同图自合成），
+    // 因此 stride 取 `src.width`，`src.height` 仅作断言依据。
+    let CanvasView {
+        data: src,
+        width: canvas_width,
+        height: canvas_height,
+    } = src;
+    debug_assert!(
+        canvas_height >= src_y + height,
+        "compose_canvas_rect 的源矩形必须在画布内（调用方负责校验）"
+    );
     for row in 0..height as usize {
         let dst_off = ((dst_y as usize + row) * canvas_width as usize + dst_x as usize) * 4;
         let src_off = ((src_y as usize + row) * canvas_width as usize + src_x as usize) * 4;
@@ -347,7 +405,12 @@ fn compose_row(dst: &mut [u8], src: &[u8], mode: CompositionMode) {
     match mode {
         CompositionMode::Overwrite => dst.copy_from_slice(src),
         CompositionMode::AlphaBlend => {
-            for (d, s) in dst.chunks_exact_mut(4).zip(src.chunks_exact(4)) {
+            for (d, s) in dst
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(src.as_chunks::<4>().0)
+            {
                 src_over(d, s);
             }
         }
@@ -581,12 +644,75 @@ mod tests {
         assert_eq!(buf, vec![0u8; 8]);
     }
 
+    /// 测试用的位置参数包装：保持用例里「一目了然的 9 个数字」写法。
+    #[allow(clippy::too_many_arguments)]
+    fn compose_rect_at(
+        dst: &mut [u8],
+        dst_w: u32,
+        dst_h: u32,
+        src: &[u8],
+        src_w: u32,
+        src_h: u32,
+        x: u32,
+        y: u32,
+        mode: CompositionMode,
+    ) {
+        compose_rect(
+            Canvas {
+                data: dst,
+                width: dst_w,
+                height: dst_h,
+            },
+            Rect {
+                data: src,
+                width: src_w,
+                height: src_h,
+                x,
+                y,
+            },
+            mode,
+        );
+    }
+
+    /// 测试用的 `compose_canvas_rect` 包装（源与目标共用一张画布）。
+    #[allow(clippy::too_many_arguments)]
+    fn compose_canvas_rect_at(
+        dst: &mut [u8],
+        src: &[u8],
+        canvas_w: u32,
+        width: u32,
+        height: u32,
+        src_x: u32,
+        src_y: u32,
+        dst_x: u32,
+        dst_y: u32,
+        mode: CompositionMode,
+    ) {
+        compose_canvas_rect(
+            dst,
+            CanvasView {
+                data: src,
+                width: canvas_w,
+                height: canvas_w,
+            },
+            ComposeRect {
+                width,
+                height,
+                src_x,
+                src_y,
+                dst_x,
+                dst_y,
+            },
+            mode,
+        );
+    }
+
     #[test]
     fn compose_rect_clips_at_canvas_edge() {
         // 2×2 画布，把 2×1 的矩形放在 (1,1)：只有第一个像素装得下。
         let mut dst = vec![0u8; 16];
         let src = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        compose_rect(&mut dst, 2, 2, &src, 2, 1, 1, 1, CompositionMode::Overwrite);
+        compose_rect_at(&mut dst, 2, 2, &src, 2, 1, 1, 1, CompositionMode::Overwrite);
 
         let mut expect = vec![0u8; 16];
         expect[12..16].copy_from_slice(&[1, 2, 3, 4]);
@@ -596,7 +722,7 @@ mod tests {
     #[test]
     fn compose_rect_outside_canvas_is_noop() {
         let mut dst = vec![0u8; 16];
-        compose_rect(
+        compose_rect_at(
             &mut dst,
             2,
             2,
@@ -614,7 +740,7 @@ mod tests {
     fn alpha_blend_matches_src_over() {
         // 不透明红打底，覆盖 50% 透明蓝：结果应是各半的紫。
         let mut dst = vec![255, 0, 0, 255];
-        compose_rect(
+        compose_rect_at(
             &mut dst,
             1,
             1,
@@ -642,7 +768,7 @@ mod tests {
     #[test]
     fn alpha_blend_with_opaque_source_is_a_copy() {
         let mut dst = vec![1, 2, 3, 4];
-        compose_rect(
+        compose_rect_at(
             &mut dst,
             1,
             1,
@@ -659,7 +785,7 @@ mod tests {
     #[test]
     fn alpha_blend_with_transparent_source_keeps_destination() {
         let mut dst = vec![1, 2, 3, 4];
-        compose_rect(
+        compose_rect_at(
             &mut dst,
             1,
             1,
@@ -678,7 +804,7 @@ mod tests {
         // 4×1 画布，把 (0,0)-(1,0) 的两像素拷到 (2,0)。
         let mut dst: Vec<u8> = vec![1, 0, 0, 255, 2, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0];
         let src = dst.clone();
-        compose_canvas_rect(
+        compose_canvas_rect_at(
             &mut dst,
             &src,
             4,
@@ -699,7 +825,7 @@ mod tests {
         // 4×1 画布，从 (2,0) 读两像素写到 (0,0)。
         let mut dst: Vec<u8> = vec![1, 0, 0, 255, 2, 0, 0, 255, 0, 0, 0, 0, 0, 0, 0, 0];
         let src = dst.clone();
-        compose_canvas_rect(
+        compose_canvas_rect_at(
             &mut dst,
             &src,
             4,

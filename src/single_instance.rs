@@ -81,7 +81,7 @@ fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
     const LOCK_EX: libc::c_int = 2;
     const LOCK_NB: libc::c_int = 4;
 
-    // SAFETY：fd 由 `file` 持有且在调用期间有效；`flock` 只操作这个 fd，
+    // SAFETY:fd 由 `file` 持有且在调用期间有效；`flock` 只操作这个 fd，
     // 没有指针参数。失败时检查 errno 区分"被别人占着"与真实错误。
     let rc = unsafe { libc::flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
     if rc == 0 {

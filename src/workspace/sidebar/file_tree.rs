@@ -234,7 +234,8 @@ impl MacosSidebar {
                 crate::sidebar_view::git_panel::GitPanelEvent::OpenFile { path, ssh_config } => {
                     cx.emit(SidebarEvent::OpenFile {
                         path: path.clone(),
-                        ssh_config: ssh_config.clone().map(Box::new),
+                        // 两层都是 `Box`，无需再包一次。
+                        ssh_config: ssh_config.clone(),
                     });
                 }
                 crate::sidebar_view::git_panel::GitPanelEvent::StatusChanged => {

@@ -58,6 +58,13 @@ const PTY_CHILD_EVENT_TOKEN: usize = alacritty_terminal::tty::PTY_CHILD_EVENT_TO
 #[derive(Clone, Debug)]
 pub struct SpawnRequest {
     pub shell: tty::Shell,
+    /// 实际执行的 shell 程序路径（`<spawn.shell>` 的程序部分）。
+    ///
+    /// `tty::Shell` 的字段是 `pub(crate)`，registry 读不到；而
+    /// [`TerminalHandle`] 需要它来回答"这条终端的 shell 叫什么"——见
+    /// [`TerminalMeta::shell`]。由 `server::handle_spawn` 在组装请求时
+    /// 一并填好，**与实际执行的程序同源**，不在这里重算一次。
+    pub shell_program: Option<String>,
     pub cwd: Option<std::path::PathBuf>,
     pub env: std::collections::HashMap<String, String>,
     pub cols: u16,
@@ -74,6 +81,7 @@ impl SpawnRequest {
     pub fn new(shell: tty::Shell) -> Self {
         Self {
             shell,
+            shell_program: None,
             cwd: None,
             env: std::collections::HashMap::new(),
             cols: DEFAULT_COLS,
@@ -315,7 +323,9 @@ impl Registry {
         let (input_tx, input_rx) = async_channel::bounded::<Input>(256);
         let handle = Arc::new(TerminalHandle::new(
             address.to_string(),
-            Vec::new(),
+            // holder 侧的 argv 只用于回答"这条终端的 shell 叫什么"
+            // （`TerminalMeta::shell`）：客户端在 GUI 重启后拿不到它。
+            request.shell_program.clone().into_iter().collect(),
             request
                 .cwd
                 .as_ref()
@@ -450,11 +460,14 @@ fn run_terminal(
     // 跨读被截断的 APC 残尾（大图分片必然跨 read）。
     let mut apc_pending: Vec<u8> = Vec::new();
 
-    // SAFETY（中文）：`pty` 在本函数结束前一直存活，注册到 poller 的 fd
+    // SAFETY:`pty` 在本函数结束前一直存活，注册到 poller 的 fd
     // 因而始终有效；退出前会显式 deregister。
     //
     // 只注册可读：PTY 主设备写侧恒可写，一并注册会在电平触发下让
     // `wait` 立即返回，形成忙循环。写入直接走 `pty.writer()`。
+    //
+    // SAFETY: `pty` 在本函数结束前一直存活，注册到 poller 的 fd 因而始终
+    // 有效；退出前会显式 deregister。
     if unsafe {
         pty.register(
             &poller,

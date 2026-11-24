@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn parses_basic_commands() {
         assert_eq!(parse("w").unwrap().name, "w");
-        assert_eq!(parse("w!").unwrap().bang, true);
+        assert!(parse("w!").unwrap().bang);
         assert_eq!(parse("q!").unwrap().name, "q");
         assert_eq!(parse("42").unwrap().name, "");
         assert_eq!(
@@ -950,7 +950,7 @@ mod tests {
         );
         assert_eq!(parse("v/foo/s/foo/bar/").unwrap().name, "v");
         assert_eq!(parse("global/^a/d").unwrap().name, "global");
-        assert_eq!(parse("g!/foo/d").unwrap().bang, true);
+        assert!(parse("g!/foo/d").unwrap().bang);
         let normal_bang = parse("normal! A;").unwrap();
         assert_eq!(normal_bang.name, "normal");
         assert!(normal_bang.bang);

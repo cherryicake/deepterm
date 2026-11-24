@@ -97,7 +97,9 @@ struct ProcessHandle(HANDLE);
 impl ProcessHandle {
     /// 打开 `pid`；失败返回 `None`（进程已退出 / 无权限）。
     fn open(pid: u32) -> Option<Self> {
-        // 成功返回的 HANDLE 一定非空，`OpenProcess` 失败时返回 Error 而非空句柄。
+        // SAFETY: `OpenProcess` 只读取进程表并返回一个新句柄；成功时该句柄
+        // 由本结构独占持有（`Drop` 里 `CloseHandle` 归还），失败时返回错误
+        // 而不是空句柄，因此下面用 `ok()?` 提前返回不会漏关任何东西。
         let handle = unsafe { OpenProcess(READ_PEB_ACCESS, false, pid) }.ok()?;
         Some(Self(handle))
     }
@@ -105,6 +107,9 @@ impl ProcessHandle {
 
 impl Drop for ProcessHandle {
     fn drop(&mut self) {
+        // SAFETY: `self.0` 来自 `ProcessHandle::open` 且非空；本类型不实现
+        // `Clone`，一个句柄只会在 `Drop` 里被关闭一次（重复 `CloseHandle`
+        // 会关闭别的线程新拿到的同号句柄，这是必须避免的）。
         let _ = unsafe { CloseHandle(self.0) };
     }
 }
@@ -117,6 +122,10 @@ fn read_remote(handle: HANDLE, address: usize, buf: &mut [u8]) -> bool {
         return false;
     }
     let mut read = 0usize;
+    // SAFETY: `handle` 是 `OpenProcess` 给出的有效句柄；内核按 `buf.len()`
+    // 校验可写范围并返回实际读到的字节数，因此越界读写不会发生在我们这边
+    // ——目标进程的内存布局不可信，失败时 `ReadProcessMemory` 返回错误而不是
+    // 破坏本进程。地址 0 已在上面排除，`buf` 是调用方持有的合法切片。
     let ok = unsafe {
         ReadProcessMemory(
             handle,
@@ -151,6 +160,9 @@ fn detect_target_bits(handle: HANDLE) -> TargetBits {
         return TargetBits::X86;
     }
     let mut wow64 = BOOL(0);
+    // SAFETY: `handle` 有效且 `wow64` 是本栈上的可写 `BOOL`；该 API 只写入
+    // 这 4 个字节，不保留指针。失败时返回值被忽略（下面走 `ok &&` 短路），
+    // 落回 `X64` 也安全：后续读指针宽度不符时只会读失败返回 `None`。
     let ok = unsafe { IsWow64Process(handle, &mut wow64) }.is_ok();
     if ok && wow64.0 != 0 {
         TargetBits::X86
@@ -165,7 +177,14 @@ pub fn query_process_working_directory(pid: u32) -> Option<PathBuf> {
     let handle = process.0;
 
     // 1) PEB 基址
+    // SAFETY: `PROCESS_BASIC_INFORMATION` 是全部为整数/指针的 POD 结构，
+    // 全零是合法位模式（没有引用、没有 Drop）；`NtQueryInformationProcess`
+    // 会按我们声明的 `size_of` 完整写入它。
     let mut pbi: PROCESS_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: `handle` 由 `OpenProcess` 获得且带 `PROCESS_QUERY_INFORMATION`；
+    // 第 3 个参数是本栈上的 `&mut pbi`（大小由第 4 参数如实声明），
+    // 第 5 个参数为 null（该信息类不返回额外长度）。接口不保留这些指针，
+    // 调用期间 `pbi` 一直有效。失败由 `status.0 < 0` 判定，不产生 UB。
     let status = unsafe {
         NtQueryInformationProcess(
             handle,

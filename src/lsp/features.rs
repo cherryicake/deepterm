@@ -795,7 +795,7 @@ pub fn decode_semantic_tokens(data: &[u32]) -> Vec<(u32, u32, u32, u32)> {
     let mut out = Vec::with_capacity(data.len() / 5);
     let mut line = 0u32;
     let mut start = 0u32;
-    for chunk in data.chunks_exact(5) {
+    for chunk in data.as_chunks::<5>().0 {
         let delta_line = chunk[0];
         let delta_start = chunk[1];
         let length = chunk[2];

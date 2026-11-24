@@ -685,6 +685,33 @@ fn format_unknown_host_error(token: &str, saved: &[SshConnectionConfig]) -> Stri
     )
 }
 
+// ── Global Executor ──────────────────────────────────────────────────────────
+
+use parking_lot::Mutex;
+use std::sync::OnceLock;
+
+static GLOBAL_EXECUTOR: OnceLock<Mutex<CommandExecutor>> = OnceLock::new();
+
+fn create_default_executor() -> CommandExecutor {
+    let mut executor = CommandExecutor::new();
+    executor.register(CommandHandlerId("open_path"), Box::new(OpenPathHandler));
+    executor.register(CommandHandlerId("scp_transfer"), Box::new(ScpHandler));
+    executor.register(CommandHandlerId("log_only"), Box::new(LogOnlyHandler));
+    executor
+}
+
+/// 初始化全局命令执行引擎
+///
+/// 在应用启动时调用一次，注册所有内置命令处理器。
+pub fn init_global_executor() {
+    let _ = GLOBAL_EXECUTOR.get_or_init(|| Mutex::new(create_default_executor()));
+}
+
+/// 获取全局命令执行引擎的引用
+pub fn global_executor() -> &'static Mutex<CommandExecutor> {
+    GLOBAL_EXECUTOR.get_or_init(|| Mutex::new(create_default_executor()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,11 +1431,8 @@ mod tests {
             CommandResult::StartTransfer { request } => {
                 // 若解析为远端（用户恰好保存了 localhost:2222）也接受；
                 // 但绝不能把 `2222:/tmp/x` 当本机路径
-                match &request.sources[0] {
-                    FileEndpoint::Local { path } => {
-                        panic!("BUG: quoted localhost:port parsed as local path {:?}", path)
-                    }
-                    _ => {}
+                if let FileEndpoint::Local { path } = &request.sources[0] {
+                    panic!("BUG: quoted localhost:port parsed as local path {:?}", path)
                 }
             }
             _ => panic!("unexpected"),
@@ -1562,31 +1586,4 @@ mod tests {
         }
         assert!(rename.is_none());
     }
-}
-
-// ── Global Executor ──────────────────────────────────────────────────────────
-
-use parking_lot::Mutex;
-use std::sync::OnceLock;
-
-static GLOBAL_EXECUTOR: OnceLock<Mutex<CommandExecutor>> = OnceLock::new();
-
-fn create_default_executor() -> CommandExecutor {
-    let mut executor = CommandExecutor::new();
-    executor.register(CommandHandlerId("open_path"), Box::new(OpenPathHandler));
-    executor.register(CommandHandlerId("scp_transfer"), Box::new(ScpHandler));
-    executor.register(CommandHandlerId("log_only"), Box::new(LogOnlyHandler));
-    executor
-}
-
-/// 初始化全局命令执行引擎
-///
-/// 在应用启动时调用一次，注册所有内置命令处理器。
-pub fn init_global_executor() {
-    let _ = GLOBAL_EXECUTOR.get_or_init(|| Mutex::new(create_default_executor()));
-}
-
-/// 获取全局命令执行引擎的引用
-pub fn global_executor() -> &'static Mutex<CommandExecutor> {
-    GLOBAL_EXECUTOR.get_or_init(|| Mutex::new(create_default_executor()))
 }

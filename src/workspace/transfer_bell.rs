@@ -343,33 +343,35 @@ impl TransferBellPanel {
             &tasks,
             theme,
             self.hover,
-            move |hover, app| {
-                if let Some(this) = weak_self_hover.upgrade() {
-                    this.update(app, |this, cx| {
-                        if this.hover != hover {
-                            this.hover = hover;
-                            cx.notify();
-                        }
-                    });
-                }
-            },
-            move |task_id, app| {
-                if let Some(ws) = weak_cancel.upgrade() {
-                    ws.update(app, |this, cx| this.cancel_transfer_task(task_id, cx));
-                }
-            },
-            move |task_id, app| {
-                if let Some(ws) = weak_remove.upgrade() {
-                    ws.update(app, |this, cx| this.remove_transfer_task(task_id, cx));
-                }
-            },
-            move |app| {
-                if let Some(ws) = weak_clear.upgrade() {
-                    ws.update(app, |this, cx| this.clear_finished_transfer_tasks(cx));
-                }
-            },
-            |_task_id, _app| {
-                // 暂未接入真实定位逻辑；保留按钮以匹配截图设计。
+            &crate::file_manager::TransferCallbacks {
+                on_hover: std::rc::Rc::new(move |hover, app| {
+                    if let Some(this) = weak_self_hover.upgrade() {
+                        this.update(app, |this, cx| {
+                            if this.hover != hover {
+                                this.hover = hover;
+                                cx.notify();
+                            }
+                        });
+                    }
+                }),
+                on_cancel: std::rc::Rc::new(move |task_id, app| {
+                    if let Some(ws) = weak_cancel.upgrade() {
+                        ws.update(app, |this, cx| this.cancel_transfer_task(task_id, cx));
+                    }
+                }),
+                on_remove: std::rc::Rc::new(move |task_id, app| {
+                    if let Some(ws) = weak_remove.upgrade() {
+                        ws.update(app, |this, cx| this.remove_transfer_task(task_id, cx));
+                    }
+                }),
+                on_clear_finished: std::rc::Rc::new(move |app| {
+                    if let Some(ws) = weak_clear.upgrade() {
+                        ws.update(app, |this, cx| this.clear_finished_transfer_tasks(cx));
+                    }
+                }),
+                on_reveal: std::rc::Rc::new(|_task_id, _app| {
+                    // 暂未接入真实定位逻辑；保留按钮以匹配截图设计。
+                }),
             },
         )?;
 

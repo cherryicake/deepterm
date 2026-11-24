@@ -470,6 +470,10 @@ pub fn serve_connection(
 }
 
 /// 分发一条控制请求；返回给客户端的 JSON。
+///
+/// `#[cfg(test)]` 而不是 `mod tests`：这是给同文件测试用的便捷入口，不是
+/// 独立测试模块——clippy 的 `items_after_test_module` 会把它误判为「测试模块
+/// 之后还有代码」，因此在下方（`mod tests` 上）显式允许该 lint。
 #[cfg(test)]
 fn dispatch(registry: &Arc<Registry>, request: &Value, conn: &Connection) -> Value {
     let machines = Machines::empty();
@@ -887,10 +891,12 @@ fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) 
             if let Some(channel) = request.get("channel").and_then(Value::as_u64) {
                 let channel = channel as u32;
                 lock(&conn.channels).remove(&channel);
-                if let Some((address, id)) = lock(&conn.attachments).remove(&channel) {
-                    if let Some(handle) = registry.get(&address) {
-                        handle.unsubscribe(id);
-                    }
+                // 两步都要做：先摘本地路由，再通知 holder 退订；缺任一步都会
+                // 留下「看得见但不会更新」的订阅，所以并成一个 let 链。
+                if let Some((address, id)) = lock(&conn.attachments).remove(&channel)
+                    && let Some(handle) = registry.get(&address)
+                {
+                    handle.unsubscribe(id);
                 }
             }
             json!({"ok": true})
@@ -901,6 +907,9 @@ fn dispatch_local(registry: &Arc<Registry>, request: &Value, conn: &Connection) 
 }
 
 #[cfg(test)]
+// 文件上方还有 `#[cfg(test)] fn dispatch`（测试专用入口，不是模块），
+// clippy 会把本模块之前的任何条目都算作「测试模块之后的代码」。
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use serde_json::json;

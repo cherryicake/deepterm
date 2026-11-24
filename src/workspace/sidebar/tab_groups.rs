@@ -10,6 +10,21 @@ pub(super) enum CollapseEpochTarget {
     Section(usize),
 }
 
+/// 一行标签页组的展示属性。
+///
+/// 这些值总是成组出现（组标识 + 文案 + 折叠态 + 编辑框 + 更多操作 + 图标），
+/// 单独传会让调用点变成一长串位置参数，读不出谁是谁。
+pub(super) struct TabGroupRow {
+    pub group_id: String,
+    pub label: String,
+    pub collapsed: bool,
+    /// 组名正在重命名时的输入框。
+    pub editing_input: Option<Entity<InputState>>,
+    /// 是否显示「更多操作」按钮（默认组不显示）。
+    pub show_more_action: bool,
+    pub icon: Icon,
+}
+
 impl MacosSidebar {
     pub fn set_tab_group_tabs(
         &mut self,
@@ -445,12 +460,14 @@ impl MacosSidebar {
                 .child(self.render_tab_group_row(
                     cx,
                     theme,
-                    group_id.clone(),
-                    group_label,
-                    group_collapsed,
-                    group_editing_input,
-                    true,
-                    Icon::SquareOnSquare,
+                    TabGroupRow {
+                        group_id: group_id.clone(),
+                        label: group_label,
+                        collapsed: group_collapsed,
+                        editing_input: group_editing_input,
+                        show_more_action: true,
+                        icon: Icon::SquareOnSquare,
+                    },
                 ))
                 .child(Self::render_collapsible_content(
                     self.render_tab_group_tabs(&group_id, &tabs, theme, cx),
@@ -497,13 +514,16 @@ impl MacosSidebar {
         &self,
         cx: &mut Context<Self>,
         theme: crate::theme::UiTheme,
-        group_id: String,
-        label: String,
-        collapsed: bool,
-        editing_input: Option<Entity<InputState>>,
-        show_more_action: bool,
-        icon: Icon,
+        row: TabGroupRow,
     ) -> gpui::AnyElement {
+        let TabGroupRow {
+            group_id,
+            label,
+            collapsed,
+            editing_input,
+            show_more_action,
+            icon,
+        } = row;
         let is_selected = self.selected_id.as_deref() == Some(group_id.as_str());
         let icon_color = if is_selected {
             theme.accent_foreground

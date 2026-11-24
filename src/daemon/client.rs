@@ -90,7 +90,7 @@ impl Client {
         // 立即失败；需要真实协议的测试自行提供隔离的 socket。
         #[cfg(test)]
         {
-            return Self::connect_existing();
+            Self::connect_existing()
         }
 
         #[cfg(not(test))]
@@ -190,7 +190,7 @@ impl Client {
 
         #[cfg(unix)]
         {
-            // SAFETY：`kill` 只是向指定 pid 发信号；pid 来自我们自己写的 pid
+            // SAFETY:`kill` 只是向指定 pid 发信号；pid 来自我们自己写的 pid
             // 文件，且这是本地单用户场景。
             unsafe {
                 if libc::kill(pid, libc::SIGTERM) != 0 {
@@ -203,7 +203,7 @@ impl Client {
             // 新旧两个 core 同时往同一个 socket 上写。
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
-                // SAFETY：信号 0 只做存在性检查，不投递。
+                // SAFETY:信号 0 只做存在性检查，不投递。
                 let alive = unsafe { libc::kill(pid, 0) == 0 };
                 if !alive {
                     break;

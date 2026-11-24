@@ -597,6 +597,17 @@ fn watch_decrement(
     false
 }
 
+/// 本轮要轮询的一项：`(路径, 服务器标识, 文件系统, 上次 metadata, 上次内容校验时刻)`。
+///
+/// 键必须含服务器标识，否则两台服务器同路径时只会轮询到先注册的那台。
+type PendingCheck = (
+    PathBuf,
+    String,
+    Arc<dyn FileSystem>,
+    Option<FileMetadata>,
+    Option<Instant>,
+);
+
 impl RemoteFsWatcher {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let watched = Arc::new(Mutex::new(HashMap::<WatchKey, RemoteWatchState>::new()));
@@ -607,15 +618,8 @@ impl RemoteFsWatcher {
             loop {
                 cx.background_executor().timer(REMOTE_POLL_INTERVAL).await;
 
-                // 快照本轮要轮询的 (路径, 服务器, fs, 上次 metadata, 上次内容校验时间)；
-                // 键必须含服务器标识，否则两台服务器同路径时只会轮询到先注册的那台。
-                let to_check: Vec<(
-                    PathBuf,
-                    String,
-                    Arc<dyn FileSystem>,
-                    Option<FileMetadata>,
-                    Option<Instant>,
-                )> = {
+                // 快照本轮要轮询的条目（见 [`PendingCheck`]）。
+                let to_check: Vec<PendingCheck> = {
                     let lock = watched_clone.lock();
                     lock.iter()
                         .map(|(key, s)| {
@@ -654,7 +658,7 @@ impl RemoteFsWatcher {
                                                 m.size <= REMOTE_CONTENT_HASH_MAX_BYTES;
                                             let meta_changed = prev_meta.as_ref() != Some(m);
                                             let hash_due = hash_candidate
-                                                && last_content_check.map_or(true, |at| {
+                                                && last_content_check.is_none_or(|at| {
                                                     at.elapsed() >= REMOTE_CONTENT_HASH_INTERVAL
                                                 });
                                             if hash_candidate && (meta_changed || hash_due) {
@@ -1257,7 +1261,7 @@ mod tests {
     #[gpui::test]
     fn remote_watcher_emits_modify_with_entries_on_delete(cx: &mut gpui::TestAppContext) {
         let events = Arc::new(StdMutex::new(Vec::new()));
-        let watcher = cx.new(|cx| RemoteFsWatcher::new(cx));
+        let watcher = cx.new(RemoteFsWatcher::new);
         let _probe = make_probe(cx, &watcher, events.clone());
 
         let fs = Arc::new(RemoteMockFs::new("srv-a", &["a.txt", "b.txt"]));
@@ -1331,7 +1335,7 @@ mod tests {
     #[gpui::test]
     fn remote_watcher_distinguishes_servers_watching_same_path(cx: &mut gpui::TestAppContext) {
         let events = Arc::new(StdMutex::new(Vec::new()));
-        let watcher = cx.new(|cx| RemoteFsWatcher::new(cx));
+        let watcher = cx.new(RemoteFsWatcher::new);
         let _probe = make_probe(cx, &watcher, events.clone());
 
         // 服务器 A 的树先 watch /root

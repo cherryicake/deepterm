@@ -36,6 +36,9 @@ impl CappedLog {
 
         let mut file = std::fs::OpenOptions::new()
             .create(true)
+            // 追加语义：显式关掉 truncate，避免「打开日志即清空」这类
+            // 隐式行为漂移（旧版本靠平台默认值，不同文件系统不一致）。
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;

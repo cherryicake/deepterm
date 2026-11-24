@@ -689,7 +689,7 @@ impl HostView {
             .context_menu(format!("folder-menu-{}", folder_id), {
                 let entity = cx.entity().clone();
                 let fid = folder_id.clone();
-                let count = count;
+                // 下面的 `move` 闭包按值捕获 `count`，无需先重绑定一份副本。
                 move |menu: PopupMenu, _window, _cx| {
                     let fid_clone = fid.clone();
                     let fid2 = fid.clone();

@@ -18,13 +18,20 @@
 /// 代价是「点菜单项也会触发关闭」。这恰好是 Zed / VSCode 的行为（菜单项点完
 /// 即关），比留着菜单让人再点一次外面更符合预期。
 ///
+/// 菜单点击外部时触发的关闭回调。
+///
+/// 抽成别名而不是在签名里重复 `Rc<dyn Fn(&mut Window, &mut App)>`：
+/// 它出现在状态栏菜单、语言菜单与 LSP 菜单三处，读代码时应该一眼看出
+/// 「这是一个关闭回调」而不是先解析一遍泛型。
+type DismissCallback = std::rc::Rc<dyn Fn(&mut Window, &mut gpui::App)>;
+
 /// 泛型在 `E` 上：语言菜单（`PopupMenu`）与 LSP 菜单（`LspMenu`）只有
 /// `Render` 不同，锚定逻辑完全一样。
 fn render_status_menu<E: Render + 'static>(
     menu: &Entity<E>,
     position: gpui::Point<Pixels>,
     window: &Window,
-    on_dismiss: std::rc::Rc<dyn Fn(&mut Window, &mut gpui::App)>,
+    on_dismiss: DismissCallback,
 ) -> gpui::AnyElement {
     gpui::deferred(
         gpui::anchored().child(
@@ -728,10 +735,12 @@ pub struct Editor {
     /// 一次」，且多占一个进程）。这些文件属于**报告这个位置的服务器的工作区**，
     /// 所以把它的根传过去，二者复用同一个进程。
     ///
+    /// 跨文件跳转的落点根：`(项目根, 服务器身份三元组)` → 目标项目根。
+    ///
     /// 用表而不是函数参数：跨文件打开要经过 `open_*_at_line_col`
     /// （终端 Cmd+Click 也用它，那边没有会话概念），而远端文件还是异步加载的
     /// ——真正接 LSP 的时刻在 `finish_file_load` 里，中间没有传参的通道。
-    lsp_jump_roots: HashMap<(String, Option<(String, u16, String)>), PathBuf>,
+    lsp_jump_roots: HashMap<LspJumpRootKey, PathBuf>,
     next_load_generation: u64,
 }
 
@@ -1663,7 +1672,7 @@ impl Editor {
                         let _ = weak.update(cx, |this, cx| {
                             if let Some(file) = this.open_files.iter_mut().find(|f| f.path == path)
                             {
-                                if let Some(ref viewer) = file.image() {
+                                if let Some(viewer) = file.image() {
                                     viewer.update(cx, |viewer, cx| {
                                         viewer.set_image(image, size, cx);
                                     });
@@ -1835,7 +1844,7 @@ impl Editor {
                         .update(cx, |state, cx| {
                             state.set_text(content.clone(), cx);
                         });
-                    if let Some(ref live) = self.open_files[file_ix].live() {
+                    if let Some(live) = self.open_files[file_ix].live() {
                         live.update(cx, |view, cx| {
                             view.set_text(&content, cx);
                         });
@@ -1924,7 +1933,7 @@ impl Editor {
                         this.open_files[file_ix].editor_state.update(cx, |state, cx| {
                             state.set_text(prompt_content.clone(), cx);
                         });
-                        if let Some(ref live) = this.open_files[file_ix].live() {
+                        if let Some(live) = this.open_files[file_ix].live() {
                             live.update(cx, |view, cx| {
                                 view.set_text(&prompt_content, cx);
                             });
@@ -5830,7 +5839,7 @@ impl Editor {
                                     state.disabled = loaded.read_only;
                                     state.set_text(loaded.text.clone(), cx);
                                 });
-                                if let Some(ref live) = file.live() {
+                                if let Some(live) = file.live() {
                                     let live_read_only = loaded.read_only;
                                     live.update(cx, |view, cx| {
                                         view.set_text(&loaded.text, cx);
@@ -6311,7 +6320,7 @@ impl Editor {
                             if let Some(file) = this.open_files.iter_mut().find(|f| f.id == tab_id)
                             {
                                 file.is_loading = false;
-                                if let Some(ref viewer) = file.image() {
+                                if let Some(viewer) = file.image() {
                                     viewer.update(cx, |viewer, cx| {
                                         viewer.set_image(image, size, cx);
                                     });
@@ -6693,7 +6702,7 @@ impl Editor {
     ///
     /// 匹配只看路径、不看主机：同一台主机上的同一个路径才是同一个文件，而
     /// 关掉的标签已经不存在，留着哪条主机的记录都没用。
-    fn prune_lsp_jump_roots(&mut self, keep: &(String, Option<(String, u16, String)>)) {
+    fn prune_lsp_jump_roots(&mut self, keep: &LspJumpRootKey) {
         if self.lsp_jump_roots.len() <= self.open_files.len() + 8 {
             return;
         }
@@ -8671,6 +8680,7 @@ pub(crate) enum LspGotoKind {
 /// - 跨文件时按错的归属开文件——远端结果去本机磁盘上找一个不存在的路径
 ///   （表现为「跳了但什么也没发生」），本地结果反过来去开一个远程标签；
 /// - 同文件判定比的是新标签的 uri，跨标签的跳转会被误判成原地跳。
+///
 /// 所以归属必须随请求一起走，不能事后重问。
 #[derive(Debug, Clone)]
 struct LspJumpOrigin {
@@ -8698,10 +8708,17 @@ struct LspJumpOrigin {
 /// 主机必须在键里：同一个绝对路径（`/srv/app/main.py`）在两台主机上是两个
 /// 文件，各自的服务器也是两个进程。这与 `ServerKey` 用
 /// `(root, language, 主机)` 认身份是同一个理由。
+/// LSP 跳转根表的键：`(文件路径, 服务器身份)`。
+///
+/// 服务器身份是 `(host, port, username)` 而不是整份 `SshConnectionConfig`
+/// ——昵称、超时、端口转发不改变「连到哪台机器」，同一个文件经不同认证方式
+/// 打开时应当命中同一条记录（见 [`lsp_jump_root_key`]）。
+pub(crate) type LspJumpRootKey = (String, Option<(String, u16, String)>);
+
 pub(crate) fn lsp_jump_root_key(
     path: &str,
     ssh: Option<&crate::ssh::SshConnectionConfig>,
-) -> (String, Option<(String, u16, String)>) {
+) -> LspJumpRootKey {
     (
         path.to_string(),
         ssh.map(|c| (c.host.clone(), c.port, c.username.clone())),
@@ -10515,7 +10532,7 @@ mod tests {
             });
         });
         assert!(
-            editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_some()),
+            editor.read_with(&*cx, |editor, _| editor.ex_command_panel.is_some()),
             "`: ` 应打开命令行面板"
         );
         let _ = cx.refresh();
@@ -10524,7 +10541,7 @@ mod tests {
         cx.simulate_keystrokes("enter");
 
         assert!(
-            editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_none()),
+            editor.read_with(&*cx, |editor, _| editor.ex_command_panel.is_none()),
             "执行后命令行面板应关闭"
         );
         assert_eq!(
@@ -10628,11 +10645,11 @@ mod tests {
             crate::keymap::reload(cx);
         });
         let _ = cx.refresh();
-        let focus = input.read_with(&mut *cx, |state, _| state.focus_handle.clone());
+        let focus = input.read_with(&*cx, |state, _| state.focus_handle.clone());
         cx.update(|window, cx| focus.focus(window, cx));
         cx.simulate_keystrokes(":");
         assert!(
-            editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_some()),
+            editor.read_with(&*cx, |editor, _| editor.ex_command_panel.is_some()),
             "Vim Normal 下按 : 应打开 Ex 面板"
         );
     }
@@ -10848,7 +10865,7 @@ mod tests {
                 editor.open_ex_command(&ExCommandLine, window, cx);
             });
         });
-        let value = editor.read_with(&mut *cx, |editor, cx| {
+        let value = editor.read_with(&*cx, |editor, cx| {
             editor
                 .ex_command_panel
                 .as_ref()
@@ -11180,7 +11197,7 @@ mod tests {
         let _ = cx.refresh();
         cx.simulate_keystrokes("2");
         cx.simulate_keystrokes("enter");
-        assert!(editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_none()));
+        assert!(editor.read_with(&*cx, |editor, _| editor.ex_command_panel.is_none()));
 
         cx.update(|window, cx| {
             editor.update(cx, |editor, cx| {
@@ -11189,7 +11206,7 @@ mod tests {
         });
         let _ = cx.refresh();
         cx.simulate_keystrokes("up");
-        let value = editor.read_with(&mut *cx, |editor, cx| {
+        let value = editor.read_with(&*cx, |editor, cx| {
             editor
                 .ex_command_panel
                 .as_ref()
@@ -11198,7 +11215,7 @@ mod tests {
         assert_eq!(value.as_deref(), Some("2"), "↑ 应召回上一条命令");
 
         cx.simulate_keystrokes("escape");
-        assert!(editor.read_with(&mut *cx, |editor, _| editor.ex_command_panel.is_none()));
+        assert!(editor.read_with(&*cx, |editor, _| editor.ex_command_panel.is_none()));
     }
 
     /// `:y` / `:j` / `:marks` / `:registers`。
@@ -11381,7 +11398,7 @@ mod tests {
         });
         assert!(!owner_focused, "焦点在别的输入框时不能认领补全键");
         assert_eq!(
-            input.read_with(&mut *cx, |state, _| state.text().to_string()),
+            input.read_with(&*cx, |state, _| state.text().to_string()),
             "pri",
             "失焦只应收起菜单，不能写入候选"
         );
@@ -11461,7 +11478,7 @@ mod tests {
         });
         assert!(
             !input
-                .read_with(&mut *cx, |state, _| state.text().to_string())
+                .read_with(&*cx, |state, _| state.text().to_string())
                 .contains('\n'),
             "兜底路径本身不能插入换行"
         );
@@ -11469,7 +11486,7 @@ mod tests {
         // 下一帧由 Editor 取走 accept 请求并执行确认。
         let _ = cx.refresh();
         assert_eq!(
-            input.read_with(&mut *cx, |state, _| state.text().to_string()),
+            input.read_with(&*cx, |state, _| state.text().to_string()),
             "println",
             "Editor 必须把 Enter 兜底请求转成补全确认"
         );

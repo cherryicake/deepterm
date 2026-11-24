@@ -61,10 +61,10 @@ fn spawn_daemon() -> std::io::Result<()> {
     #[cfg(test)]
     {
         log::warn!("测试进程不拉起守护进程");
-        return Err(std::io::Error::new(
+        Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "测试进程禁止拉起守护进程",
-        ));
+        ))
     }
 
     #[cfg(not(test))]
@@ -126,9 +126,7 @@ pub fn daemon_binary_path() -> Option<std::path::PathBuf> {
             return Some(bundled);
         }
         // 与当前可执行文件同目录（开发构建、旧安装与预期中的兼容路径）。
-        let Some(dir) = current.parent() else {
-            return None;
-        };
+        let dir = current.parent()?;
         let sibling = dir.join(&name);
         if sibling.is_file() {
             return Some(sibling);

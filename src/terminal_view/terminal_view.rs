@@ -3312,7 +3312,12 @@ impl TerminalView {
                 .as_ref()
                 .map(|c| c.nickname.clone().unwrap_or_else(|| c.host.clone()))
                 .unwrap_or_else(|| self.title().to_string());
-            let process = term.remote_process_name();
+            let process = term
+                .remote_process_name()
+                // GUI 重开后历史 OSC 不再重放，空闲标签的进程名由守护进程
+                // 快照补（`apply_daemon_meta`）；它报 `None` 表示前台就是
+                // 这个 shell，回落成 shell 名才能维持 `host · zsh` 的形态。
+                .or_else(|| term.shell_name());
             let username = self.ssh_config.as_ref().map(|c| c.username.as_str());
             let cwd = self
                 .current_remote_working_directory(cx)
@@ -3395,7 +3400,10 @@ impl TerminalView {
                 .as_ref()
                 .map(|c| c.nickname.clone().unwrap_or_else(|| c.host.clone()))
                 .unwrap_or_else(|| self.title().to_string());
-            let process = term.remote_process_name();
+            let process = term
+                .remote_process_name()
+                // 同 `tab_label`：重启后空闲标签靠守护进程快照补 shell 名。
+                .or_else(|| term.shell_name());
             let username = self.ssh_config.as_ref().map(|c| c.username.as_str());
             let cwd = self
                 .current_remote_working_directory(cx)
@@ -3479,7 +3487,7 @@ impl TerminalView {
         // 进程边界不能各写一套；那段注释解释了为什么失效的身份必须丢弃。
         let agent = term
             .foreground_agent()
-            .filter(|agent| agent.self_report_still_holds(own_argv.as_deref()));
+            .filter(|agent| agent.self_report_still_holds(own_argv));
         let app = agent.map(|agent| agent.slug());
         let remote = term.remote_process_name();
         let shell = term.shell_name();
@@ -5797,7 +5805,7 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) -> bool {
         let mode = self.terminal.read(cx).last_content().mode;
-        to_esc_str(&event.keystroke, &mode, false).is_some()
+        to_esc_str(&event.keystroke, &mode).is_some()
     }
 
     /// 处理内建命令模式下的按键。
@@ -6231,7 +6239,7 @@ impl TerminalView {
         let mut input_bytes: Option<Vec<u8>> = None;
         let handled = self.terminal.update(cx, |terminal, _cx| {
             let mode = terminal.last_content().mode;
-            if let Some(bytes) = to_esc_str(&event.keystroke, &mode, false) {
+            if let Some(bytes) = to_esc_str(&event.keystroke, &mode) {
                 // `write` 只需要切片；发送完把已拥有的 Vec 直接交给广播路径，
                 // 避免每个按键多一次 `to_vec()` 拷贝。
                 terminal.write(&bytes);
@@ -8141,6 +8149,110 @@ mod tests {
             assert!(
                 name.contains("192.168.194.4"),
                 "两段式标签的名字段应含主机，实际 {name:?}"
+            );
+        });
+    }
+
+    /// 重启 GUI 接回远端终端后，标签必须显示"正在跑什么"，空闲时显示 shell。
+    ///
+    /// 回归价值（用户实测）：重启 deepterm 后接回远端标签，**图标是对的、
+    /// 文字里却没有程序名**。两个数据源分叉了——
+    ///
+    /// - 图标读 `foreground_argv`，由守护进程 `Kind::Meta` 补发快照 → 正确；
+    /// - 标签文字读 `remote_process_name`，唯一写入点是运行期的
+    ///   `OSC 1337;Proc=`，而 attach 只重放整屏快照、不回放历史 OSC。
+    ///
+    /// 空闲时连 shell 名也没有（客户端没见过 spawn 的 shell），标签只剩主机名。
+    /// 这条用例从"视图 + 一份 Meta"出发，走真实的 `tab_label` 路径断言三段
+    /// 信息齐备：主机、程序名（或 shell 名）、远端 cwd。
+    #[gpui::test]
+    fn restored_remote_tab_shows_the_foreground_program_then_falls_back_to_shell(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::daemon::terminal::TerminalMeta;
+        use crate::ssh::config::AuthMethod;
+
+        let _env = crate::daemon::IsolatedTestEnv::new("/tmp/deepterm-remote-restored-label");
+        cx.update(|cx| {
+            crate::theme::init(cx);
+            crate::sidebar_view::font_settings::FontState::init(cx);
+        });
+
+        let config = SshConnectionConfig::new("192.168.194.4", "tester", AuthMethod::Agent);
+        let view = cx.update(|cx| {
+            TerminalView::new_remote_core_ssh_resuming(
+                cx,
+                &config,
+                Some("/home/tester/project".into()),
+                Some("lingsi-ubuntu/t2".to_string()),
+                120,
+                40,
+            )
+        });
+
+        // 守护进程的 Meta 快照：opencode 在前台，shell 是 zsh。
+        view.update(cx, |view, cx| {
+            let terminal = view.terminal().clone();
+            terminal.update(cx, |term, cx| {
+                term.apply_daemon_meta(
+                    TerminalMeta {
+                        foreground: Some("opencode".into()),
+                        shell: Some("zsh".into()),
+                        argv: Some(vec!["opencode".into()]),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+        });
+
+        view.read_with(cx, |view, cx| {
+            let label = view.tab_label(cx);
+            assert!(
+                label.contains("192.168.194.4"),
+                "标签必须带主机，实际 {label:?}"
+            );
+            assert!(
+                label.contains("opencode"),
+                "重启后标签必须显示正在跑的程序，实际 {label:?}"
+            );
+            assert!(
+                label.contains("~/project"),
+                "远端 cwd 应相对家目录缩写，实际 {label:?}"
+            );
+
+            let (name, cwd) = view.tab_title_parts(cx);
+            assert!(
+                name.contains("opencode"),
+                "两段式标签的名字段应含程序名，实际 {name:?}"
+            );
+            assert_eq!(cwd, "~/project", "目录段应单独给出缩写后的路径");
+        });
+
+        // 回到 shell：程序名清空，标签回落成 shell 名，而不是只剩主机。
+        view.update(cx, |view, cx| {
+            let terminal = view.terminal().clone();
+            terminal.update(cx, |term, cx| {
+                term.apply_daemon_meta(
+                    TerminalMeta {
+                        foreground: None,
+                        shell: Some("zsh".into()),
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+        });
+
+        view.read_with(cx, |view, cx| {
+            let label = view.tab_label(cx);
+            assert!(
+                label.contains("zsh"),
+                "空闲时标签要回落成 shell 名，实际 {label:?}"
+            );
+            assert!(
+                !label.contains("opencode"),
+                "已经退出的程序名不能残留在标签上，实际 {label:?}"
             );
         });
     }

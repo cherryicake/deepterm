@@ -48,7 +48,7 @@ fn platform_foreground_argv(pid: u32) -> Option<Vec<String>> {
 
     // 第一趟：只问长度。`sysctl` 允许 oldp 为 NULL 时用它回报缓冲区大小。
     let mut len = 0usize;
-    // SAFETY（中文）：`mib` 是长度为 3 的合法数组，传入的 `namelen` 与之匹配；
+    // SAFETY:`mib` 是长度为 3 的合法数组，传入的 `namelen` 与之匹配；
     // `oldp` 为 NULL 且 `oldlenp` 指向本栈变量，符合 sysctl 的"探长度"用法；
     // 后两个参数（newp/newlen）为 NULL/0 表示只读查询。
     let probe = unsafe {
@@ -67,7 +67,7 @@ fn platform_foreground_argv(pid: u32) -> Option<Vec<String>> {
     }
 
     let mut buf = vec![0u8; len];
-    // SAFETY（中文）：`buf` 已按刚探到的 `len` 分配，`oldlenp` 初值为其真实容量
+    // SAFETY:`buf` 已按刚探到的 `len` 分配，`oldlenp` 初值为其真实容量
     // （sysctl 据此判定可写入上限，成功后回写实际写入量）；指针与容量一致。
     let read = unsafe {
         libc::sysctl(

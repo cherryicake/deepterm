@@ -1844,7 +1844,7 @@ mod tests {
         s.place(1, 2, placement(1, 2));
         assert!(s.remove_history_placements());
         let stored = s.get(1).unwrap();
-        assert!(stored.placements.get(&1).is_none(), "历史区放置应删除");
-        assert!(stored.placements.get(&2).is_some(), "屏幕内放置应保留");
+        assert!(!stored.placements.contains_key(&1), "历史区放置应删除");
+        assert!(stored.placements.contains_key(&2), "屏幕内放置应保留");
     }
 }

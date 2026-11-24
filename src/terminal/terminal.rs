@@ -506,7 +506,7 @@ fn shell_integration_root() -> PathBuf {
     {
         // temp_dir 本身在 macOS/Linux 上就是按用户隔离的，再叠加 uid
         // 兜底（如 TMPDIR 被指向共享目录时）
-        // SAFETY（中文）：`getuid` 为 async-signal-safe 的纯查询调用，
+        // SAFETY:`getuid` 为 async-signal-safe 的纯查询调用，
         // 无指针参数、无全局状态写入，多线程并发调用安全。
         let uid = unsafe { libc::getuid() };
         std::env::temp_dir().join(format!("deepterm-shell-integration-{uid}"))
@@ -524,7 +524,7 @@ fn integration_dir_is_trusted(root: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     match fs::metadata(root) {
         Ok(md) => {
-            // SAFETY（中文）：`getuid` 同上，为只读查询，并发安全；
+            // SAFETY:`getuid` 同上，为只读查询，并发安全；
             // `metadata` 结果与 `getuid` 比较用于防同机预建目录攻击。
             md.is_dir()
                 && md.uid() == unsafe { libc::getuid() }
@@ -554,7 +554,7 @@ fn hostname_via_syscall() -> String {
     #[cfg(unix)]
     {
         let mut buf = [0u8; 256];
-        // SAFETY（中文）：gethostname 为只读 syscall，缓冲区指针/长度均有效；
+        // SAFETY:gethostname 为只读 syscall，缓冲区指针/长度均有效；
         // 名字超长时 Linux 截断并补 NUL、macOS 返回 ERANGE（此时退回空串）。
         let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
         if ok != 0 {
@@ -1486,6 +1486,26 @@ fn program_display_name(argv0: &str) -> String {
     }
 }
 
+/// 构造「字节来自外部」的终端所需的全部输入源。
+///
+/// 这些字段成对出现（term/listener 绑定同一份网格，events/driver 是两条
+/// 事件流，input/resize 是回写通道），因此打包传递而不是逐个罗列。
+#[allow(clippy::too_many_arguments)]
+struct AttachableParts<F, R>
+where
+    F: Fn(&[u8]) + Send + Sync + 'static,
+    R: Fn(u16, u16, f32) + Send + Sync + 'static,
+{
+    term: Arc<FairMutex<Term<ZedListener>>>,
+    listener: ZedListener,
+    events_rx: UnboundedReceiver<AlacTermEvent>,
+    driver_rx: async_channel::Receiver<DriverEvent>,
+    input_handler: F,
+    resize_handler: R,
+    scrollback_requested: usize,
+    russh_handle: Option<RusshTerminal>,
+}
+
 impl Terminal {
     fn terminal_config_with_scrollback(scrollback_lines: usize) -> Config {
         Config {
@@ -1662,7 +1682,7 @@ impl Terminal {
         #[cfg(unix)]
         let (child_process_id, shell_process_group_id, pty_master_fd) = {
             let pid = pty.child().id();
-            // SAFETY（中文）：`getpgid` 传入刚创建的子进程 pid（有效正整数），
+            // SAFETY:`getpgid` 传入刚创建的子进程 pid（有效正整数），
             // 无指针参数，失败时返回 -1 并设置 errno，已判 `>=0` 处理；
             // fd 复用竞态理论存在但窗口极小，失败仅降级为 None，不影响终端创建。
             let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
@@ -2102,14 +2122,16 @@ impl Terminal {
         let terminal = Self::build_attachable(
             cx,
             TerminalType::Attached { address },
-            term,
-            listener,
-            events_rx,
-            driver_rx,
-            input,
-            resize,
-            scrollback_lines,
-            None,
+            AttachableParts {
+                term,
+                listener,
+                events_rx,
+                driver_rx,
+                input_handler: input,
+                resize_handler: resize,
+                scrollback_requested: scrollback_lines,
+                russh_handle: None,
+            },
         );
         // **`terminal_bounds` 必须与守护进程那份网格一致。**
         //
@@ -2172,14 +2194,16 @@ impl Terminal {
         Self::create_remote_terminal(
             cx,
             ssh_config,
-            term.clone(),
-            listener,
-            events_rx,
-            driver_rx,
-            move |data| russh_for_input.write(data),
-            move |cols, rows, _scale| russh_for_resize.resize(cols, rows),
-            scrollback_requested,
-            Some(russh_for_status),
+            AttachableParts {
+                term: term.clone(),
+                listener,
+                events_rx,
+                driver_rx,
+                input_handler: move |data| russh_for_input.write(data),
+                resize_handler: move |cols, rows, _scale| russh_for_resize.resize(cols, rows),
+                scrollback_requested,
+                russh_handle: Some(russh_for_status),
+            },
         )
     }
 
@@ -2275,27 +2299,29 @@ impl Terminal {
         let terminal = Self::create_remote_terminal(
             cx,
             ssh_config,
-            term,
-            terminal_listener,
-            events_rx,
-            driver_rx,
-            move |data| pty_input.write(data),
-            move |cols, rows, scale| {
-                let bounds = TerminalBounds::new(
-                    default_bounds.line_height,
-                    default_bounds.cell_width,
-                    Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(cols as f32 * default_bounds.cell_width.as_f32()),
-                            height: px(rows as f32 * default_bounds.line_height.as_f32()),
+            AttachableParts {
+                term,
+                listener: terminal_listener,
+                events_rx,
+                driver_rx,
+                input_handler: move |data| pty_input.write(data),
+                resize_handler: move |cols, rows, scale| {
+                    let bounds = TerminalBounds::new(
+                        default_bounds.line_height,
+                        default_bounds.cell_width,
+                        Bounds {
+                            origin: Point::default(),
+                            size: Size {
+                                width: px(cols as f32 * default_bounds.cell_width.as_f32()),
+                                height: px(rows as f32 * default_bounds.line_height.as_f32()),
+                            },
                         },
-                    },
-                );
-                pty_resize.resize(bounds, scale);
+                    );
+                    pty_resize.resize(bounds, scale);
+                },
+                scrollback_requested,
+                russh_handle: None,
             },
-            scrollback_requested,
-            None,
         );
         // 保存一份句柄供 `kill()` 显式 close；输入/尺寸闭包里的克隆仍然
         // 只是借用同一个 sender。
@@ -2309,32 +2335,17 @@ impl Terminal {
     fn create_remote_terminal(
         cx: &mut App,
         ssh_config: &SshConnectionConfig,
-        term: Arc<FairMutex<Term<ZedListener>>>,
-        listener: ZedListener,
-        events_rx: UnboundedReceiver<AlacTermEvent>,
-        driver_rx: async_channel::Receiver<DriverEvent>,
-        input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
-        resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
-        scrollback_requested: usize,
-        russh_handle: Option<RusshTerminal>,
+        parts: AttachableParts<
+            impl Fn(&[u8]) + Send + Sync + 'static,
+            impl Fn(u16, u16, f32) + Send + Sync + 'static,
+        >,
     ) -> Entity<Self> {
         let terminal_type = TerminalType::Remote {
             host: ssh_config.host.clone(),
             username: ssh_config.username.clone(),
             port: ssh_config.port,
         };
-        Self::build_attachable(
-            cx,
-            terminal_type,
-            term,
-            listener,
-            events_rx,
-            driver_rx,
-            input_handler,
-            resize_handler,
-            scrollback_requested,
-            russh_handle,
-        )
+        Self::build_attachable(cx, terminal_type, parts)
     }
 
     /// 构造一个"字节来自外部"的终端：远程 SSH 与守护进程挂接共用这一条。
@@ -2346,19 +2357,24 @@ impl Terminal {
     /// 抽出来的价值：挂接式终端不必复制一遍 200 行的字段初始化——那份
     /// 初始化里有一堆必须成对出现的 `Arc`（kitty 图像、应答队列、脏标记），
     /// 复制粘贴迟早漏一个，表现为"图片渲染不出来"这种很难查的故障。
-    #[allow(clippy::too_many_arguments)]
     fn build_attachable(
         cx: &mut App,
         terminal_type: TerminalType,
-        term: Arc<FairMutex<Term<ZedListener>>>,
-        listener: ZedListener,
-        events_rx: UnboundedReceiver<AlacTermEvent>,
-        driver_rx: async_channel::Receiver<DriverEvent>,
-        input_handler: impl Fn(&[u8]) + Send + Sync + 'static,
-        resize_handler: impl Fn(u16, u16, f32) + Send + Sync + 'static,
-        scrollback_requested: usize,
-        russh_handle: Option<RusshTerminal>,
+        parts: AttachableParts<
+            impl Fn(&[u8]) + Send + Sync + 'static,
+            impl Fn(u16, u16, f32) + Send + Sync + 'static,
+        >,
     ) -> Entity<Self> {
+        let AttachableParts {
+            term,
+            listener,
+            events_rx,
+            driver_rx,
+            input_handler,
+            resize_handler,
+            scrollback_requested,
+            russh_handle,
+        } = parts;
         let default_bounds = TerminalBounds::default();
 
         // 远程路径的字节在 UI 线程解析，因此扫描器/共享状态都在这里建立。
@@ -2618,7 +2634,7 @@ impl Terminal {
         #[cfg(unix)]
         {
             match self.pty_master_fd {
-                // SAFETY（中文）：`tcgetpgrp` 传入存活的 pty master fd，
+                // SAFETY:`tcgetpgrp` 传入存活的 pty master fd，
                 // 失败返回 -1，已判 `>=0`；fd 关闭竞态下仅降级为 false，不扩散。
                 Some(fd) => match unsafe { libc::tcgetpgrp(fd) } {
                     pgid if pgid >= 0 => self.shell_process_group_id == Some(pgid),
@@ -2644,7 +2660,16 @@ impl Terminal {
             .and_then(|n| n.to_str())
     }
 
-    /// 获取远程前台进程名（由远程 shell 的 preexec hook 通过 OSC 1337;Proc= 上报）。
+    /// 获取远程前台进程名。
+    ///
+    /// 两个写入源，都是"事件/快照驱动"的权威结论：
+    /// - **运行期**：远程 shell 的 preexec hook 通过 `OSC 1337;Proc=` 上报
+    ///   （`try_handle_osc_sequence`），能跟上"刚敲下 vim"这种边沿；
+    /// - **attach 后**：持有 PTY 的守护进程每 500ms 实测一次并经
+    ///   `Kind::Meta` 推来快照（[`Self::apply_daemon_meta`]）。GUI 重开时
+    ///   OSC 历史不会重放，只能靠它——否则标签会丢掉"正在跑什么"。
+    ///
+    /// `None` = 前台就是 shell（或还没有任何一方报过）。
     pub fn remote_process_name(&self) -> Option<&str> {
         self.remote_process_name.as_deref()
     }
@@ -2697,7 +2722,7 @@ impl Terminal {
 
         #[cfg(unix)]
         if let Some(fd) = self.pty_master_fd {
-            // SAFETY（中文）：`tcgetpgrp` 只读查询，失败（`<0`）就退回快照。
+            // SAFETY:`tcgetpgrp` 只读查询，失败（`<0`）就退回快照。
             let pgid = unsafe { libc::tcgetpgrp(fd) };
             if pgid > 0 {
                 // 前台进程组就是 shell 自己：没有前台应用，这是结论。
@@ -2922,7 +2947,7 @@ impl Terminal {
     fn local_child_alive(&self) -> bool {
         match self.child_process_id {
             Some(pid) => {
-                // SAFETY（中文）：`kill(pid, 0)` 仅做存在性探测，信号量为 0
+                // SAFETY:`kill(pid, 0)` 仅做存在性探测，信号量为 0
                 // 不产生任何实际信号；pid 为创建时捕获的有效子进程 pid。
                 unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
             }
@@ -3378,6 +3403,22 @@ impl Terminal {
     /// 这个入口把守护进程的结论写进与本地探测**同一组字段**
     /// （`foreground_argv` / `foreground_agent`），于是标签、图标、agent
     /// 状态点等所有下游消费者都无需区分终端类型。
+    ///
+    /// # 另外两条必须一并补齐的状态
+    ///
+    /// `remote_process_name` 与 `shell_program` 在本地探测路径里根本不存在
+    /// （它们只服务远程终端），而 GUI 侧唯一的历史写入点是
+    /// `OSC 1337;Proc=`。重开 GUI 后 attach 只重放整屏快照、不回放历史
+    /// OSC，于是：
+    ///
+    /// - `tab_label` 的远程分支取 `remote_process_name` 得到 `None`，标签
+    ///   少了"正在跑什么"那一段；
+    /// - 空闲时连 shell 名都没有，标签只剩主机名；
+    /// - `needs_close_confirmation` 读的也是 `remote_process_name`，关闭
+    ///   正在跑 `nvim` 的远端面板不再弹确认。
+    ///
+    /// 守护进程每 500ms 实测一次这两件事，且快照会在 `subscribe` 时补发，
+    /// 所以落到这里就是重启后唯一可靠的数据来源。
     pub fn apply_daemon_meta(
         &mut self,
         meta: crate::daemon::terminal::TerminalMeta,
@@ -3392,6 +3433,18 @@ impl Terminal {
             .argv
             .clone()
             .or_else(|| meta.foreground.as_ref().map(|name| vec![name.clone()]));
+
+        // 远程终端的"前台程序名"：与 `OSC 1337;Proc=` 是同一个字段的两个
+        // 来源（运行期事件 / 进程探测快照）。先记 `None` 也要写——那是
+        // "回到 shell"的结论，留着旧程序名会让标签停在已经退出的程序上。
+        let process_changed = meta.foreground != self.remote_process_name;
+        self.remote_process_name = meta.foreground.clone();
+
+        // shell 名只在 spawn 时确定，客户端拿不到；空值时保持原值，避免旧
+        // 版本 core（不报这个字段）把已有名字抹掉。
+        if let Some(shell) = meta.shell.clone() {
+            self.shell_program = Some(shell);
+        }
 
         // 复用同一套 agent 识别，保证本地/挂接两条路径的结论一致。
         //
@@ -3434,7 +3487,7 @@ impl Terminal {
             cx.emit(Event::AgentChanged);
         }
 
-        if !agent_changed && !session_changed && argv_changed {
+        if !agent_changed && !session_changed && (argv_changed || process_changed) {
             cx.emit(Event::TitleChanged);
         }
     }
@@ -3457,7 +3510,7 @@ impl Terminal {
         let Some(fd) = pty_master_fd else {
             return unavailable;
         };
-        // SAFETY（中文）：`tcgetpgrp` 只读查询，传入存活的 pty master fd；
+        // SAFETY:`tcgetpgrp` 只读查询，传入存活的 pty master fd；
         // 失败返回 -1，由下面判掉。
         let pgid = unsafe { libc::tcgetpgrp(fd) };
         if pgid < 0 {
@@ -5690,8 +5743,10 @@ impl Terminal {
                 e.modifiers,
                 true,
                 self.last_content.mode,
-                self.sgr_pixels_active(),
-                self.display_scale,
+                crate::terminal::mappings::mouse::PixelCoords::from_flag(
+                    self.sgr_pixels_active(),
+                    self.display_scale,
+                ),
             ) {
                 self.write(&bytes);
             }
@@ -5749,8 +5804,10 @@ impl Terminal {
                 e.modifiers,
                 false,
                 self.last_content.mode,
-                self.sgr_pixels_active(),
-                self.display_scale,
+                crate::terminal::mappings::mouse::PixelCoords::from_flag(
+                    self.sgr_pixels_active(),
+                    self.display_scale,
+                ),
             ) {
                 self.write(&bytes);
             }
@@ -5864,8 +5921,10 @@ impl Terminal {
                 e.pressed_button,
                 e.modifiers,
                 self.last_content.mode,
-                self.sgr_pixels_active(),
-                self.display_scale,
+                crate::terminal::mappings::mouse::PixelCoords::from_flag(
+                    self.sgr_pixels_active(),
+                    self.display_scale,
+                ),
             ) {
                 self.write(&bytes);
             }
@@ -5894,8 +5953,10 @@ impl Terminal {
                     scroll_lines,
                     e,
                     self.last_content.mode,
-                    self.sgr_pixels_active(),
-                    self.display_scale,
+                    crate::terminal::mappings::mouse::PixelCoords::from_flag(
+                        self.sgr_pixels_active(),
+                        self.display_scale,
+                    ),
                 ) {
                     for scroll in scrolls {
                         self.write(&scroll);
@@ -7347,7 +7408,7 @@ mod tests {
     fn oversized_unterminated_osc_does_not_accumulate(cx: &mut TestAppContext) {
         let terminal = cx.new(|_| anchor_test_terminal());
         let mut data = vec![0x1b, b']'];
-        data.extend(std::iter::repeat(b'x').take(9 * 1024));
+        data.extend(std::iter::repeat_n(b'x', 9 * 1024));
         terminal.update(cx, |t, cx| {
             t.handle_pty_data(&data, false, cx);
             assert!(t.pending_osc.is_empty());
@@ -7625,8 +7686,7 @@ mod tests {
             "sentinel 不得被当成桌面通知，实际事件 {seen:?}"
         );
         assert!(
-            seen.iter()
-                .any(|e| *e == crate::terminal::Event::AgentChanged),
+            seen.contains(&crate::terminal::Event::AgentChanged),
             "应发出 AgentChanged，实际事件 {seen:?}"
         );
     }
@@ -8133,6 +8193,7 @@ mod tests {
                     argv: None,
                     agent: None,
                     agent_session: Some(AgentSessionState::default()),
+                    ..Default::default()
                 },
                 cx,
             );
@@ -8144,6 +8205,93 @@ mod tests {
             assert!(
                 t.agent_session().is_none(),
                 "身份清空后不能残留 session（否则状态点永不熄灭）"
+            );
+        });
+    }
+
+    /// 守护进程的 Meta 必须补上 `remote_process_name` 与 shell 名。
+    ///
+    /// 回归价值（用户实测现象）：重启 GUI 后接回远端终端，**标签上不再显示
+    /// 正在运行的程序**，但图标是对的。两个数据源分叉了：
+    ///
+    /// - 图标读 `foreground_argv`，由本函数写入 → 正确；
+    /// - 标签文字读 `remote_process_name`，唯一的写入点是运行期的
+    ///   `OSC 1337;Proc=`。attach 只重放整屏快照、不回放历史 OSC，于是它
+    ///   停在 `None`，标签只剩主机名。
+    ///
+    /// 顺带守两条同源回归：
+    /// - 空闲时（`foreground: None`）`shell_name()` 必须有值，否则标签连
+    ///   `host · zsh` 都拼不出来；
+    /// - `needs_close_confirmation` 读的也是 `remote_process_name`，缺了它
+    ///   关闭一个正在跑 `nvim` 的远端面板不会弹确认。
+    #[gpui::test]
+    fn daemon_meta_restores_the_foreground_program_and_shell_name(cx: &mut TestAppContext) {
+        use crate::daemon::terminal::TerminalMeta;
+
+        let terminal = cx.new(|_| {
+            let mut t = Terminal::create_error_terminal();
+            t.terminal_type = TerminalType::Attached {
+                address: "lingsi-ubuntu/t2".into(),
+            };
+            t
+        });
+
+        terminal.update(cx, |t, cx| {
+            // 前提：刚 attach 回来，历史 OSC 没有重放。
+            assert!(t.remote_process_name().is_none());
+            assert!(t.shell_name().is_none());
+
+            // 守护进程报：opencode 在前台，shell 是 zsh。
+            t.apply_daemon_meta(
+                TerminalMeta {
+                    foreground: Some("opencode".into()),
+                    shell: Some("zsh".into()),
+                    argv: Some(vec!["opencode".into()]),
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                t.remote_process_name(),
+                Some("opencode"),
+                "标签文字靠它：必须与图标同源，不能等下一次 OSC"
+            );
+            assert_eq!(t.shell_name(), Some("zsh"), "空闲时标签要能回落成 shell 名");
+            assert!(
+                t.needs_close_confirmation(),
+                "远端在跑程序，关闭面板必须确认，不能静默杀掉"
+            );
+
+            // 回到 shell：程序名清空（有效结论），shell 名保留。
+            t.apply_daemon_meta(
+                TerminalMeta {
+                    foreground: None,
+                    shell: Some("zsh".into()),
+                    argv: None,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert!(
+                t.remote_process_name().is_none(),
+                "回到 shell 后不能残留已经退出的程序名"
+            );
+            assert_eq!(t.shell_name(), Some("zsh"), "shell 名不该被清掉");
+            assert!(!t.needs_close_confirmation(), "回到 shell 后直接关闭即可");
+
+            // 旧版本 core 不报 shell（`None`）：已有名字必须保留，不能被抹掉。
+            t.apply_daemon_meta(
+                TerminalMeta {
+                    foreground: None,
+                    shell: None,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert_eq!(
+                t.shell_name(),
+                Some("zsh"),
+                "缺字段是「不知道」，不是「没有 shell」"
             );
         });
     }
@@ -8462,11 +8610,12 @@ mod tests {
         });
     }
 
+    /// 记录下来的尺寸通知：`(cols, rows, scale)`。
+    type RecordedResizes = Arc<Mutex<Vec<(u16, u16, f32)>>>;
+
     /// 构造一个无 PTY、但带记录型 `remote_resize_callback` 的终端，
     /// 以便观察「窗口尺寸通知」的下发次数与内容（含缩放）。
-    fn resize_test_terminal(
-        cx: &mut TestAppContext,
-    ) -> (Entity<Terminal>, Arc<Mutex<Vec<(u16, u16, f32)>>>) {
+    fn resize_test_terminal(cx: &mut TestAppContext) -> (Entity<Terminal>, RecordedResizes) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let sink = calls.clone();
         let terminal = cx.new(move |_| {

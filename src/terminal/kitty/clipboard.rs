@@ -56,25 +56,13 @@ struct MimeData {
     encoded: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct WriteTxn {
     id: String,
     current_mime: Option<String>,
     entries: HashMap<String, MimeData>,
     aliases: HashMap<String, String>,
     bytes: usize,
-}
-
-impl Default for WriteTxn {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            current_mime: None,
-            entries: HashMap::new(),
-            aliases: HashMap::new(),
-            bytes: 0,
-        }
-    }
 }
 
 /// 每个终端一份的协议状态。
@@ -408,7 +396,7 @@ fn encode_packet(
 /// 图形协议那边允许忽略换行等噪声（历史行为），剪贴板协议要求严格；
 /// 不能复用宽松的 `decode_base64`，否则损坏数据会被静默解成空串。
 fn decode_base64_strict(input: &[u8]) -> Option<Vec<u8>> {
-    if input.len() % 4 != 0 {
+    if !input.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(input.len() / 4 * 3);

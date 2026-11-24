@@ -628,7 +628,7 @@ pub fn to_render_image(image: &DecodedImage) -> gpui::RenderImage {
 /// `DecodedImage`）。
 pub fn to_render_image_from(width: u32, height: u32, rgba: &[u8]) -> gpui::RenderImage {
     let mut rgba = rgba.to_vec();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         gpui::swap_rgba_pa_to_bgra(pixel);
     }
     // 损坏帧/动画换帧的尺寸与缓冲不一致时，`from_raw` 返回 None。

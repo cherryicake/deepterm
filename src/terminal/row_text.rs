@@ -164,8 +164,7 @@ impl WrappedText {
         }
         let mut out: Vec<(usize, usize, usize)> = Vec::new();
         let mut prev_cell: Option<(usize, usize)> = None;
-        for byte in start..end {
-            let loc = self.byte_loc[byte];
+        for &loc in &self.byte_loc[start..end] {
             // 同一格的多字节字符只算一次，否则一个宽字符会吐出一串重复区间
             if prev_cell == Some((loc.row, loc.col)) {
                 continue;

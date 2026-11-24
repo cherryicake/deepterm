@@ -179,9 +179,19 @@ fn decode_raw(
     let rgba = if bpp == 4 {
         data[..expected].to_vec()
     } else {
-        let mut out = Vec::with_capacity(pixels * 4);
-        for px in data[..expected].chunks_exact(3) {
-            out.extend_from_slice(&[px[0], px[1], px[2], 0xFF]);
+        // RGB → RGBA 一次扩容到位、按 stride 直接写，避免每个像素一次
+        // `extend_from_slice(&[..])`（8000×8000 图会有 6400 万次小写入）。
+        let mut out = vec![0u8; pixels * 4];
+        for (dst, src) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(data[..expected].as_chunks::<3>().0)
+        {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = 0xFF;
         }
         out
     };

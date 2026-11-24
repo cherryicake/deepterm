@@ -472,7 +472,7 @@ pub fn merge_bridge_config(
             if entry
                 .get("command")
                 .and_then(|v| v.as_str())
-                .is_some_and(&is_ours)
+                .is_some_and(is_ours)
             {
                 return false;
             }
@@ -481,7 +481,7 @@ pub fn merge_bridge_config(
                 handlers.retain(|h| {
                     !h.get("command")
                         .and_then(|v| v.as_str())
-                        .is_some_and(&is_ours)
+                        .is_some_and(is_ours)
                 });
                 return before == handlers.len() || !handlers.is_empty();
             }

@@ -1101,21 +1101,15 @@ impl TabBar {
         let new_id: SharedString = id.into();
         let changed = self.active_tab_id.as_ref() != Some(&new_id);
         if changed {
-            self.active_tab_id = Some(new_id);
-            // 激活即清铃：后台响铃 / 通知产生的小红点，切过来后视为已读。
-            if let Some(tab) = self
-                .tabs
-                .iter_mut()
-                .find(|t| t.id == *self.active_tab_id.as_ref().unwrap())
-            {
+            // 先按 id 定位，再写入状态：避免「刚写进 Some 又立刻 unwrap 取回」。
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == new_id) {
+                // 激活即清铃：后台响铃 / 通知产生的小红点，切过来后视为已读。
                 tab.needs_attention = false;
             }
+            let index = self.tabs.iter().position(|t| t.id == new_id);
+            self.active_tab_id = Some(new_id);
             // 溢出时把新激活的标签滚动到可见区域（最小滚动策略）
-            if let Some(index) = self
-                .active_tab_id
-                .as_ref()
-                .and_then(|id| self.tabs.iter().position(|t| t.id == *id))
-            {
+            if let Some(index) = index {
                 self.scroll_handle.scroll_to_item(index);
             }
             cx.notify();

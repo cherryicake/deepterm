@@ -386,10 +386,13 @@ fn snapshot_refresh_yields_to_grid_lock_without_starving(cx: &mut TestAppContext
 
     // 阶段划分依赖「跳过上限至少为 2」：阶段 1 消耗第一次跳过，阶段 2 把它顶
     // 到上限，阶段 3 才落到回退分支。上限为 1 时阶段 1 就会去阻塞，断言失真。
-    assert!(
-        MAX_SNAPSHOT_LOCK_SKIPS >= 2,
-        "本测试的阶段性依赖 MAX_SNAPSHOT_LOCK_SKIPS >= 2（当前 {MAX_SNAPSHOT_LOCK_SKIPS}）"
-    );
+    // const 块让它在**编译期**就失败，而不是等跑到这个用例才报。
+    const {
+        assert!(
+            MAX_SNAPSHOT_LOCK_SKIPS >= 2,
+            "本测试的阶段性依赖 MAX_SNAPSHOT_LOCK_SKIPS >= 2"
+        )
+    };
 
     let terminal = cx.update(|cx| {
         let t = Terminal::new_headless(cx, 200);

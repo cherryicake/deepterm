@@ -172,7 +172,18 @@ pub fn paint_box_drawing(
                 let right = (segs >> 2) & 0x03;
                 let up = (segs >> 4) & 0x03;
                 let down = (segs >> 6) & 0x03;
-                paint_segments(origin, cell_w, cell_h, left, right, up, down, &mut paint);
+                paint_segments(
+                    CellBox {
+                        origin,
+                        w: cell_w,
+                        h: cell_h,
+                    },
+                    left,
+                    right,
+                    up,
+                    down,
+                    &mut paint,
+                );
             }
         }
         // U+2580–U+259F：块元素字符，按比例填充单元格的指定区域
@@ -189,6 +200,43 @@ fn stroke(cell_w: Pixels) -> Pixels {
     px((cell_w.as_f32() / 11.0).max(1.0).round())
 }
 
+/// 单元格尺寸与落点（箱线图/象限块绘制共用）。
+///
+/// 三个值总是一起出现，单独传容易把宽高顺序写反。
+#[derive(Clone, Copy)]
+struct CellBox {
+    origin: Point<Pixels>,
+    w: Pixels,
+    h: Pixels,
+}
+
+/// 四分之一块的填充象限。
+///
+/// 用一个字节的位标志而不是四个 `bool` 参数：调用点（`0x2596..=0x259F`
+/// 的十个分支）读起来就是「哪些象限」，也不用担心实参顺序写错。
+#[derive(Clone, Copy, Default)]
+struct Quadrants(u8);
+
+impl Quadrants {
+    const UPPER_LEFT: u8 = 0b0001;
+    const UPPER_RIGHT: u8 = 0b0010;
+    const LOWER_LEFT: u8 = 0b0100;
+    const LOWER_RIGHT: u8 = 0b1000;
+
+    const fn new(ul: bool, ur: bool, ll: bool, lr: bool) -> Self {
+        Self(
+            (if ul { Self::UPPER_LEFT } else { 0 })
+                | (if ur { Self::UPPER_RIGHT } else { 0 })
+                | (if ll { Self::LOWER_LEFT } else { 0 })
+                | (if lr { Self::LOWER_RIGHT } else { 0 }),
+        )
+    }
+
+    const fn contains(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+}
+
 /// 将四个方向的线段描述（左/右/上/下，每个带粗细权重）逐一通过回调 `f` 输出矩形。
 ///
 /// 绘制规则：
@@ -196,15 +244,14 @@ fn stroke(cell_w: Pixels) -> Pixels {
 /// - 纵向线段：以单元格水平中线为中心，左右各延伸半个笔画粗细的垂直矩形
 /// - 双线：在中心两侧各偏移 1.5 倍笔画粗细处各画一条细线
 fn paint_segments(
-    origin: Point<Pixels>,
-    w: Pixels,
-    h: Pixels,
+    cell: CellBox,
     left: u8,
     right: u8,
     up: u8,
     down: u8,
     f: &mut impl FnMut(Bounds<Pixels>),
 ) {
+    let CellBox { origin, w, h } = cell;
     let s = stroke(w);
 
     let hc = px((w.as_f32() / 2.0).floor()); // 单元格水平中心（竖线所在列）
@@ -436,16 +483,66 @@ fn paint_block_element(
         }
 
         // ▖▗▘▙▚▛▜▝▞▟ 四分之一块组合：每个字符是若干象限的填充组合
-        0x2596 => quadrant_paint(origin, w, h, false, false, true, false, color, &mut paint), // ▖ 左下象限
-        0x2597 => quadrant_paint(origin, w, h, false, false, false, true, color, &mut paint), // ▗ 右下象限
-        0x2598 => quadrant_paint(origin, w, h, true, false, false, false, color, &mut paint), // ▘ 左上象限
-        0x2599 => quadrant_paint(origin, w, h, true, false, true, true, color, &mut paint), // ▙ 左上 + 左下 + 右下
-        0x259A => quadrant_paint(origin, w, h, true, false, false, true, color, &mut paint), // ▚ 左上 + 右下（对角）
-        0x259B => quadrant_paint(origin, w, h, true, true, true, false, color, &mut paint), // ▛ 左上 + 右上 + 左下
-        0x259C => quadrant_paint(origin, w, h, true, true, false, true, color, &mut paint), // ▜ 左上 + 右上 + 右下
-        0x259D => quadrant_paint(origin, w, h, false, true, false, false, color, &mut paint), // ▝ 右上象限
-        0x259E => quadrant_paint(origin, w, h, false, true, true, false, color, &mut paint), // ▞ 右上 + 左下（对角）
-        0x259F => quadrant_paint(origin, w, h, false, true, true, true, color, &mut paint), // ▟ 右上 + 左下 + 右下
+        0x2596 => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(false, false, true, false),
+            color,
+            &mut paint,
+        ), // ▖ 左下象限
+        0x2597 => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(false, false, false, true),
+            color,
+            &mut paint,
+        ), // ▗ 右下象限
+        0x2598 => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(true, false, false, false),
+            color,
+            &mut paint,
+        ), // ▘ 左上象限
+        0x2599 => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(true, false, true, true),
+            color,
+            &mut paint,
+        ), // ▙ 左上 + 左下 + 右下
+        0x259A => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(true, false, false, true),
+            color,
+            &mut paint,
+        ), // ▚ 左上 + 右下（对角）
+        0x259B => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(true, true, true, false),
+            color,
+            &mut paint,
+        ), // ▛ 左上 + 右上 + 左下
+        0x259C => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(true, true, false, true),
+            color,
+            &mut paint,
+        ), // ▜ 左上 + 右上 + 右下
+        0x259D => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(false, true, false, false),
+            color,
+            &mut paint,
+        ), // ▝ 右上象限
+        0x259E => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(false, true, true, false),
+            color,
+            &mut paint,
+        ), // ▞ 右上 + 左下（对角）
+        0x259F => quadrant_paint(
+            CellBox { origin, w, h },
+            Quadrants::new(false, true, true, true),
+            color,
+            &mut paint,
+        ), // ▟ 右上 + 左下 + 右下
 
         _ => {}
     }
@@ -454,16 +551,18 @@ fn paint_block_element(
 /// 象限块渲染（直接绘制版本）：将单元格均分为四个象限，按参数填充指定象限。
 /// 用于渲染 ▖▗▘▙▚▛▜▝▞▟ 等四分之一块组合字符。
 fn quadrant_paint(
-    origin: Point<Pixels>,
-    w: Pixels,
-    h: Pixels,
-    upper_left: bool,
-    upper_right: bool,
-    lower_left: bool,
-    lower_right: bool,
+    cell: CellBox,
+    quadrants: Quadrants,
     color: Hsla,
     paint: &mut impl FnMut(Bounds<Pixels>, Hsla),
 ) {
+    let CellBox { origin, w, h } = cell;
+    let (upper_left, upper_right, lower_left, lower_right) = (
+        quadrants.contains(Quadrants::UPPER_LEFT),
+        quadrants.contains(Quadrants::UPPER_RIGHT),
+        quadrants.contains(Quadrants::LOWER_LEFT),
+        quadrants.contains(Quadrants::LOWER_RIGHT),
+    );
     // 象限宽/高 = 单元格宽/高的一半（取整）
     let hw = px((w.as_f32() / 2.0).round());
     let hh = px((h.as_f32() / 2.0).round());
