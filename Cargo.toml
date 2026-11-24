@@ -149,7 +149,16 @@ open = "5"
 tree-sitter-yaml = "0.7"
 tree-sitter-java = "0.23"
 tree-sitter-xml = "0.7"
-merman = { version = "0.7.0", features = ["render"] }
+# Mermaid 渲染。0.11 的 flowchart 布局器换成直角折线的分层布局（旧的 0.7 用
+# dagre 贝塞尔曲线，密集跨组连线时会把分组横向摊开成两三千像素宽，看起来就是
+# 「本该上下堆叠的两个部分被拉成左右错开」）。
+# `all-diagrams`：deepterm 对 Mermaid 全类型放开（sequence/class/er/gantt/… 都渲染）。
+# `layout-elk`：0.11 新增的布局能力开关。
+merman = { version = "0.11", default-features = false, features = [
+    "all-diagrams",
+    "layout-elk",
+    "svg",
+] }
 # 项目级搜索与模糊查找器的文件遍历层：尊重 .gitignore/.ignore 的并行 walker。
 # 不用 walkdir 自己实现——忽略规则的层级语义（父目录规则约束子目录、
 # 白名单 `!` 反选、`.git/info/exclude`、全局 gitignore）极易写错。

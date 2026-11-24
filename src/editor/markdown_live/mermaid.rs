@@ -1,23 +1,45 @@
 //! mermaid 图实时渲染：` ```mermaid ` 代码卡片默认画成真实图形（flowchart /
 //! sequenceDiagram / gantt / pie … 全类型），卡片左上角「预览 | 源码」切换。
 //!
-//! 管线参考 zed（`crates/markdown/src/mermaid.rs` + `crates/mermaid_render`）：
-//! `merman`（Latias94/merman，zed 同源上游）解析 + 布局 + 出 SVG → 主题化
-//! → accent 美化 → usvg 量尺寸 → `gpui::Image`（SVG 位图由 gpui 缓存栅格化）。
-//! 与 zed 的差异（也是刻意为之）：
-//! - zed 的 `mermaid_render` postprocess 是 GPL-3.0 代码，不能复制；本模块的
-//!   accent 美化（`accent_postprocess`）为自研实现，只参考其思路。
+//! 管线：`merman` 解析 + 布局 + 出 SVG（自带 resvg-safe 管线）→ usvg 量尺寸
+//! → `gpui::Image`（SVG 位图由 gpui 缓存栅格化）。
+//!
+//! # 为什么用 merman 0.11 而不是 0.7
+//!
+//! 0.7 的 flowchart 只有 dagre 布局，它把同一 rank 的节点横向排开。跨组连线
+//! 密集的架构图（两个 subgraph、十几条边）会被摊成两三千像素宽——用户看到
+//! 的是「本该上下堆叠的两部分被拉成左右错开，连线绕成蜘蛛网」，调 `nodeSpacing`
+//! / `rankSpacing` / `viewport_width` 都无法根治（都实测过）。
+//!
+//! 0.11 换成分层折线布局（直角连线、分组纵向堆叠），同一张 19 节点 / 13 条
+//! 跨组边的图从 3115×967（宽高比 3.22）变成 1455×1701（0.86）。
+//! 回归用例：`dense_architecture_graph_lays_out_vertically`。
+//!
+//! # 主题化：走 Mermaid 原生 `themeVariables`
+//!
+//! 0.11 把宿主主题换成了基于 recipe 的新架构（`DiagramTheme`），迁移面很大；
+//! 而 `themeVariables` 是 Mermaid 原生、跨版本稳定的接口。`MermaidColors` 本来
+//! 就按 Mermaid 的语义槽位组织，直接映射即可（见 `theme_config`）。
+//!
+//! 顺带的好处：0.11 完整支持 `classDef`，所以不再需要手工注入节点填充
+//! （0.7 时代那套 `accent_postprocess` 已删除）。
+//!
+//! # 与 zed 的差异
+//!
+//! - zed 的 `mermaid_render` postprocess 是 GPL-3.0 代码，不能复制。
 //! - zed 是只读 markdown 视图；这里是 live 编辑视图，图模式下源码行不渲染，
 //!   光标不可进入块内（见 `LiveMarkdownView::mermaid_image_ranges`），编辑必须
 //!   经「源码」tab —— 绝无隐藏编辑。
 //!
 //! 实测约束（踩过的坑，改代码前先读）：
-//! - mermaid 输出把节点填充写在**共享 CSS 规则**里
-//!   （`#mermaid .node rect,…{fill:#…}`），不是内联属性；且会**丢弃 alpha**
-//!   （8 位 hex 截断成 6 位）。所以主题色一律预混成不透明色（见 `blend`），
-//!   美化层靠注入内联 `style="fill:…"` 覆盖规则（usvg 实测内联优先）。
-//! - 根 `<svg>` 默认带 `background-color:white`；必须让 host profile 的
-//!   `root_background = Canvas` 把它改写成画布色，否则暗色主题下整块白底。
+//! - mermaid 会**丢弃 themeVariables 里的 alpha**（8 位 hex 截断成 6 位）。
+//!   所以 `MermaidColors` 的颜色一律预混成不透明色（见 `blend`）——直接传
+//!   accent 原色会让节点变成实心高饱和块。
+//! - 根 `<svg>` 默认带 `background-color:white`。必须显式给
+//!   `themeVariables.background`，否则暗色主题下整张图是一块白板
+//!   （回归用例 `real_output_uses_dark_theme_background`）。
+//! - `themeVariables` 只能通过 `SemanticParser::with_site_config` 注入；
+//!   `Renderer` 本身没有 `with_site_config`（0.11 的 API 分层）。
 //!
 //! 缓存键 = (块源码, 主题指纹)：切主题 → 指纹变 → 自动重渲染，无需订阅。
 //! 渲染走后台任务 + 200ms 防抖（编辑中不逐键重算），渲染期间优先复用上一帧
@@ -30,7 +52,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use gpui::{AppContext, Context, Hsla, Image, ImageFormat, Task};
-use regex::Regex;
 
 use crate::editor::markdown_live::view::LiveMarkdownView;
 use crate::theme::AppTheme;
@@ -140,17 +161,6 @@ impl MermaidColors {
         chan("git_modified", self.git_modified);
         h.finish()
     }
-
-    /// 节点填充轮换色板（accent / success / warning / git 蓝，恒定顺序）。
-    /// 各色与画布预混（不透明），保证节点上的文字对比度稳定。
-    fn palette(&self) -> [String; 4] {
-        [
-            css_hex(blend(self.accent, self.canvas, 0.22)),
-            css_hex(blend(self.success, self.canvas, 0.20)),
-            css_hex(blend(self.warning, self.canvas, 0.22)),
-            css_hex(blend(self.git_modified, self.canvas, 0.20)),
-        ]
-    }
 }
 
 /// `#rrggbb` / `#rrggbbaa`（按 alpha 决定位数）。
@@ -257,55 +267,64 @@ pub(crate) fn zoomed_size(natural: (f32, f32), zoom: f32) -> (f32, f32) {
     ((natural.0 * z).max(1.0), (natural.1 * z).max(1.0))
 }
 
-/// 构建 deepterm 主题的 merman host profile：
-/// 第 1 层主题化（roles → themeVariables）+ resvg-safe 输出管线。
-fn build_profile(c: &MermaidColors) -> merman::render::HostThemeProfile {
-    use merman::render::{
-        HostThemeAppearance, HostThemeOutput, HostThemeProfile, HostThemeRoles,
-        HostThemeRootBackground,
-    };
+/// 把 deepterm 主题写进 Mermaid 的 `themeVariables`。
+///
+/// 为什么用 `themeVariables` 而不是 merman 的宿主主题 API：
+/// 0.11 把宿主主题换成了基于 recipe 的新架构（`DiagramTheme`），迁移面很大；
+/// 而 `themeVariables` 是 Mermaid 原生、跨版本稳定的接口，`%%{init}%%`
+/// 指令和 site config 都能生效。配色集合本来就是按 Mermaid 的语义槽位
+/// 组织的（`primaryColor` / `clusterBkg` …），直接映射即可。
+///
+/// 注意 mermaid 会丢弃 alpha（8 位 hex 截断成 6 位），所以 `MermaidColors`
+/// 里的颜色都已经预混成不透明色。
+fn theme_config(colors: &MermaidColors) -> merman::MermaidConfig {
     let h = css_hex;
-    let roles = HostThemeRoles {
-        canvas: Some(h(c.canvas)),
-        surface: Some(h(c.surface)),
-        surface_alt: Some(h(c.surface_alt)),
-        surface_muted: Some(h(c.surface_muted)),
-        text: Some(h(c.text)),
-        subtle_text: Some(h(c.subtle_text)),
-        border: Some(h(c.border)),
-        line: Some(h(c.line)),
-        // 边标签底用画布色（融入背景），且不在节点轮换集合内。
-        edge_label_background: Some(h(c.canvas)),
-        cluster_background: Some(h(c.cluster_bg)),
-        cluster_border: Some(h(c.cluster_border)),
-        note_background: Some(h(c.surface_alt)),
-        note_border: Some(h(c.border)),
-        note_text: Some(h(c.text)),
-        actor_background: Some(h(c.surface_alt)),
-        actor_border: Some(h(c.border)),
-        actor_text: Some(h(c.text)),
-        activation_background: Some(h(c.surface_muted)),
-        activation_border: Some(h(c.border)),
-        error: Some(h(c.error)),
-        warning: Some(h(c.warning)),
-        success: Some(h(c.success)),
-    };
-    let mut output = HostThemeOutput::resvg_safe_editor();
-    // 根背景必须设成画布色：mermaid 默认在根 `<svg style>` 写
-    // `background-color:white`，usvg 会照实渲染成白底（暗色主题下刺眼）。
-    // `Canvas` 让管线把它改写成 `editor_background`，与代码卡片底色一致。
-    output.root_background = HostThemeRootBackground::Canvas;
-    HostThemeProfile::builder()
-        .appearance(if c.is_dark {
-            HostThemeAppearance::Dark
-        } else {
-            HostThemeAppearance::Light
-        })
-        .font_family(FONT_STACK)
-        .roles(roles)
-        .series_palette([c.accent, c.success, c.warning, c.git_modified].map(css_hex))
-        .output(output)
-        .build()
+    let vars = serde_json::json!({
+        "theme": "base",
+        "themeVariables": {
+            // 根背景：不给的话 mermaid 会用白色，暗色主题下刺眼。
+            "background": h(colors.canvas),
+            "fontFamily": FONT_STACK,
+            "fontSize": "14px",
+            // 节点头部（primary）与正文。
+            "primaryColor": h(colors.surface),
+            "primaryTextColor": h(colors.text),
+            "primaryBorderColor": h(colors.border),
+            // 次级/三级（部分图类型用）。
+            "secondaryColor": h(colors.surface_alt),
+            "tertiaryColor": h(colors.surface_muted),
+            "secondaryTextColor": h(colors.text),
+            "tertiaryTextColor": h(colors.text),
+            // 连线与箭头。
+            "lineColor": h(colors.line),
+            // 分组（subgraph）：0.11 的分层布局会把分组画成实心框，
+            // 底色必须比节点更淡，否则节点会糊在框里分辨不出。
+            "clusterBkg": h(colors.cluster_bg),
+            "clusterBorder": h(colors.cluster_border),
+            // 边标签。
+            "edgeLabelBackground": h(colors.canvas),
+            // 状态/序列图等用的语义色。
+            "errorBkgColor": h(colors.error),
+            "errorTextColor": h(colors.text),
+            "noteBkgColor": h(colors.surface_alt),
+            "noteTextColor": h(colors.text),
+            "noteBorderColor": h(colors.border),
+            "actorBkg": h(colors.surface_alt),
+            "actorBorder": h(colors.border),
+            "actorTextColor": h(colors.text),
+            "signalColor": h(colors.line),
+            "signalTextColor": h(colors.text),
+            "labelBoxBkgColor": h(colors.surface_muted),
+            "labelBoxBorderColor": h(colors.border),
+            "labelTextColor": h(colors.text),
+            "loopTextColor": h(colors.text),
+            "activationBkgColor": h(colors.surface_muted),
+            "activationBorderColor": h(colors.border),
+        },
+        // series：多系列图的轮换色板。
+        "themeCSS": null,
+    });
+    merman::MermaidConfig::from_value(vars)
 }
 
 /// 源码 → 展示图。全类型放开（flowchart/sequence/gantt/pie/…）：
@@ -316,30 +335,47 @@ pub(crate) fn render_to_image(
     source: &str,
     colors: &MermaidColors,
 ) -> Result<Arc<RenderedMermaid>, String> {
-    use merman::render::HeadlessRenderer;
-    let profile = build_profile(colors);
-    let renderer = HeadlessRenderer::new().with_host_theme(&profile);
-    // resvg-safe 管线由 profile 输出 preset（ResvgSafe）提供：剥
-    // `<foreignObject>`、可读文本回退、清栅格化隐患。
+    use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SemanticParser};
+
+    // 非图文本：merman 在解析路径上会失败，错误文案对用户没意义
+    // （"No diagram type detected…"）。先探测让 footer 说人话；
+    // 探测通过后的失败才是真·渲染失败（保留原因）。
     //
-    // 非图文本：merman 在渲染路径上回 `Err(Parse(DetectType))`，错误文案对
-    // 用户没意义（"No diagram type detected…"）。用同一份探测注册表先判，
-    // 让 footer 说人话；探测通过后的失败才是真·渲染失败（保留原因）。
-    if renderer
-        .engine
-        .registry()
-        .detect_type(source, &mut merman::MermaidConfig::empty_object())
+    // 探测用**不带主题**的默认 parser：主题只影响出图样式，不影响图类型判定。
+    if merman::DetectorRegistry::pinned_mermaid_baseline()
+        .detect_type(source, &mut merman::SourcePresentationConfig::default())
         .is_err()
     {
         return Err("未识别为 Mermaid 图，以源码展示".to_string());
     }
-    let svg = renderer
-        .render_svg_sync(source)
-        .map_err(|e| format!("Mermaid 渲染失败：{e}"))?
-        .ok_or_else(|| "未识别为 Mermaid 图，以源码展示".to_string())?;
 
-    // 第 2 层主题美化：节点填充轮换 accent 色板（自研，见模块文档）。
-    let svg = accent_postprocess(&svg, colors);
+    let parser = SemanticParser::new().with_site_config(theme_config(colors));
+    let renderer = Renderer::new().with_semantic_parser(parser);
+    // **必须显式选 resvg-safe 管线。**
+    //
+    // `SvgRequest::default()` 的管线是 `Parity`：它保留 mermaid 原生的
+    // `<foreignObject>` HTML 标签，那是给浏览器/WebView 用的。而 gpui 用
+    // usvg 栅格化 SVG，usvg **不支持 foreignObject** —— 结果是所有标签文字
+    // 静默消失，只剩空框（布局、连线、配色都正常，看起来像「文字被吃了」）。
+    //
+    // `resvg_safe` 会把 HTML 标签降级成 `<text>`/`<tspan>` 并清掉其它
+    // usvg 不认的结构（非法数值属性、CSS 动画等）。
+    // 回归用例：`svg_has_real_text_not_foreign_object`。
+    let svg_request = merman::SvgRequest {
+        pipeline: Some(merman::svg::SvgPipeline::resvg_safe()),
+        ..Default::default()
+    };
+    let output = renderer
+        .render(RenderRequest::svg(
+            source,
+            OperationControl::new(),
+            svg_request,
+        ))
+        .map_err(|e| format!("Mermaid 渲染失败：{e}"))?;
+    let RenderOutput::Svg(Some(svg)) = output else {
+        return Err("未识别为 Mermaid 图，以源码展示".to_string());
+    };
+    let svg = svg.svg().to_string();
 
     // usvg 校验 + 量尺寸（gpui 栅格化走同一 usvg 解析，这里等价于预检）。
     let bytes = svg.as_bytes();
@@ -368,67 +404,6 @@ pub(crate) fn render_to_image(
 // ---------------------------------------------------------------------------
 // accent 美化（自研 postprocess）
 // ---------------------------------------------------------------------------
-
-/// 节点填充轮换：给每个 `.node` 组的首个形状注入内联 `style="fill:…"`。
-///
-/// 为什么不改 CSS/属性：mermaid 把节点填充写在**共享规则**里
-/// （`#mermaid .node rect,…{fill:#…}`），且属性值不含 alpha——只能覆盖。
-/// 实测 usvg 解析时**内联 style 优先于 CSS 规则**（resvg-safe 管线也不会剥
-/// 它），所以在形状标签上注入 style 最稳。识别不到 `.node` 组（sequence /
-/// pie 等）就原样返回：主题层已给出正确配色，美化层只做点缀。
-///
-/// 安全边界：只认「节点开标签之后、遇到嵌套 `<g` 或 `</g>` 之前」的第一个
-/// 形状标签；带 `style=` 的跳过。结构不符就静默不轮换，绝不动标签文字。
-fn accent_postprocess(svg: &str, colors: &MermaidColors) -> String {
-    static NODE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    static SHAPE_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    if !svg.contains("<g class=\"node") {
-        return svg.to_string();
-    }
-    let node_re =
-        NODE_RE.get_or_init(|| Regex::new(r#"<g class="node[^"]*"[^>]*>"#).expect("node regex"));
-    let shape_re = SHAPE_RE.get_or_init(|| {
-        Regex::new(r#"<(?:rect|circle|ellipse|polygon|path)\b[^>]*?/?>"#).expect("shape regex")
-    });
-    let palette = colors.palette();
-    let mut out = String::with_capacity(svg.len() + 64 * 8);
-    let mut last = 0usize;
-    let mut ix = 0usize;
-    for m in node_re.find_iter(svg) {
-        let search_start = m.end();
-        let limit = (search_start + 800).min(svg.len());
-        let window = &svg[search_start..limit];
-        // 形状必须在嵌套子组/节点结束之前出现（否则是别的结构，放弃）。
-        let mut stop = window.find("<g").unwrap_or(window.len());
-        if let Some(end) = window.find("</g>") {
-            stop = stop.min(end);
-        }
-        let Some(sm) = shape_re.find(&window[..stop]) else {
-            continue;
-        };
-        let tag = sm.as_str();
-        if tag.contains("style=") {
-            continue;
-        }
-        let fill = &palette[ix % palette.len()];
-        ix += 1;
-        let new_tag = inject_inline_fill(tag, fill);
-        out.push_str(&svg[last..search_start + sm.start()]);
-        out.push_str(&new_tag);
-        last = search_start + sm.end();
-    }
-    out.push_str(&svg[last..]);
-    out
-}
-
-/// 在形状标签名后插入 `style="fill:…"`（保留原有属性与自闭合形态）。
-fn inject_inline_fill(tag: &str, fill: &str) -> String {
-    let name_end = tag
-        .find(|c: char| c.is_whitespace() || c == '>' || c == '/')
-        .unwrap_or(tag.len());
-    let (head, tail) = tag.split_at(name_end);
-    format!("{head} style=\"fill:{fill}\"{tail}")
-}
 
 // ---------------------------------------------------------------------------
 // 缓存 / 异步 / tab 状态
@@ -680,6 +655,46 @@ mod tests {
     use super::*;
     use gpui::rgb;
 
+    const SAMPLE: &str = r#"flowchart TD
+    A["改 my_policy/policy.py<br/>或 v1-SKILL.md"] --> B
+    B["探活端点<br/>probe_endpoint.py"] --> C{模型可用?}
+    C -->|"否"| B1["换端点 / 等配额<br/>改 .env.local"]
+    B1 --> B
+    C -->|"是"| D
+    D["离线自检<br/>test_my_policy.py<br/>无 Docker · 无 key"] --> E{通过?}
+    E -->|"否"| A
+    E -->|"是"| F
+    F["构建 pack<br/>trajectoryrl-miner build"] --> G
+    G["同步到服务器<br/>scp → 192.168.194.4"] --> H
+    H["真场景评测<br/>eval_local.py --scenarios a,b,c"] --> I
+    I["读产物<br/>results.json / policy.log / meter.json"] --> J{分数提升?}
+    J -->|"否"| K["看 testee_transcript.txt<br/>定位 agent 死因"]
+    J -->|"是"| L["保留 · 更新 README"]
+    K --> A"#;
+
+    /// 与 [`render_to_image`] 走同一套主题配置，只返回未美化的原始 SVG。
+    ///
+    /// 测试要断言「主题化之后长什么样」，所以不能直接用 `render_to_image`
+    /// （它已经做了 accent 注入）；这里复刻渲染入口的主题参数。
+    fn render_svg_for_test(source: &str, colors: &MermaidColors) -> String {
+        let parser = merman::SemanticParser::new().with_site_config(theme_config(colors));
+        let renderer = merman::Renderer::new().with_semantic_parser(parser);
+        let out = renderer
+            .render(merman::RenderRequest::svg(
+                source,
+                merman::OperationControl::new(),
+                merman::SvgRequest {
+                    pipeline: Some(merman::svg::SvgPipeline::resvg_safe()),
+                    ..Default::default()
+                },
+            ))
+            .expect("render ok");
+        match out {
+            merman::RenderOutput::Svg(Some(svg)) => svg.svg().to_string(),
+            other => panic!("expected svg, got {other:?}"),
+        }
+    }
+
     fn colors() -> MermaidColors {
         MermaidColors {
             is_dark: true,
@@ -701,23 +716,18 @@ mod tests {
         }
     }
 
-    /// 会话验收样例：改策略 → 探活 → 分支 → 构建 → 部署 → 评测 → 回环。
-    const SAMPLE: &str = r#"flowchart TD
-    A["改 my_policy/policy.py<br/>或 v1-SKILL.md"] --> B
-    B["探活端点<br/>probe_endpoint.py"] --> C{模型可用?}
-    C -->|"否"| B1["换端点 / 等配额<br/>改 .env.local"]
-    B1 --> B
-    C -->|"是"| D
-    D["离线自检<br/>test_my_policy.py<br/>无 Docker · 无 key"] --> E{通过?}
-    E -->|"否"| A
-    E -->|"是"| F
-    F["构建 pack<br/>trajectoryrl-miner build"] --> G
-    G["同步到服务器<br/>scp → 192.168.194.4"] --> H
-    H["真场景评测<br/>eval_local.py --scenarios a,b,c"] --> I
-    I["读产物<br/>results.json / policy.log / meter.json"] --> J{分数提升?}
-    J -->|"否"| K["看 testee_transcript.txt<br/>定位 agent 死因"]
-    J -->|"是"| L["保留 · 更新 README"]
-    K --> A"#;
+    #[test]
+    fn fingerprint_tracks_theme_changes() {
+        let a = colors();
+        let fp = a.fingerprint();
+        assert_eq!(fp, a.fingerprint(), "同色应同指纹");
+        let mut b = clone_colors(&a);
+        b.is_dark = !b.is_dark;
+        assert_ne!(fp, b.fingerprint(), "明暗切换必须换指纹（触发重渲染）");
+        let mut c = clone_colors(&a);
+        c.accent = rgb(0xff0000).into();
+        assert_ne!(fp, c.fingerprint(), "accent 变化必须换指纹");
+    }
 
     #[test]
     fn sample_flowchart_renders() {
@@ -773,180 +783,103 @@ mod tests {
         let _ = render_to_image(&src, &colors());
     }
 
+    /// 端到端：真实 merman 输出必须带上 deepterm 的暗色主题。
+    ///
+    /// 回归价值：mermaid 默认根背景是白色，暗色主题下刺眼；`themeVariables`
+    /// 一旦没生效（拼错键名、被 `%%{init}%%` 覆盖），整张图会在深色卡片上
+    /// 变成一块白板。
     #[test]
-    fn accent_rotation_injects_inline_fill_on_node_shapes() {
+    fn real_output_uses_dark_theme_background() {
         let c = colors();
-        let palette = c.palette();
-        // 模拟真实结构：节点填充在共享 CSS 规则里，形状标签无 fill/style。
-        let svg = concat!(
-            r#"<svg><style>#m .node rect{fill:#89b4fa;}</style><g class="nodes">"#,
-            r#"<g class="node default" id="n0" transform="translate(1,2)"><rect class="basic label-container" x="0" y="0" width="10" height="10"/><g class="label"></g></g>"#,
-            r#"<g class="node default" id="n1" transform="translate(3,4)"><path class="basic label-container" d="M0 0h5v5z"/></g>"#,
-            r#"<g class="node default" id="n2"><rect class="basic label-container" width="8" height="8"/></g>"#,
-            r#"<g class="cluster"><rect width="99" height="99"/></g>"#,
-            r#"</g></svg>"#,
-        );
-        let out = accent_postprocess(svg, &c);
+        let raw = render_svg_for_test(SAMPLE, &c);
+        let canvas = css_hex(c.canvas);
         assert!(
-            out.contains(&format!("style=\"fill:{}\"", palette[0])),
-            "n0 应注入第 1 色：{out}"
+            raw.contains(&canvas),
+            "画布色 {canvas} 必须出现在输出里（themeVariables.background）"
         );
+        // 不得残留 mermaid 默认白底。
         assert!(
-            out.contains(&format!("style=\"fill:{}\"", palette[1])),
-            "n1 应注入第 2 色：{out}"
-        );
-        assert!(
-            out.contains(&format!("style=\"fill:{}\"", palette[2])),
-            "n2 应注入第 3 色：{out}"
-        );
-        // cluster 不是 node：不能被动。
-        assert_eq!(
-            out.matches("style=\"fill:").count(),
-            3,
-            "只应注入 3 个节点：{out}"
-        );
-        // 原始属性必须原样保留（只在标签名后插入了 style）。
-        assert!(
-            out.contains(r#"class="basic label-container" x="0" y="0" width="10" height="10"/>"#),
-            "原有属性与自闭合形态必须保留：{out}"
+            !raw.contains("background-color:white") && !raw.contains("background-color: white"),
+            "根 svg 白底必须被主题覆盖：{:.400}",
+            raw
         );
     }
 
+    /// 回归：跨组连线密集的架构图必须**纵向为主**。
+    ///
+    /// 用户报告的是「本该上下堆叠的两个部分被拉成左右错开、连线绕成蜘蛛网」。
+    /// 根因在 0.7 的 dagre 布局：它把同 rank 的节点横向排开，19 节点 / 13 条
+    /// 跨组边的图会摊成 3115×967（宽高比 3.22）。0.11 换成分层折线布局后
+    /// 同一张图是 1455×1701（0.86）。
+    ///
+    /// 判据钉在宽高比上而不是绝对尺寸：布局器调参不该让这条用例变红，
+    /// 但**换回横向铺开的算法**必须变红。
     #[test]
-    fn accent_skips_shapes_that_already_have_style() {
-        let c = colors();
-        let svg = concat!(
-            r#"<svg><g class="node default" id="n0">"#,
-            r#"<rect style="opacity:0.5" class="basic label-container" width="4" height="4"/></g></svg>"#,
-        );
-        let out = accent_postprocess(svg, &c);
-        assert_eq!(out, svg, "已有 style 的形状不能重复注入");
-    }
-
-    #[test]
-    fn accent_noop_without_node_groups() {
-        // sequence / pie 等无 `.node` 组：原样返回（第 1 层主题已配色）。
-        let c = colors();
-        let svg = r#"<svg><g class="actor"><rect width="4" height="4"/></g></svg>"#;
-        assert_eq!(accent_postprocess(svg, &c), svg);
-    }
-
-    #[test]
-    fn accent_palette_cycles() {
-        let c = colors();
-        let palette = c.palette();
-        let nodes: String = (0..5)
-            .map(|i| {
-                format!(r#"<g class="node default" id="n{i}"><rect width="4" height="4"/></g>"#)
-            })
-            .collect();
-        let out = accent_postprocess(&format!(r#"<svg>{nodes}</svg>"#), &c);
-        let count: usize = palette
-            .iter()
-            .map(|p| out.matches(p.as_str()).count())
-            .sum();
-        assert_eq!(count, 5, "5 个节点都应被轮换：{out}");
-        // 第 5 个回绕到第 1 色。
-        assert_eq!(
-            out.matches(&format!("style=\"fill:{}\"", palette[0]))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn fingerprint_tracks_theme_changes() {
-        let a = colors();
-        let fp = a.fingerprint();
-        assert_eq!(fp, a.fingerprint(), "同色应同指纹");
-        let mut b = clone_colors(&a);
-        b.is_dark = !b.is_dark;
-        assert_ne!(fp, b.fingerprint(), "明暗切换必须换指纹（触发重渲染）");
-        let mut c = clone_colors(&a);
-        c.accent = rgb(0xff0000).into();
-        assert_ne!(fp, c.fingerprint(), "accent 变化必须换指纹");
-    }
-
-    /// 端到端：真实 merman 输出上，美化层必须真的改到填充（不是空转），
-    /// 且渲染结果里不含白色根背景（暗色主题白底是最刺眼的回归）。
-    #[test]
-    fn real_output_is_accented_and_has_no_white_root_background() {
-        let c = colors();
-        let profile = build_profile(&c);
-        let renderer = merman::render::HeadlessRenderer::new().with_host_theme(&profile);
-        let raw = renderer.render_svg_sync(SAMPLE).unwrap().unwrap();
-        let out = accent_postprocess(&raw, &c);
-        let palette = c.palette();
-        let hits: usize = palette
-            .iter()
-            .map(|p| out.matches(p.as_str()).count())
-            .sum();
-        assert!(
-            hits >= 4,
-            "真实 flowchart 上应至少轮换 4 个节点，实际 {hits}"
-        );
-        assert!(out.contains("style=\"fill:"), "应注入内联 style");
-        // 根背景：不得残留 mermaid 默认白底。
-        assert!(
-            !raw.contains("background-color:white"),
-            "根 svg 白底必须被改写：{raw:.400}"
-        );
-        assert!(
-            !raw.contains("background-color: white"),
-            "根 svg 白底必须被改写"
-        );
-    }
-
-    /// usvg 解析后的实际填充必须命中轮换色板（验证内联 style 真的生效，
-    /// 而不是写进了被 CSS 覆盖的无效位置）。
-    #[test]
-    fn inline_fill_survives_usvg_resolution() {
-        let c = colors();
-        let profile = build_profile(&c);
-        let renderer = merman::render::HeadlessRenderer::new().with_host_theme(&profile);
-        let raw = renderer.render_svg_sync(SAMPLE).unwrap().unwrap();
-        let out = accent_postprocess(&raw, &c);
-        let opt = usvg::Options {
-            resources_dir: None,
-            ..usvg::Options::default()
-        };
-        let tree = usvg::Tree::from_data(out.as_bytes(), &opt).expect("美化后的 SVG 必须仍可解析");
-        fn collect(n: &usvg::Node, out: &mut Vec<(u8, u8, u8)>) {
-            match n {
-                usvg::Node::Group(g) => {
-                    for ch in g.children() {
-                        collect(ch, out);
-                    }
-                }
-                usvg::Node::Path(p) => {
-                    if let Some(usvg::Paint::Color(col)) = p.fill().map(|f| f.paint()) {
-                        out.push((col.red, col.green, col.blue));
-                    }
-                }
-                _ => {}
-            }
+    fn dense_architecture_graph_lays_out_vertically() {
+        // 两个分组 + 密集跨组边（含反向），与用户那张图同构。
+        let mut src = String::from("flowchart TB\n    subgraph host[\"宿主机\"]\n");
+        for i in 0..10 {
+            src.push_str(&format!("        H{i}[\"host 服务 {i}<br/>:8000\"]\n"));
         }
-        let mut fills = Vec::new();
-        collect(
-            &usvg::Node::Group(Box::new(tree.root().clone())),
-            &mut fills,
-        );
-        // 轮换色板的 RGB 必须在解析结果里出现。
-        let palette_rgb: Vec<(u8, u8, u8)> = c
-            .palette()
-            .iter()
-            .map(|hex| {
-                let b = |i: usize| u8::from_str_radix(&hex[1 + i * 2..3 + i * 2], 16).unwrap();
-                (b(0), b(1), b(2))
-            })
-            .collect();
-        let hit = palette_rgb.iter().filter(|rgb| fills.contains(rgb)).count();
+        src.push_str("    end\n    subgraph ext[\"外部依赖\"]\n");
+        for i in 0..7 {
+            src.push_str(&format!("        E{i}[\"外部 {i}\"]\n"));
+        }
+        src.push_str("    end\n");
+        for i in 1..10 {
+            src.push_str(&format!("    H{} --> H{i}\n", i - 1));
+        }
+        for i in 0..7 {
+            src.push_str(&format!("    H{} --> E{i}\n", i % 10));
+            src.push_str(&format!("    E{i} -.-> H{}\n", (i + 3) % 10));
+        }
+
+        let out = render_to_image(&src, &colors()).expect("应渲染成功");
+        let ratio = out.width / out.height;
         assert!(
-            hit >= 3,
-            "usvg 解析后应至少命中 3 个轮换色，实际 {hit}（fills={fills:?}）"
+            ratio < 1.5,
+            "架构图应纵向为主（宽高比 < 1.5），实际 {ratio:.2}（{}x{}）",
+            out.width,
+            out.height
         );
-        // 暗色主题：解析结果里不得有纯白填充（白底回归检测）。
-        assert!(!fills.contains(&(255, 255, 255)), "不得残留纯白填充");
+    }
+
+    /// **标签文字必须真的出现在 SVG 里。**
+    ///
+    /// 回归：`SvgRequest::default()` 的管线是 `Parity`，它保留 mermaid 原生的
+    /// `<foreignObject>` HTML 标签。gpui 用 usvg 栅格化，而 **usvg 不支持
+    /// foreignObject** —— 图上所有文字静默消失，只剩空框（布局/连线/配色都对，
+    /// 唯独没有字，极易被误判成「字体加载失败」）。
+    ///
+    /// 必须显式选 `ResvgSafe` 管线，它会把 HTML 标签降级成 `<text>`。
+    #[test]
+    fn svg_has_real_text_not_foreign_object() {
+        let src = "flowchart TD\n    A[甲乙丙] --> B[丁戊己]";
+        let c = colors();
+        let svg = render_svg_for_test(src, &c);
+        assert!(
+            !svg.contains("<foreignObject"),
+            "不得残留 foreignObject（usvg 不渲染它，文字会整段消失）"
+        );
+        assert!(svg.contains("<text"), "标签必须降级成 <text>：{:.400}", svg);
+        assert!(svg.contains("甲乙丙"), "节点文案必须出现在 SVG 文本里");
+    }
+
+    /// `classDef` 必须真的生效：0.11 的布局/绘制支持样式类，旧版 0.7 不支持
+    /// （所以当年才用 `accent_postprocess` 手工注入 `style="fill:…"`）。
+    ///
+    /// 现在改为断言 SVG 形状上带 `style` 且含 `stroke-width`——用户那张架构图
+    /// 里 `public` / `external` / `state` 几个类的粗细与虚线全靠它。
+    #[test]
+    fn class_defs_survive_into_shape_styles() {
+        let src = "flowchart TD\n    A[甲] --> B[乙]\n    classDef thick stroke-width:4px\n    class A thick";
+        let c = colors();
+        let raw = render_svg_for_test(src, &c);
+        assert!(
+            raw.contains("stroke-width"),
+            "classDef 的 stroke-width 必须落到形状上：{:.400}",
+            raw
+        );
     }
 
     #[test]
