@@ -101,12 +101,48 @@ const TAB_REORDER_FALLBACK_WIDTH_PX: f32 = 160.0;
 const TAB_REORDER_DRAGGED_TAB_OPACITY: f32 = 0.0;
 const TAB_DRAG_PREVIEW_MIN_WIDTH_PX: f32 = 48.0;
 const TAB_DRAG_PREVIEW_PADDING_X_PX: f32 = 12.0;
-const TAB_MAX_WIDTH_PX: f32 = 180.0;
-const TAB_HEIGHT_PX: f32 = 30.0;
-const TAB_PADDING_X_PX: f32 = 12.0;
+
+// ── 编辑器标签栏（紧凑模式）─────────────────────────────────────────────
+//
+// 取自 Winc 顶栏的文件标签：宽度贴合文件名（80–180），当前标签是一块实心
+// 胶囊，未选中的标签之间用一条短竖线分隔；关闭按钮固定在右端、悬停或选中
+// 时才出现，有未保存改动时改为一个灰点。终端标签栏不用这套尺寸，它走
+// herdr 的托盘样式（见 [`TabBar::render_tray`]）。
+/// 标签高度。编辑器标签栏总高 30，上下各留 2。
+const EDITOR_TAB_HEIGHT_PX: f32 = 26.0;
+/// 标签间距；分隔竖线画在间距正中。
+const EDITOR_TAB_GAP_PX: f32 = 4.0;
+/// 标签圆角。
 const TAB_RADIUS_PX: f32 = 8.0;
+/// 标签最小 / 最大宽度：宽度贴合文件名，太长时截短。
+const EDITOR_TAB_MIN_WIDTH_PX: f32 = 80.0;
+const EDITOR_TAB_MAX_WIDTH_PX: f32 = 180.0;
+/// 左内边距、文件图标、图标与文字之间的间距。
+const EDITOR_TAB_PADDING_LEFT_PX: f32 = 10.0;
+const EDITOR_TAB_ICON_SIZE_PX: f32 = 16.0;
+const EDITOR_TAB_ICON_GAP_PX: f32 = 7.0;
+/// 文字与右端关闭槽之间的间距。
+const EDITOR_TAB_CLOSE_GAP_PX: f32 = 6.0;
+/// 关闭按钮的点击区域与图形大小。
+const EDITOR_TAB_CLOSE_SIZE_PX: f32 = 16.0;
+const EDITOR_TAB_CLOSE_GLYPH_PX: f32 = 11.0;
+/// 右端留白；关闭按钮不贴边。
+const EDITOR_TAB_PADDING_RIGHT_PX: f32 = 6.0;
+/// 文件名文本的最大宽度：由标签最大宽度减去图标、关闭槽和内边距得到。
+const EDITOR_TAB_LABEL_MAX_PX: f32 = EDITOR_TAB_MAX_WIDTH_PX
+    - EDITOR_TAB_PADDING_LEFT_PX
+    - EDITOR_TAB_ICON_SIZE_PX
+    - EDITOR_TAB_ICON_GAP_PX
+    - EDITOR_TAB_CLOSE_GAP_PX
+    - EDITOR_TAB_CLOSE_SIZE_PX
+    - EDITOR_TAB_PADDING_RIGHT_PX;
+/// 标签之间竖线的高度。
+const EDITOR_TAB_DIVIDER_HEIGHT_PX: f32 = 14.0;
+/// 未保存改动圆点的直径。
+const EDITOR_TAB_MODIFIED_DOT_PX: f32 = 6.0;
+/// 标签文字大小。
+const EDITOR_TAB_TEXT_PX: f32 = 13.0;
 const ICON_SIZE_PX: f32 = 16.0;
-const FILE_ICON_SIZE_PX: f32 = 22.0;
 const AGENT_DOT_SIZE_PX: f32 = 6.0;
 
 const NEW_TAB_BUTTON_SIZE_PX: f32 = 32.0;
@@ -807,6 +843,31 @@ fn should_show_attention_dot(tab: &TabItem) -> bool {
     tab.needs_attention && !tab.is_modified
 }
 
+/// 编辑器标签左侧是否画分隔竖线。
+///
+/// 竖线画在 `index` 与 `index - 1` 两个标签之间的空隙里，所以只有**两边都是
+/// 普通标签**时才画：当前标签、悬停标签有底色，竖线贴着胶囊会显得脏；拖动中
+/// 的标签让位动画会带着竖线一起动，看起来像在抖。第一个标签左侧没有邻居。
+fn should_draw_tab_divider(
+    index: usize,
+    tabs: &[TabItem],
+    active_tab_id: Option<&SharedString>,
+    hovered_tab_id: Option<&SharedString>,
+    dragged_tab_id: Option<&SharedString>,
+) -> bool {
+    if index == 0 {
+        return false;
+    }
+    let (Some(prev), Some(tab)) = (tabs.get(index - 1), tabs.get(index)) else {
+        return false;
+    };
+
+    let is_decorated = |id: &SharedString| {
+        active_tab_id == Some(id) || hovered_tab_id == Some(id) || dragged_tab_id == Some(id)
+    };
+    !is_decorated(&prev.id) && !is_decorated(&tab.id)
+}
+
 /// 标签栏组件
 pub struct TabBar {
     id: ElementId,
@@ -1435,10 +1496,15 @@ impl TabBar {
             .get(preview.dragged_tab.from_index)
             .map(|bounds| {
                 let width: f32 = bounds.size.width.into();
-                // 用托盘的真实间距：`TAB_REORDER_GAP_PX`(4) 是旧版标签栏的
-                // 间距，托盘是 `TRAY_GAP_PX`(3)。差这 1px，重排时让位的标签
-                // 会与落点差一点点，累积在多个标签上就是肉眼可见的错位。
-                width + TRAY_GAP_PX
+                // 重排让位的距离必须包含真实的标签间距：编辑器栏是 4，
+                // 终端托盘是 3。差这 1px，重排时让位的标签会与落点差一点，
+                // 累积在多个标签上就是肉眼可见的错位。
+                let gap = if self.compact {
+                    EDITOR_TAB_GAP_PX
+                } else {
+                    TRAY_GAP_PX
+                };
+                width + gap
             })
             .unwrap_or(TAB_REORDER_FALLBACK_WIDTH_PX)
     }
@@ -1496,6 +1562,10 @@ impl TabBar {
         let on_panel_drop = self.on_panel_drop.clone();
         let panel_drop_preview = self.panel_drop_preview.clone();
         let theme = cx.theme().ui;
+        let dragged_id = self
+            .reorder_preview
+            .as_ref()
+            .map(|preview| preview.dragged_tab.tab_id.clone());
 
         let mut children: Vec<AnyElement> =
             Vec::with_capacity(self.tabs.len() + usize::from(panel_drop_preview.is_some()));
@@ -1512,7 +1582,14 @@ impl TabBar {
                 ));
             }
             if let Some(tab) = self.tabs.get(index) {
-                children.push(self.render_tab(tab, index, cx));
+                let show_divider = should_draw_tab_divider(
+                    index,
+                    &self.tabs,
+                    self.active_tab_id.as_ref(),
+                    self.hovered_tab_id.as_ref(),
+                    dragged_id.as_ref(),
+                );
+                children.push(self.render_tab(tab, index, show_divider, cx));
             }
         }
 
@@ -1521,7 +1598,7 @@ impl TabBar {
             .flex()
             .flex_row()
             .items_center()
-            .gap_1()
+            .gap(px(EDITOR_TAB_GAP_PX))
             .h_full()
             .on_drag_move::<DraggedPanel>(cx.listener(|this, event, _window, cx| {
                 this.handle_panel_drag_move(event, cx);
@@ -1597,11 +1674,24 @@ impl TabBar {
             .children(children)
     }
 
-    /// 渲染单个标签（含重排补间动画包装）
-    fn render_tab(&self, tab: &TabItem, index: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// 渲染单个编辑器标签（含重排补间动画包装）。
+    ///
+    /// 视觉对齐 Winc 顶栏：当前标签是实心胶囊（`tab_active_background` +
+    /// 细边），未选中标签只在悬停时铺浅色；相邻的普通标签之间画一条短竖线，
+    /// 当前 / 悬停 / 拖动中的标签两侧不画（它们自己已经有底色，竖线会粘在
+    /// 底色上）。宽度贴合文件名，右端固定留出关闭槽，标签不会因为悬停而
+    /// 左右跳动。
+    fn render_tab(
+        &self,
+        tab: &TabItem,
+        index: usize,
+        show_divider: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme().ui;
         let tab_id = tab.id.clone();
         let is_active = self.active_tab_id.as_ref() == Some(&tab.id);
+        let is_hovered = self.hovered_tab_id.as_ref() == Some(&tab.id);
         let label = tab.label.clone();
 
         let start_offset =
@@ -1611,43 +1701,56 @@ impl TabBar {
             self.tab_opacity_for_preview(self.previous_reorder_preview.as_ref(), index);
         let end_opacity = self.tab_opacity_for_preview(self.reorder_preview.as_ref(), index);
 
-        let tab_height = if self.compact {
-            px(24.0)
-        } else {
-            px(TAB_HEIGHT_PX)
-        };
-        let (border, bg, hover_bg) = if self.compact {
-            (theme.transparent(), gpui::transparent_black(), None)
-        } else if is_active {
-            (theme.tab_active_border, theme.tab_active_background, None)
-        } else {
-            (
-                theme.transparent(),
-                theme.tab_inactive_background,
-                Some(theme.tab_hover_background),
-            )
-        };
+        let divider_color = theme.text_subtle.opacity(0.5);
+        let debug_selector_id = tab_id.clone();
         let tab_inner = div()
             .id(tab_id.clone())
-            .h(tab_height)
-            .px(px(TAB_PADDING_X_PX))
+            .debug_selector(move || debug_selector_id.to_string())
+            .relative()
+            .h(px(EDITOR_TAB_HEIGHT_PX))
+            .min_w(px(EDITOR_TAB_MIN_WIDTH_PX))
+            .max_w(px(EDITOR_TAB_MAX_WIDTH_PX))
+            .pl(px(EDITOR_TAB_PADDING_LEFT_PX))
+            .pr(px(EDITOR_TAB_PADDING_RIGHT_PX))
             .flex()
             .flex_shrink_0()
             .items_center()
-            .gap_1()
             .rounded(px(TAB_RADIUS_PX))
             .border_1()
-            .border_color(border)
-            .bg(bg)
-            .hover(move |style| match hover_bg {
-                Some(hover) => style.bg(hover),
-                None => style,
+            .border_color(if is_active {
+                theme.tab_active_border
+            } else {
+                theme.transparent()
+            })
+            .bg(if is_active {
+                theme.tab_active_background
+            } else {
+                gpui::transparent_black()
+            })
+            .when(!is_active, move |this| {
+                this.hover(move |style| style.bg(theme.tab_hover_background))
+            })
+            .when(show_divider, move |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .left(px(-(EDITOR_TAB_GAP_PX / 2.0 + 0.5)))
+                        .top(px(
+                            (EDITOR_TAB_HEIGHT_PX - EDITOR_TAB_DIVIDER_HEIGHT_PX) / 2.0
+                        ))
+                        .w(px(1.0))
+                        .h(px(EDITOR_TAB_DIVIDER_HEIGHT_PX))
+                        .bg(divider_color),
+                )
             })
             .on_hover(cx.listener({
                 let tab_id = tab_id.clone();
                 move |this, hovered: &bool, _window, cx| {
-                    this.hovered_tab_id = hovered.then(|| tab_id.clone());
-                    cx.notify();
+                    let next = hovered.then(|| tab_id.clone());
+                    if this.hovered_tab_id != next {
+                        this.hovered_tab_id = next;
+                        cx.notify();
+                    }
                 }
             }))
             .on_drag(
@@ -1664,8 +1767,16 @@ impl TabBar {
                     }
                 },
             )
-            .child(self.render_tab_icon_slot(tab, &tab_id, is_active, cx))
+            .child(self.render_tab_icon_slot(tab, is_active, cx))
             .child(Self::render_tab_label(tab, is_active, theme))
+            .child(Self::render_tab_close_slot(
+                tab,
+                is_active,
+                is_hovered,
+                theme,
+                self.on_tab_close.clone(),
+                cx,
+            ))
             .on_click(cx.listener({
                 let on_tab_click = self.on_tab_click.clone();
                 let tab_id = tab_id.clone();
@@ -1737,58 +1848,32 @@ impl TabBar {
         }
     }
 
-    /// 标签的图标/关闭按钮/loading 槽位。
-    /// 关闭按钮不依赖 icon 存在：hover 时统一显示关闭按钮，
-    /// 其优先于 loading 动画，慢速远程连接也能从标签上直接关闭。
+    /// 标签左侧的图标 / loading 槽位。
+    ///
+    /// 关闭按钮已经搬到标签右端（见 [`Self::render_tab_close_slot`]），这里
+    /// 只负责图标：悬停时图标不会消失，标签的宽度也就不会因为鼠标移入而
+    /// 变化。槽位固定 16px，没有图标时也占位，保证所有标签的文字起点一致。
     fn render_tab_icon_slot(
         &self,
         tab: &TabItem,
-        tab_id: &SharedString,
         is_active: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme().ui;
         let icon = tab.icon;
-        let is_hovered = self.hovered_tab_id.as_ref() == Some(tab_id);
-
-        let icon_slot_width = if icon.is_some_and(|i| matches!(i, Icon::FileIcon(_))) {
-            px(FILE_ICON_SIZE_PX)
+        let icon_color = if is_active {
+            theme.text
         } else {
-            px(ICON_SIZE_PX)
+            theme.text_muted
         };
 
-        let content = if is_hovered {
-            let on_tab_close = self.on_tab_close.clone();
-            let tab_id_close = tab_id.clone();
+        let content = if tab.is_loading {
             svg()
-                .size(px(ICON_SIZE_PX))
-                .cursor_pointer()
-                .text_color(if is_active {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
-                .path(Icon::XmarkCircleFill.path())
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |_this, _event, window, cx| {
-                        if let Some(ref callback) = on_tab_close {
-                            callback(tab_id_close.clone(), window, cx);
-                        }
-                    }),
-                )
-                .into_any_element()
-        } else if tab.is_loading {
-            svg()
-                .size(px(ICON_SIZE_PX))
-                .text_color(if is_active {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
+                .size(px(EDITOR_TAB_ICON_SIZE_PX))
+                .text_color(icon_color)
                 .path(Icon::Loader.path())
                 .with_animation(
-                    format!("tab-loading-{}", tab_id),
+                    format!("tab-loading-{}", tab.id),
                     Animation::new(Duration::from_millis(800))
                         .repeat()
                         .with_easing(ease_in_out),
@@ -1806,12 +1891,14 @@ impl TabBar {
             // agent 图标压过一切：跑着 agent 的 tab，「这是哪个 agent、它现在
             // 在干嘛」永远比「什么类型的 panel」更重要。这个分支必须排在下面
             // 的通用 icon 分支之前——`AgentIcon` 也是一个 `Icon`。
-            let surface = if self.compact {
-                theme.tab_bar_background
-            } else if is_active {
+            //
+            // 编辑器栏会拒绝 agent 状态（`set_accepts_agent_state(false)`），
+            // 这里保留通用处理只是为了 TabBar 的两种渲染路径共用同一套图标
+            // 语义，不表示编辑器标签会出现 agent。
+            let surface = if is_active {
                 theme.tab_active_background
             } else {
-                theme.tab_inactive_background
+                theme.tab_bar_background
             };
             Self::render_agent_icon_slot(
                 path,
@@ -1822,18 +1909,9 @@ impl TabBar {
                 theme.border,
             )
         } else if let Some(icon) = icon {
-            let icon_size = if matches!(icon, Icon::FileIcon(_)) {
-                px(FILE_ICON_SIZE_PX)
-            } else {
-                px(ICON_SIZE_PX)
-            };
             svg()
-                .size(icon_size)
-                .text_color(if is_active {
-                    theme.text
-                } else {
-                    theme.text_muted
-                })
+                .size(px(EDITOR_TAB_ICON_SIZE_PX))
+                .text_color(icon_color)
                 .path(icon.path())
                 .into_any_element()
         } else {
@@ -1841,7 +1919,9 @@ impl TabBar {
         };
 
         div()
-            .w(icon_slot_width)
+            .flex_none()
+            .w(px(EDITOR_TAB_ICON_SIZE_PX))
+            .h(px(EDITOR_TAB_ICON_SIZE_PX))
             .flex()
             .items_center()
             .justify_center()
@@ -1907,78 +1987,111 @@ impl TabBar {
             .into_any_element()
     }
 
-    /// 标签文本（含未保存 / 需关注圆点），非激活时限宽截断
+    /// 标签文件名：宽度贴合内容，最长到 [`EDITOR_TAB_LABEL_MAX_PX`]，超出截短。
     ///
-    /// 两个圆点是**两个维度**，可以同时出现：
-    /// - 灰点 = 文件有未保存改动（编辑器专属语义）；
-    /// - 红点 = 「需关注」——后台 tab 响了铃，或 agent 跑完了一个回合而你还没
-    ///   看过它（激活即清除）。判定见 [`should_show_attention_dot`]。
-    ///
-    /// 红点**不**因为图标上有 agent 状态点而让位：那个点说的是"agent 在干什么"，
-    /// 不会因为你切过去看过就消失；红点说的是"这次完成你还没看"。前者是状态，
-    /// 后者是未读，两者不重复。详见 [`should_show_attention_dot`] 的文档。
+    /// 不再在文字前画未保存圆点：圆点和关闭按钮共用右端槽位（见
+    /// [`Self::render_tab_close_slot`]），这是 Winc 顶栏的做法——文件名
+    /// 从图标右侧一个固定位置开始，切换标签时文字不会左右跳。
     fn render_tab_label(tab: &TabItem, is_active: bool, theme: UiTheme) -> Div {
+        div()
+            .ml(px(EDITOR_TAB_ICON_GAP_PX))
+            .min_w_0()
+            .max_w(px(EDITOR_TAB_LABEL_MAX_PX))
+            .truncate()
+            .text_size(px(EDITOR_TAB_TEXT_PX))
+            .text_color(if is_active {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .child(tab.label.clone())
+    }
+
+    /// 标签右端槽位：需关注红点 / 未保存灰点 / 关闭按钮 / 空位，共用同一块宽度。
+    ///
+    /// 规则与 Winc 顶栏一致：
+    /// - 有「需关注」（后台铃 / agent 跑完一回合）且鼠标不在标签上 → 红点；
+    /// - 有未保存改动且鼠标不在标签上 → 灰点（当前标签也显示，提示未保存）；
+    /// - 否则，悬停或当前标签 → 关闭按钮；
+    /// - 其余情况留空，但**占同样的宽度**，标签不会因为悬停而变宽。
+    fn render_tab_close_slot(
+        tab: &TabItem,
+        is_active: bool,
+        is_hovered: bool,
+        theme: UiTheme,
+        on_tab_close: OptionalTabCallback,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let tab_id = tab.id.clone();
         let show_attention = should_show_attention_dot(tab);
+        let show_close = is_hovered || is_active;
+        let show_modified = tab.is_modified && !is_hovered;
+
+        let content = if show_attention && !is_hovered {
+            div()
+                .size(px(EDITOR_TAB_MODIFIED_DOT_PX))
+                .flex_none()
+                .rounded_full()
+                .bg(theme.error)
+                .into_any_element()
+        } else if show_modified {
+            div()
+                .size(px(EDITOR_TAB_MODIFIED_DOT_PX))
+                .flex_none()
+                .rounded_full()
+                .bg(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted.opacity(0.7)
+                })
+                .into_any_element()
+        } else if show_close {
+            div()
+                .id(format!("tab-close-{}", tab_id))
+                .size(px(EDITOR_TAB_CLOSE_SIZE_PX))
+                .flex_none()
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(move |style| style.bg(theme.tab_hover_background))
+                .child(
+                    svg()
+                        .size(px(EDITOR_TAB_CLOSE_GLYPH_PX))
+                        .text_color(if is_active {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .path(Icon::WindowClose.path()),
+                )
+                // 用 click 而不是 mouse_down：mouse_down 里 stop_propagation
+                // 会把父标签的 click 候选一起掐掉，正中点击反而选不中这个标签。
+                .on_click(
+                    cx.listener(move |_this, _event: &gpui::ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(ref callback) = on_tab_close {
+                            callback(tab_id.clone(), window, cx);
+                        }
+                    }),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
 
         div()
-            .relative()
-            .overflow_hidden()
+            .ml_auto()
+            .pl(px(EDITOR_TAB_CLOSE_GAP_PX))
             .flex_none()
+            .w(px(EDITOR_TAB_CLOSE_GAP_PX + EDITOR_TAB_CLOSE_SIZE_PX))
+            .h(px(EDITOR_TAB_CLOSE_SIZE_PX))
             .flex()
             .items_center()
-            .gap(px(4.0))
-            .when(!is_active, |this| this.max_w(px(TAB_MAX_WIDTH_PX)))
-            .when(tab.is_modified, |this| {
-                this.child(
-                    div()
-                        .size(px(6.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(if is_active {
-                            theme.text_muted
-                        } else {
-                            theme.text_muted.opacity(0.7)
-                        }),
-                )
-            })
-            // 需关注（后台铃 / 通知）：更醒目的强调色圆点，激活后清除。
-            .when(show_attention, |this| {
-                this.child(
-                    div()
-                        .size(px(7.0))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(theme.error),
-                )
-            })
-            .child(
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .text_sm()
-                    .whitespace_nowrap()
-                    .font_weight(if is_active {
-                        gpui::FontWeight::SEMIBOLD
-                    } else {
-                        gpui::FontWeight::NORMAL
-                    })
-                    .text_color(if is_active {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    // 宽度基准（ghost sizer）：这里必须永远渲染一份**普通文本**。
-                    // 扫光动画每帧都会改变高亮分段，gpui 会按分段重新 shaping，
-                    // 行宽在两个整像素值之间逐帧振荡；若让扫光文本直接待在文档流里，
-                    // tab（flex_shrink_0 自适应内容）就会跟着一帧一抖。
-                    // 普通文本是单 run 排版，宽度逐帧恒定，由它撑住 tab 宽度；
-                    // Working 时只把它隐形，扫光以覆盖层形式叠在上面，不参与布局。
-                    // text_ellipsis 挂在 sizer 上而不是外层容器：避免覆盖层里的
-                    // 标签文字不做任何动效：与 herdr 一致，agent 在干活
-                    // 也只靠方块上的状态点表达，文字始终是静态的。
-                    .child(div().min_w_0().text_ellipsis().child(tab.label.clone())),
-            )
+            .justify_center()
+            .child(content)
+            .into_any_element()
     }
 
     /// Panel 拖入时的插入位置预览
@@ -2046,10 +2159,10 @@ impl TabBar {
 }
 
 impl TabBar {
-    /// 紧凑模式（编辑器标签栏）的渲染：沿用改造前的样式。
+    /// 紧凑模式（编辑器标签栏）的渲染：Winc 顶栏风格的文件标签。
     ///
     /// 终端标签栏换成 herdr 的托盘样式（见 [`Self::render_tray`]）之后，
-    /// 编辑器栏保持原样：它显示的是文件，不是「终端里跑着什么程序」，
+    /// 编辑器栏保持文件标签的形态：它显示的是文件，不是「终端里跑着什么程序」，
     /// 套用程序方块与 260px 宽标签只会让人误读。
     fn render_compact(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme().ui;
@@ -2074,14 +2187,14 @@ impl TabBar {
             })
             .overflow_hidden()
             .pt(if self.compact {
-                px(2.5)
+                px(2.0)
             } else if self.transparent_bg {
                 px(4.)
             } else {
                 px(5.)
             })
             .pb(if self.compact {
-                px(3.5)
+                px(2.0)
             } else if self.transparent_bg {
                 px(4.)
             } else {
@@ -3031,7 +3144,8 @@ struct TrayColors {
 
 impl Render for TabBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // 紧凑模式就是编辑器标签栏：那边保持旧样式，终端栏走新的托盘样式。
+        // 紧凑模式就是编辑器标签栏：那边走 Winc 顶栏的文件标签，
+        // 终端栏走 herdr 的托盘样式。
         if self.compact {
             return self.render_compact(window, cx).into_any_element();
         }
@@ -3155,6 +3269,100 @@ mod tests {
         assert_eq!(insert_slot_for_content_x(px(1000.0), &bounds), 3);
         // 无标签：只能插入到 0
         assert_eq!(insert_slot_for_content_x(px(10.0), &[]), 0);
+    }
+
+    /// 分隔竖线只出现在两个普通标签之间：当前 / 悬停 / 拖动中的标签两侧
+    /// 都不能画（它们有底色，竖线会贴上去），第一个标签左侧本来就没有邻居。
+    #[test]
+    fn editor_dividers_skip_decorated_tabs() {
+        let tabs = make_tabs(&["a", "b", "c", "d"]);
+        let active = SharedString::from("b");
+        let hovered = SharedString::from("c");
+        let dragged = SharedString::from("b");
+
+        assert!(!should_draw_tab_divider(0, &tabs, None, None, None));
+        assert!(should_draw_tab_divider(1, &tabs, None, None, None));
+        assert!(should_draw_tab_divider(2, &tabs, None, None, None));
+
+        // b 当前：a|b、b|c 都不画，c|d 照常。
+        assert!(!should_draw_tab_divider(
+            1,
+            &tabs,
+            Some(&active),
+            None,
+            None
+        ));
+        assert!(!should_draw_tab_divider(
+            2,
+            &tabs,
+            Some(&active),
+            None,
+            None
+        ));
+        assert!(should_draw_tab_divider(3, &tabs, Some(&active), None, None));
+
+        // c 悬停：b|c、c|d 不画；a|b 仍可画。
+        assert!(should_draw_tab_divider(
+            1,
+            &tabs,
+            None,
+            Some(&hovered),
+            None
+        ));
+        assert!(!should_draw_tab_divider(
+            2,
+            &tabs,
+            None,
+            Some(&hovered),
+            None
+        ));
+        assert!(!should_draw_tab_divider(
+            3,
+            &tabs,
+            None,
+            Some(&hovered),
+            None
+        ));
+
+        // 拖动中的标签与悬停/当前同样处理。
+        assert!(!should_draw_tab_divider(
+            1,
+            &tabs,
+            None,
+            None,
+            Some(&dragged)
+        ));
+        assert!(!should_draw_tab_divider(
+            2,
+            &tabs,
+            None,
+            None,
+            Some(&dragged)
+        ));
+
+        // 索引越界不画，也不 panic。
+        assert!(!should_draw_tab_divider(4, &tabs, None, None, None));
+        assert!(!should_draw_tab_divider(1, &[], None, None, None));
+    }
+
+    /// 编辑器标签的宽度预算必须自洽：左内边距 + 图标 + 间距 + 最长文件名 +
+    /// 关闭槽 + 右内边距恰好等于最大宽度。任何一项调整后没同步这一条，
+    /// 长文件名就会把关闭按钮挤出胶囊，或者标签整体超过上限。
+    #[test]
+    fn editor_tab_width_budget_adds_up() {
+        assert!(EDITOR_TAB_MIN_WIDTH_PX < EDITOR_TAB_MAX_WIDTH_PX);
+        assert_eq!(
+            EDITOR_TAB_PADDING_LEFT_PX
+                + EDITOR_TAB_ICON_SIZE_PX
+                + EDITOR_TAB_ICON_GAP_PX
+                + EDITOR_TAB_LABEL_MAX_PX
+                + EDITOR_TAB_CLOSE_GAP_PX
+                + EDITOR_TAB_CLOSE_SIZE_PX
+                + EDITOR_TAB_PADDING_RIGHT_PX,
+            EDITOR_TAB_MAX_WIDTH_PX
+        );
+        // 26 的标签放进 30 高的标签栏，上下各留 2（见 `render_compact`）。
+        assert_eq!(EDITOR_TAB_HEIGHT_PX + 2.0 * 2.0, 30.0);
     }
 
     #[test]
@@ -3392,6 +3600,56 @@ mod tests {
             bar.tabs.iter().map(|t| t.id.to_string()).collect()
         });
         assert_eq!(order, ["t1", "t2"]);
+    }
+
+    /// 编辑器标签的布局契约：高度锁 26，宽度贴合文件名且停在 80–180 之间。
+    ///
+    /// 这不是像素洁癖：宽度如果跟着 hover / 关闭按钮出现而变化，切 tab 时
+    /// 整排标签会左右跳；上限如果失守，一个超长文件名会把后面的标签全挤出
+    /// 可视区。
+    #[gpui::test]
+    fn editor_tabs_are_content_sized_and_capped(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::theme::init);
+        let bar = cx.update(|cx| {
+            let bar = TabBar::new_with_tabs(
+                "editor-tab-layout-bar",
+                cx,
+                vec![
+                    TabItem::new("short", "a.rs"),
+                    TabItem::new("long", "a_really_long_file_name_that_must_be_truncated.rs"),
+                ],
+            );
+            bar.update(cx, |bar, cx| bar.set_compact(true, cx));
+            bar
+        });
+        let window = cx.open_window(size(px(400.), px(30.)), {
+            let bar = bar.clone();
+            move |_, _| MenuProbeHost { bar: bar.clone() }
+        });
+        let handle: gpui::AnyWindowHandle = window.into();
+        let mut visual = gpui::VisualTestContext::from_window(handle, cx);
+        visual.run_until_parked();
+
+        let short = visual.debug_bounds("short").expect("短标签应有布局");
+        let long = visual.debug_bounds("long").expect("长标签应有布局");
+
+        assert_eq!(short.size.height, px(EDITOR_TAB_HEIGHT_PX));
+        assert_eq!(long.size.height, px(EDITOR_TAB_HEIGHT_PX));
+        assert!(
+            short.size.width >= px(EDITOR_TAB_MIN_WIDTH_PX),
+            "短标签宽度不得低于下限：{:?}",
+            short.size.width
+        );
+        assert!(
+            short.size.width < px(EDITOR_TAB_MAX_WIDTH_PX),
+            "短标签应按内容收窄，而不是直接顶到上限：{:?}",
+            short.size.width
+        );
+        assert_eq!(
+            long.size.width,
+            px(EDITOR_TAB_MAX_WIDTH_PX),
+            "超长文件名必须停在最大宽度"
+        );
     }
 
     // ===== agent 状态点（阶段 4）=====
