@@ -1504,16 +1504,15 @@ impl ImageStore {
             CompositionMode::Overwrite
         };
 
-        // 先只读地把源帧数据与图像尺寸取出来（取副本，避免同时持有源与目标的
-        // 借用），并在此完成"帧是否存在"的校验。
+        // 先只读地校验源/目标帧并取得几何；像素借用留到同一个可变存储
+        // 作用域里拆分，避免为规避借用检查而复制整份源帧。
         let geometry = self.with_storage(|s| {
             let stored = s.get(id)?;
-            // 源帧与目标帧都必须存在。注意 `r` 是源、`c` 是目标。
-            let src = stored.frame_data(source_frame)?.to_vec();
+            stored.frame_data(source_frame)?;
             stored.frame_data(dest_frame)?;
-            Some((stored.image.width, stored.image.height, src))
+            Some((stored.image.width, stored.image.height))
         });
-        let Some((img_width, img_height, src)) = geometry else {
+        let Some((img_width, img_height)) = geometry else {
             return Err(ExecutionError::Animation("ENOENT: frame not found"));
         };
 
@@ -1551,58 +1550,24 @@ impl ImageStore {
             }
         }
 
-        // 目标帧可能是根帧（图像自身数据），也可能在动画里；两者要写回不同位置。
-        let dest_is_root = dest_frame == 1;
-        let dest_index = dest_frame.checked_sub(2).map(|i| i as usize);
-
-        self.with_storage_mut(|s| {
-            let Some(stored) = s.get_mut(id) else {
-                return;
-            };
-            if dest_is_root {
-                animation::compose_canvas_rect(
-                    &mut stored.image.rgba,
-                    animation::CanvasView {
-                        data: &src,
-                        width: img_width,
-                        height: img_height,
-                    },
-                    animation::ComposeRect {
-                        width: w as u32,
-                        height: h as u32,
-                        src_x: left_edge,
-                        src_y: top_edge,
-                        dst_x: x,
-                        dst_y: y,
-                    },
-                    mode,
-                );
-            } else if let Some(index) = dest_index {
-                let anim = match stored.animation.as_mut() {
-                    Some(anim) => anim,
-                    None => return,
-                };
-                if let Some(frame) = anim.frames.get_mut(index) {
-                    animation::compose_canvas_rect(
-                        &mut frame.data,
-                        animation::CanvasView {
-                            data: &src,
-                            width: img_width,
-                            height: img_height,
-                        },
-                        animation::ComposeRect {
-                            width: w as u32,
-                            height: h as u32,
-                            src_x: left_edge,
-                            src_y: top_edge,
-                            dst_x: x,
-                            dst_y: y,
-                        },
-                        mode,
-                    );
-                }
-            }
+        let composed = self.with_storage_mut(|s| {
+            s.get_mut(id)?.compose_frames(
+                source_frame,
+                dest_frame,
+                animation::ComposeRect {
+                    width: w as u32,
+                    height: h as u32,
+                    src_x: left_edge,
+                    src_y: top_edge,
+                    dst_x: x,
+                    dst_y: y,
+                },
+                mode,
+            )
         });
+        if composed.is_none() {
+            return Err(ExecutionError::Animation("ENOENT: frame not found"));
+        }
 
         // 目标是显示中的帧 → 屏幕内容变了；否则只是存储内容变了。
         let current =
@@ -3884,6 +3849,74 @@ mod tests {
             &anim.frames[0].data[4..8],
             &[255, 0, 0, 255],
             "右像素应被根帧左像素覆盖"
+        );
+    }
+
+    #[test]
+    fn compose_copies_rect_in_both_directions_between_animation_frames() {
+        let mut store = ImageStore::new(1024 * 1024);
+        run(&mut store, TWO_PIXEL_IMAGE, (0, 0)).unwrap();
+        let green = pixel_b64(0, 255, 0, 255);
+        let blue = pixel_b64(0, 0, 255, 255);
+        run(&mut store, &format!("a=f,i=1,f=32,s=1,v=1;{green}"), (0, 0)).unwrap();
+        run(&mut store, &format!("a=f,i=1,f=32,s=1,v=1;{blue}"), (0, 0)).unwrap();
+
+        // 较低的帧 → 较高的帧，走 split_at_mut 的左源/右目标分支。
+        run(&mut store, "a=c,i=1,r=2,c=3,w=1,h=1,C=1", (0, 0)).unwrap();
+        {
+            let guard = store.lock_storage();
+            let anim = guard.get(1).unwrap().animation.as_ref().unwrap();
+            assert_eq!(&anim.frames[1].data[..4], &[0, 255, 0, 255]);
+        }
+
+        // 较高的帧 → 较低的帧，走左目标/右源分支。
+        run(&mut store, "a=c,i=1,r=3,c=2,w=1,h=1,C=1", (0, 0)).unwrap();
+        let guard = store.lock_storage();
+        let anim = guard.get(1).unwrap().animation.as_ref().unwrap();
+        assert_eq!(&anim.frames[0].data[..4], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn compose_does_not_allocate_a_source_frame_copy() {
+        use crate::utils::alloc_probe::AllocObserver;
+
+        const WIDTH: u32 = 256;
+        const HEIGHT: u32 = 256;
+        const FRAME_BYTES: usize = WIDTH as usize * HEIGHT as usize * 4;
+        let mut store = ImageStore::new(FRAME_BYTES * 2 + 4096);
+        store.with_storage_mut(|storage| {
+            storage.insert(
+                1,
+                image::DecodedImage {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    rgba: vec![1; FRAME_BYTES],
+                },
+                None,
+                false,
+            );
+            storage.get_mut(1).unwrap().animation = Some(Animation {
+                frames: vec![Frame {
+                    data: vec![0; FRAME_BYTES],
+                    gap_ms: 0,
+                }],
+                ..Animation::default()
+            });
+        });
+
+        let mut parser = Parser::new();
+        parser
+            .feed_slice(b"a=c,i=1,r=1,c=2,C=1")
+            .expect("解析合成命令");
+        let command = parser.finish().expect("完整合成命令");
+        // 预热 TLS，测得的字节只对应命令执行本身。
+        let _ = AllocObserver::scope(|| ());
+        let (result, stats) = AllocObserver::scope(|| store.execute(command, (0, 0)));
+        result.unwrap();
+        assert!(
+            stats.bytes < 4096,
+            "整帧合成不应再复制 {FRAME_BYTES} 字节源帧，实际分配 {} 字节",
+            stats.bytes
         );
     }
 

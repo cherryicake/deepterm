@@ -117,6 +117,7 @@ const EDITOR_TAB_RADIUS_PX: f32 = 13.0;
 /// 标签最小 / 最大宽度：宽度贴合文件名，太长时截短。
 const EDITOR_TAB_MIN_WIDTH_PX: f32 = 80.0;
 const EDITOR_TAB_MAX_WIDTH_PX: f32 = 180.0;
+const _: () = assert!(EDITOR_TAB_MIN_WIDTH_PX < EDITOR_TAB_MAX_WIDTH_PX);
 /// 左内边距、文件图标、图标与文字之间的间距。
 const EDITOR_TAB_PADDING_LEFT_PX: f32 = 10.0;
 const EDITOR_TAB_ICON_SIZE_PX: f32 = 16.0;
@@ -3357,7 +3358,6 @@ mod tests {
     /// 长文件名就会把关闭按钮挤出胶囊，或者标签整体超过上限。
     #[test]
     fn editor_tab_width_budget_adds_up() {
-        assert!(EDITOR_TAB_MIN_WIDTH_PX < EDITOR_TAB_MAX_WIDTH_PX);
         assert_eq!(
             EDITOR_TAB_PADDING_LEFT_PX
                 + EDITOR_TAB_ICON_SIZE_PX

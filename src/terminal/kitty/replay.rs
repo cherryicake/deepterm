@@ -30,6 +30,7 @@
 //! 否则程序会收到一波它没请求的 `OK`。
 
 use super::command::encode_base64;
+use super::image::ImageId;
 use super::storage::{PlacementLocation, Storage};
 
 /// 单条命令的原始负载字节数。
@@ -50,6 +51,43 @@ pub struct Replay {
     pub placements: usize,
     /// 因超出预算或不在视口内而跳过的图像/放置数量（诊断用）。
     pub skipped: usize,
+}
+
+/// 图像传输命令中 base64 负载之前的控制序列（含 `;`）。
+fn transmission_prefix(id: ImageId, width: u32, height: u32, first: bool, more: bool) -> String {
+    if first {
+        format!(
+            "\x1b_Ga=t,f=32,s={width},v={height},i={id},q=2,m={};",
+            u8::from(more)
+        )
+    } else {
+        format!("\x1b_Gm={};", u8::from(more))
+    }
+}
+
+/// 不重编码整图，预先计算完整分片传输的命令字节数。
+///
+/// 必须先算再写：若写到一半才发现预算不够，既不能留下半个 loading image，
+/// 也无法在不重新遍历 base64 数据的情况下安全收回已经追加的字节。
+fn transmission_len(data_len: usize, id: ImageId, width: u32, height: u32) -> usize {
+    let mut offset = 0;
+    let mut first = true;
+    let mut total = 0usize;
+    while offset < data_len {
+        let end = (offset + CHUNK_BYTES).min(data_len);
+        let more = end < data_len;
+        let prefix = transmission_prefix(id, width, height, first, more);
+        let encoded_len = (end - offset).div_ceil(3) * 4;
+        total += prefix.len() + encoded_len + "\x1b\\".len();
+        first = false;
+        offset = end;
+    }
+    total
+}
+
+/// 给结尾的光标恢复序列预留 2 字节后的剩余预算。
+fn remaining_budget(out_len: usize, budget: usize) -> usize {
+    budget.saturating_sub(out_len.saturating_add("\x1b8".len()))
 }
 
 /// 把存储里的图像与放置编码成 kitty 命令。
@@ -73,7 +111,7 @@ pub fn encode(storage: &Storage, rows: usize, budget: usize) -> Replay {
         let Some(stored) = storage.get(id) else {
             continue;
         };
-        if out.bytes.len() >= budget {
+        if remaining_budget(out.bytes.len(), budget) == 0 {
             out.skipped += 1;
             continue;
         }
@@ -91,26 +129,25 @@ pub fn encode(storage: &Storage, rows: usize, budget: usize) -> Replay {
         // 图像数据。`render_data` 是当前动画帧（无动画时就是根帧）。
         let data = stored.render_data();
         let (w, h) = (stored.image.width, stored.image.height);
+        let needed = transmission_len(data.len(), id, w, h);
+        if needed > remaining_budget(out.bytes.len(), budget) {
+            // 不能只传前几个分片：那会留下一张永远不完整的 loading image。
+            out.skipped += 1;
+            continue;
+        }
         let mut offset = 0;
         let mut first = true;
         while offset < data.len() {
             let end = (offset + CHUNK_BYTES).min(data.len());
             let more = end < data.len();
             let chunk = encode_base64(&data[offset..end]);
-            let mut cmd = String::with_capacity(chunk.len() + 96);
-            if first {
-                cmd.push_str(&format!(
-                    "\x1b_Ga=t,f=32,s={w},v={h},i={id},q=2,m={}",
-                    u8::from(more)
-                ));
-                first = false;
-            } else {
-                cmd.push_str(&format!("\x1b_Gm={}", u8::from(more)));
-            }
-            cmd.push(';');
+            let prefix = transmission_prefix(id, w, h, first, more);
+            let mut cmd = String::with_capacity(prefix.len() + chunk.len() + 2);
+            cmd.push_str(&prefix);
             cmd.push_str(&chunk);
             cmd.push_str("\x1b\\");
             out.bytes.extend_from_slice(cmd.as_bytes());
+            first = false;
             offset = end;
         }
         out.images += 1;
@@ -120,23 +157,20 @@ pub fn encode(storage: &Storage, rows: usize, budget: usize) -> Replay {
         let mut placement_ids: Vec<_> = stored.placements.keys().copied().collect();
         placement_ids.sort_unstable();
         for pid in placement_ids {
-            if out.bytes.len() >= budget {
-                out.skipped += 1;
-                continue;
-            }
             let Some(p) = stored.placements.get(&pid) else {
                 continue;
             };
-            if p.location == PlacementLocation::Anchor {
+            let cursor = if p.location == PlacementLocation::Anchor {
                 // 视口外的放置：行号为负（在回滚区）或超出视口底部，都不该
                 // 在本屏出现。
                 if p.row < 0 || p.row as usize >= rows {
                     out.skipped += 1;
                     continue;
                 }
-                out.bytes
-                    .extend_from_slice(format!("\x1b[{};{}H", p.row + 1, p.col + 1).as_bytes());
-            }
+                format!("\x1b[{};{}H", p.row + 1, p.col + 1)
+            } else {
+                String::new()
+            };
             let mut cmd = format!("\x1b_Ga=p,i={id},p={pid},q=2");
             if let Some(cols) = p.columns {
                 cmd.push_str(&format!(",c={cols}"));
@@ -157,6 +191,11 @@ pub fn encode(storage: &Storage, rows: usize, budget: usize) -> Replay {
                 cmd.push_str(",U=1");
             }
             cmd.push_str("\x1b\\");
+            if cursor.len() + cmd.len() > remaining_budget(out.bytes.len(), budget) {
+                out.skipped += 1;
+                continue;
+            }
+            out.bytes.extend_from_slice(cursor.as_bytes());
             out.bytes.extend_from_slice(cmd.as_bytes());
             out.placements += 1;
         }
@@ -276,11 +315,38 @@ mod tests {
         }
         let replay = encode(&storage, 24, 64 * 1024);
         assert!(
-            replay.bytes.len() <= 64 * 1024 + 16 * 1024,
-            "预算应封顶，实际 {} 字节",
+            replay.bytes.len() <= 64 * 1024,
+            "预算应严格封顶，实际 {} 字节",
             replay.bytes.len()
         );
         assert!(replay.skipped > 0, "超预算的图像应被计数");
+    }
+
+    /// 单张图片也必须受预算约束，不能只在图片之间检查预算。
+    #[test]
+    fn one_large_image_cannot_bypass_the_budget() {
+        let mut storage = Storage::new(1 << 20);
+        storage.insert(
+            9,
+            DecodedImage {
+                width: 64,
+                height: 64,
+                rgba: vec![7; 64 * 64 * 4],
+            },
+            None,
+            false,
+        );
+        storage.place(9, 0, Placement::default());
+
+        let replay = encode(&storage, 24, 1024);
+        assert!(
+            replay.bytes.len() <= 1024,
+            "单图也不能超预算：实际 {} 字节",
+            replay.bytes.len()
+        );
+        assert_eq!(replay.images, 0, "放不下的图必须整图跳过");
+        assert_eq!(replay.placements, 0, "没有像素就不能单独回放放置");
+        assert!(replay.skipped > 0);
     }
 
     /// 没有图像时不产生任何字节：attach 的普通路径不该多出两个空序列。

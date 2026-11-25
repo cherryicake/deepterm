@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
-use super::animation::Animation;
+use super::animation::{self, Animation, ComposeRect, CompositionMode};
 use super::image::{DecodedImage, ImageId};
 
 /// 取图像存储锁；锁被投毒时恢复内部数据而不是 panic。
@@ -325,6 +325,83 @@ impl StoredImage {
                 .frame(number)
                 .map(|f| f.data.as_slice()),
         }
+    }
+
+    fn frame_data_mut(&mut self, number: u32) -> Option<&mut [u8]> {
+        match number {
+            0 => None,
+            1 => Some(&mut self.image.rgba),
+            _ => self
+                .animation
+                .as_mut()?
+                .frame_mut(number)
+                .map(|f| f.data.as_mut_slice()),
+        }
+    }
+
+    /// 在两个已校验的帧之间合成矩形，不复制整份源帧。
+    ///
+    /// 不同帧通过字段拆分或 `split_at_mut` 同时借用；同帧自合成则走专门的
+    /// in-place 路径。调用方负责校验矩形边界以及同帧矩形不相交。
+    pub fn compose_frames(
+        &mut self,
+        source: u32,
+        dest: u32,
+        rect: ComposeRect,
+        mode: CompositionMode,
+    ) -> Option<()> {
+        let canvas_width = self.image.width;
+        let canvas_height = self.image.height;
+        if source == dest {
+            let data = self.frame_data_mut(dest)?;
+            animation::compose_canvas_rect_in_place(data, canvas_width, rect, mode);
+            return Some(());
+        }
+
+        let image = &mut self.image;
+        let anim_state = &mut self.animation;
+        let (dest, source): (&mut [u8], &[u8]) = match (source, dest) {
+            (1, _) => {
+                let dest = anim_state.as_mut()?.frame_mut(dest)?;
+                (dest.data.as_mut_slice(), image.rgba.as_slice())
+            }
+            (_, 1) => {
+                let source = anim_state.as_ref()?.frame(source)?;
+                (image.rgba.as_mut_slice(), source.data.as_slice())
+            }
+            _ => {
+                let anim = anim_state.as_mut()?;
+                let source_index = usize::try_from(source.checked_sub(2)?).ok()?;
+                let dest_index = usize::try_from(dest.checked_sub(2)?).ok()?;
+                if source_index >= anim.frames.len() || dest_index >= anim.frames.len() {
+                    return None;
+                }
+                if source_index < dest_index {
+                    let (before, after) = anim.frames.split_at_mut(dest_index);
+                    (
+                        after[0].data.as_mut_slice(),
+                        before[source_index].data.as_slice(),
+                    )
+                } else {
+                    let (before, after) = anim.frames.split_at_mut(source_index);
+                    (
+                        before[dest_index].data.as_mut_slice(),
+                        after[0].data.as_slice(),
+                    )
+                }
+            }
+        };
+        animation::compose_canvas_rect(
+            dest,
+            animation::CanvasView {
+                data: source,
+                width: canvas_width,
+                height: canvas_height,
+            },
+            rect,
+            mode,
+        );
+        Some(())
     }
 
     /// 当前应显示的像素数据：有动画时是当前帧，否则是图像自身数据。

@@ -134,23 +134,34 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     }
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = segment.chars().collect();
-    // 经典回溯：`*` 不跨 `/`（此处 segment 已不含分隔符，天然满足）。
-    fn go(p: &[char], s: &[char]) -> bool {
-        match p.first() {
-            None => s.is_empty(),
-            Some('*') => {
-                for i in 0..=s.len() {
-                    if go(&p[1..], &s[i..]) {
-                        return true;
-                    }
-                }
-                false
-            }
-            Some('?') => !s.is_empty() && go(&p[1..], &s[1..]),
-            Some(c) => !s.is_empty() && s[0] == *c && go(&p[1..], &s[1..]),
+    // 贪心匹配只记住最近一个 `*` 的位置。失配时让它多消费一个字符即可，
+    // 不需要递归枚举所有后续组合；长模式不会栈溢出，多个 `*` 也不会造成
+    // 指数级回溯。`?` 按 char 而不是 UTF-8 字节消费，保持 Unicode 语义。
+    let (mut pattern_index, mut segment_index) = (0usize, 0usize);
+    let mut last_star = None;
+    let mut star_segment_end = 0usize;
+    while segment_index < s.len() {
+        if p.get(pattern_index)
+            .is_some_and(|ch| *ch == '?' || (*ch != '*' && *ch == s[segment_index]))
+        {
+            pattern_index += 1;
+            segment_index += 1;
+        } else if p.get(pattern_index) == Some(&'*') {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_segment_end = segment_index;
+        } else if let Some(star) = last_star {
+            pattern_index = star + 1;
+            star_segment_end += 1;
+            segment_index = star_segment_end;
+        } else {
+            return false;
         }
     }
-    go(&p, &s)
+    while p.get(pattern_index) == Some(&'*') {
+        pattern_index += 1;
+    }
+    pattern_index == p.len()
 }
 
 /// 路径是否落在**构建产物**目录里（`target/`、`.git/` 等）。
@@ -244,6 +255,22 @@ mod tests {
         // 之前就是这里在 Windows 上失配：glob 用 `/`，路径给的是 `C:\ws\...`。
         assert!(m("**/Cargo.toml", "C:\\ws\\sub\\Cargo.toml"));
         assert!(m("src/**/*.rs", "C:\\ws\\src\\a\\b.rs"));
+    }
+
+    #[test]
+    fn long_and_adversarial_segment_patterns_do_not_recurse() {
+        let long = "a".repeat(32_000);
+        assert!(segment_match(&format!("{long}?"), &format!("{long}b")));
+
+        let pattern = format!("{}b", "*a".repeat(64));
+        assert!(!segment_match(&pattern, &"a".repeat(4096)));
+    }
+
+    #[test]
+    fn wildcard_question_mark_consumes_one_unicode_scalar() {
+        assert!(segment_match("a?c", "a中c"));
+        assert!(!segment_match("a?c", "a中的c"));
+        assert!(segment_match("*中*", "前缀中后缀"));
     }
 
     #[test]

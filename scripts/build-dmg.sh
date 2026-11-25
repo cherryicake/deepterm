@@ -120,14 +120,26 @@ else
     echo -e "${GREEN}Terminfo compiled into bundle.${NC}"
 fi
 
-# Inject the Local Network usage description. cargo-bundle cannot set this
-# key, and without it macOS silently denies every LAN connection instead of
-# showing the permission prompt (observed as EHOSTUNREACH "No route to host").
-echo "Patching Info.plist for Local Network permission..."
+# Inject privacy usage descriptions. cargo-bundle cannot set these keys;
+# without them macOS silently returns EPERM instead of showing a prompt.
+# Keep the outer app in sync with the holder's user-folder descriptions:
+# terminal children may be attributed to either responsible process.
+echo "Patching Info.plist for privacy permissions..."
 PLIST="${PROJECT_DIR}/${APP_BUNDLE}/Contents/Info.plist"
-LOCAL_NET_DESC="DeepTerm 需要访问本地网络,以连接局域网中的 SSH 服务器。"
-/usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string ${LOCAL_NET_DESC}" "${PLIST}" 2>/dev/null \
-    || /usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription ${LOCAL_NET_DESC}" "${PLIST}"
+set_plist_string() {
+    local key="$1"
+    local description="$2"
+    /usr/libexec/PlistBuddy -c "Add :${key} string ${description}" "${PLIST}" 2>/dev/null \
+        || /usr/libexec/PlistBuddy -c "Set :${key} ${description}" "${PLIST}"
+}
+set_plist_string "NSLocalNetworkUsageDescription" \
+    "DeepTerm 需要访问本地网络，以连接局域网中的 SSH 服务器。"
+set_plist_string "NSDocumentsFolderUsageDescription" \
+    "DeepTerm 需要访问“文稿”文件夹，以打开项目、编辑文件并运行终端程序。"
+set_plist_string "NSDesktopFolderUsageDescription" \
+    "DeepTerm 需要访问桌面，以打开项目、编辑文件并运行终端程序。"
+set_plist_string "NSDownloadsFolderUsageDescription" \
+    "DeepTerm 需要访问“下载”文件夹，以打开文件并运行终端程序。"
 # The nested core is already signed. Sign only the outer bundle so codesign
 # does not replace the core's independently bound identifier.
 codesign --force --sign - "${PROJECT_DIR}/${APP_BUNDLE}"

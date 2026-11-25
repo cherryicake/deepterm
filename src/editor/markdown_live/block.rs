@@ -477,12 +477,21 @@ fn fence_marker(line: &str, max_indent: usize) -> Option<(u8, usize, Option<std:
 
 /// `---` / `***` / `___` with optional interior spaces, three or more.
 fn is_rule(line: &str) -> bool {
-    let t: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-    if t.len() < 3 {
+    let mut chars = line.chars().filter(|c| !c.is_whitespace());
+    let Some(marker) = chars.next() else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
         return false;
     }
-    let ch = t.chars().next().unwrap();
-    matches!(ch, '-' | '*' | '_') && t.chars().all(|c| c == ch)
+    let mut count = 1usize;
+    for ch in chars {
+        if ch != marker {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 3
 }
 
 /// `#{1,6}` followed by a space (or end of line): (level, content offset).

@@ -165,6 +165,11 @@ impl Animation {
         frame_index(number).and_then(|i| self.frames.get(i))
     }
 
+    /// 取协议帧号 `number` 的可变帧数据。
+    pub fn frame_mut(&mut self, number: u32) -> Option<&mut Frame> {
+        frame_index(number).and_then(|i| self.frames.get_mut(i))
+    }
+
     /// 当前显示帧的零基下标对应的帧数据（根帧返回 `None`，它在图像自身里）。
     pub fn current_frame(&self) -> Option<&Frame> {
         if self.current_index == 0 {
@@ -355,7 +360,8 @@ pub struct ComposeRect {
 /// `width × height` 矩形：从 `src` 的 `(src_x, src_y)` 读到 `dst` 的 `(dst_x, dst_y)`。
 ///
 /// 调用方必须保证两个矩形都**在界内**——`a=c` 把越界矩形报成错误而不是裁剪，
-/// 与 `a=f` 不同。两个矩形不相交时，同帧自合成也是良定义的。
+/// 与 `a=f` 不同。源与目标是两块独立缓冲；同帧自合成使用
+/// [`compose_canvas_rect_in_place`]，避免逐行临时分配。
 pub fn compose_canvas_rect(
     dst: &mut [u8],
     src: CanvasView<'_>,
@@ -385,17 +391,47 @@ pub fn compose_canvas_rect(
         let dst_off = ((dst_y as usize + row) * canvas_width as usize + dst_x as usize) * 4;
         let src_off = ((src_y as usize + row) * canvas_width as usize + src_x as usize) * 4;
         let len = width as usize * 4;
-        // 源与目标可能在同一块缓冲上（同帧自合成），此时不能同时可变/不可变借用。
-        if std::ptr::eq(dst.as_ptr(), src.as_ptr()) {
-            // 矩形已由调用方校验不相交，逐字节处理即可。
-            let src_pixels: Vec<u8> = src[src_off..src_off + len].to_vec();
-            compose_row(&mut dst[dst_off..dst_off + len], &src_pixels, mode);
-        } else {
-            compose_row(
-                &mut dst[dst_off..dst_off + len],
-                &src[src_off..src_off + len],
-                mode,
-            );
+        compose_row(
+            &mut dst[dst_off..dst_off + len],
+            &src[src_off..src_off + len],
+            mode,
+        );
+    }
+}
+
+/// 在同一画布内合成两个**不相交**的矩形。
+///
+/// `copy_within` 在覆盖模式下直接复用标准库的 memmove；alpha 模式每次只把
+/// 一个源像素复制到栈上，因此整块合成不需要临时的整帧或逐行 Vec。
+pub fn compose_canvas_rect_in_place(
+    data: &mut [u8],
+    canvas_width: u32,
+    rect: ComposeRect,
+    mode: CompositionMode,
+) {
+    let ComposeRect {
+        width,
+        height,
+        src_x,
+        src_y,
+        dst_x,
+        dst_y,
+    } = rect;
+    for row in 0..height as usize {
+        let dst_off = ((dst_y as usize + row) * canvas_width as usize + dst_x as usize) * 4;
+        let src_off = ((src_y as usize + row) * canvas_width as usize + src_x as usize) * 4;
+        let len = width as usize * 4;
+        if mode == CompositionMode::Overwrite {
+            data.copy_within(src_off..src_off + len, dst_off);
+            continue;
+        }
+        for pixel in 0..width as usize {
+            let src_at = src_off + pixel * 4;
+            let dst_at = dst_off + pixel * 4;
+            let src: [u8; 4] = data[src_at..src_at + 4]
+                .try_into()
+                .expect("RGBA pixel is four bytes");
+            src_over(&mut data[dst_at..dst_at + 4], &src);
         }
     }
 }
@@ -839,5 +875,33 @@ mod tests {
         );
         assert_eq!(&dst[0..4], &[0, 0, 0, 0], "源像素 (2,0) 原本是透明");
         assert_eq!(&dst[4..8], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn in_place_alpha_blend_matches_the_disjoint_buffer_path() {
+        let original = vec![200, 100, 50, 128, 20, 40, 80, 128];
+        let rect = ComposeRect {
+            width: 1,
+            height: 1,
+            src_x: 0,
+            src_y: 0,
+            dst_x: 1,
+            dst_y: 0,
+        };
+        let mut expected = original.clone();
+        compose_canvas_rect(
+            &mut expected,
+            CanvasView {
+                data: &original,
+                width: 2,
+                height: 1,
+            },
+            rect,
+            CompositionMode::AlphaBlend,
+        );
+
+        let mut actual = original;
+        compose_canvas_rect_in_place(&mut actual, 2, rect, CompositionMode::AlphaBlend);
+        assert_eq!(actual, expected);
     }
 }
