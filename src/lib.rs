@@ -1730,7 +1730,6 @@ impl AppWindow {
 
 impl Render for AppWindow {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         self.flush_tab_group_select_request(window, cx);
 
         // 记住窗口尺寸：关窗回调拿不到 `&Window`（那时窗口已在销毁），
@@ -1781,7 +1780,8 @@ impl Render for AppWindow {
 
         let mut root = div()
             .size_full()
-            .bg(theme.app_background)
+            // island：窗口底色比卡片暗一档，卡片四周的留白因此可见。
+            .bg(cx.theme().island_frame_background())
             .flex()
             .flex_row()
             .relative()

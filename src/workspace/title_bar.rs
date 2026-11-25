@@ -21,7 +21,9 @@ use super::tab_bar::TabBar;
 use super::workspace::Workspace;
 use crate::theme::ActiveTheme;
 
-pub const TITLE_BAR_HEIGHT: Pixels = px(44.);
+/// 标题栏高度（逻辑像素值，供托盘底部间距运算）。
+pub const TITLE_BAR_HEIGHT_PX: f32 = 44.0;
+pub const TITLE_BAR_HEIGHT: Pixels = px(TITLE_BAR_HEIGHT_PX);
 
 #[cfg(target_os = "macos")]
 const TITLE_BAR_LEFT_PADDING: Pixels = px(8.);
@@ -164,7 +166,8 @@ impl Render for TitleBar {
             .items_center()
             .h(TITLE_BAR_HEIGHT)
             .pl(self.left_padding)
-            .bg(theme.app_background)
+            // island：标题栏与窗口 frame 同色，不是卡片的一部分。
+            .bg(cx.theme().island_frame_background())
             // TabBar (如果有) - 阻止事件冒泡以防止触发窗口拖拽
             .when_some(self.tab_bar.clone(), |this, tab_bar| {
                 this.child(

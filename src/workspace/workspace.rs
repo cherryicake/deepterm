@@ -88,7 +88,8 @@ const FONT_SIZE_STEP: f32 = 1.0;
 /// 12px 分隔条压到约 6px。会话恢复时 `normalize_sizes` 又把比例归一到
 /// 总和 1，分隔条不再被压，于是「重启后面板间距突然变大」。
 /// 固定为 6px 既保持用户当前看到的间距，也让新建/恢复完全一致。
-const SPLIT_HANDLE_THICKNESS: f32 = 6.0;
+/// 分屏分隔条厚度：即两张 island 卡片之间的间距，分隔条画在间距里。
+const SPLIT_HANDLE_THICKNESS: gpui::Pixels = crate::theme::ISLAND_GAP;
 
 /// 最后一个 tab 关闭时的回调（不需要跨线程，故无 `Send + Sync`）。
 ///
@@ -2914,14 +2915,10 @@ impl Workspace {
                             // 同一布局在新建与恢复后宽度不同。
                             .flex_none()
                             .when(is_horizontal, |this| {
-                                this.w(px(SPLIT_HANDLE_THICKNESS))
-                                    .h_full()
-                                    .cursor_col_resize()
+                                this.w(SPLIT_HANDLE_THICKNESS).h_full().cursor_col_resize()
                             })
                             .when(!is_horizontal, |this| {
-                                this.h(px(SPLIT_HANDLE_THICKNESS))
-                                    .w_full()
-                                    .cursor_row_resize()
+                                this.h(SPLIT_HANDLE_THICKNESS).w_full().cursor_row_resize()
                             })
                             .flex()
                             .items_center()
@@ -3002,7 +2999,6 @@ impl Drop for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().ui;
         // 只在广播开启时处理队列
         if self.get_current_broadcast_state() {
             self.process_broadcast_queue(cx);
@@ -3051,7 +3047,8 @@ impl Render for Workspace {
             .relative()
             .flex()
             .flex_col()
-            .bg(theme.app_background)
+            // island：工作区底色 = 窗口 frame 色，卡片浮在其上。
+            .bg(cx.theme().island_frame_background())
             .child(resize_handler)
             // 内容区域 - 只渲染当前活动tab对应的panel(s)
             .child(
@@ -3059,10 +3056,15 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .overflow_hidden()
-                    .pt(px(2.0))
-                    .pl(px(8.0))
-                    .pr(px(8.0))
-                    .pb(px(8.0))
+                    // 顶部只补差值：标签托盘底部自带 7px 间距
+                    // （`TRAY_BOTTOM_INSET_PX`），再补 1px 使「标签胶囊底 →
+                    // Panel 顶」= 8px，与卡片到窗口左/右/下边缘一致。
+                    .pt(px((crate::theme::ISLAND_MARGIN_PX
+                        - crate::workspace::tab_bar::TRAY_BOTTOM_INSET_PX)
+                        .max(0.0)))
+                    .pl(crate::theme::ISLAND_MARGIN)
+                    .pr(crate::theme::ISLAND_MARGIN)
+                    .pb(crate::theme::ISLAND_MARGIN)
                     .when_some(active_container, |this, container| {
                         // 缩放：被放大的面板独占整个内容区，分屏结构不变
                         // （取消放大即原样回来）。herdr 的 `pane.zoom` 同义。

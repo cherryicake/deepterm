@@ -275,7 +275,7 @@ pub struct Panel {
     pub remote_os: Option<RemoteOS>,
     /// ID of the workspace this panel belongs to
     pub workspace_id: String,
-    /// Whether this is the only panel in the workspace (affects border rendering)
+    /// Whether this is the only panel in the workspace (affects title bar visibility)
     pub is_solo: bool,
     /// Whether this panel is currently selected
     pub is_selected: bool,
@@ -1307,7 +1307,11 @@ impl Panel {
             .items_center()
             .justify_between()
             .cursor_move()
-            .bg(theme.app_background)
+            // 标题条是卡片的一部分，与卡片底色一致（island 卡片无独立条带色）。
+            .bg(match &self.content {
+                PanelContent::Terminal(_) => cx.theme().terminal.background,
+                PanelContent::Text(_) => theme.panel_background,
+            })
             .child(
                 // 标题栏左侧主区域都可拖拽（排除右侧控制按钮区域）
                 div()
@@ -1472,6 +1476,9 @@ impl Panel {
 
     /// 渲染内容区域
     fn render_content(&self) -> impl IntoElement {
+        // island 卡片内边距：终端内容不贴卡片边缘，圆角弧区只有卡片底色。
+        // GPUI 的 overflow 裁剪只认矩形，终端的直角背景 quad 若贴边会把
+        // 圆角啃出缺口（见 `theme::ISLAND_CARD_PADDING`）。
         match &self.content {
             PanelContent::Text(text) => {
                 div().flex_1().flex().items_center().justify_center().child(
@@ -1481,7 +1488,11 @@ impl Panel {
                         .unwrap_or_else(|| text.clone()),
                 )
             }
-            PanelContent::Terminal(terminal_view) => div().flex_1().child(terminal_view.clone()),
+            PanelContent::Terminal(terminal_view) => div()
+                .flex_1()
+                .min_h_0()
+                .p(crate::theme::ISLAND_CARD_PADDING)
+                .child(terminal_view.clone()),
         }
     }
 
@@ -1668,33 +1679,40 @@ impl Render for Panel {
         let is_solo = self.is_solo;
         let is_selected = self.is_selected;
 
+        // island 卡片底：终端面板与终端背景同色，内边距才不会露出一圈异色。
+        // 终端背景必须保持主题原色（TUI 程序颜色正确性），卡片与窗口的色差
+        // 由 `island_frame_background` 在窗口底色一侧派生。
+        let card_bg = match &self.content {
+            PanelContent::Terminal(_) => cx.theme().terminal.background,
+            PanelContent::Text(_) => theme.panel_background,
+        };
+
         div()
             .id(format!("panel-{}", self.panel_id))
             .size_full()
-            .bg(theme.panel_background)
-            .when(!is_solo, |this| {
-                // 选中时边框颜色加深，未选中时让边框更接近背景色，仅微微可见
-                let border_color = if is_selected {
-                    theme.border_strong
-                } else {
-                    theme.border
-                };
-                this.border_1()
-                    .border_color(border_color)
-                    // 阴影 - 复刻 Hosts 卡片风格
-                    .shadow(vec![BoxShadow {
-                        color: theme.shadow.opacity(if cx.theme().appearance.is_dark() {
-                            0.32
-                        } else {
-                            0.18
-                        }),
-                        offset: point(px(2.), px(4.)),
-                        blur_radius: px(20.),
-                        spread_radius: px(-4.),
-                        inset: false,
-                    }])
+            .bg(card_bg)
+            // island 卡片（IDEA 式）：未选中时不画可见边框，悬浮感由卡片
+            // 背景与 frame 的色差 + 阴影承担；选中时才给高亮边框。
+            // 未选中保留 1px 透明边框：选中切换不会改变内容区尺寸。
+            .border_1()
+            .border_color(if is_selected {
+                theme.border_strong
+            } else {
+                gpui::transparent_black()
             })
-            .rounded(px(12.0))
+            // 阴影 - 复刻 Hosts 卡片风格
+            .shadow(vec![BoxShadow {
+                color: theme.shadow.opacity(if cx.theme().appearance.is_dark() {
+                    0.32
+                } else {
+                    0.18
+                }),
+                offset: point(px(2.), px(4.)),
+                blur_radius: px(20.),
+                spread_radius: px(-4.),
+                inset: false,
+            }])
+            .rounded(crate::theme::ISLAND_RADIUS)
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if *hovered != this.is_hovered {
                     this.is_hovered = *hovered;

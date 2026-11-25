@@ -8173,26 +8173,17 @@ impl Render for Editor {
             })
             .into_any_element()
         } else {
-            let is_selected = self.tab_bar.read(cx).is_focused(window)
-                || self.active_file_id.as_ref().is_some_and(|active_id| {
-                    self.open_files.iter().any(|f| {
-                        &f.id == active_id
-                            && f.editor_state.read(cx).focus_handle.is_focused(window)
-                    })
-                });
-            let border_color = if is_selected {
-                theme.border_strong
-            } else {
-                theme.border
-            };
+            // island 卡片（侧边栏玻璃同款）：不随焦点画高亮边框——光标
+            // 进入编辑器时卡片外观不变。悬浮感由背景色差 + hairline 细边
+            // （暗色 = text 13% 的亮边反光）+ 双层阴影承担。
             let glass_panel: gpui::AnyElement = div()
                 .relative()
                 .h_full()
                 .w_full()
-                .rounded(px(12.0))
+                .rounded(crate::theme::ISLAND_RADIUS)
                 .bg(theme.app_background)
-                .border_1()
-                .border_color(border_color)
+                .border(px(if is_dark { 0.5 } else { 0.75 }))
+                .border_color(crate::sidebar_view::style::border_color(theme, is_dark))
                 .shadow(vec![
                     BoxShadow {
                         color: theme.shadow.opacity(if is_dark { 0.45 } else { 0.22 }),
@@ -8218,9 +8209,9 @@ impl Render for Editor {
             let padded: gpui::AnyElement = div()
                 .w_full()
                 .h_full()
-                .pl(px(8.0))
-                .pt(px(8.0))
-                .pb(px(8.0))
+                .pl(crate::theme::ISLAND_MARGIN)
+                .pt(crate::theme::ISLAND_MARGIN)
+                .pb(crate::theme::ISLAND_MARGIN)
                 .relative()
                 .child(glass_panel)
                 .child(resize_handle)

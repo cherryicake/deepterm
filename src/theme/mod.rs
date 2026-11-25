@@ -5,6 +5,19 @@ use gpui::{App, Global, Hsla, Pixels, SharedString, WindowAppearance, px, rgb};
 
 pub const CLIENT_SIDE_DECORATION_ROUNDING: Pixels = px(10.0);
 pub const CLIENT_SIDE_DECORATION_SHADOW: Pixels = px(10.0);
+
+// island 布局（IDEA / Winc 式悬浮卡片）的统一度量。
+/// 卡片到窗口边缘的留白（逻辑像素值，供间距运算）。
+pub const ISLAND_MARGIN_PX: f32 = 8.0;
+/// 卡片到窗口边缘的留白。
+pub const ISLAND_MARGIN: Pixels = px(ISLAND_MARGIN_PX);
+/// 相邻两张卡片之间的间距（分屏分隔条画在其中）。
+pub const ISLAND_GAP: Pixels = px(8.0);
+/// 卡片圆角半径，终端面板与编辑器面板共用。
+pub const ISLAND_RADIUS: Pixels = px(12.0);
+/// 卡片内边距：终端内容不贴卡片边缘，圆角弧区只有卡片底色——
+/// GPUI 的 overflow 裁剪只认矩形，终端的直角背景 quad 若贴边会把圆角啃出缺口。
+pub const ISLAND_CARD_PADDING: Pixels = px(4.0);
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -405,6 +418,18 @@ impl std::ops::Deref for AppTheme {
     }
 }
 
+/// island 布局里窗口底色与卡片底色的最小对比度（浅色主题）。
+///
+/// 取 1.14 而不是「刚好能分辨」的 1.04：后者在浅色主题上只得到 `#FAFAFA`
+/// 对 `#FFFFFF`（ΔL* ≈ 1.2），圆角和阴影都看不出来。Winc 自家浅色主题的
+/// 帧 / 卡片差也是 1.14。
+const ISLAND_FRAME_MIN_CONTRAST_LIGHT: f32 = 1.14;
+/// 同上（深色主题）。压暗比浅色难——深色主题的底色本来就接近黑色，1.14
+/// 会把不少主题的 frame 压成纯黑、丢掉色相（tokyo-night 要混 54% 黑）。
+/// 1.08 时大多只需混 10~30%，frame 保留主题色相；Winc 深色主题也只取
+/// 1.053。极黑主题（ayu-dark 等）压到纯黑也达不到时由边框与阴影补足。
+const ISLAND_FRAME_MIN_CONTRAST_DARK: f32 = 1.08;
+
 impl AppTheme {
     pub fn editor_background(&self) -> Hsla {
         self.highlight_theme
@@ -412,6 +437,77 @@ impl AppTheme {
             .editor_background
             .unwrap_or(self.ui.panel_background)
     }
+
+    /// island 布局的窗口底色：终端、编辑器卡片四周与之间的留白，以及标题栏。
+    /// 卡片本身的颜色一律不动。
+    ///
+    /// 从卡片色**往纯黑混合**派生——深色、浅色主题同向，frame 始终比卡片暗
+    /// （Winc 的 `frame_bg` 与 IDEA island 均如此）。不能反向提亮卡片：终端
+    /// 背景是终端配色的一部分，nvim 等 TUI 程序的颜色正确性依赖它保持主题原色。
+    ///
+    /// 基准取 `app_background`、`terminal.background`、`editor_background` 中
+    /// **最暗**的那个：7 个内置主题的编辑区底色比窗口底色更暗（如
+    /// catppuccin-mocha 的 `#181825` 对 `#1e1e2e`），以最暗卡片为基准求解，
+    /// 与其余更亮的卡片的对比度自然只会更大。
+    ///
+    /// 混合比例用二分求解到目标对比度（深色 1.08 / 浅色 1.14）：29/31 内置
+    /// 主题的终端背景与窗口背景相同，不派生出这层色差，圆角和间距加上去也
+    /// 看不见卡片。极黑主题（如 flexoki-dark）压到纯黑也够不到目标时，由卡片
+    /// 边框与阴影补足轮廓。
+    pub fn island_frame_background(&self) -> Hsla {
+        let base = [
+            self.ui.app_background,
+            self.terminal.background,
+            self.editor_background(),
+        ]
+        .into_iter()
+        .min_by(|a, b| {
+            relative_luminance(*a)
+                .partial_cmp(&relative_luminance(*b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(self.ui.app_background);
+        let target = if self.appearance.is_dark() {
+            ISLAND_FRAME_MIN_CONTRAST_DARK
+        } else {
+            ISLAND_FRAME_MIN_CONTRAST_LIGHT
+        };
+        mix_until_contrast(base, gpui::black(), target)
+    }
+}
+
+/// 把 `color` 朝 `ink` 混合，直到它与自身原色的对比度达到 `target`。
+///
+/// 二分 12 次即可收敛到 1/4096，肉眼与 8 位色深都看不出差别。
+/// 压到纯 `ink` 也达不到目标时返回纯 `ink`（对比度取可达的最大值）。
+fn mix_until_contrast(color: Hsla, ink: Hsla, target: f32) -> Hsla {
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..12 {
+        let mid = (lo + hi) / 2.0;
+        if contrast_ratio(color.blend(ink.opacity(mid)), color) >= target {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    color.blend(ink.opacity(hi))
+}
+
+fn relative_luminance(color: Hsla) -> f32 {
+    let rgba = gpui::Rgba::from(color);
+    let linear = |c: f32| {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(rgba.r) + 0.7152 * linear(rgba.g) + 0.0722 * linear(rgba.b)
+}
+
+fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (x, y) = (relative_luminance(a), relative_luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
 }
 
 #[derive(Debug, Deserialize)]
@@ -923,6 +1019,69 @@ mod tests {
             failures.is_empty(),
             "unexpected visibility issues: {failures:?}"
         );
+    }
+
+    #[test]
+    fn island_frame_contrasts_with_cards_in_all_builtin_themes() {
+        let themes = load_builtin_themes().expect("builtin themes must parse");
+        assert!(!themes.is_empty());
+        for theme in &themes {
+            let frame = theme.island_frame_background();
+            // frame 必须比窗口原底色暗（或已到纯黑），不能反向提亮。
+            assert!(
+                relative_luminance(frame) <= relative_luminance(theme.ui.app_background),
+                "{}: frame 不能比 app_background 亮",
+                theme.id
+            );
+            // 可达对比度上限：最暗卡片色压到纯黑时的对比度。
+            let base_lum = [
+                theme.ui.app_background,
+                theme.terminal.background,
+                theme.editor_background(),
+            ]
+            .into_iter()
+            .map(relative_luminance)
+            .fold(f32::INFINITY, f32::min);
+            let max = (base_lum + 0.05) / 0.05;
+            let target = if theme.appearance.is_dark() {
+                ISLAND_FRAME_MIN_CONTRAST_DARK
+            } else {
+                ISLAND_FRAME_MIN_CONTRAST_LIGHT
+            };
+            let expected = target.min(max);
+            // 可达对比度有富余时不许压成纯黑：frame 要保留主题色相。
+            if max > target + 0.02 {
+                assert!(
+                    relative_luminance(frame) > 0.0,
+                    "{}: 对比度有富余（max {max:.3} > 目标 {target}），frame 不应压成纯黑",
+                    theme.id
+                );
+            }
+            for (name, card) in [
+                ("app_background", theme.ui.app_background),
+                ("terminal.background", theme.terminal.background),
+                ("editor_background", theme.editor_background()),
+            ] {
+                let actual = contrast_ratio(frame, card);
+                assert!(
+                    actual >= expected - 0.03,
+                    "{}: frame 与 {name} 对比度 {actual:.3} 不足（期望 ≥ {:.3}）",
+                    theme.id,
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn island_frame_is_reachable_extremes() {
+        // 纯白底：frame 应被压暗到达标对比度；纯黑底：压无可压，返回纯黑。
+        let white = gpui::white();
+        let frame = mix_until_contrast(white, gpui::black(), ISLAND_FRAME_MIN_CONTRAST_LIGHT);
+        assert!(contrast_ratio(frame, white) >= ISLAND_FRAME_MIN_CONTRAST_LIGHT - 1e-3);
+        let black = gpui::black();
+        let frame = mix_until_contrast(black, gpui::black(), ISLAND_FRAME_MIN_CONTRAST_DARK);
+        assert_eq!(contrast_ratio(frame, black), 1.0);
     }
 
     #[test]

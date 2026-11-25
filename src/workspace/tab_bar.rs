@@ -158,6 +158,17 @@ const TRAY_HEIGHT_PX: f32 = 36.0;
 const TRAY_TAB_HEIGHT_PX: f32 = TRAY_HEIGHT_PX - TRAY_PADDING_PX * 2.0;
 /// 托盘内边距。
 const TRAY_PADDING_PX: f32 = 3.0;
+/// 终端标签胶囊底边到标题栏底边的距离：托盘（36 高）在标题栏（44 高）里
+/// 垂直居中，下方余量 (44−36)/2 = 4；胶囊底距托盘底还有托盘内 padding 3。
+/// 工作区顶部留白 = `ISLAND_MARGIN_PX` − 本值，使「标签底 → Panel 顶」与
+/// 「Panel → 窗口边缘」一致（见 `workspace.rs` 内容区 `.pt`）。
+pub const TRAY_BOTTOM_INSET_PX: f32 =
+    (crate::workspace::title_bar::TITLE_BAR_HEIGHT_PX - TRAY_HEIGHT_PX) / 2.0 + TRAY_PADDING_PX;
+// 「标签胶囊底 → Panel 顶」的总间距 = ISLAND_MARGIN_PX，由托盘自带间距 +
+// 工作区顶部补差组成。托盘自带间距若超过 ISLAND_MARGIN_PX，补差会被
+// .max(0.0) 截断，总间距就悄悄大于卡片到其他边缘的距离。编译期守住。
+const _: () = assert!(TRAY_BOTTOM_INSET_PX > 0.0);
+const _: () = assert!(TRAY_BOTTOM_INSET_PX <= crate::theme::ISLAND_MARGIN_PX);
 /// 托盘圆角。
 const TRAY_RADIUS_PX: f32 = 16.0;
 /// 标签间距。
@@ -2187,11 +2198,12 @@ impl TabBar {
             .w_full()
             .flex()
             .items_center()
-            // 标签栏背景：编辑器悬浮面板内需透明以透出玻璃材质，其余场景保持 app 背景避免脱节
+            // 标签栏背景：编辑器悬浮面板内需透明以透出玻璃材质；窗口标题栏
+            // 场景与 island 的 frame 底色一致，不能在标题栏上盖一块异色。
             .bg(if self.transparent_bg {
                 gpui::transparent_black()
             } else {
-                theme.app_background
+                cx.theme().island_frame_background()
             })
             .overflow_hidden()
             .pt(if self.compact {
@@ -2730,8 +2742,13 @@ impl TabBar {
             .into_any_element()
     }
 
-    /// herdr terminals-bar 的托盘颜色：标签条自己是一块比背景略深的底，
-    /// 选中的标签从这块底上「浮」出来。
+    /// herdr terminals-bar 的托盘颜色：标签条自己是一张 island 卡片，
+    /// 选中的标签从这张卡片上「浮」出来。
+    ///
+    /// island 布局下标题栏底色是 `island_frame_background()`（从卡片色往
+    /// 纯黑派生、对比度有保证），托盘因此直接取卡片色 `app_background`——
+    /// 与终端 / 编辑器 Panel 同一套「卡片叠在 frame 上」的关系，不会再
+    /// 出现「托盘压深一档后与 frame 几乎同色」的问题。
     ///
     /// 五档颜色全部从主题令牌推导，不写死 herdr 的 `#1d1f22` / `#34373c`
     /// 那套 hex：deepterm 有 31 个明暗主题，写死会在一半主题上糊掉。
@@ -2752,16 +2769,10 @@ impl TabBar {
         let dark = theme.text.l > 0.5;
         let app = theme.app_background;
 
-        // 托盘底：比应用背景沉一档。暗色主题若已接近纯黑（没有更暗的
-        // 空间），改为向上找——关键是「与背景不同」，而不是非得是更暗那方。
-        let tray = {
-            let darker = Self::shift_lightness(app, -0.024);
-            if Self::contrast_ratio(darker, app) >= 1.05 {
-                darker
-            } else {
-                Self::step_lightness(app, app, 1.06, dark, 0.012)
-            }
-        };
+        // 托盘底 = 卡片色。标题栏已是更深的 frame 色（由
+        // `island_frame_background` 保证对比度），托盘不再需要自己压深；
+        // 它与终端 / 编辑器 Panel 一样，靠「卡片色 vs frame」获得层次。
+        let tray = app;
 
         // 悬停与选中：都在托盘之上继续同向提亮，形成两级台阶。
         // 台阶高度不同（选中比悬停更亮），所以「悬停」和「已选中」不会混淆。
@@ -3983,10 +3994,13 @@ mod tests {
             if dim < 2.0 {
                 failures.push(format!("{}: 目录段对托盘底仅 {dim:.2}", app.id));
             }
-            // 托盘本身要能从应用背景里分出来（否则整条标签栏糊进标题栏）。
-            let tray_vs_app = TabBar::contrast_ratio(tray.tray, theme.app_background);
-            if tray_vs_app < 1.04 {
-                failures.push(format!("{}: 托盘对应用背景仅 {tray_vs_app:.2}", app.id));
+            // 托盘是一张 island 卡片：必须能从标题栏的 frame 底色里分出来
+            // （否则整条标签栏糊进标题栏）。frame 由 island_frame_background
+            // 派生，对比度在所有内置主题下都有保证。
+            let frame = app.island_frame_background();
+            let tray_vs_frame = TabBar::contrast_ratio(tray.tray, frame);
+            if tray_vs_frame < 1.04 {
+                failures.push(format!("{}: 托盘对 frame 仅 {tray_vs_frame:.2}", app.id));
             }
             // 悬停与选中必须是两级**不同**的台阶，否则分不清「悬停中」
             // 和「已选中」。方向也要对：选中比悬停更远离背景。
