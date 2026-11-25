@@ -36,6 +36,9 @@ pub const SOCKET_FILE_NAME: &str = "daemon.sock";
 /// socket。
 pub const RUNTIME_DIR_ENV: &str = "DEEPTERM_RUNTIME_DIR";
 
+/// 持久状态目录的环境变量覆盖（core 身份等跨重启文件）。
+pub const STATE_DIR_ENV: &str = "DEEPTERM_STATE_DIR";
+
 /// 守护进程的运行时目录：放 socket 与 pid 文件。
 ///
 /// 优先 `$DEEPTERM_RUNTIME_DIR`，其次 `$XDG_RUNTIME_DIR/deepterm`，
@@ -87,6 +90,35 @@ pub fn runtime_dir() -> PathBuf {
     }
 
     config
+}
+
+/// 持久状态目录：放 core 身份这类**必须跨重启存活**的文件。
+///
+/// 与 [`runtime_dir`] 严格分工：
+///
+/// - `runtime_dir` 放 socket / pid / token，可以被 tmpfs 清空；
+/// - `state_dir` 放 `core-id`，必须是真实磁盘。
+///
+/// 早期版本把 `core-id` 写在运行时目录里。Linux 上那是
+/// `$XDG_RUNTIME_DIR`（tmpfs），机器重启或 systemd `RemoveIPC` 之后文件消失，
+/// core 换一个新 id，于是本机记着的 `remote_core_id` 永远对不上，机器列表
+/// 永久卡在「同一目标上出现了另一个 core」。身份必须落在 tmpfs 之外。
+///
+/// 优先级：`$DEEPTERM_STATE_DIR`（测试与并行安装）→ `$XDG_STATE_HOME/deepterm`
+/// → `~/.local/state/deepterm`。三者都拿不到时才退回配置目录——那里虽然不
+/// 理想，但至少是磁盘。
+pub fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(STATE_DIR_ENV).filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir).join("deepterm");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".local").join("state").join("deepterm");
+    }
+    // 极端情况（无 home）：配置目录通常在磁盘上，仍比 tmpfs 强。
+    crate::workspace::persistence::PersistenceManager::get_config_dir()
 }
 
 /// `/tmp` 兜底目录是否可信：必须是本人拥有的真实目录且不可被他人写入。

@@ -39,6 +39,16 @@
 - 机器表 `machines.json` 与每台机器一条 SSH line 已落地。line 复用
   `src/ssh` 的 russh 认证、Keychain/密码、代理与 host-key 校验，不调用系统
   `ssh`。断线按 250ms→30s 退避重拨；认证失败走 120s/300s/600s 慢重试。
+- **core 身份落在持久目录**（`$XDG_STATE_HOME/deepterm/core-id`，兜底
+  `~/.local/state/deepterm/core-id`），不再放 `$XDG_RUNTIME_DIR`。后者在
+  Linux 上是 tmpfs，重启 / `RemoveIPC` 会清空，core 换了 id 之后本机记着的
+  `remote_core_id` 永远对不上，机器永久卡在“另一个 core”。升级时若旧位置
+  还有身份文件，会沿用它的值迁移过去，不换 id。socket 仍留在运行时目录。
+- **身份变化不再和版本不兼容混为一谈**：`hello` 的 `core_id` 与记录不一致时
+  上报 `kind: rebuilt`（而不是 `incompatible`），监督线程立刻返回而不是等
+  满 30 秒超时；客户端据此清掉同目标的旧机器条目再重新添加，新条目从
+  `remote_core_id: None` 开始，首次握手即记下对端当前身份。`incompatible`
+  仍然保留给“版本不一致，自动更新远端 core”这条路径。
 - 远端地址映射为 `<machine>/tN`；`spawn/list/attach/resize/write/close/remove`
   都经 line 路由。远端 attach 的 channel 在本机按 generation 重新登记，
   core 重启、line 重拨后会自动重挂同一地址。

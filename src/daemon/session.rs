@@ -275,6 +275,92 @@ pub fn add_machine(
     Ok(reply["machine"].clone())
 }
 
+/// 从机器表里删掉一台机器。
+///
+/// 对端 core 换了身份（`kind: rebuilt`）时，唯一正确的恢复路径是
+/// “删掉旧条目 + 用同一份 SSH 配置重新添加”：新条目的 `remote_core_id` 从
+/// 空开始，第一次握手就会记下对端当前的身份。保留旧 id 硬改是不行的——
+/// 那等于把两个不同的 core 当成同一个，它名下的终端地址会指向不存在的东西。
+pub fn remove_machine(name: &str) -> Result<(), String> {
+    let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
+    let reply = client
+        .call(serde_json::json!({"op": "machine.remove", "name": name}))
+        .map_err(|e| format!("删除机器失败: {e}"))?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("守护进程拒绝删除机器")
+            .to_string());
+    }
+    Ok(())
+}
+
+/// 当前机器表（每项含 `name` / `ssh` / `remote_core_id` / `state` 等）。
+pub fn list_machines() -> Result<Vec<serde_json::Value>, String> {
+    let client = client().ok_or_else(|| "守护进程不可用".to_string())?;
+    let reply = client
+        .call(serde_json::json!({"op": "machine.list"}))
+        .map_err(|e| format!("读取机器表失败: {e}"))?;
+    if reply["ok"] != true {
+        return Err(reply["error"]
+            .as_str()
+            .unwrap_or("守护进程拒绝列出机器")
+            .to_string());
+    }
+    Ok(reply["machines"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// 一条机器视图是否指向给定的 SSH 目标。
+///
+/// 逐字段比较，不用 `SshConnectionConfig::id()`：那个 id 把昵称也算进去，
+/// 而这里要找的正是“同一个目标的所有条目”，昵称恰恰是不该参与的部分。
+/// 字段在机器视图里是平铺的（见 `Machine::view`），不是嵌在 `ssh` 下面。
+///
+/// 抽成纯函数是为了可测：真正调用会走 RPC 删条目，单测里碰不到。
+fn targets_same_host(machine: &serde_json::Value, config: &crate::ssh::SshConnectionConfig) -> bool {
+    machine.get("host").and_then(serde_json::Value::as_str) == Some(config.host.as_str())
+        && machine
+            .get("port")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(22)
+            == config.port as u64
+        && machine.get("username").and_then(serde_json::Value::as_str)
+            == Some(config.username.as_str())
+}
+
+/// 删掉指向同一个 SSH 目标的机器条目，返回删掉的条目数。
+///
+/// 按 **SSH 目标**而不是名字查找，因为 `MachineBook::ensure` 在名字冲突时
+/// 会自动加后缀（`host` → `host-2`）。用户给的昵称对不上实际条目名时，
+/// 按名删会静默失败，而 `ensure` 随后又会把新身份并进那条旧记录里——
+/// 结果是 rebuilt 永远自愈不了。
+fn forget_target_machine(config: &crate::ssh::SshConnectionConfig) -> usize {
+    let Ok(machines) = list_machines() else {
+        return 0;
+    };
+    let mut removed = 0;
+    for machine in machines {
+        if !targets_same_host(&machine, config) {
+            continue;
+        }
+        let Some(name) = machine["name"].as_str() else {
+            continue;
+        };
+        match remove_machine(name) {
+            Ok(()) => {
+                removed += 1;
+                log::info!("远端 core 身份已变化，已清掉旧机器条目 {name}");
+            }
+            // 条目本来就不在不是失败：下面的添加会重建它。
+            Err(error) => log::info!("清掉旧机器条目 {name} 未成功: {error}"),
+        }
+    }
+    removed
+}
+
 /// 在远端 core 里创建终端，返回 `machine/tN` 地址。
 ///
 /// 首次连接可能要建立 SSH、拉起远端 core，因此超时比普通控制请求长；
@@ -310,6 +396,32 @@ pub fn spawn_machine_terminal(
         .ok_or_else(|| "远端 core 没有返回终端地址".to_string())
 }
 
+/// 守护进程对「远端 core 换了身份」给出的 `kind`。
+///
+/// 这是 [`restore_machine_terminal`] 需要单独处理的第三条路径：不是“终端
+/// 没了”，也不是“临时连不上”，而是对端已是另一个 core、旧身份整体作废。
+pub const REBUILT_MACHINE_MARKER: &str = "kind: rebuilt";
+
+pub(crate) fn is_rebuilt_machine_error(error: &str) -> bool {
+    error.contains(REBUILT_MACHINE_MARKER)
+}
+
+/// 对端 core 换了身份之后清掉旧条目。
+///
+/// 只删不建：调用方随后会走“添加机器 + 新建终端”的正常路径。新条目的
+/// `remote_core_id` 是 `None`，第一次握手就会记下对端当前身份，不需要客户端
+/// 猜。必须删掉而不能只改 `remote_core_id`——机器名由 `MachineBook::ensure`
+/// 按 SSH 目标去重，旧条目留着会让新身份被并进那条旧记录里。
+fn forget_rebuilt_machine(config: &crate::ssh::SshConnectionConfig) {
+    if forget_target_machine(config) == 0 {
+        // 没有条目可删同样是正常情况：本地 core 刚重启、或用户已经删过。
+        log::info!(
+            "远端 core 身份已变化，没有可清理的旧条目；直接重新添加 {}",
+            config.host_label()
+        );
+    }
+}
+
 /// 恢复一个远端终端：优先接回会话里保存的 `machine/tN`，接不上再新建。
 ///
 /// 这个函数会做阻塞的 daemon RPC（包括首次部署远端 core 时的 SSH 握手），
@@ -319,6 +431,10 @@ pub fn spawn_machine_terminal(
 /// `opencode` / 编译任务还在原来的屏幕上”这一能力的核心。只有守护进程
 /// 明确回答 `not_found` 才新建；超时、连接中断等错误直接上报，避免把一次
 /// 临时拥塞误判成“终端已消失”，从而额外拉起一个重复的 shell。
+///
+/// 对端 core 换了身份（[`REBUILT_MACHINE_MARKER`]）是第三条路径：那不是
+/// “终端没了”，也不是“临时连不上”，而是旧身份整体作废。此时清掉同目标的
+/// 机器条目，让底部的“添加机器 + 新建终端”用对端当前身份重来一次。
 pub fn restore_machine_terminal(
     config: &crate::ssh::SshConnectionConfig,
     name: Option<String>,
@@ -354,6 +470,12 @@ pub fn restore_machine_terminal(
                         return Err(format!("接回远端终端 {address} 失败: {error}"));
                     }
                 }
+            }
+            Err(error) if is_rebuilt_machine_error(&error) => {
+                // 对端换了一个 core：旧地址属于**那个** core，接不回来了。
+                // 清掉旧条目后落到底部的“添加+新建”路径，不要拿旧地址再试。
+                log::warn!("{error}");
+                forget_rebuilt_machine(config);
             }
             Err(error) => {
                 return Err(format!("接回远端终端 {address} 失败: {error}"));
@@ -861,5 +983,42 @@ mod tests {
             Some((126, 43, 2, 3)),
             "clear 只断开当前会话，最新尺寸要留给下一次 bind"
         );
+    }
+
+    /// 重建机器时按**目标**找条目，不看昵称。
+    ///
+    /// `ensure` 在名字冲突时会加后缀（`host` → `host-2`），所以用户给的昵称
+    /// 未必等于条目名。按名删会静默漏掉那条旧记录，然后 `ensure` 又把新身份
+    /// 并进旧记录里——`rebuilt` 就永远自愈不了。
+    #[test]
+    fn rebuilding_matches_entries_by_target_not_by_nickname() {
+        let config = crate::ssh::SshConnectionConfig::new("10.0.0.9", "me", crate::ssh::config::AuthMethod::Agent);
+
+        let entry = |host: &str, port: u64, user: &str| {
+            serde_json::json!({
+                "name": "whatever-the-book-called-it",
+                "host": host,
+                "port": port,
+                "username": user,
+                "nickname": "a-name-the-user-typed",
+            })
+        };
+
+        assert!(targets_same_host(&entry("10.0.0.9", 22, "me"), &config));
+        // 昵称与条目名不一致不影响判定。
+        assert!(targets_same_host(&entry("10.0.0.9", 22, "me"), &config));
+
+        // 主机、端口、用户任一不同都不是同一目标；误删会毁掉用户的其它机器。
+        assert!(!targets_same_host(&entry("10.0.0.10", 22, "me"), &config));
+        assert!(!targets_same_host(&entry("10.0.0.9", 2222, "me"), &config));
+        assert!(!targets_same_host(&entry("10.0.0.9", 22, "someone"), &config));
+    }
+
+    /// 缺字段的旧条目按 22 端口处理，不能因为一次 serde 变化就删不掉。
+    #[test]
+    fn a_machine_without_a_port_is_port_22() {
+        let config = crate::ssh::SshConnectionConfig::new("h", "u", crate::ssh::config::AuthMethod::Agent);
+        let machine = serde_json::json!({"name": "h", "host": "h", "username": "u"});
+        assert!(targets_same_host(&machine, &config));
     }
 }

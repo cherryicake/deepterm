@@ -353,6 +353,12 @@ pub enum LinkKind {
     Incompatible,
     InstallFailed,
     Unreachable,
+    /// 对端 core 换了身份：同一 SSH 目标上现在跑的是另一个 core。
+    ///
+    /// 与 [`Self::Incompatible`] 分开是必要的：那一种是「这个 core 太旧/太新，
+    /// 更新它就能继续用」，这一种是「对方已经是另一个东西了，本机记的身份
+    /// 永远对不上」。前者能自动更新，后者只能由用户确认重建机器条目。
+    Rebuilt,
 }
 
 impl LinkKind {
@@ -367,8 +373,18 @@ impl LinkKind {
             Self::Incompatible => "incompatible",
             Self::InstallFailed => "install_failed",
             Self::Unreachable => "unreachable",
+            Self::Rebuilt => "rebuilt",
         }
     }
+}
+
+/// 机器被重建时的说明文案。
+///
+/// 客户端靠 `kind: rebuilt` 判断这一种失败，不靠这段文案——文案会随版本
+/// 变化，拿中文子串去匹配迟早出错。这里把新身份写进括号只是为了排障时
+/// 能在日志和错误页上直接看到“对端现在是哪个 core”。
+pub fn rebuilt_message(remote_core_id: &str) -> String {
+    format!("远端 core 已更换（新身份 {remote_core_id}）")
 }
 
 #[derive(Clone, Debug)]
@@ -586,6 +602,16 @@ impl MachineRuntime {
             }
             if let Some(line) = &state.live {
                 return Ok(line.clone());
+            }
+            // `rebuilt` 是终态：对端已经是另一个 core，本机的旧身份永远对不上，
+            // 监督线程只会一直按退避重拨同一个失败的握手。等满超时没有意义，
+            // 立刻把结论交给调用方，让它走“清掉旧条目 + 重新添加”。
+            if state.status.kind == LinkKind::Rebuilt {
+                return Err(state
+                    .status
+                    .why
+                    .clone()
+                    .unwrap_or_else(|| LinkKind::Rebuilt.as_str().to_string()));
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -958,12 +984,19 @@ impl MachineRuntime {
                 && !expected.is_empty()
                 && expected != remote_core_id
             {
-                self.set_down(
-                    LinkKind::Incompatible,
-                    format!(
-                        "同一目标上出现了另一个 core（期望 {expected}，实际 {remote_core_id}）"
-                    ),
+                // 这不一定是"出错了"：远端重装、换了磁盘、或者身份文件刚从
+                // tmpfs 挪到持久目录，都会让 id 变化。但它也不能被自动接受
+                // ——本机记着的终端地址属于**那个** core，静默改写身份等于
+                // 把两个不同的东西当成同一个。
+                //
+                // 所以这里明确停下，用独立的 `rebuilt` 类型交给客户端：GUI
+                // 据此提示"这台机器被重建了"，由用户确认后才清掉旧条目重新
+                // 添加。新旧 id 都写进日志，排障时能直接看到是哪一个。
+                log::warn!(
+                    "机器 {} 的 core 身份已变化（期望 {expected}，实际 {remote_core_id}），需要用户确认重建",
+                    machine.name
                 );
+                self.set_down(LinkKind::Rebuilt, rebuilt_message(remote_core_id));
                 self.sleep_or_stop(backoff);
                 backoff = (backoff * 2).min(RECONNECT_MAX);
                 continue;
@@ -2139,5 +2172,42 @@ mod tests {
         assert_eq!(refreshed.keeps_running_after_logout, None);
         assert_eq!(refreshed.logout_linger_user.as_deref(), Some("u"));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 身份变化必须报成 `rebuilt`，不能和「版本不兼容」混在一起。
+    ///
+    /// 两者的恢复路径完全不同：`incompatible` 会触发自动重装远端 core，
+    /// `rebuilt` 只能由客户端删掉条目重新添加。混用会让自动重装反复跑在
+    /// 一个永远装不成的情景里，而真正该做的重建一次都没发生。
+    #[test]
+    fn rebuilt_and_incompatible_are_distinct_kinds() {
+        assert_eq!(LinkKind::Rebuilt.as_str(), "rebuilt");
+        assert_ne!(LinkKind::Rebuilt.as_str(), LinkKind::Incompatible.as_str());
+        assert_ne!(LinkKind::Rebuilt, LinkKind::Incompatible);
+    }
+
+    /// 客户端靠 `kind` 判定重建，不靠文案；文案里要能看见新身份。
+    #[test]
+    fn the_rebuilt_kind_is_what_clients_match_on() {
+        let why = rebuilt_message("01f734da-48cd-4c2c-8d05-f9de1794e639");
+        let described = format!("{why}（kind: {}）", LinkKind::Rebuilt.as_str());
+        assert!(
+            crate::daemon::session::is_rebuilt_machine_error(&described),
+            "{described}"
+        );
+        assert!(described.contains("01f734da"), "新身份要能直接读到: {described}");
+        // 其它失败绝不能被误判成重建，否则会平白删掉用户的机器条目。
+        for other in [
+            LinkKind::Incompatible,
+            LinkKind::Unreachable,
+            LinkKind::NeedsLogin,
+            LinkKind::CoreMissing,
+        ] {
+            let text = format!("boom（kind: {}）", other.as_str());
+            assert!(
+                !crate::daemon::session::is_rebuilt_machine_error(&text),
+                "{text}"
+            );
+        }
     }
 }

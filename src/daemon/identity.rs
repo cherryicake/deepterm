@@ -1,8 +1,17 @@
 //! core 在握手中报告的身份。
 //!
 //! `generation` 每次 core 启动都会变化，供 app 区分“core 重启了”与“同一条
-//! core 上又开了一条连接”；`core_id` 则持久化在同一运行时目录里，供未来的
-//! 机器列表把远端 core 当作稳定实体。两者都不是鉴权凭据。
+//! core 上又开了一条连接”；`core_id` 则是**跨重启稳定**的实体标识，供机器
+//! 列表把远端 core 当作同一个对象。两者都不是鉴权凭据。
+//!
+//! # `core_id` 为什么不放在运行时目录
+//!
+//! 运行时目录（`$XDG_RUNTIME_DIR/deepterm`）在 Linux 上是 **tmpfs**：重启、
+//! 登出、或者 systemd 的 `RemoveIPC` 都会把它清空。身份文件放在那里，同一
+//! 台机器的 core 每次重启都会换一个新 id，于是远端记着的 `remote_core_id`
+//! 永远对不上，机器列表会一直卡在「同一目标上出现了另一个 core」。所以身份
+//! 文件走 [`state_dir`]（`$XDG_STATE_HOME`，在 tmpfs 之外），只有 socket 留在
+//! 运行时目录——与 herdr 的 `paths.rs` / `server.rs::load_identity` 同构。
 
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
@@ -294,16 +303,46 @@ impl ServerIdentity {
 }
 
 fn load_or_create_core_id() -> std::io::Result<String> {
-    let path = super::runtime_dir().join("core-id");
-    if let Ok(id) = read_valid_id(&path) {
+    let path = super::state_dir().join("core-id");
+    load_or_create_core_id_at(&path, &super::runtime_dir().join("core-id"))
+}
+
+/// [`load_or_create_core_id`] 的可注入版本。
+///
+/// `legacy` 是早期版本写身份的位置（运行时目录）。它只在**新位置还没有身份**
+/// 时被读一次，读到就搬到新位置：升级不该让一台已经在用的机器换 id，否则
+/// 远端记着的 `remote_core_id` 立刻失配。
+fn load_or_create_core_id_at(
+    path: &std::path::Path,
+    legacy: &std::path::Path,
+) -> std::io::Result<String> {
+    if let Ok(id) = read_valid_id(path) {
         return Ok(id);
     }
 
-    let generated = uuid::Uuid::new_v4().to_string();
+    // 迁移：旧的运行时目录文件还在的话，沿用它的值。
+    let inherited = read_valid_id(legacy).ok();
+
+    let generated = inherited
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    if let Some(parent) = path.parent() {
+        // 首次运行时状态目录还没有；0700 与运行时目录一致。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(parent)?;
+    }
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(path)
     {
         Ok(mut file) => {
             file.write_all(generated.as_bytes())?;
@@ -311,12 +350,19 @@ fn load_or_create_core_id() -> std::io::Result<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            if inherited.is_some() {
+                log::info!(
+                    "core_id 已迁移到持久目录 {}（沿用 {} 的身份）",
+                    path.display(),
+                    legacy.display()
+                );
             }
             Ok(generated)
         }
         // 另一个 core 抢先创建了：读它的值，保证同一台机器只有一个 core_id。
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_valid_id(&path),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_valid_id(path),
         Err(e) => Err(e),
     }
 }
@@ -587,6 +633,58 @@ mod tests {
         std::fs::write(&path, b"not-a-uuid").expect("write");
         assert!(read_valid_id(&path).is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    /// 升级后第一次启动：身份要从运行时目录搬进持久目录，且**值不变**。
+    ///
+    /// 变值的后果不是本机可见的：远端机器表里记着的 `remote_core_id` 立刻
+    /// 失配，那台机器永久停在「同一目标上出现了另一个 core」。
+    #[test]
+    fn a_core_id_in_the_runtime_dir_moves_to_the_state_dir_unchanged() {
+        let root = std::env::temp_dir().join(format!("deepterm-id-move-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("run/core-id");
+        let path = root.join("state/core-id");
+        std::fs::create_dir_all(legacy.parent().unwrap()).expect("runtime dir");
+        let existing = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&legacy, &existing).expect("old id");
+
+        assert_eq!(load_or_create_core_id_at(&path, &legacy).expect("load"), existing);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("new file").trim(),
+            existing,
+            "新位置必须写着同一个 id"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 持久目录已有身份时，旧运行时文件即使还在也不能覆盖它。
+    #[test]
+    fn the_state_dir_id_wins_over_a_stale_runtime_copy() {
+        let root = std::env::temp_dir().join(format!("deepterm-id-wins-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("run/core-id");
+        let path = root.join("state/core-id");
+        std::fs::create_dir_all(legacy.parent().unwrap()).expect("runtime dir");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("state dir");
+        let durable = uuid::Uuid::new_v4().to_string();
+        std::fs::write(&path, &durable).expect("durable id");
+        std::fs::write(&legacy, uuid::Uuid::new_v4().to_string()).expect("stale id");
+
+        assert_eq!(load_or_create_core_id_at(&path, &legacy).expect("load"), durable);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 全新机器（两处都没有）：生成一个并落盘，第二次读到的必须是同一个。
+    #[test]
+    fn a_fresh_core_id_survives_the_next_load() {
+        let root = std::env::temp_dir().join(format!("deepterm-id-fresh-{}", uuid::Uuid::new_v4()));
+        let legacy = root.join("run/core-id");
+        let path = root.join("state/core-id");
+
+        let first = load_or_create_core_id_at(&path, &legacy).expect("create");
+        assert!(path.is_file(), "身份必须立刻落盘，不能只留在内存里");
+        let second = load_or_create_core_id_at(&path, &legacy).expect("reload");
+        assert_eq!(first, second);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[cfg(target_os = "linux")]
