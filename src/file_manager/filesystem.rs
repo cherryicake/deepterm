@@ -51,6 +51,11 @@ pub trait FileSystem: Send + Sync + 'static {
         Err(FileOpError::unsupported("创建目录"))
     }
 
+    /// 仅为多级新建补齐父目录；最终目标仍走 create_dir/create_file 防覆盖。
+    fn create_dir_all(&self, _path: &Path) -> Result<(), FileOpError> {
+        Err(FileOpError::unsupported("递归创建目录"))
+    }
+
     /// 创建空文件；目标已存在时返回 `AlreadyExists`（不覆盖既有内容）。
     fn create_file(&self, _path: &Path) -> Result<(), FileOpError> {
         Err(FileOpError::unsupported("创建文件"))
@@ -257,6 +262,10 @@ impl FileSystem for LocalFileSystem {
         std::fs::create_dir(path).map_err(|e| map_io_error(e, path))
     }
 
+    fn create_dir_all(&self, path: &Path) -> Result<(), FileOpError> {
+        std::fs::create_dir_all(path).map_err(|error| map_io_error(error, path))
+    }
+
     fn create_file(&self, path: &Path) -> Result<(), FileOpError> {
         // create_new：原子拒绝覆盖，避免「检查存在 → 创建」的 TOCTOU。
         std::fs::OpenOptions::new()
@@ -300,16 +309,26 @@ impl FileSystem for RemoteFileSystem {
 
         let mut result: Vec<FileEntry> = entries
             .into_iter()
-            .map(|e| FileEntry {
-                name: e.name,
-                path: PathBuf::from(e.path),
-                kind: match e.kind {
-                    RemoteFileKind::Directory => FileEntryKind::Directory,
-                    RemoteFileKind::File => FileEntryKind::File,
-                    RemoteFileKind::Symlink => FileEntryKind::Symlink,
-                    RemoteFileKind::Other => FileEntryKind::Other,
-                },
-                size: e.size,
+            .map(|e| {
+                let symlink_target_is_dir = e.kind == RemoteFileKind::Symlink
+                    && sftp_fs::with_cached_session(&self.config, |session| {
+                        Ok(session
+                            .metadata(&e.path)
+                            .is_ok_and(|metadata| metadata.kind == RemoteFileKind::Directory))
+                    })
+                    .unwrap_or(false);
+                FileEntry {
+                    name: e.name,
+                    path: PathBuf::from(e.path),
+                    kind: match e.kind {
+                        RemoteFileKind::Directory => FileEntryKind::Directory,
+                        RemoteFileKind::File => FileEntryKind::File,
+                        RemoteFileKind::Symlink => FileEntryKind::Symlink,
+                        RemoteFileKind::Other => FileEntryKind::Other,
+                    },
+                    size: e.size,
+                    symlink_target_is_dir,
+                }
             })
             .collect();
         result.sort_by_key(|a| a.sort_key());
@@ -394,6 +413,13 @@ impl FileSystem for RemoteFileSystem {
                 }
             }
             Ok(session.create_dir(&path_str).map_err(remote_err))
+        }))
+    }
+
+    fn create_dir_all(&self, path: &Path) -> Result<(), FileOpError> {
+        let path_str = path.to_string_lossy().into_owned();
+        flatten_remote(sftp_fs::with_cached_session(&self.config, |session| {
+            Ok(session.create_dir_all(&path_str).map_err(remote_err))
         }))
     }
 

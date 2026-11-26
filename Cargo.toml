@@ -146,6 +146,8 @@ tree-sitter-make = "1.1.1"
 regex = "1.12.3"
 imara-diff = "0.1.8"
 open = "5"
+# 本地文件树默认移入系统废纸篓；永久删除是独立的显式操作。
+trash = "5.2"
 tree-sitter-yaml = "0.7"
 tree-sitter-java = "0.23"
 tree-sitter-xml = "0.7"

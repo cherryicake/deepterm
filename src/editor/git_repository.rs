@@ -458,6 +458,21 @@ impl GitRepository {
         }))
     }
 
+    /// 任意文件比较只复用 DiffView 的显示外壳，不执行 Git 操作。
+    /// root 仅作为标签身份命名空间；comparison 模式会屏蔽所有仓库读写。
+    pub(crate) fn for_comparison(from: &Path, ssh_config: Option<SshConnectionConfig>) -> Self {
+        let root = from.parent().unwrap_or(from).to_string_lossy().into_owned();
+        Self {
+            root,
+            backend: match ssh_config {
+                Some(config) => GitBackend::Remote {
+                    config: Box::new(config),
+                },
+                None => GitBackend::Local,
+            },
+        }
+    }
+
     /// Get the repository root path
     pub fn root(&self) -> &str {
         &self.root

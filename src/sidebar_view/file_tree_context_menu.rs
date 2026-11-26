@@ -8,6 +8,7 @@
 
 use gpui::prelude::*;
 use gpui::{Context, Entity, Focusable, PromptLevel, Styled, Window, div, px, relative};
+use std::path::PathBuf;
 
 use crate::components::input::{EditorInput, Escape, InputEvent, InputState};
 use crate::components::menu::{PopupMenu, PopupMenuItem};
@@ -23,6 +24,41 @@ use super::file_tree::{INDENT_SIZE, LIST_ROW_HEIGHT, SidebarFileTree};
 
 /// 新建撞名时最多换号重试的次数（含首次尝试）。
 const MAX_CREATE_ATTEMPTS: u32 = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeClipboardOperation {
+    Copy,
+    Cut,
+}
+
+#[derive(Clone, Debug)]
+struct TreeClipboard {
+    operation: TreeClipboardOperation,
+    sources: Vec<FileEndpoint>,
+}
+
+static TREE_CLIPBOARD: std::sync::OnceLock<parking_lot::Mutex<Option<TreeClipboard>>> =
+    std::sync::OnceLock::new();
+
+fn tree_clipboard() -> &'static parking_lot::Mutex<Option<TreeClipboard>> {
+    TREE_CLIPBOARD.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+fn tree_menu_action(
+    label: impl Into<gpui::SharedString>,
+    icon: &'static str,
+    tree: Entity<SidebarFileTree>,
+    action: impl Fn(&mut SidebarFileTree, &mut Window, &mut Context<SidebarFileTree>) + 'static,
+) -> PopupMenuItem {
+    PopupMenuItem::new(label)
+        .icon(crate::components::button::Icon::new(icon))
+        .on_click(move |_, window, cx| {
+            tree.update(cx, |this, cx| {
+                this.close_context_menu(cx);
+                action(this, window, cx);
+            });
+        })
+}
 
 /// 生成第 `attempt` 次重试的候选名：文件取「主名 2.扩展名」，目录取「名字 2」。
 fn next_candidate_name(target: &std::path::Path, attempt: u32, is_dir: bool) -> std::path::PathBuf {
@@ -44,6 +80,29 @@ fn next_candidate_name(target: &std::path::Path, attempt: u32, is_dir: bool) -> 
         }
     };
     parent.join(new_name)
+}
+
+fn validate_create_path(name: &str) -> Result<(), String> {
+    use std::path::Component;
+    if name.is_empty() || name.contains('\0') || name.ends_with('/') {
+        return Err("名称不能为空、以 / 结尾或包含 NUL".to_string());
+    }
+    let path = std::path::Path::new(name);
+    if path.is_absolute() {
+        return Err("请输入工作区内的相对路径".to_string());
+    }
+    let mut count = 0;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => count += 1,
+            _ => return Err("路径只能包含普通目录和文件名，不能包含 . 或 ..".to_string()),
+        }
+    }
+    if count == 0 {
+        Err("名称不能为空".to_string())
+    } else {
+        Ok(())
+    }
 }
 
 /// 行内编辑模式
@@ -68,6 +127,7 @@ pub(crate) struct TreeEditing {
     pub input: Entity<InputState>,
     /// 提交操作进行中：忽略重复 Enter / 失焦提交。
     pub locked: bool,
+    pub error: Option<String>,
     /// 编辑所在窗口（spawn 的提交操作用它弹错误提示）。
     pub window_handle: gpui::AnyWindowHandle,
     pub _subscription: gpui::Subscription,
@@ -135,6 +195,7 @@ impl SidebarFileTree {
             },
             input: input.clone(),
             locked: false,
+            error: None,
             window_handle: window.window_handle(),
             _subscription: subscription,
         });
@@ -177,6 +238,7 @@ impl SidebarFileTree {
             },
             input: input.clone(),
             locked: false,
+            error: None,
             window_handle: window.window_handle(),
             _subscription: subscription,
         });
@@ -199,6 +261,13 @@ impl SidebarFileTree {
             }
             InputEvent::Change | InputEvent::Focus => {}
         })
+    }
+
+    fn set_editing_error(&mut self, error: String, cx: &mut Context<Self>) {
+        if let Some(editing) = self.editing.as_mut() {
+            editing.error = Some(error);
+        }
+        cx.notify();
     }
 
     pub(super) fn cancel_editing(&mut self, cx: &mut Context<Self>) {
@@ -232,9 +301,9 @@ impl SidebarFileTree {
                     self.cancel_editing(cx);
                     return;
                 }
-                // 非法名：保留编辑行让用户修正（Enter 无反应），Esc 可退出
-                if validate_rename_to(&name).is_err() {
-                    log::warn!("新建名称不合法: {name:?}");
+                // 新建允许普通相对路径组件，例如 a/b/c.txt；拒绝绝对路径和 ..。
+                if let Err(error) = validate_create_path(&name) {
+                    self.set_editing_error(error, cx);
                     return;
                 }
                 let window_handle = match self.editing.as_mut() {
@@ -258,8 +327,8 @@ impl SidebarFileTree {
                     self.cancel_editing(cx);
                     return;
                 }
-                if validate_rename_to(&name).is_err() {
-                    log::warn!("重命名名称不合法: {name:?}");
+                if let Err(error) = validate_rename_to(&name) {
+                    self.set_editing_error(error.to_string(), cx);
                     return;
                 }
                 let window_handle = match self.editing.as_mut() {
@@ -303,6 +372,10 @@ impl SidebarFileTree {
                 .background_executor()
                 .spawn(async move {
                     let mut candidate = target.clone();
+                    // 多级新建只补父链；最终目标仍由下方 no-replace 创建。
+                    if let Some(parent) = target.parent() {
+                        backend.create_dir_all(parent)?;
+                    }
                     // 撞名自动换号重试：目录缓存缺失时（父目录还没加载过）
                     // 占位名去重无从下手，重试兜住「连点两次新建」这种场景。
                     for attempt in 1..=MAX_CREATE_ATTEMPTS {
@@ -338,6 +411,7 @@ impl SidebarFileTree {
                     if let Some(editing) = this.editing.as_mut() {
                         editing.locked = false;
                     }
+                    this.set_editing_error(err.to_string(), cx);
                     this.prompt_operation_error("新建失败", err, window_handle, cx);
                 }
             });
@@ -374,6 +448,7 @@ impl SidebarFileTree {
                     if let Some(editing) = this.editing.as_mut() {
                         editing.locked = false;
                     }
+                    this.set_editing_error(err.to_string(), cx);
                     this.prompt_operation_error("重命名失败", err, window_handle, cx);
                 }
             });
@@ -381,31 +456,67 @@ impl SidebarFileTree {
         .detach();
     }
 
-    /// 删除入口（菜单）：确认对话框 → 后台删除 → 状态清理。
+    /// 删除入口：本地默认废纸篓，远程因无系统废纸篓而明确永久删除。
     pub(super) fn start_delete(
         &mut self,
         entry: &FileEntry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let permanent = !self.loader.is_local();
+        self.begin_delete(entry, permanent, window, cx);
+    }
+
+    pub(super) fn start_permanent_delete(
+        &mut self,
+        entry: &FileEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.begin_delete(entry, true, window, cx);
+    }
+
+    fn begin_delete(
+        &mut self,
+        entry: &FileEntry,
+        permanent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.cancel_editing(cx);
-        let path = entry.path.clone();
-        let is_dir = entry.kind == FileEntryKind::Directory;
-        let name = entry.name.clone();
+        let mut paths = self.selected_operation_paths();
+        if paths.is_empty() {
+            paths.push(entry.path.clone());
+        }
+        let use_trash = self.loader.is_local() && !permanent;
         let backend = self.loader.backend().clone();
         let root_epoch = self.root_epoch;
         let window_handle = window.window_handle();
-
-        let detail = if is_dir {
-            format!("将递归删除文件夹「{name}」及其全部内容，此操作不可撤销。")
+        let count = paths.len();
+        let detail = match (count, use_trash) {
+            (1, true) => format!("将把「{}」移到系统废纸篓。", entry.name),
+            (1, false) => format!(
+                "将永久删除「{}」{}，此操作不可撤销。",
+                entry.name,
+                if entry.kind == FileEntryKind::Directory {
+                    "及其全部内容"
+                } else {
+                    ""
+                }
+            ),
+            (_, true) => format!("将把选中的 {count} 个条目移到系统废纸篓。"),
+            (_, false) => format!("将永久删除选中的 {count} 个条目，此操作不可撤销。"),
+        };
+        let action = if use_trash {
+            "移到废纸篓"
         } else {
-            format!("将删除文件「{name}」，此操作不可撤销。")
+            "永久删除"
         };
         let prompt = window.prompt(
             PromptLevel::Warning,
-            "删除",
+            action,
             Some(&detail),
-            &["删除", "取消"],
+            &[action, "取消"],
             cx,
         );
 
@@ -416,21 +527,41 @@ impl SidebarFileTree {
             if choice != 0 {
                 return;
             }
-            let removed_after = path.clone();
-            let path_in_op = path.clone();
-            let result = cx
+            let paths_for_op = paths.clone();
+            let results = cx
                 .background_executor()
-                .spawn(async move { backend.remove_path(&path_in_op) })
+                .spawn(async move {
+                    let mut results = Vec::with_capacity(paths_for_op.len());
+                    for path in paths_for_op {
+                        let result = if use_trash {
+                            trash::delete(&path)
+                                .map_err(|error| FileOpError::Other(error.to_string()))
+                        } else {
+                            backend.remove_path(&path)
+                        };
+                        results.push((path, result));
+                    }
+                    results
+                })
                 .await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(()) => {
-                    if this.root_epoch == root_epoch {
-                        this.apply_path_removed(&removed_after, cx);
+            let _ = this.update(cx, |this, cx| {
+                if this.root_epoch != root_epoch {
+                    return;
+                }
+                let mut failures = Vec::new();
+                for (path, result) in results {
+                    match result {
+                        Ok(()) => this.apply_path_removed(&path, cx),
+                        Err(error) => failures.push(format!("{}: {error}", path.display())),
                     }
                 }
-                Err(err) => {
-                    log::warn!("删除失败 {}: {err}", path.display());
-                    this.prompt_operation_error("删除失败", err, window_handle, cx);
+                if !failures.is_empty() {
+                    this.prompt_operation_error(
+                        "删除失败",
+                        FileOpError::Other(failures.join("\n")),
+                        window_handle,
+                        cx,
+                    );
                 }
             });
         })
@@ -453,6 +584,13 @@ impl SidebarFileTree {
     ) {
         self.refresh_directory(parent.to_path_buf(), cx);
         self.selected_path = Some(target.to_path_buf());
+        self.selected_paths.clear();
+        self.selected_paths.insert(target.to_path_buf());
+        self.selection_anchor = Some(target.to_path_buf());
+        self.pending_reveal = Some(crate::sidebar_view::file_tree::PendingReveal {
+            path: target.to_path_buf(),
+            root_epoch: self.root_epoch,
+        });
         if kind == FileEntryKind::File {
             // 新建文件直接打开编辑（VSCode / Zed 行为）
             cx.emit(FileTreeEvent::OpenFile {
@@ -469,7 +607,7 @@ impl SidebarFileTree {
     }
 
     /// 重命名成功：以旧路径为前缀同步所有按路径键控的状态。
-    fn apply_path_renamed(
+    pub(crate) fn apply_path_renamed(
         &mut self,
         from: &std::path::Path,
         to: &std::path::Path,
@@ -508,6 +646,14 @@ impl SidebarFileTree {
             }
         }
         // 选中 / 悬停同步
+        self.selected_paths = self
+            .selected_paths
+            .iter()
+            .map(|path| rekey_path(path, from, to))
+            .collect();
+        if let Some(anchor) = self.selection_anchor.clone() {
+            self.selection_anchor = Some(rekey_path(&anchor, from, to));
+        }
         if let Some(selected) = self.selected_path.clone()
             && selected.starts_with(from)
         {
@@ -532,7 +678,7 @@ impl SidebarFileTree {
         cx.emit(FileTreeEvent::PathRenamed {
             from: from.to_path_buf(),
             to: to.to_path_buf(),
-            ssh_config: self.loader.ssh_config().cloned().map(Box::new),
+            ssh_config: self.event_ssh_config(),
         });
         self.invalidate_flat_cache();
         cx.notify();
@@ -542,12 +688,21 @@ impl SidebarFileTree {
     /// 本地树 watcher 事件也会执行同样清理（幂等）；远端无事件由这里兜底。
     fn apply_path_removed(&mut self, removed: &std::path::Path, cx: &mut Context<Self>) {
         self.expanded_folders.retain(|p| !p.starts_with(removed));
+        self.selected_paths
+            .retain(|path| !path.starts_with(removed));
         if self
             .selected_path
             .as_ref()
             .is_some_and(|p| p.starts_with(removed))
         {
-            self.selected_path = None;
+            self.selected_path = self.selected_paths.iter().next().cloned();
+        }
+        if self
+            .selection_anchor
+            .as_ref()
+            .is_some_and(|path| path.starts_with(removed))
+        {
+            self.selection_anchor = self.selected_path.clone();
         }
         if self
             .hovered_path
@@ -577,7 +732,7 @@ impl SidebarFileTree {
         // 让编辑器关掉对应的标签：文件已经不在了，留着只会在保存时被写回来。
         cx.emit(FileTreeEvent::PathRemoved {
             path: removed.to_path_buf(),
-            ssh_config: self.loader.ssh_config().cloned().map(Box::new),
+            ssh_config: self.event_ssh_config(),
         });
         self.invalidate_flat_cache();
         cx.notify();
@@ -616,6 +771,183 @@ impl SidebarFileTree {
     }
 
     // ------------------------------------------------------------------
+    // 文件剪贴板与路径复制
+    // ------------------------------------------------------------------
+
+    fn endpoint_for_path(&self, path: &std::path::Path) -> Option<FileEndpoint> {
+        if self.loader.is_local() {
+            Some(FileEndpoint::Local {
+                path: path.to_path_buf(),
+            })
+        } else {
+            Some(FileEndpoint::Remote {
+                ssh_config: self.loader.ssh_config()?.clone(),
+                path: path.to_string_lossy().into_owned(),
+            })
+        }
+    }
+
+    pub(super) fn copy_selection_to_clipboard(&mut self, cut: bool, cx: &mut Context<Self>) {
+        let paths = self.selected_operation_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let text = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        let sources = paths
+            .iter()
+            .filter_map(|path| self.endpoint_for_path(path))
+            .collect();
+        *tree_clipboard().lock() = Some(TreeClipboard {
+            operation: if cut {
+                TreeClipboardOperation::Cut
+            } else {
+                TreeClipboardOperation::Copy
+            },
+            sources,
+        });
+    }
+
+    pub(super) fn copy_selected_paths(&self, relative: bool, cx: &mut Context<Self>) {
+        let mut paths = self.selected_operation_paths();
+        if paths.is_empty() && !relative {
+            paths.push(self.root_path.clone());
+        }
+        let text = paths
+            .iter()
+            .map(|path| {
+                if relative {
+                    path.strip_prefix(&self.root_path)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .replace('\\', "/")
+                } else {
+                    path.to_string_lossy().into_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !text.is_empty() {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+
+    pub(super) fn has_file_clipboard(&self) -> bool {
+        tree_clipboard()
+            .lock()
+            .as_ref()
+            .is_some_and(|clipboard| !clipboard.sources.is_empty())
+    }
+
+    pub(super) fn paste_into_tree(
+        &mut self,
+        target_dir: std::path::PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(destination) = self.endpoint_for_path(&target_dir) else {
+            return;
+        };
+        let clipboard = tree_clipboard().lock().clone();
+        let Some(clipboard) = clipboard else {
+            return;
+        };
+        if clipboard.sources.iter().any(|source| {
+            source.is_same_device(&destination) && target_dir.starts_with(source.path_buf())
+        }) {
+            self.prompt_simple_error("无法粘贴", "目标目录不能是源条目自身或其后代。", cx);
+            return;
+        }
+        let operation = match clipboard.operation {
+            TreeClipboardOperation::Copy => TransferOperation::Copy,
+            TreeClipboardOperation::Cut => TransferOperation::Move,
+        };
+        cx.emit(FileTreeEvent::StartTransfer {
+            request: Box::new(TransferRequest {
+                sources: clipboard.sources,
+                destination,
+                operation,
+                conflict_policy: ConflictPolicy::Ask,
+                rename_to: None,
+            }),
+        });
+        // 剪切语义为移动一次；复制保留剪贴板，可连续粘贴多份。
+        if clipboard.operation == TreeClipboardOperation::Cut {
+            tree_clipboard().lock().take();
+        }
+    }
+
+    pub(super) fn selected_directory(&self) -> std::path::PathBuf {
+        let Some(path) = self.selected_path.as_ref() else {
+            return self.root_path.clone();
+        };
+        let is_dir = self
+            .flat_cache
+            .as_ref()
+            .and_then(|flat| flat.iter().find(|(entry, _)| entry.path == *path))
+            .is_some_and(|(entry, _)| entry.is_dir());
+        if is_dir {
+            path.clone()
+        } else {
+            path.parent().unwrap_or(&self.root_path).to_path_buf()
+        }
+    }
+
+    fn prompt_simple_error(&self, title: &str, message: &str, cx: &mut Context<Self>) {
+        let title = title.to_string();
+        let message = message.to_string();
+        if let Some(window) = self.context_menu_window {
+            cx.spawn(async move |_, cx| {
+                if let Ok(receiver) = cx.update_window(window, |_, window, cx| {
+                    window.prompt(PromptLevel::Warning, &title, Some(&message), &["确定"], cx)
+                }) {
+                    let _ = receiver.await;
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn open_selected_entries(&self, cx: &mut Context<Self>) {
+        let selected = self.selected_operation_paths();
+        if let Some(flat) = &self.flat_cache {
+            for (entry, _) in flat
+                .iter()
+                .filter(|(entry, _)| selected.contains(&entry.path) && !entry.is_dir())
+            {
+                cx.emit(FileTreeEvent::OpenFile {
+                    path: entry.path.clone(),
+                    ssh_config: self.event_ssh_config(),
+                });
+            }
+        }
+    }
+
+    fn compare_selected_entries(&self, cx: &mut Context<Self>) {
+        let selected = self.selected_operation_paths();
+        let files: Vec<PathBuf> = self
+            .flat_cache
+            .as_ref()
+            .into_iter()
+            .flat_map(|flat| flat.iter())
+            .filter(|(entry, _)| {
+                selected.contains(&entry.path) && entry.kind == FileEntryKind::File
+            })
+            .map(|(entry, _)| entry.path.clone())
+            .collect();
+        if let [left, right] = files.as_slice() {
+            cx.emit(FileTreeEvent::CompareFiles {
+                left: left.clone(),
+                right: right.clone(),
+                ssh_config: self.event_ssh_config(),
+            });
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 下载（仅远端）
     // ------------------------------------------------------------------
 
@@ -630,8 +962,22 @@ impl SidebarFileTree {
         let Some(ssh_config) = self.loader.ssh_config().cloned() else {
             return;
         };
-        let remote_path = entry.path.to_string_lossy().to_string();
-        let entry_name = entry.name.clone();
+        let mut paths = self.selected_operation_paths();
+        if paths.is_empty() {
+            paths.push(entry.path.clone());
+        }
+        let entry_name = if paths.len() == 1 {
+            entry.name.clone()
+        } else {
+            format!("{} 个条目", paths.len())
+        };
+        let sources = paths
+            .iter()
+            .map(|path| FileEndpoint::Remote {
+                ssh_config: ssh_config.clone(),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .collect();
 
         let picker = cx.prompt_for_paths(gpui::PathPromptOptions {
             files: false,
@@ -647,10 +993,7 @@ impl SidebarFileTree {
             };
             let _ = this.update(cx, |_, cx| {
                 let request = TransferRequest {
-                    sources: vec![FileEndpoint::Remote {
-                        ssh_config,
-                        path: remote_path,
-                    }],
+                    sources,
                     destination: FileEndpoint::Local {
                         path: destination_dir,
                     },
@@ -726,6 +1069,7 @@ impl SidebarFileTree {
             return div().into_any_element();
         };
         let input = editing.input.clone();
+        let error = editing.error.clone();
         let icon = match &editing.mode {
             TreeEditMode::Create { kind, .. } => {
                 if *kind == FileEntryKind::Directory {
@@ -769,6 +1113,19 @@ impl SidebarFileTree {
                 // 行内紧凑输入：transparent 去掉输入框背景/内边距，融入树行
                 EditorInput::new(&input).small().transparent(),
             ))
+            .when_some(error, |row, error| {
+                row.child(
+                    div()
+                        .id("file-tree-editing-error")
+                        .w(px(120.0))
+                        .flex_none()
+                        .truncate()
+                        .text_xs()
+                        .text_color(theme.status_conflict)
+                        .tooltip(crate::components::tooltip::Tooltip::text(error.clone()))
+                        .child(error),
+                )
+            })
             // Esc 取消：InputState 的 Escape 会向上冒泡（未启用 clean_on_escape）
             .on_action(cx.listener(|this, _: &Escape, _window, cx| {
                 this.cancel_editing(cx);
@@ -778,6 +1135,26 @@ impl SidebarFileTree {
 }
 
 /// 路径前缀替换：`from`（或其后代）→ 同形态 `to` 路径。
+fn reveal_local_path(path: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let result = crate::utils::console::hidden_command("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ());
+    #[cfg(target_os = "windows")]
+    let result = crate::utils::console::hidden_command("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ());
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let result = open::that(path.parent().unwrap_or(path)).map(|_| ());
+
+    if let Err(error) = result {
+        log::warn!("无法打开系统文件管理器 {}: {error}", path.display());
+    }
+}
+
 pub(crate) fn rekey_path(
     path: &std::path::Path,
     from: &std::path::Path,
@@ -895,9 +1272,7 @@ impl SidebarFileTree {
         )
     }
 
-    /// 条目右键菜单（VSCode 区分文件 / 文件夹）：
-    /// - 文件：下载（远端）/ 重命名 / 删除 —— 没有新建项
-    /// - 文件夹：下载（远端）/ 新建文件 / 新建文件夹 / 重命名 / 删除
+    /// 条目右键菜单：单选提供完整文件操作，多选仅保留有意义的批量动作。
     pub(super) fn open_context_menu_for_entry(
         &mut self,
         entry: &FileEntry,
@@ -908,97 +1283,208 @@ impl SidebarFileTree {
         let tree = cx.entity();
         let entry = entry.clone();
         let is_remote = !self.loader.is_local();
-        let is_dir = entry.kind == FileEntryKind::Directory;
+        let is_dir = entry.is_dir();
+        let multi = self.selected_paths.len() > 1;
+        let can_compare = self.selected_paths.len() == 2
+            && self
+                .flat_cache
+                .as_ref()
+                .into_iter()
+                .flat_map(|flat| flat.iter())
+                .filter(|(candidate, _)| self.selected_paths.contains(&candidate.path))
+                .filter(|(candidate, _)| candidate.kind == FileEntryKind::File)
+                .count()
+                == 2;
+        let can_paste = self.has_file_clipboard();
+        let event_ssh_config = self.event_ssh_config();
+        let paste_target = if is_dir {
+            entry.path.clone()
+        } else {
+            entry.path.parent().unwrap_or(&self.root_path).to_path_buf()
+        };
+
         self.open_menu(position, window, cx, move |menu, _window, _cx| {
-            let mut menu = menu;
+            let mut menu = menu.item(tree_menu_action(
+                if multi { "打开所选项" } else { "打开" },
+                "icons/go.to.file.svg",
+                tree.clone(),
+                |this, _, cx| this.open_selected_entries(cx),
+            ));
+            if can_compare {
+                menu = menu.item(tree_menu_action(
+                    "比较所选文件",
+                    "icons/git.svg",
+                    tree.clone(),
+                    |this, _, cx| this.compare_selected_entries(cx),
+                ));
+            }
+            menu = menu.separator();
 
-            // 下载到本地（仅远端）
+            if is_dir && !multi {
+                for (label, icon, kind) in [
+                    ("新建文件", "icons/new_file.svg", FileEntryKind::File),
+                    (
+                        "新建文件夹",
+                        "icons/new_folder.svg",
+                        FileEntryKind::Directory,
+                    ),
+                ] {
+                    let parent = entry.path.clone();
+                    menu = menu.item(tree_menu_action(
+                        label,
+                        icon,
+                        tree.clone(),
+                        move |this, window, cx| {
+                            this.start_create(parent.clone(), kind.clone(), window, cx)
+                        },
+                    ));
+                }
+                menu = menu.separator();
+            }
+
+            if !is_remote {
+                let path = entry.path.clone();
+                menu = menu.item(tree_menu_action(
+                    "在系统文件管理器中显示",
+                    "icons/reveal.svg",
+                    tree.clone(),
+                    move |_, _, _| reveal_local_path(&path),
+                ));
+            }
+            let terminal_path = if is_dir {
+                entry.path.clone()
+            } else {
+                entry.path.parent().unwrap_or(&entry.path).to_path_buf()
+            };
+            let terminal_config = event_ssh_config.clone();
+            menu = menu.item(tree_menu_action(
+                "在终端中打开",
+                "icons/terminal.svg",
+                tree.clone(),
+                move |_, _, cx| {
+                    cx.emit(FileTreeEvent::OpenInTerminal {
+                        path: terminal_path.clone(),
+                        ssh_config: terminal_config.clone(),
+                        run_script: false,
+                    });
+                },
+            ));
+            if is_dir && !is_remote {
+                let path = entry.path.clone();
+                menu = menu.item(tree_menu_action(
+                    "在此目录中搜索",
+                    "icons/magnifying_glass.svg",
+                    tree.clone(),
+                    move |_, _, cx| {
+                        cx.emit(FileTreeEvent::FindInFolder { path: path.clone() });
+                    },
+                ));
+            }
+            if !is_dir && !multi && !is_remote {
+                let path = entry.path.clone();
+                let config = event_ssh_config.clone();
+                menu = menu.item(tree_menu_action(
+                    "在终端中运行",
+                    "icons/terminal.svg",
+                    tree.clone(),
+                    move |_, _, cx| {
+                        cx.emit(FileTreeEvent::OpenInTerminal {
+                            path: path.clone(),
+                            ssh_config: config.clone(),
+                            run_script: true,
+                        });
+                    },
+                ));
+            }
+            menu = menu.separator();
+
+            menu = menu
+                .item(tree_menu_action(
+                    "剪切",
+                    "icons/scissors.svg",
+                    tree.clone(),
+                    |this, _, cx| this.copy_selection_to_clipboard(true, cx),
+                ))
+                .item(tree_menu_action(
+                    "复制",
+                    "icons/copy.svg",
+                    tree.clone(),
+                    |this, _, cx| this.copy_selection_to_clipboard(false, cx),
+                ));
+            if can_paste && !multi {
+                let target = paste_target.clone();
+                menu = menu.item(tree_menu_action(
+                    "粘贴",
+                    "icons/document.on.document.svg",
+                    tree.clone(),
+                    move |this, _, cx| this.paste_into_tree(target.clone(), cx),
+                ));
+            }
             if is_remote {
-                let tree_dl = tree.clone();
-                let dl_entry = entry.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("下载到本地…")
-                        .icon(crate::components::button::Icon::new("icons/download.svg"))
-                        .on_click(move |_, window, cx| {
-                            tree_dl.update(cx, |this, cx| {
-                                this.close_context_menu(cx);
-                                this.start_download(&dl_entry, window, cx);
-                            });
-                        }),
-                );
-                menu = menu.separator();
+                let download_entry = entry.clone();
+                menu = menu.item(tree_menu_action(
+                    if multi {
+                        "下载所选项到本地…"
+                    } else {
+                        "下载到本地…"
+                    },
+                    "icons/download.svg",
+                    tree.clone(),
+                    move |this, window, cx| this.start_download(&download_entry, window, cx),
+                ));
             }
+            menu = menu.separator();
+            menu = menu
+                .item(tree_menu_action(
+                    "复制路径",
+                    "icons/copy.svg",
+                    tree.clone(),
+                    |this, _, cx| this.copy_selected_paths(false, cx),
+                ))
+                .item(tree_menu_action(
+                    "复制相对路径",
+                    "icons/copy.svg",
+                    tree.clone(),
+                    |this, _, cx| this.copy_selected_paths(true, cx),
+                ))
+                .separator();
 
-            // 新建（仅文件夹：在该文件夹内创建）
-            if is_dir {
-                let tree_file = tree.clone();
-                let parent_file = entry.path.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("新建文件")
-                        .icon(crate::components::button::Icon::new("icons/new_file.svg"))
-                        .on_click(move |_, window, cx| {
-                            tree_file.update(cx, |this, cx| {
-                                this.close_context_menu(cx);
-                                this.start_create(
-                                    parent_file.clone(),
-                                    FileEntryKind::File,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }),
-                );
-                let tree_dir = tree.clone();
-                let parent_dir = entry.path.clone();
-                menu = menu.item(
-                    PopupMenuItem::new("新建文件夹")
-                        .icon(crate::components::button::Icon::new("icons/new_folder.svg"))
-                        .on_click(move |_, window, cx| {
-                            tree_dir.update(cx, |this, cx| {
-                                this.close_context_menu(cx);
-                                this.start_create(
-                                    parent_dir.clone(),
-                                    FileEntryKind::Directory,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }),
-                );
-                menu = menu.separator();
+            if !multi {
+                let rename_entry = entry.clone();
+                menu = menu.item(tree_menu_action(
+                    "重命名",
+                    "icons/pencil.svg",
+                    tree.clone(),
+                    move |this, window, cx| this.start_rename(&rename_entry, window, cx),
+                ));
             }
-
-            // 重命名 / 删除
-            let tree_rename = tree.clone();
-            let rename_entry = entry.clone();
-            menu = menu.item(
-                PopupMenuItem::new("重命名")
-                    .icon(crate::components::button::Icon::new("icons/pencil.svg"))
-                    .on_click(move |_, window, cx| {
-                        tree_rename.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.start_rename(&rename_entry, window, cx);
-                        });
-                    }),
-            );
-            let tree_delete = tree.clone();
             let delete_entry = entry.clone();
-            menu = menu.item(
-                PopupMenuItem::new(if is_dir { "删除文件夹" } else { "删除" })
-                    .icon(crate::components::button::Icon::new("icons/trash_zed.svg"))
-                    .on_click(move |_, window, cx| {
-                        tree_delete.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.start_delete(&delete_entry, window, cx);
-                        });
-                    }),
-            );
-
+            menu = menu.item(tree_menu_action(
+                if is_remote {
+                    "永久删除"
+                } else if multi {
+                    "将所选项移到废纸篓"
+                } else {
+                    "移到废纸篓"
+                },
+                "icons/trash_zed.svg",
+                tree.clone(),
+                move |this, window, cx| this.start_delete(&delete_entry, window, cx),
+            ));
+            if !is_remote {
+                let delete_entry = entry.clone();
+                menu = menu.item(tree_menu_action(
+                    "永久删除…",
+                    "icons/trash.svg",
+                    tree.clone(),
+                    move |this, window, cx| this.start_permanent_delete(&delete_entry, window, cx),
+                ));
+            }
             menu
         });
     }
 
-    /// 根目录右键菜单：新建文件 / 新建文件夹 / 折叠全部（根不可重命名 / 删除）。
+    /// 根目录与空白区菜单：根本身不可改名/删除，但可作为所有目录操作的目标。
     pub(super) fn open_context_menu_for_root(
         &mut self,
         position: gpui::Point<gpui::Pixels>,
@@ -1007,48 +1493,137 @@ impl SidebarFileTree {
     ) {
         let tree = cx.entity();
         let root = self.root_path.clone();
+        let is_remote = !self.loader.is_local();
+        let can_paste = self.has_file_clipboard();
+        let compact = self.compact_folders;
+        let event_ssh_config = self.event_ssh_config();
         self.open_menu(position, window, cx, move |menu, _window, _cx| {
-            let tree_file = tree.clone();
-            let root_file = root.clone();
-            let tree_dir = tree.clone();
-            let root_dir = root.clone();
-            let tree_collapse = tree.clone();
-            menu.item(
-                PopupMenuItem::new("新建文件")
-                    .icon(crate::components::button::Icon::new("icons/new_file.svg"))
-                    .on_click(move |_, window, cx| {
-                        tree_file.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.start_create(root_file.clone(), FileEntryKind::File, window, cx);
-                        });
-                    }),
-            )
-            .item(
-                PopupMenuItem::new("新建文件夹")
-                    .icon(crate::components::button::Icon::new("icons/new_folder.svg"))
-                    .on_click(move |_, window, cx| {
-                        tree_dir.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.start_create(
-                                root_dir.clone(),
-                                FileEntryKind::Directory,
-                                window,
-                                cx,
-                            );
-                        });
-                    }),
-            )
-            .separator()
-            .item(
-                PopupMenuItem::new("折叠全部")
-                    .icon(crate::components::button::Icon::new("icons/collapse.svg"))
-                    .on_click(move |_, _window, cx| {
-                        tree_collapse.update(cx, |this, cx| {
-                            this.close_context_menu(cx);
-                            this.collapse_all(cx);
-                        });
-                    }),
-            )
+            let mut menu = menu;
+            for (label, icon, kind) in [
+                ("新建文件", "icons/new_file.svg", FileEntryKind::File),
+                (
+                    "新建文件夹",
+                    "icons/new_folder.svg",
+                    FileEntryKind::Directory,
+                ),
+            ] {
+                let parent = root.clone();
+                menu = menu.item(tree_menu_action(
+                    label,
+                    icon,
+                    tree.clone(),
+                    move |this, window, cx| {
+                        this.start_create(parent.clone(), kind.clone(), window, cx)
+                    },
+                ));
+            }
+            if !is_remote {
+                menu = menu.item(tree_menu_action(
+                    "添加文件夹到工作区…",
+                    "icons/folder.badge.plus.svg",
+                    tree.clone(),
+                    |this, window, cx| this.add_workspace_folder_prompt(window, cx),
+                ));
+            }
+            menu = menu.separator();
+            if !is_remote {
+                let path = root.clone();
+                menu = menu.item(tree_menu_action(
+                    "在系统文件管理器中显示",
+                    "icons/reveal.svg",
+                    tree.clone(),
+                    move |_, _, _| reveal_local_path(&path),
+                ));
+            }
+            let terminal_path = root.clone();
+            let config = event_ssh_config.clone();
+            menu = menu.item(tree_menu_action(
+                "在终端中打开",
+                "icons/terminal.svg",
+                tree.clone(),
+                move |_, _, cx| {
+                    cx.emit(FileTreeEvent::OpenInTerminal {
+                        path: terminal_path.clone(),
+                        ssh_config: config.clone(),
+                        run_script: false,
+                    });
+                },
+            ));
+            if !is_remote {
+                let path = root.clone();
+                menu = menu.item(tree_menu_action(
+                    "在此目录中搜索",
+                    "icons/magnifying_glass.svg",
+                    tree.clone(),
+                    move |_, _, cx| {
+                        cx.emit(FileTreeEvent::FindInFolder { path: path.clone() });
+                    },
+                ));
+            }
+            menu = menu.separator();
+            if can_paste {
+                let target = root.clone();
+                menu = menu.item(tree_menu_action(
+                    "粘贴",
+                    "icons/document.on.document.svg",
+                    tree.clone(),
+                    move |this, _, cx| this.paste_into_tree(target.clone(), cx),
+                ));
+            }
+            let copy_root = root.clone();
+            menu = menu.item(tree_menu_action(
+                "复制路径",
+                "icons/copy.svg",
+                tree.clone(),
+                move |_, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                        copy_root.to_string_lossy().into_owned(),
+                    ));
+                },
+            ));
+            menu = menu
+                .separator()
+                .item(tree_menu_action(
+                    if compact {
+                        "逐级显示目录"
+                    } else {
+                        "合并连续单子目录"
+                    },
+                    "icons/folder.svg",
+                    tree.clone(),
+                    |this, _, cx| this.toggle_compact_folders(cx),
+                ))
+                .item(tree_menu_action(
+                    "刷新",
+                    "icons/arrow.clockwise.svg",
+                    tree.clone(),
+                    |this, _, cx| this.refresh_all_loaded(cx),
+                ))
+                .item(tree_menu_action(
+                    "折叠全部",
+                    "icons/collapse.svg",
+                    tree.clone(),
+                    |this, _, cx| this.collapse_all(cx),
+                ));
+            menu
+        });
+    }
+
+    pub(super) fn open_context_menu_for_extra_root(
+        &mut self,
+        root: PathBuf,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tree = cx.entity();
+        self.open_menu(position, window, cx, move |menu, _, _| {
+            menu.item(tree_menu_action(
+                "从工作区移除（不删除文件）",
+                "icons/trash.svg",
+                tree,
+                move |this, _, cx| this.remove_extra_root(&root, cx),
+            ))
         });
     }
 
@@ -1066,60 +1641,46 @@ impl SidebarFileTree {
     // 树内拖拽移动（DraggedTreeEntry → Move）
     // ------------------------------------------------------------------
 
-    /// 树内条目拖入目标目录：构建 Move 传输请求（复用统一链路的进度 / 冲突 / 取消）。
-    /// 拖到自身或其后代目录无效（VSCode 同款限制）。
+    /// 树内条目拖入目标目录：多选移动，按住 Option/Alt 松开则复制。
+    /// 拖到自身、后代或原地移动均视为无效，不产生传输任务。
     pub(super) fn drop_tree_entry(
         &mut self,
         dragged: &DraggedTreeEntry,
         target_dir: &std::path::Path,
+        copy: bool,
         cx: &mut Context<Self>,
     ) {
-        // 自拖自 / 拖入后代目录：无效
-        if target_dir.starts_with(&dragged.path) {
-            log::debug!(
-                "忽略无效拖拽：{} → {}（自身或后代）",
-                dragged.path.display(),
-                target_dir.display()
-            );
+        self.clear_drag_expand();
+        if !can_drop_tree_entry(dragged, target_dir, copy) {
             return;
         }
-        let source = if self.loader.is_local() {
-            FileEndpoint::Local {
-                path: dragged.path.clone(),
-            }
+        let paths = if dragged.paths.is_empty() {
+            vec![dragged.path.clone()]
         } else {
-            let Some(config) = self.loader.ssh_config().cloned() else {
-                return;
-            };
-            FileEndpoint::Remote {
-                ssh_config: config,
-                path: dragged.path.to_string_lossy().to_string(),
-            }
+            dragged.paths.clone()
         };
-        let destination = if self.loader.is_local() {
-            FileEndpoint::Local {
-                path: target_dir.to_path_buf(),
-            }
-        } else {
-            let Some(config) = self.loader.ssh_config().cloned() else {
-                return;
-            };
-            FileEndpoint::Remote {
-                ssh_config: config,
-                path: target_dir.to_string_lossy().to_string(),
-            }
+        let sources: Vec<FileEndpoint> = paths
+            .iter()
+            .filter_map(|path| self.endpoint_for_path(path))
+            .collect();
+        let Some(destination) = self.endpoint_for_path(target_dir) else {
+            return;
         };
         let request = TransferRequest {
-            sources: vec![source],
+            sources,
             destination,
-            operation: TransferOperation::Move,
+            operation: if copy {
+                TransferOperation::Copy
+            } else {
+                TransferOperation::Move
+            },
             conflict_policy: ConflictPolicy::Ask,
             rename_to: None,
         };
         cx.emit(FileTreeEvent::StartTransfer {
             request: Box::new(request),
         });
-        // 同上：刷新交给传输结束事件，Move 的「目标目录 + 源父目录」都会覆盖到。
+        // 刷新和真实移动路径同步由 TransferFinished 统一完成。
     }
 }
 
@@ -1128,9 +1689,24 @@ impl SidebarFileTree {
 // ------------------------------------------------------------------
 
 /// 树内拖拽负载：行 `on_drag` 携带，目录行 `on_drop` 接收。
+pub(crate) fn can_drop_tree_entry(
+    dragged: &DraggedTreeEntry,
+    target_dir: &std::path::Path,
+    copy: bool,
+) -> bool {
+    let paths = if dragged.paths.is_empty() {
+        std::slice::from_ref(&dragged.path)
+    } else {
+        dragged.paths.as_slice()
+    };
+    !paths.iter().any(|path| target_dir.starts_with(path))
+        && (copy || !paths.iter().all(|path| path.parent() == Some(target_dir)))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DraggedTreeEntry {
     pub path: std::path::PathBuf,
+    pub paths: Vec<std::path::PathBuf>,
     pub name: String,
     pub is_dir: bool,
 }
@@ -1180,6 +1756,7 @@ impl gpui::Render for DraggedTreeEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn rekey_path_replaces_prefix_and_descendants() {
@@ -1248,5 +1825,39 @@ mod tests {
             unique_placeholder_name("src", &["other".to_string()]),
             "src"
         );
+    }
+
+    #[test]
+    fn create_path_allows_nested_names_without_traversal() {
+        assert!(validate_create_path("a/b/c.txt").is_ok());
+        assert!(validate_create_path("单个.txt").is_ok());
+        for invalid in ["", "../escape", "a/../../escape", "/absolute", "a/", "."] {
+            assert!(
+                validate_create_path(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drag_validation_handles_batches_and_copy() {
+        let dragged = DraggedTreeEntry {
+            path: PathBuf::from("/work/a"),
+            paths: vec![PathBuf::from("/work/a"), PathBuf::from("/work/b")],
+            name: "2 个条目".into(),
+            is_dir: true,
+        };
+        assert!(!can_drop_tree_entry(
+            &dragged,
+            Path::new("/work/a/child"),
+            false
+        ));
+        assert!(!can_drop_tree_entry(&dragged, Path::new("/work"), false));
+        assert!(can_drop_tree_entry(&dragged, Path::new("/work"), true));
+        assert!(can_drop_tree_entry(
+            &dragged,
+            Path::new("/elsewhere"),
+            false
+        ));
     }
 }

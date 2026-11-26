@@ -64,6 +64,12 @@ impl MacosSidebar {
                         ssh_config: ssh_config.clone(),
                     });
                 }
+                FileTreeEvent::PreviewFile { path, ssh_config } => {
+                    cx.emit(SidebarEvent::PreviewFile {
+                        path: path.clone(),
+                        ssh_config: ssh_config.clone(),
+                    });
+                }
                 FileTreeEvent::StartTransfer { request } => {
                     cx.emit(SidebarEvent::StartTransfer {
                         request: Box::new((**request).clone()),
@@ -89,6 +95,45 @@ impl MacosSidebar {
                 FileTreeEvent::RootChanged => {
                     this.ensure_git_panel(cx);
                     this.ensure_file_search_panel(cx);
+                }
+                FileTreeEvent::LocateActiveFile => {
+                    cx.emit(SidebarEvent::LocateActiveFile);
+                }
+                FileTreeEvent::FocusActiveTerminal => {
+                    cx.emit(SidebarEvent::FocusActiveTerminal);
+                }
+                FileTreeEvent::CompareFiles {
+                    left,
+                    right,
+                    ssh_config,
+                } => {
+                    cx.emit(SidebarEvent::CompareFiles {
+                        left: left.clone(),
+                        right: right.clone(),
+                        ssh_config: ssh_config.clone(),
+                    });
+                }
+                FileTreeEvent::OpenInTerminal {
+                    path,
+                    ssh_config,
+                    run_script,
+                } => {
+                    cx.emit(SidebarEvent::OpenInTerminal {
+                        path: path.clone(),
+                        ssh_config: ssh_config.clone(),
+                        run_script: *run_script,
+                    });
+                }
+                FileTreeEvent::FindInFolder { path } => {
+                    this.ensure_file_search_panel(cx);
+                    if let Some(panel) = &this.file_search_panel {
+                        panel.update(cx, |panel, cx| {
+                            panel.set_root(Some(path.clone()), cx);
+                            panel.request_focus(cx);
+                        });
+                    }
+                    this.file_tree_panel_tabs.select(FileTreePanel::Search);
+                    cx.notify();
                 }
             },
         );

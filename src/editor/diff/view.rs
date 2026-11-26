@@ -164,6 +164,14 @@ impl Highlights {
     }
 }
 
+/// 任意文件比较的全部输入，避免构造参数阶梯。
+pub struct FileComparison {
+    pub left_path: String,
+    pub right_path: String,
+    pub left_text: String,
+    pub right_text: String,
+}
+
 pub struct DiffView {
     path: String,
     repo: GitRepository,
@@ -202,6 +210,8 @@ pub struct DiffView {
     /// The first load's jump to the first change has been made.
     jumped: bool,
     recompute_gen: u32,
+    /// 任意两个文件的只读比较，不是 Git 工作区 diff。
+    comparison: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -252,10 +262,75 @@ impl DiffView {
             diff_menu_subscription: None,
             jumped: false,
             recompute_gen: 0,
+            comparison: false,
             _subscriptions: Vec::new(),
         };
         this.fetch_contents(cx);
         this
+    }
+
+    /// 从已经读取好的两份文本创建任意文件比较；不访问 Git。
+    pub fn new_comparison(
+        comparison: FileComparison,
+        repo: GitRepository,
+        editor: WeakEntity<Editor>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let FileComparison {
+            left_path,
+            right_path,
+            left_text,
+            right_text,
+        } = comparison;
+        let display_path = format!("{left_path} ↔ {right_path}");
+        let file = FileDiff::between(Some(left_path), Some(right_path), &left_text, &right_text);
+        let mut this = Self {
+            path: display_path,
+            repo,
+            editor,
+            base_text: Arc::from(left_text.clone()),
+            new_text: right_text.clone(),
+            saved_text: right_text,
+            hunks: Vec::new(),
+            hunks_source: TextFingerprint::default(),
+            diff: DiffState::new(vec![file]),
+            old_hl: Highlights::default(),
+            new_hl: Highlights::default(),
+            preference: LayoutPreference::default(),
+            available_width: 0.0,
+            list_state: ListState::new(0, ListAlignment::Top, px(600.))
+                .with_uniform_item_height(px(22.)),
+            list_rev: 0,
+            focus_handle: cx.focus_handle(),
+            theme: DiffTheme::new(cx),
+            target: DiffTarget::Worktree,
+            is_new: false,
+            is_binary: false,
+            loading: false,
+            load_error: None,
+            refreshing: false,
+            staging_hunk: None,
+            staging_file: false,
+            diff_menu: None,
+            diff_menu_position: None,
+            diff_menu_subscription: None,
+            jumped: false,
+            recompute_gen: 0,
+            comparison: true,
+            _subscriptions: Vec::new(),
+        };
+        this.recompute(cx);
+        this
+    }
+
+    pub fn is_comparison(&self) -> bool {
+        self.comparison
+    }
+
+    #[cfg(test)]
+    pub(crate) fn comparison_texts(&self) -> (&str, &str) {
+        (self.base_text.as_ref(), self.new_text.as_str())
     }
 
     fn diff_hunk_rows(&self) -> Vec<u32> {
@@ -311,6 +386,9 @@ impl DiffView {
 
     /// 切换工作区/已暂存内容（同一 tab 内）：重拉三元组。
     pub fn set_kind(&mut self, staged: bool, cx: &mut Context<Self>) {
+        if self.comparison {
+            return;
+        }
         let kind = if staged {
             DiffTarget::Staged
         } else {
@@ -399,7 +477,7 @@ impl DiffView {
 
     /// 暂存单个 hunk（`git apply --cached` 零上下文补丁）。
     fn stage_hunk(&mut self, hunk_ix: usize, cx: &mut Context<Self>) {
-        if self.target != DiffTarget::Worktree || self.staging_hunk.is_some() {
+        if self.comparison || self.target != DiffTarget::Worktree || self.staging_hunk.is_some() {
             return;
         }
         if self.is_binary {
@@ -451,7 +529,7 @@ impl DiffView {
 
     /// 暂存整个文件（工具栏）。
     fn stage_file(&mut self, cx: &mut Context<Self>) {
-        if self.staging_file || self.target != DiffTarget::Worktree {
+        if self.comparison || self.staging_file || self.target != DiffTarget::Worktree {
             return;
         }
         self.staging_file = true;
@@ -804,6 +882,9 @@ impl DiffView {
     /// here: it writes through `save_text_to_file`, keeping the file's encoding and line
     /// endings, then reloads.
     fn revert_hunk(&mut self, hunk_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.comparison {
+            return;
+        }
         if self.is_binary {
             self.notify_warning(cx, "二进制文件不支持按块还原");
             return;
@@ -903,7 +984,7 @@ impl DiffView {
 
     /// Re-fetch HEAD + staged + working-tree content.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.refreshing || self.loading {
+        if self.comparison || self.refreshing || self.loading {
             return;
         }
         self.refreshing = true;

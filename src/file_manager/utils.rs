@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::{anyhow, bail};
 
 use crate::file_manager::{
-    ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, wait_for_resolution,
+    ConflictPolicy, ConflictPrompt, ConflictResolution, ConflictResolver, FileEndpoint,
+    wait_for_resolution,
 };
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
@@ -21,6 +22,9 @@ pub struct TransferSummary {
     /// 因冲突选择"跳过"、或遇到不支持的条目（符号链接 / 特殊文件）而未传输的条目数。
     /// Move 操作只有在 `skipped == 0` 时才允许删除源，避免把未传输的内容连源一起删掉。
     pub skipped: usize,
+    /// 已实际完成的顶层移动（源，含冲突自动改名后的真实目标）。
+    /// 编辑器据此同步已打开标签，不能自行猜测目标路径。
+    pub completed_moves: Vec<(FileEndpoint, FileEndpoint)>,
 }
 
 impl TransferSummary {
@@ -29,6 +33,7 @@ impl TransferSummary {
             files_transferred: 1,
             bytes_transferred,
             skipped: 0,
+            completed_moves: Vec::new(),
         }
     }
 
@@ -38,6 +43,7 @@ impl TransferSummary {
             files_transferred: 0,
             bytes_transferred: 0,
             skipped: 1,
+            completed_moves: Vec::new(),
         }
     }
 
@@ -57,6 +63,10 @@ impl TransferSummary {
         }
     }
 
+    pub fn record_move(&mut self, from: FileEndpoint, to: FileEndpoint) {
+        self.completed_moves.push((from, to));
+    }
+
     pub fn merge(&mut self, other: Self) {
         self.files_transferred = self
             .files_transferred
@@ -65,6 +75,7 @@ impl TransferSummary {
             .bytes_transferred
             .saturating_add(other.bytes_transferred);
         self.skipped = self.skipped.saturating_add(other.skipped);
+        self.completed_moves.extend(other.completed_moves);
     }
 }
 

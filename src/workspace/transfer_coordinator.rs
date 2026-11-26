@@ -285,6 +285,11 @@ impl Workspace {
         dirs: Vec<FileEndpoint>,
         cx: &mut Context<Self>,
     ) {
+        let completed_moves = result
+            .as_ref()
+            .ok()
+            .map(|summary| summary.completed_moves.clone())
+            .unwrap_or_default();
         let Some(task) = self
             .transfer_tasks
             .iter_mut()
@@ -334,7 +339,10 @@ impl Workspace {
 
         // 传输结束后才通知视图刷新：取消 / 失败也可能已经拷进了一部分文件，
         // 因此所有终态都刷新（刷新本身走防抖 + loader 去重，代价很低）。
-        cx.emit(WorkspaceEvent::TransferFinished { dirs });
+        cx.emit(WorkspaceEvent::TransferFinished {
+            dirs,
+            moves: completed_moves,
+        });
 
         // 已完成/失败/取消的任务保留在列表中，仅通过用户点击"清除"或"×"手动移除。
         let _ = transfer_id;

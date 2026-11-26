@@ -10,7 +10,7 @@ use crate::file_manager::utils::{
     prevent_local_recursive_copy, remove_local_source, resolve_local_conflict,
     temporary_local_path, validate_rename_to,
 };
-use crate::file_manager::{ConflictPolicy, ConflictResolver};
+use crate::file_manager::{ConflictPolicy, ConflictResolver, FileEndpoint};
 
 pub fn copy_local_to_local(
     source_path: &Path,
@@ -116,11 +116,22 @@ pub fn move_local_to_local(
     }
 
     match fs::rename(source_path, &destination_path) {
-        Ok(()) => Ok(TransferSummary::from_metadata(&metadata)),
+        Ok(()) => {
+            let mut summary = TransferSummary::from_metadata(&metadata);
+            summary.record_move(
+                FileEndpoint::Local {
+                    path: source_path.to_path_buf(),
+                },
+                FileEndpoint::Local {
+                    path: destination_path,
+                },
+            );
+            Ok(summary)
+        }
         Err(_) => {
             // rename 失败（通常跨设备）⇒ 退化为复制 + 删源。
             // 只有在没有任何条目被跳过时才删源，避免把未复制成功的内容连源一起删掉。
-            let summary = copy_local_to_local(
+            let mut summary = copy_local_to_local(
                 source_path,
                 destination_dir,
                 conflict_policy,
@@ -130,6 +141,14 @@ pub fn move_local_to_local(
             )?;
             if summary.skipped == 0 {
                 remove_local_source(source_path)?;
+                summary.record_move(
+                    FileEndpoint::Local {
+                        path: source_path.to_path_buf(),
+                    },
+                    FileEndpoint::Local {
+                        path: destination_path,
+                    },
+                );
             } else {
                 log::warn!(
                     "本地移动：有 {} 个条目被跳过，保留源 {} 不删除",
@@ -417,6 +436,34 @@ mod tests {
             "保留两者：应生成 _副本"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn move_reports_actual_auto_renamed_destination() {
+        let root = unique_temp_dir("move-report-target");
+        let source = root.join("source.txt");
+        let destination = root.join("dst");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(&source, b"new").unwrap();
+        fs::write(destination.join("source.txt"), b"old").unwrap();
+        let summary = move_local_to_local(
+            &source,
+            &destination,
+            ConflictPolicy::AutoRename,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(summary.completed_moves.len(), 1);
+        let (from, to) = &summary.completed_moves[0];
+        assert_eq!(from.path_buf(), source);
+        let target = to.path_buf();
+        assert_ne!(target, destination.join("source.txt"));
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(fs::read(destination.join("source.txt")).unwrap(), b"old");
+        assert!(!source.exists());
         let _ = fs::remove_dir_all(&root);
     }
 }

@@ -151,7 +151,25 @@ impl SidebarMenuSection {
 #[derive(Clone)]
 pub enum SidebarEvent {
     TabGroupsChanged,
+    /// 文件树根目录工具栏：展开并定位活动编辑器文件。
+    LocateActiveFile,
+    /// 文件树 Esc：焦点回到当前活动终端。
+    FocusActiveTerminal,
+    CompareFiles {
+        left: PathBuf,
+        right: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
+    OpenInTerminal {
+        path: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+        run_script: bool,
+    },
     OpenFile {
+        path: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
+    PreviewFile {
         path: PathBuf,
         ssh_config: Option<Box<SshConnectionConfig>>,
     },
@@ -196,7 +214,24 @@ impl std::fmt::Debug for SidebarEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TabGroupsChanged => write!(f, "TabGroupsChanged"),
+            Self::LocateActiveFile => write!(f, "LocateActiveFile"),
+            Self::FocusActiveTerminal => write!(f, "FocusActiveTerminal"),
+            Self::CompareFiles { left, right, .. } => f
+                .debug_struct("CompareFiles")
+                .field("left", left)
+                .field("right", right)
+                .finish(),
+            Self::OpenInTerminal {
+                path, run_script, ..
+            } => f
+                .debug_struct("OpenInTerminal")
+                .field("path", path)
+                .field("run_script", run_script)
+                .finish(),
             Self::OpenFile { path, .. } => f.debug_struct("OpenFile").field("path", path).finish(),
+            Self::PreviewFile { path, .. } => {
+                f.debug_struct("PreviewFile").field("path", path).finish()
+            }
             Self::StartTransfer { .. } => write!(f, "StartTransfer"),
             Self::PathRenamed { from, to, .. } => f
                 .debug_struct("PathRenamed")

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -7,6 +7,9 @@ use crate::file_manager::file_tree_cache::RemoteFileTreeCache;
 use crate::file_manager::types::FileEntry;
 use crate::file_manager::watcher::{FsChangeEvent, FsChangeKind};
 use crate::ssh::SshConnectionConfig;
+
+/// 单棵 View 的目录工作集上限；更老目录仍可从共享缓存或磁盘重新加载。
+const MAX_WORKING_SET_DIRS: usize = 512;
 
 /// 文件树数据加载器 —— 纯数据层，不依赖 GPUI 渲染。
 ///
@@ -18,6 +21,7 @@ use crate::ssh::SshConnectionConfig;
 pub struct FileTreeLoader {
     /// path -> entries，本地工作集缓存
     directory_cache: HashMap<PathBuf, Vec<FileEntry>>,
+    cache_order: VecDeque<PathBuf>,
     /// 正在加载的路径
     loading_paths: HashSet<PathBuf>,
     /// 等待刷新的路径（加载期间收到的刷新请求）
@@ -54,6 +58,7 @@ impl FileTreeLoader {
         }
         Self {
             directory_cache: HashMap::new(),
+            cache_order: VecDeque::new(),
             loading_paths: HashSet::new(),
             pending_refresh: HashSet::new(),
             backend,
@@ -79,6 +84,17 @@ impl FileTreeLoader {
 
     // ── 本地缓存查询 ──
 
+    fn insert_cached(&mut self, path: PathBuf, entries: Vec<FileEntry>) {
+        self.cache_order.retain(|cached| cached != &path);
+        self.cache_order.push_back(path.clone());
+        self.directory_cache.insert(path, entries);
+        while self.cache_order.len() > MAX_WORKING_SET_DIRS {
+            if let Some(oldest) = self.cache_order.pop_front() {
+                self.directory_cache.remove(&oldest);
+            }
+        }
+    }
+
     /// 查询本地缓存
     pub fn get_cached(&self, path: &Path) -> Option<&Vec<FileEntry>> {
         self.directory_cache.get(path)
@@ -87,6 +103,13 @@ impl FileTreeLoader {
     /// 本地缓存是否包含某路径
     pub fn has_cached(&self, path: &Path) -> bool {
         self.directory_cache.contains_key(path)
+    }
+
+    /// 当前工作集中已加载目录的快照，供手动刷新使用。
+    pub fn cached_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self.directory_cache.keys().cloned().collect();
+        paths.sort();
+        paths
     }
 
     /// 是否正在加载
@@ -108,7 +131,7 @@ impl FileTreeLoader {
     /// 完成加载：写入本地缓存，清除 loading 状态。
     pub fn finish_load(&mut self, path: &Path, entries: Vec<FileEntry>) {
         if self.loading_paths.remove(path) {
-            self.directory_cache.insert(path.to_path_buf(), entries);
+            self.insert_cached(path.to_path_buf(), entries);
         }
     }
 
@@ -140,7 +163,7 @@ impl FileTreeLoader {
     /// 完成刷新：有变化返回 true，调用方应通知 UI 更新。
     pub fn finish_refresh(&mut self, path: &Path, entries: Vec<FileEntry>) -> bool {
         if self.loading_paths.remove(path) && self.directory_cache.get(path) != Some(&entries) {
-            self.directory_cache.insert(path.to_path_buf(), entries);
+            self.insert_cached(path.to_path_buf(), entries);
             true
         } else {
             false
@@ -162,7 +185,7 @@ impl FileTreeLoader {
     /// 返回 true 表示确实发生了变更。
     pub fn update_cached(&mut self, path: &Path, entries: Vec<FileEntry>) -> bool {
         if self.directory_cache.get(path) != Some(&entries) {
-            self.directory_cache.insert(path.to_path_buf(), entries);
+            self.insert_cached(path.to_path_buf(), entries);
             true
         } else {
             false
@@ -174,11 +197,13 @@ impl FileTreeLoader {
     /// 清除以 path 为前缀的所有本地缓存
     pub fn remove_cached_recursive(&mut self, path: &Path) {
         self.directory_cache.retain(|p, _| !p.starts_with(path));
+        self.cache_order.retain(|cached| !cached.starts_with(path));
     }
 
     /// 保留根路径，清除其所有子目录缓存
     pub fn keep_root_clear_descendants(&mut self, root: &Path) {
         self.directory_cache.retain(|p, _| p == root);
+        self.cache_order.retain(|cached| cached == root);
     }
 
     /// 清空所有 pending refresh
@@ -220,8 +245,7 @@ impl FileTreeLoader {
         if let Some(ref entries) = event.entries {
             if self.directory_cache.get(&event.path) != Some(entries) {
                 self.loading_paths.remove(&event.path);
-                self.directory_cache
-                    .insert(event.path.clone(), entries.clone());
+                self.insert_cached(event.path.clone(), entries.clone());
             }
             return None; // 已直接更新，无需额外刷新
         }
@@ -277,7 +301,10 @@ impl FileTreeLoader {
     /// 从共享缓存获取目录条目
     pub fn get_shared_cache(&self, path: &Path) -> Option<Vec<FileEntry>> {
         let config = self.ssh_config.as_ref()?;
-        RemoteFileTreeCache::global().lock().get(config, path)
+        RemoteFileTreeCache::global()
+            .lock()
+            .get_shared(config, path)
+            .map(|entries| entries.to_vec())
     }
 
     /// 写入共享缓存
@@ -372,6 +399,7 @@ mod tests {
                 path: PathBuf::from(format!("/root/{n}")),
                 kind: FileEntryKind::File,
                 size: 0,
+                symlink_target_is_dir: false,
             })
             .collect()
     }
@@ -577,5 +605,23 @@ mod tests {
         assert_eq!(ancestor, Some(PathBuf::from("/root")));
         assert!(!loader.has_cached(Path::new("/root/sub")));
         assert!(loader.has_cached(Path::new("/root")));
+    }
+
+    #[test]
+    fn working_set_evicts_oldest_directories() {
+        let backend = Arc::new(MockFs {
+            entries: StdMutex::new(Ok(entries(&["a"]))),
+            config: test_config("working-set-lru"),
+        });
+        let mut loader = FileTreeLoader::new(backend);
+        for index in 0..=MAX_WORKING_SET_DIRS {
+            let path = PathBuf::from(format!("/root/{index}"));
+            assert!(loader.begin_load(&path));
+            loader.finish_load(&path, Vec::new());
+        }
+        assert_eq!(loader.directory_cache.len(), MAX_WORKING_SET_DIRS);
+        assert_eq!(loader.cache_order.len(), MAX_WORKING_SET_DIRS);
+        assert!(!loader.has_cached(Path::new("/root/0")));
+        assert!(loader.has_cached(Path::new(&format!("/root/{MAX_WORKING_SET_DIRS}"))));
     }
 }

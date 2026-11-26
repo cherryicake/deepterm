@@ -11,7 +11,28 @@ pub enum FileTreeEvent {
         path: PathBuf,
         ssh_config: Option<Box<SshConnectionConfig>>,
     },
+    PreviewFile {
+        path: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
     RootChanged,
+    /// 根目录工具栏「定位当前文件」，由 AppWindow 从活动编辑器取得路径后调用 reveal。
+    LocateActiveFile,
+    /// Esc 离开文件树，焦点回到活动终端。
+    FocusActiveTerminal,
+    CompareFiles {
+        left: PathBuf,
+        right: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+    },
+    OpenInTerminal {
+        path: PathBuf,
+        ssh_config: Option<Box<SshConnectionConfig>>,
+        run_script: bool,
+    },
+    FindInFolder {
+        path: PathBuf,
+    },
     /// 发起一次文件传输（下载到本地 / 拖拽上传等），由 workspace 的
     /// 传输协调器执行（进度、冲突、取消均复用统一链路）。
     /// `TransferRequest` 较大（含多源 endpoint），装箱保持事件枚举小体积。

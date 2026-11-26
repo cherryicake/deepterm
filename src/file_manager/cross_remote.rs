@@ -735,6 +735,7 @@ fn copy_via_agent_forward_scp(
                 files_transferred: remote_total_files(source_session, remote_path),
                 bytes_transferred: total,
                 skipped: 0,
+                completed_moves: Vec::new(),
             })
         } else {
             Ok(TransferSummary::one_file(total))
@@ -1056,6 +1057,7 @@ fn copy_via_remote_scp(
                         files_transferred: remote_total_files(source_session, remote_path),
                         bytes_transferred: total,
                         skipped: 0,
+                        completed_moves: Vec::new(),
                     })
                 } else {
                     Ok(TransferSummary::one_file(total))

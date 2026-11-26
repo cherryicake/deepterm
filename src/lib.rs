@@ -511,6 +511,92 @@ impl AppWindow {
                         });
                     });
                 }
+                SidebarEvent::FocusActiveTerminal => {
+                    _this.workspace.update(cx, |workspace, cx| {
+                        workspace.focus_active_tab_panel(window, cx);
+                    });
+                }
+                SidebarEvent::LocateActiveFile => {
+                    let location = _this.editor.read(cx).active_location();
+                    let sidebar = _this.sidebar.clone();
+                    window.defer(cx, move |_window, cx| {
+                        let Some((path, config)) = location else {
+                            return;
+                        };
+                        let Some(tree) = sidebar.read(cx).file_tree_view() else {
+                            return;
+                        };
+                        let matches_backend = tree.read(cx).matches_backend(config.as_ref());
+                        if matches_backend {
+                            tree.update(cx, |tree, cx| {
+                                tree.reveal(path, cx);
+                            });
+                        }
+                    });
+                }
+                SidebarEvent::OpenInTerminal {
+                    path,
+                    ssh_config,
+                    run_script,
+                } => {
+                    let workspace = _this.workspace.clone();
+                    let path = path.clone();
+                    let config = ssh_config.as_deref().cloned();
+                    let run_script = *run_script;
+                    window.defer(cx, move |window, cx| {
+                        workspace.update(cx, |workspace, cx| {
+                            if let Some(config) = config {
+                                workspace.create_ssh_terminal_with_config_and_cwd(
+                                    &config,
+                                    Some(path.to_string_lossy().into_owned()),
+                                    window,
+                                    cx,
+                                );
+                            } else if run_script {
+                                workspace.run_local_script_in_terminal(path, window, cx);
+                            } else {
+                                workspace.create_local_terminal_in_directory(path, window, cx);
+                            }
+                        });
+                    });
+                }
+                SidebarEvent::CompareFiles {
+                    left,
+                    right,
+                    ssh_config,
+                } => {
+                    let editor = editor_for_open.clone();
+                    let (left, right) = (left.clone(), right.clone());
+                    let config = ssh_config.as_deref().cloned();
+                    window.defer(cx, move |window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |editor, cx| {
+                                editor.open_file_comparison(left, right, config, window, cx);
+                            });
+                        }
+                    });
+                }
+                SidebarEvent::PreviewFile { path, ssh_config } => {
+                    let editor = editor_for_open.clone();
+                    let path = path.clone();
+                    let config = ssh_config.clone();
+                    window.defer(cx, move |window, cx| {
+                        if let Some(editor) = editor.upgrade() {
+                            editor.update(cx, |e, cx| {
+                                if let Some(config) = config {
+                                    e.preview_remote_file(
+                                        path.to_string_lossy().to_string(),
+                                        *config,
+                                        window,
+                                        cx,
+                                    );
+                                } else {
+                                    e.preview_local_file(path, window, cx);
+                                }
+                            });
+                        }
+                    });
+                }
                 SidebarEvent::OpenFile { path, ssh_config } => {
                     let editor = editor_for_open.clone();
                     let path = path.clone();
@@ -567,7 +653,7 @@ impl AppWindow {
                     });
                 }
                 SidebarEvent::PathRemoved { path, ssh_config } => {
-                    // 文件树里删掉了：关掉对应标签（不弹未保存确认，文件已不存在）。
+                    // 文件树里删掉了：关闭干净标签；未保存标签保留最后一份内存内容。
                     let editor = editor_for_open.clone();
                     let path = path.clone();
                     let config = ssh_config.as_deref().cloned();
@@ -750,15 +836,26 @@ impl AppWindow {
                         cx,
                     );
                 }
-                WorkspaceEvent::TransferFinished { dirs } => {
+                WorkspaceEvent::TransferFinished { dirs, moves } => {
                     // 传输真正结束后再刷新文件树（远端没有 watcher，只能靠这条链路）。
+                    // Move 必须按传输层返回的真实目标同步树和已打开标签，尤其是冲突自动改名。
                     let sidebar = this.sidebar.clone();
                     let dirs = dirs.clone();
+                    let moves = moves.clone();
                     window.defer(cx, move |_window, cx| {
                         let Some(tree) = sidebar.read(cx).file_tree_view() else {
                             return;
                         };
-                        tree.update(cx, |tree, cx| tree.refresh_affected_dirs(&dirs, cx));
+                        tree.update(cx, |tree, cx| {
+                            for (from, to) in &moves {
+                                if from.matches_fs(tree.is_local(), tree.ssh_config())
+                                    && to.matches_fs(tree.is_local(), tree.ssh_config())
+                                {
+                                    tree.apply_path_renamed(&from.path_buf(), &to.path_buf(), cx);
+                                }
+                            }
+                            tree.refresh_affected_dirs(&dirs, cx);
+                        });
                     });
                 }
             },

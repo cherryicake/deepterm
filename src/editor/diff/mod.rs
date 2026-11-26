@@ -19,4 +19,4 @@ pub use model::{
 };
 pub use state::{DiffMode, DiffState, EXPAND_STEP, Expand, LineRange, LineRef, Row};
 pub use theme::{DiffTheme, Tints};
-pub use view::DiffView;
+pub use view::{DiffView, FileComparison};

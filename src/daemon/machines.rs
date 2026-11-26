@@ -2195,7 +2195,10 @@ mod tests {
             crate::daemon::session::is_rebuilt_machine_error(&described),
             "{described}"
         );
-        assert!(described.contains("01f734da"), "新身份要能直接读到: {described}");
+        assert!(
+            described.contains("01f734da"),
+            "新身份要能直接读到: {described}"
+        );
         // 其它失败绝不能被误判成重建，否则会平白删掉用户的机器条目。
         for other in [
             LinkKind::Incompatible,

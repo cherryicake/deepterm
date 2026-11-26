@@ -22,7 +22,16 @@ struct PersistedCache {
 #[derive(Serialize, Deserialize)]
 struct PersistedServer {
     nodes: HashMap<String, Vec<FileEntry>>,
-    expanded: HashSet<String>,
+    /// 根目录 -> 该工作区的展开集合。
+    #[serde(default)]
+    expanded_by_root: HashMap<String, HashSet<String>>,
+    /// 旧格式的全局展开集合；首次按工作区根读取时过滤迁移。
+    #[serde(
+        default,
+        rename = "expanded",
+        skip_serializing_if = "HashSet::is_empty"
+    )]
+    legacy_expanded: HashSet<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,8 +115,10 @@ struct ServerFileCache {
 struct ServerTree {
     /// path -> DirNode，扁平映射，隐式形成树结构
     nodes: HashMap<PathBuf, DirNode>,
-    /// 保持展开状态的文件夹路径
-    expanded: HashSet<PathBuf>,
+    /// 按工作区根隔离的展开状态。
+    expanded_by_root: HashMap<PathBuf, HashSet<PathBuf>>,
+    /// 旧格式尚未按根认领的展开路径；不再写回磁盘。
+    legacy_expanded: HashSet<PathBuf>,
     /// 正在使用这棵树的终端数量（引用计数）
     ref_count: usize,
     /// 引用归零的时间；`None` 表示仍有活跃引用。
@@ -171,8 +182,16 @@ impl RemoteFileTreeCache {
                     },
                 );
             }
-            for p_str in persisted_server.expanded {
-                tree.expanded.insert(PathBuf::from(p_str));
+            tree.legacy_expanded = persisted_server
+                .legacy_expanded
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+            for (root, expanded) in persisted_server.expanded_by_root {
+                tree.expanded_by_root.insert(
+                    PathBuf::from(root),
+                    expanded.into_iter().map(PathBuf::from).collect(),
+                );
             }
             tree.orphaned_since = Some(Instant::now());
             self.servers.insert(key, tree);
@@ -215,12 +234,27 @@ impl RemoteFileTreeCache {
                     .take(MAX_PERSISTED_DIRS_PER_HOST)
                     .map(|(path, node)| (path.to_string_lossy().to_string(), node.entries.to_vec()))
                     .collect();
-                let expanded = tree
-                    .expanded
+                let expanded_by_root = tree
+                    .expanded_by_root
                     .iter()
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|(root, expanded)| {
+                        (
+                            root.to_string_lossy().into_owned(),
+                            expanded
+                                .iter()
+                                .map(|path| path.to_string_lossy().into_owned())
+                                .collect(),
+                        )
+                    })
                     .collect();
-                (key.clone(), PersistedServer { nodes, expanded })
+                (
+                    key.clone(),
+                    PersistedServer {
+                        nodes,
+                        expanded_by_root,
+                        legacy_expanded: HashSet::new(),
+                    },
+                )
             })
             .collect();
         let file_caches = self
@@ -324,12 +358,6 @@ impl RemoteFileTreeCache {
         // 与 watcher 的 watch 状态 key 同源，两处必须永远一致：
         // 共享缓存与轮询器都以服务器为隔离单元，格式漂移会导致错位。
         crate::file_manager::watcher::remote_server_key(config)
-    }
-
-    /// 查询目录缓存，返回该目录的子项列表
-    /// 兼容旧接口（返回 `Vec` 拷贝）；高频路径请用 [`Self::get_shared`] 零拷贝版本。
-    pub fn get(&self, config: &SshConnectionConfig, path: &Path) -> Option<Vec<FileEntry>> {
-        self.get_shared(config, path).map(|arc| arc.to_vec())
     }
 
     /// 查询目录缓存的零拷贝版本，返回 `Arc<[FileEntry]>`。
@@ -438,22 +466,38 @@ impl RemoteFileTreeCache {
         }
     }
 
-    /// 保存展开状态到共享缓存
-    pub fn save_expanded(&mut self, config: &SshConnectionConfig, expanded: HashSet<PathBuf>) {
+    /// 保存某个工作区根的展开状态。
+    pub fn save_expanded(
+        &mut self,
+        config: &SshConnectionConfig,
+        root: &Path,
+        expanded: HashSet<PathBuf>,
+    ) {
         let key = Self::server_key(config);
         if let Some(tree) = self.servers.get_mut(&key) {
-            tree.expanded = expanded;
+            tree.expanded_by_root.insert(root.to_path_buf(), expanded);
         }
         self.schedule_save();
     }
 
-    /// 从共享缓存加载展开状态
-    pub fn load_expanded(&self, config: &SshConnectionConfig) -> HashSet<PathBuf> {
+    /// 恢复某个工作区根的展开状态；旧格式在首次读取时按根过滤迁移。
+    pub fn load_expanded(&mut self, config: &SshConnectionConfig, root: &Path) -> HashSet<PathBuf> {
         let key = Self::server_key(config);
-        self.servers
-            .get(&key)
-            .map(|tree| tree.expanded.clone())
-            .unwrap_or_default()
+        let Some(tree) = self.servers.get_mut(&key) else {
+            return HashSet::new();
+        };
+        if !tree.expanded_by_root.contains_key(root) {
+            let inherited: HashSet<PathBuf> = tree
+                .legacy_expanded
+                .iter()
+                .filter(|path| path.starts_with(root))
+                .cloned()
+                .collect();
+            if !inherited.is_empty() {
+                tree.expanded_by_root.insert(root.to_path_buf(), inherited);
+            }
+        }
+        tree.expanded_by_root.get(root).cloned().unwrap_or_default()
     }
 
     /// 缓存远程文件内容（默认持久化；hover / 目录预取请传 `persist: false`）
@@ -594,7 +638,8 @@ impl ServerTree {
     fn new() -> Self {
         Self {
             nodes: HashMap::new(),
-            expanded: HashSet::new(),
+            expanded_by_root: HashMap::new(),
+            legacy_expanded: HashSet::new(),
             ref_count: 0,
             orphaned_since: None,
         }
@@ -708,7 +753,7 @@ mod tests {
         cache.release(&config);
 
         // 归零后仍在保温期内，数据可读
-        assert!(cache.get(&config, Path::new("/root")).is_some());
+        assert!(cache.get_shared(&config, Path::new("/root")).is_some());
 
         // 再次 acquire 不会重复计数（复用而非重建导致 ref_count 异常）
         cache.acquire(&config);
@@ -732,11 +777,74 @@ mod tests {
         cache.acquire(&config);
         let mut expanded = HashSet::new();
         expanded.insert(PathBuf::from("/root/sub"));
-        cache.save_expanded(&config, expanded);
+        cache.save_expanded(&config, Path::new("/root"), expanded);
         cache.release(&config);
 
-        let restored = cache.load_expanded(&config);
+        let restored = cache.load_expanded(&config, Path::new("/root"));
         assert!(restored.contains(Path::new("/root/sub")));
+    }
+
+    #[test]
+    fn expanded_state_is_isolated_by_workspace_root() {
+        let config = test_config("expanded-by-root");
+        let mut cache = RemoteFileTreeCache::global().lock();
+        cache.acquire(&config);
+        cache.save_expanded(
+            &config,
+            Path::new("/work/a"),
+            [PathBuf::from("/work/a/src")].into_iter().collect(),
+        );
+        cache.save_expanded(
+            &config,
+            Path::new("/work/b"),
+            [PathBuf::from("/work/b/docs")].into_iter().collect(),
+        );
+        let a = cache.load_expanded(&config, Path::new("/work/a"));
+        let b = cache.load_expanded(&config, Path::new("/work/b"));
+        assert_eq!(a, [PathBuf::from("/work/a/src")].into_iter().collect());
+        assert_eq!(b, [PathBuf::from("/work/b/docs")].into_iter().collect());
+    }
+
+    #[test]
+    fn legacy_expanded_state_is_filtered_and_migrated_by_root() {
+        let persisted: PersistedServer = serde_json::from_value(serde_json::json!({
+            "nodes": {},
+            "expanded": ["/work/a/src", "/work/b/docs", "/outside/ignored"]
+        }))
+        .expect("反序列化旧 expanded 格式");
+        assert!(persisted.expanded_by_root.is_empty());
+
+        let mut tree = ServerTree::new();
+        tree.legacy_expanded = persisted
+            .legacy_expanded
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let config = test_config("legacy-expanded");
+        let mut cache = RemoteFileTreeCache::new();
+        cache
+            .servers
+            .insert(RemoteFileTreeCache::server_key(&config), tree);
+
+        let a = cache.load_expanded(&config, Path::new("/work/a"));
+        let b = cache.load_expanded(&config, Path::new("/work/b"));
+        assert_eq!(a, [PathBuf::from("/work/a/src")].into_iter().collect());
+        assert_eq!(b, [PathBuf::from("/work/b/docs")].into_iter().collect());
+
+        let persisted = cache.to_persisted();
+        let server = persisted
+            .servers
+            .get(&RemoteFileTreeCache::server_key(&config))
+            .expect("迁移后的服务器缓存");
+        assert!(server.legacy_expanded.is_empty());
+        assert_eq!(
+            server.expanded_by_root.get("/work/a"),
+            Some(&["/work/a/src".to_string()].into_iter().collect())
+        );
+        assert_eq!(
+            server.expanded_by_root.get("/work/b"),
+            Some(&["/work/b/docs".to_string()].into_iter().collect())
+        );
     }
 
     /// 超过孤儿数量上限时按最旧优先逐出
@@ -756,9 +864,9 @@ mod tests {
         }
 
         // 逐出最旧的（sweep-0），其余保留
-        assert!(cache.get(&configs[0], Path::new("/root")).is_none());
+        assert!(cache.get_shared(&configs[0], Path::new("/root")).is_none());
         for config in &configs[1..] {
-            assert!(cache.get(config, Path::new("/root")).is_some());
+            assert!(cache.get_shared(config, Path::new("/root")).is_some());
         }
     }
 

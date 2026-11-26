@@ -476,6 +476,7 @@ pub(crate) fn load_remote_text(
     // 避免对 1GB 远端文件全量 `read_to_end` 进内存导致 OOM/卡死。
     // `metadata` 走 SFTP 会话缓存，仅一次往返；与本地 `load_local_text` 的
     // `metadata` 粗筛对称。>512KB 的大文件后续走流水线读取（见 sftp_fs）。
+    log::info!("remote-open: metadata start {path}");
     if let Ok(meta) = crate::ssh::sftp_fs::metadata(config, path)
         && meta.size > MAX_EDITOR_FILE_BYTES as u64
     {
@@ -484,9 +485,11 @@ pub(crate) fn load_remote_text(
             meta.size / (1024 * 1024)
         ));
     }
+    log::info!("remote-open: read start {path}");
     let bytes = crate::ssh::sftp_fs::read_file_bytes(config, path)
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "文件不存在或为空".to_string())?;
+    log::info!("remote-open: read finished {path} len={}", bytes.len());
     if bytes.len() > MAX_EDITOR_FILE_BYTES {
         return Err(format!(
             "文件过大（{} MB），超过 {MAX_EDITOR_FILE_MB} MB 限制",
@@ -502,6 +505,54 @@ pub(crate) fn load_remote_text(
         encoding: decoded.encoding,
         read_only: false,
     })
+}
+
+/// 比较读取必须有硬上限：metadata 只负责提前拒绝，take 负责防止文件随后增长。
+fn load_comparison_text(
+    path: &Path,
+    ssh_config: Option<&SshConnectionConfig>,
+) -> Result<String, String> {
+    const MAX_COMPARE_BYTES: usize = MAX_EDITOR_FILE_BYTES;
+    const READ_LIMIT: u64 = MAX_COMPARE_BYTES as u64 + 1;
+    let too_large = || format!("文件超过 20 MiB: {}", path.display());
+
+    if let Some(config) = ssh_config {
+        if let Ok(meta) = crate::ssh::sftp_fs::metadata(config, &path.to_string_lossy())
+            && meta.size > MAX_COMPARE_BYTES as u64
+        {
+            return Err(too_large());
+        }
+    } else if let Ok(meta) = std::fs::metadata(path)
+        && meta.len() > MAX_COMPARE_BYTES as u64
+    {
+        return Err(too_large());
+    }
+
+    let bytes = if let Some(config) = ssh_config {
+        crate::ssh::sftp_fs::read_preview_bytes(
+            config,
+            &path.to_string_lossy(),
+            MAX_COMPARE_BYTES + 1,
+        )
+        .map_err(|error| error.to_string())?
+        // 远程 open 不存在会返回 Err；None 在这里表示已成功读取空文件。
+        .unwrap_or_default()
+    } else {
+        use std::io::Read as _;
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        let mut bytes = Vec::new();
+        file.take(READ_LIMIT)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        bytes
+    };
+    if bytes.len() > MAX_COMPARE_BYTES {
+        return Err(too_large());
+    }
+    if crate::ssh::sftp_fs::is_binary_bytes(&bytes) {
+        return Err(format!("二进制文件不支持比较: {}", path.display()));
+    }
+    Ok(encoding::decode_bytes(&bytes).text)
 }
 
 /// 文件树标识符，用于区分不同的文件树（终端会话）
@@ -584,6 +635,8 @@ pub struct Editor {
     tab_bar: Entity<TabBar>,
     open_files: Vec<EditorFile>,
     active_file_id: Option<SharedString>,
+    /// 文件树单击打开的临时预览标签；普通打开/编辑会将其固定。
+    preview_file_id: Option<SharedString>,
     width: f32,
     resize_drag_x: Option<Pixels>,
     /// 上帧窗口宽：`render` 用它算窗口增量并按比例跟随（`width` 保持
@@ -872,6 +925,7 @@ impl Editor {
             tab_bar,
             open_files: Vec::new(),
             active_file_id: None,
+            preview_file_id: None,
             width: EDITOR_DEFAULT_WIDTH,
             resize_drag_x: None,
             last_window_width: 0.0,
@@ -1054,6 +1108,13 @@ impl Editor {
         self.active_file_id.as_ref()
     }
 
+    /// 活动标签对应的磁盘位置，供文件树「定位当前文件」使用。
+    pub fn active_location(&self) -> Option<(PathBuf, Option<SshConnectionConfig>)> {
+        let id = self.active_file_id.as_ref()?;
+        let file = self.open_files.iter().find(|file| file.id == *id)?;
+        Some((PathBuf::from(&file.path), file.ssh_config.clone()))
+    }
+
     /// 获取打开文件的基本信息列表，用于标签页组切换
     ///
     /// `dirty` 必须**当场从实体读**（diff tab 的编辑状态不在 `EditorFile.dirty`
@@ -1079,7 +1140,10 @@ impl Editor {
                     Some(diff) => diff.read(cx).is_dirty(),
                     None => f.dirty,
                 },
-                diff_repo: f.diff_repo().cloned(),
+                diff_repo: match f.diff() {
+                    Some(diff) if diff.read(cx).is_comparison() => None,
+                    _ => f.diff_repo().cloned(),
+                },
             })
             .collect()
     }
@@ -1249,8 +1313,7 @@ impl Editor {
                 );
                 continue;
             }
-            // 兼容旧缓存：id 是 `diff-` 前缀但没有仓库快照时跳过建空白 tab，
-            // 避免切组回来留下一个空白的只读编辑器。
+            // 没有缓存视图、又缺仓库快照时无法恢复 Diff；跳过空白只读页。
             if file_info.id.as_ref().starts_with("diff-") {
                 log::warn!(
                     "skip restoring diff tab without repo snapshot: {}",
@@ -1392,11 +1455,8 @@ impl Editor {
             .extension()
             .and_then(|e| e.to_str())
             == Some("md");
-        // 旧会话里可能存着**没有** `#live` 后缀的 md tab（只读预览时代的 id）。
-        // 预览已删除，这类 tab 必须按 live 恢复，否则会退化成代码编辑器。
         let is_live = is_md;
-        // 恢复用的 id 必须与「全新打开」算出来的一致（`open_local_file_inner`
-        // 对 .md 会拼 `#live`），否则同一个文件会同时存在旧 id 和新 id 两个 tab。
+        // 恢复 ID 必须与全新打开一致，否则同一 Markdown 会出现两个标签。
         let restored_id = if is_live && !file_info.id.as_ref().ends_with(Self::MARKDOWN_LIVE_SUFFIX)
         {
             format!("{}{}", file_info.id, Self::MARKDOWN_LIVE_SUFFIX)
@@ -1476,6 +1536,9 @@ impl Editor {
                         this.open_files[idx].last_checked_text_version = text_version;
                         if this.open_files[idx].dirty != dirty {
                             this.open_files[idx].dirty = dirty;
+                            if dirty && this.preview_file_id.as_ref() == Some(&observe_tab_id) {
+                                this.preview_file_id = None;
+                            }
                             this.sync_tab_modified(&observe_tab_id, dirty, cx);
                         }
                     }
@@ -1491,7 +1554,7 @@ impl Editor {
             ssh_config: ssh_config.clone(),
             editor_state: editor_state.clone(),
             // 恢复磁盘基线，保留文件树切换前的未保存状态；
-            // 旧状态可能没有该字段（兼容 None = 以缓存内容为准）。
+            // 加载中状态没有磁盘基线时，以当前缓存内容为准。
             original_content,
             encoding: file_info.encoding,
             read_only: file_info.read_only,
@@ -2027,6 +2090,7 @@ impl Editor {
         self.unwatch_all_files(cx);
         self.open_files.clear();
         self.active_file_id = None;
+        self.preview_file_id = None;
         self.loading_gens.clear();
         self.editor_state_subscriptions.clear();
         // 挂起表里存的是 tab id，标签都没了就没有意义。清掉后，重新打开的
@@ -5320,8 +5384,60 @@ impl Editor {
         }
     }
 
+    fn pin_active_preview(&mut self) {
+        if self.preview_file_id == self.active_file_id {
+            self.preview_file_id = None;
+        }
+    }
+
+    fn finish_preview_open(
+        &mut self,
+        previous: Option<SharedString>,
+        target_id: String,
+        current_was_pinned: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // 加载去重或打开失败时 active 可能仍是旧标签；不能误改它的 preview 状态。
+        if self.active_file_id.as_deref() != Some(target_id.as_str()) {
+            return;
+        }
+        let current: SharedString = target_id.into();
+        if previous.as_ref() != Some(&current)
+            && let Some(previous) = previous
+            && let Some(index) = self.open_files.iter().position(|file| file.id == previous)
+        {
+            self.flush_all_live_shadows(cx);
+            if !self.file_is_dirty(&self.open_files[index], cx) {
+                self.close_file_direct(previous.as_ref(), cx);
+            }
+        }
+        self.preview_file_id = if current_was_pinned {
+            None
+        } else {
+            Some(current)
+        };
+    }
+
     pub fn open_file(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.open_local_file(path, window, cx);
+        self.pin_active_preview();
+    }
+
+    pub fn preview_local_file(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target_id = Self::local_tab_id(&path);
+        let current_was_pinned = self
+            .open_files
+            .iter()
+            .any(|file| file.id.as_ref() == target_id)
+            && self.preview_file_id.as_deref() != Some(target_id.as_str());
+        let previous = self.preview_file_id.clone();
+        self.open_local_file(path, window, cx);
+        self.finish_preview_open(previous, target_id, current_was_pinned, cx);
     }
 
     /// Terminal `Cmd+Click`: open local file and jump to `line:col`.
@@ -5503,6 +5619,90 @@ impl Editor {
         }
     }
 
+    /// 比较文件树中任意两个文件（本地或同一 SSH 后端）。
+    pub fn open_file_comparison(
+        &mut self,
+        left: PathBuf,
+        right: PathBuf,
+        ssh_config: Option<SshConnectionConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let left_for_read = left.clone();
+        let right_for_read = right.clone();
+        let config_for_read = ssh_config.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    Ok::<_, String>((
+                        load_comparison_text(&left_for_read, config_for_read.as_ref())?,
+                        load_comparison_text(&right_for_read, config_for_read.as_ref())?,
+                    ))
+                })
+                .await;
+            this.update_in(cx, |editor, window, cx| match result {
+                Ok((left_text, right_text)) => {
+                    let repo = crate::editor::git_repository::GitRepository::for_comparison(
+                        &left,
+                        ssh_config.clone(),
+                    );
+                    let tab_id = format!(
+                        "compare-{}:{} ↔ {}",
+                        ssh_config
+                            .as_ref()
+                            .map(|config| config.host_label())
+                            .unwrap_or_else(|| "local".to_string()),
+                        left.display(),
+                        right.display()
+                    );
+                    if editor.open_files.iter().any(|file| file.id == tab_id) {
+                        // 只读比较无需保留旧视图；重建才能使用本次读到的新文本。
+                        editor.close_file_direct(&tab_id, cx);
+                    }
+                    let left_label = left
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| left.display().to_string());
+                    let right_label = right
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| right.display().to_string());
+                    let label = format!("{left_label} ↔ {right_label}");
+                    let path = label.clone();
+                    let editor_state = cx.new(|cx| {
+                        let mut state = InputState::new(window, cx).multi_line(true);
+                        state.disabled = true;
+                        state
+                    });
+                    let editor_weak = cx.entity().downgrade();
+                    let diff_view = cx.new(|cx| {
+                        crate::editor::diff::DiffView::new_comparison(
+                            crate::editor::diff::FileComparison {
+                                left_path: left.to_string_lossy().into_owned(),
+                                right_path: right.to_string_lossy().into_owned(),
+                                left_text,
+                                right_text,
+                            },
+                            repo.clone(),
+                            editor_weak,
+                            window,
+                            cx,
+                        )
+                    });
+                    editor.push_diff_tab(tab_id, path, label, editor_state, diff_view, repo, cx);
+                }
+                Err(error) => editor.show_notification(
+                    format!("无法比较文件: {error}"),
+                    NotificationKind::Error,
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Opens the diff tab instantly; content loads in the background.
     /// 同一文件只有一个 diff tab（VSCode 行为）：已存在则切换并按需切换
     /// 工作区/已暂存内容；`staged` 为 true 打开已暂存 diff（HEAD↔暂存区）。
@@ -5663,6 +5863,15 @@ impl Editor {
         self.open_local_file_inner(path, window, cx, OpenOptions { silent: false });
     }
 
+    fn local_tab_id(path: &Path) -> String {
+        let path_str = path.to_string_lossy();
+        if Self::default_live_mode(path) {
+            format!("editor-{path_str}{}", Self::MARKDOWN_LIVE_SUFFIX)
+        } else {
+            format!("editor-{path_str}")
+        }
+    }
+
     fn open_local_file_at(
         &mut self,
         path: PathBuf,
@@ -5671,13 +5880,7 @@ impl Editor {
         line: Option<u32>,
         col: Option<u32>,
     ) {
-        let path_str = path.to_string_lossy().to_string();
-        let live_mode = Self::default_live_mode(&path);
-        let tab_id = if live_mode {
-            format!("editor-{}{}", path_str, Self::MARKDOWN_LIVE_SUFFIX)
-        } else {
-            format!("editor-{}", path_str)
-        };
+        let tab_id = Self::local_tab_id(&path);
         // Already open (or loading): switch + jump (or defer via pending).
         if self.open_files.iter().any(|f| f.id == tab_id) {
             self.switch_to_file(&tab_id, cx);
@@ -5715,11 +5918,7 @@ impl Editor {
         let live_mode = Self::default_live_mode(&path);
         let silent = options.silent;
         let path_str = path.to_string_lossy().to_string();
-        let tab_id = if live_mode {
-            format!("editor-{}{}", path_str, Self::MARKDOWN_LIVE_SUFFIX)
-        } else {
-            format!("editor-{}", path_str)
-        };
+        let tab_id = Self::local_tab_id(&path);
         let is_image = crate::editor::image_viewer::is_image_file(&path);
         log::debug!("open_local_file: path={:?}, is_image={}", path, is_image);
 
@@ -5815,6 +6014,11 @@ impl Editor {
                     .background_executor()
                     .spawn(async move { load_content() })
                     .await;
+                log::info!(
+                    "remote-open: load future completed tab={} ok={}",
+                    tab_id,
+                    result.is_ok()
+                );
 
                 match result {
                     Ok(loaded) => {
@@ -5976,6 +6180,38 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         self.open_remote_file_inner(path, ssh_config, window, cx, OpenOptions { silent: false });
+        self.pin_active_preview();
+    }
+
+    pub fn preview_remote_file(
+        &mut self,
+        path: String,
+        ssh_config: SshConnectionConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        log::info!("remote-open: preview start {path}");
+        let suffix = if Self::default_live_mode(Path::new(&path)) {
+            Self::MARKDOWN_LIVE_SUFFIX
+        } else {
+            ""
+        };
+        let target_id = Self::remote_tab_id(&path, &ssh_config, suffix);
+        let current_was_pinned = self
+            .open_files
+            .iter()
+            .any(|file| file.id.as_ref() == target_id)
+            && self.preview_file_id.as_deref() != Some(target_id.as_str());
+        let previous = self.preview_file_id.clone();
+        self.open_remote_file_inner(
+            path.clone(),
+            ssh_config,
+            window,
+            cx,
+            OpenOptions { silent: false },
+        );
+        self.finish_preview_open(previous, target_id, current_was_pinned, cx);
+        log::info!("remote-open: preview returned {path}");
     }
 
     fn open_remote_file_at(
@@ -6501,6 +6737,11 @@ impl Editor {
                     this.open_files[idx].last_checked_text_version = text_version;
                     if this.open_files[idx].dirty != dirty {
                         this.open_files[idx].dirty = dirty;
+                        if dirty
+                            && this.preview_file_id.as_deref() == Some(sync_tab_id.as_str())
+                        {
+                            this.preview_file_id = None;
+                        }
                         this.sync_tab_modified(&sync_tab_id, dirty, cx);
                     }
                     // LSP 文档同步：只在文本真的变了时发 didChange。
@@ -7126,6 +7367,9 @@ impl Editor {
             .is_some_and(|live| live.read(cx).is_dirty_fast());
         if self.open_files[idx].dirty != dirty {
             self.open_files[idx].dirty = dirty;
+            if dirty && self.preview_file_id.as_ref() == Some(live_tab_id) {
+                self.preview_file_id = None;
+            }
             self.sync_tab_modified(live_tab_id, dirty, cx);
         }
         self.schedule_live_shadow_sync(live_tab_id, version, cx);
@@ -7406,6 +7650,9 @@ impl Editor {
     /// - 已通过 close_file 的弹窗确认；
     /// - 文件加载失败后关闭（加载失败的文件保持 disabled，不可能有未保存内容）。
     fn close_file_direct(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.preview_file_id.as_deref() == Some(id) {
+            self.preview_file_id = None;
+        }
         self.loading_gens.remove(id);
         self.pending_jumps.remove(id);
         self.pending_lsp_jumps.remove(id);
@@ -7518,22 +7765,25 @@ impl Editor {
         }
     }
 
-    /// 外部删除后关闭对应的标签（文件树发起的删除）。
+    /// 外部删除后关闭对应的干净标签；有未保存修改的标签继续保留内存内容。
     ///
-    /// 直接关闭、不弹「未保存」确认：文件已经不存在了，留着只会在保存时
-    /// 把它重新写回磁盘。
+    /// 保留脏标签是最后一份未落盘数据的防丢保护。用户仍可另存或保存以重建文件，
+    /// 不能因为磁盘条目被删除就静默丢弃编辑。
     pub fn close_open_path(
         &mut self,
         removed: &Path,
         ssh_config: Option<&SshConnectionConfig>,
         cx: &mut Context<Self>,
     ) {
+        // live Markdown 的修改可能还在防抖后的影子 InputState 中，先同步再判断脏状态。
+        self.flush_all_live_shadows(cx);
         let ids: Vec<String> = self
             .open_files
             .iter()
-            // 同上：只关同一后端的标签
             .filter(|f| {
-                f.ssh_config.as_ref() == ssh_config && path_is_under(Path::new(&f.path), removed)
+                f.ssh_config.as_ref() == ssh_config
+                    && path_is_under(Path::new(&f.path), removed)
+                    && !self.file_is_dirty(f, cx)
             })
             .map(|f| f.id.to_string())
             .collect();
@@ -10410,6 +10660,129 @@ mod tests {
         assert!(err.contains("GBK"));
     }
 
+    #[test]
+    fn comparison_reader_accepts_empty_and_rejects_oversized_files() {
+        let root = std::env::temp_dir().join(format!(
+            "deepterm-comparison-reader-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create comparison test root");
+        let empty = root.join("empty.txt");
+        std::fs::write(&empty, b"").expect("write empty file");
+        assert_eq!(load_comparison_text(&empty, None).unwrap(), "");
+
+        let oversized = root.join("oversized.txt");
+        let file = std::fs::File::create(&oversized).expect("create sparse oversized file");
+        file.set_len(MAX_EDITOR_FILE_BYTES as u64 + 1)
+            .expect("size sparse oversized file");
+        let error = load_comparison_text(&oversized, None).unwrap_err();
+        assert!(error.contains("20 MiB"), "{error}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn preview_does_not_turn_an_existing_pinned_tab_into_a_preview(cx: &mut gpui::TestAppContext) {
+        let (editor, _input, cx) = completion_key_fixture(cx, false);
+        cx.update(|_, cx| crate::lsp::project::LspManager::init(cx));
+        editor.update(cx, |editor, cx| editor.clear(cx));
+        let root =
+            std::env::temp_dir().join(format!("deepterm-preview-pinned-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create preview test root");
+        let a = root.join("a.txt");
+        let b = root.join("b.txt");
+        let c = root.join("c.txt");
+        for path in [&a, &b, &c] {
+            std::fs::write(path, b"text").expect("write preview test file");
+        }
+        let a_id = Editor::local_tab_id(&a);
+        let b_id = Editor::local_tab_id(&b);
+        let c_id = Editor::local_tab_id(&c);
+        let open = |path: PathBuf, preview: bool, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    if preview {
+                        editor.preview_local_file(path, window, cx);
+                    } else {
+                        editor.open_file(path, window, cx);
+                    }
+                });
+            });
+            cx.run_until_parked();
+        };
+
+        open(a.clone(), false, cx);
+        open(b, true, cx);
+        assert!(editor.read_with(cx, |editor, _| {
+            editor.preview_file_id.as_deref() == Some(b_id.as_str())
+        }));
+        open(a.clone(), true, cx);
+        assert!(editor.read_with(cx, |editor, _| editor.preview_file_id.is_none()));
+
+        open(c, true, cx);
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                editor
+                    .open_files
+                    .iter()
+                    .any(|file| file.id.as_ref() == a_id)
+            );
+            assert_eq!(editor.preview_file_id.as_deref(), Some(c_id.as_str()));
+            assert_eq!(editor.active_file_id.as_deref(), Some(c_id.as_str()));
+        });
+        editor.update(cx, |editor, cx| editor.clear(cx));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[gpui::test]
+    fn reopening_comparison_uses_new_file_contents(cx: &mut gpui::TestAppContext) {
+        let (editor, _input, cx) = completion_key_fixture(cx, false);
+        let root = std::env::temp_dir().join(format!(
+            "deepterm-comparison-reopen-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("create comparison test root");
+        let left = root.join("left.txt");
+        let right = root.join("right.txt");
+        std::fs::write(&left, "left-v1").expect("write left");
+        std::fs::write(&right, "right-v1").expect("write right");
+
+        let compare = |left: PathBuf, right: PathBuf, cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| {
+                editor.update(cx, |editor, cx| {
+                    editor.open_file_comparison(left, right, None, window, cx);
+                });
+            });
+            cx.run_until_parked();
+        };
+        compare(left.clone(), right.clone(), cx);
+        editor.read_with(cx, |editor, cx| {
+            let diff = editor
+                .open_files
+                .iter()
+                .find_map(|file| file.diff())
+                .expect("comparison diff");
+            assert_eq!(diff.read(cx).comparison_texts(), ("left-v1", "right-v1"));
+        });
+
+        std::fs::write(&left, "left-v2").expect("rewrite left");
+        std::fs::write(&right, "right-v2").expect("rewrite right");
+        compare(left, right, cx);
+        editor.read_with(cx, |editor, cx| {
+            let comparisons: Vec<_> = editor
+                .open_files
+                .iter()
+                .filter_map(|file| file.diff())
+                .collect();
+            assert_eq!(comparisons.len(), 1);
+            assert_eq!(
+                comparisons[0].read(cx).comparison_texts(),
+                ("left-v2", "right-v2")
+            );
+        });
+        editor.update(cx, |editor, cx| editor.clear(cx));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// 建一个带「可见补全菜单」的 Editor，供 Enter 键位回归用例复用。
     fn completion_key_fixture(
         cx: &mut gpui::TestAppContext,
@@ -10991,83 +11364,6 @@ mod tests {
     /// 只读预览时代的 id 就是不带后缀的 md 路径。删掉预览后这类 id 若原样
     /// 恢复，会退化成代码编辑器（看到 `![](a.png)` 源码），而且 `open_files`
     /// 与标签栏/LSP 会各自持有一份不同的 id。
-    #[gpui::test]
-    fn restore_upgrades_legacy_preview_id_to_live(cx: &mut gpui::TestAppContext) {
-        struct EditorHost(gpui::Entity<Editor>);
-        impl Render for EditorHost {
-            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-                div().size_full().child(self.0.clone())
-            }
-        }
-
-        cx.update(|cx| {
-            crate::theme::init(cx);
-            crate::sidebar_view::font_settings::FontState::init(cx);
-            crate::file_manager::watcher::init(cx);
-            crate::vim::init(cx);
-            crate::keymap::init(cx);
-        });
-        let (host, cx) =
-            cx.add_window_view(|window, cx| EditorHost(cx.new(|cx| Editor::new(window, cx))));
-        let editor = host.read_with(cx, |h, _| h.0.clone());
-
-        // 关键：id 是**旧形态**（没有 `#live`）。
-        let info = EditorOpenFileInfo {
-            id: "note.md".into(),
-            path: "note.md".into(),
-            label: "note.md".into(),
-            ssh_config: None,
-            is_loading: false,
-            original_content: Some("![i](a.png)\n".to_string()),
-            encoding: FileEncoding::Utf8,
-            read_only: false,
-            dirty: false,
-            diff_repo: None,
-        };
-        cx.update(|window, cx| {
-            let cached = cx.new(|cx| {
-                let mut state = InputState::new(window, cx).multi_line(true);
-                state.set_value("![i](a.png)\n", window, cx);
-                state
-            });
-            editor.update(cx, |editor, cx| {
-                editor.restore_file_from_cache(&info, cached, window, cx);
-
-                let file = editor
-                    .open_files
-                    .iter()
-                    .find(|f| f.path == "note.md")
-                    .expect("md tab should be restored");
-                assert_eq!(
-                    file.id.as_ref(),
-                    "note.md#live",
-                    "legacy preview id must be upgraded to the live suffix"
-                );
-                assert!(
-                    file.live().is_some(),
-                    "restored md tab must render as the live editor"
-                );
-                // 标签栏**注册项**必须与 `open_files` 用同一个 id。注意不能只
-                // 断言 `active_tab_id`：`switch_to_file` 会把它无条件改写成传入
-                // 的 id，从而掩盖 `add_tab` 里用旧 id 注册的缺陷（点这个标签
-                // 会切到不存在的 tab）。
-                let registered: Vec<String> = editor
-                    .tab_bar
-                    .read(cx)
-                    .tabs
-                    .iter()
-                    .map(|t| t.id.to_string())
-                    .collect();
-                assert_eq!(
-                    registered,
-                    vec!["note.md#live".to_string()],
-                    "tab bar must register the normalized id"
-                );
-            });
-        });
-    }
-
-    /// 端到端：打开 md 必须直接进实时编辑器（只读预览已删除）。
     #[gpui::test]
     fn opening_md_always_uses_live_editor(cx: &mut gpui::TestAppContext) {
         let (_editor, _input, cx) = completion_key_fixture(cx, false);

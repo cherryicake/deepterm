@@ -6,7 +6,7 @@ use crate::file_manager::utils::{
     prevent_remote_recursive_copy, remote_file_name, remove_remote_source, resolve_remote_conflict,
     walk_remote_dir,
 };
-use crate::file_manager::{ConflictPolicy, ConflictResolver, TransferCtx};
+use crate::file_manager::{ConflictPolicy, ConflictResolver, FileEndpoint, TransferCtx};
 use crate::ssh::SshConnectionConfig;
 use crate::ssh::sftp_fs::{self, RemoteFileKind};
 
@@ -139,9 +139,22 @@ pub fn move_remote_to_same_remote(
         }
 
         match session.rename(remote_path, &destination_path) {
-            Ok(()) => Ok(TransferSummary::from_remote_metadata(&metadata)),
+            Ok(()) => {
+                let mut summary = TransferSummary::from_remote_metadata(&metadata);
+                summary.record_move(
+                    FileEndpoint::Remote {
+                        ssh_config: ssh_config.clone(),
+                        path: remote_path.to_string(),
+                    },
+                    FileEndpoint::Remote {
+                        ssh_config: ssh_config.clone(),
+                        path: destination_path,
+                    },
+                );
+                Ok(summary)
+            }
             Err(_) => {
-                let summary = copy_remote_to_same_remote(
+                let mut summary = copy_remote_to_same_remote(
                     ssh_config,
                     remote_path,
                     destination_dir,
@@ -157,6 +170,16 @@ pub fn move_remote_to_same_remote(
                 // 只有在没有任何条目被跳过时才删源，避免把未复制成功的内容连源一起删掉。
                 if summary.skipped == 0 {
                     remove_remote_source(session, remote_path)?;
+                    summary.record_move(
+                        FileEndpoint::Remote {
+                            ssh_config: ssh_config.clone(),
+                            path: remote_path.to_string(),
+                        },
+                        FileEndpoint::Remote {
+                            ssh_config: ssh_config.clone(),
+                            path: destination_path,
+                        },
+                    );
                 } else {
                     log::warn!(
                         "远程移动：有 {} 个条目被跳过，保留源 {} 不删除",

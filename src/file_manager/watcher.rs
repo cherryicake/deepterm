@@ -916,6 +916,7 @@ mod tests {
             path: PathBuf::from(name),
             kind,
             size: 0,
+            symlink_target_is_dir: false,
         }
     }
 
@@ -1170,6 +1171,7 @@ mod tests {
                             path: PathBuf::from(format!("/root/{n}")),
                             kind: FileEntryKind::File,
                             size: 0,
+                            symlink_target_is_dir: false,
                         })
                         .collect(),
                 ),

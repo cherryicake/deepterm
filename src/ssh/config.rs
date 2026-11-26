@@ -81,9 +81,6 @@ pub struct HostGroup {
     #[serde(default)]
     pub sort_order: u32,
     pub created_at: DateTime<Utc>,
-    /// 兼容旧折叠字段，现不使用但保留以避免反序列化失败
-    #[serde(default)]
-    pub collapsed: bool,
 }
 
 impl HostGroup {
@@ -93,7 +90,6 @@ impl HostGroup {
             name: name.into(),
             sort_order,
             created_at: Utc::now(),
-            collapsed: false,
         }
     }
 }
@@ -1074,14 +1070,12 @@ mod tests {
                 name: "b".into(),
                 sort_order: 1,
                 created_at: Utc::now(),
-                collapsed: false,
             },
             HostGroup {
                 id: "1".into(),
                 name: "a".into(),
                 sort_order: 0,
                 created_at: Utc::now(),
-                collapsed: false,
             },
         ];
         sort_host_groups(&mut groups, SortMode::NameAsc, None);

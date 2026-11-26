@@ -307,10 +307,7 @@ pub fn list_machines() -> Result<Vec<serde_json::Value>, String> {
             .unwrap_or("守护进程拒绝列出机器")
             .to_string());
     }
-    Ok(reply["machines"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
+    Ok(reply["machines"].as_array().cloned().unwrap_or_default())
 }
 
 /// 一条机器视图是否指向给定的 SSH 目标。
@@ -320,7 +317,10 @@ pub fn list_machines() -> Result<Vec<serde_json::Value>, String> {
 /// 字段在机器视图里是平铺的（见 `Machine::view`），不是嵌在 `ssh` 下面。
 ///
 /// 抽成纯函数是为了可测：真正调用会走 RPC 删条目，单测里碰不到。
-fn targets_same_host(machine: &serde_json::Value, config: &crate::ssh::SshConnectionConfig) -> bool {
+fn targets_same_host(
+    machine: &serde_json::Value,
+    config: &crate::ssh::SshConnectionConfig,
+) -> bool {
     machine.get("host").and_then(serde_json::Value::as_str) == Some(config.host.as_str())
         && machine
             .get("port")
@@ -992,7 +992,11 @@ mod tests {
     /// 并进旧记录里——`rebuilt` 就永远自愈不了。
     #[test]
     fn rebuilding_matches_entries_by_target_not_by_nickname() {
-        let config = crate::ssh::SshConnectionConfig::new("10.0.0.9", "me", crate::ssh::config::AuthMethod::Agent);
+        let config = crate::ssh::SshConnectionConfig::new(
+            "10.0.0.9",
+            "me",
+            crate::ssh::config::AuthMethod::Agent,
+        );
 
         let entry = |host: &str, port: u64, user: &str| {
             serde_json::json!({
@@ -1011,13 +1015,17 @@ mod tests {
         // 主机、端口、用户任一不同都不是同一目标；误删会毁掉用户的其它机器。
         assert!(!targets_same_host(&entry("10.0.0.10", 22, "me"), &config));
         assert!(!targets_same_host(&entry("10.0.0.9", 2222, "me"), &config));
-        assert!(!targets_same_host(&entry("10.0.0.9", 22, "someone"), &config));
+        assert!(!targets_same_host(
+            &entry("10.0.0.9", 22, "someone"),
+            &config
+        ));
     }
 
     /// 缺字段的旧条目按 22 端口处理，不能因为一次 serde 变化就删不掉。
     #[test]
     fn a_machine_without_a_port_is_port_22() {
-        let config = crate::ssh::SshConnectionConfig::new("h", "u", crate::ssh::config::AuthMethod::Agent);
+        let config =
+            crate::ssh::SshConnectionConfig::new("h", "u", crate::ssh::config::AuthMethod::Agent);
         let machine = serde_json::json!({"name": "h", "host": "h", "username": "u"});
         assert!(targets_same_host(&machine, &config));
     }

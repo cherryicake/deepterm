@@ -6863,6 +6863,14 @@ impl Render for TerminalView {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.add_paths_to_terminal(paths.paths(), cx);
             }))
+            .on_drop(cx.listener(
+                |this,
+                 dragged: &crate::sidebar_view::file_tree_context_menu::DraggedTreeEntry,
+                 _window,
+                 cx| {
+                    this.add_paths_to_terminal(&dragged.paths, cx);
+                },
+            ))
             .child(
                 // Use relative positioning: terminal fills container, scrollbar floats on top
                 div()

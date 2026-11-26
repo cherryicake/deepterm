@@ -16,6 +16,9 @@ pub struct FileEntry {
     pub kind: FileEntryKind,
     /// Size in bytes; used to choose pipelined reads for large files.
     pub size: u64,
+    /// 符号链接目标是否为目录；普通条目恒为 false。
+    #[serde(default)]
+    pub symlink_target_is_dir: bool,
 }
 
 impl FileEntry {
@@ -33,12 +36,20 @@ impl FileEntry {
             FileEntryKind::Other
         };
         let size = entry.metadata().map_or(0, |m| m.len());
+        let symlink_target_is_dir = file_type.is_symlink()
+            && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir());
         Some(Self {
             name,
             path,
             kind,
             size,
+            symlink_target_is_dir,
         })
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.kind == FileEntryKind::Directory
+            || (self.kind == FileEntryKind::Symlink && self.symlink_target_is_dir)
     }
 
     pub fn sort_key(&self) -> (u8, String) {

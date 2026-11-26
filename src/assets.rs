@@ -63,6 +63,8 @@ pub enum Icon {
     ChevronRight,
     ChevronUpDown,
     ChevronLeft,
+    /// 文件树根目录工具栏：折叠全部文件夹。
+    CollapseFolders,
     // Git panel variants (stroke-weight redesigns; the plain ones are shared
     // elsewhere and keep their original look).
     ChevronDownThick,
@@ -162,6 +164,7 @@ impl Icon {
             Icon::ChevronRight => SharedString::new_static("icons/chevron.right.svg"),
             Icon::ChevronUpDown => SharedString::new_static("icons/chevron.up.chevron.down.svg"),
             Icon::ChevronLeft => SharedString::new_static("icons/chevron.left.svg"),
+            Icon::CollapseFolders => SharedString::new_static("icons/collapse.svg"),
             Icon::Eye => SharedString::new_static("icons/eye.svg"),
             Icon::EyeOff => SharedString::new_static("icons/eye_off.svg"),
             Icon::Loader => SharedString::new_static("icons/loader.svg"),

@@ -648,7 +648,10 @@ mod tests {
         let existing = uuid::Uuid::new_v4().to_string();
         std::fs::write(&legacy, &existing).expect("old id");
 
-        assert_eq!(load_or_create_core_id_at(&path, &legacy).expect("load"), existing);
+        assert_eq!(
+            load_or_create_core_id_at(&path, &legacy).expect("load"),
+            existing
+        );
         assert_eq!(
             std::fs::read_to_string(&path).expect("new file").trim(),
             existing,
@@ -669,7 +672,10 @@ mod tests {
         std::fs::write(&path, &durable).expect("durable id");
         std::fs::write(&legacy, uuid::Uuid::new_v4().to_string()).expect("stale id");
 
-        assert_eq!(load_or_create_core_id_at(&path, &legacy).expect("load"), durable);
+        assert_eq!(
+            load_or_create_core_id_at(&path, &legacy).expect("load"),
+            durable
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

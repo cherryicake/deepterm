@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -120,6 +121,8 @@ pub enum WorkspaceEvent {
     /// 供文件树等在**传输结束后**刷新 —— 之前只能在发起时刷新，等于空转。
     TransferFinished {
         dirs: Vec<FileEndpoint>,
+        /// 实际完成的顶层移动，包含冲突自动改名后的真实目标。
+        moves: Vec<(FileEndpoint, FileEndpoint)>,
     },
 }
 
@@ -2347,6 +2350,61 @@ impl Workspace {
         self.add_terminal_tab(label, panel, icon, window, cx);
     }
 
+    /// 在指定本地目录打开默认 shell，保持终端可继续交互。
+    pub fn create_local_terminal_in_directory(
+        &mut self,
+        directory: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        #[cfg(windows)]
+        let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        #[cfg(not(windows))]
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        self.create_local_terminal_with_command_and_working_directory(
+            &shell,
+            &[],
+            Some(directory),
+            window,
+            cx,
+        );
+    }
+
+    /// 在本地终端执行文件树脚本，结束后保留交互 shell。
+    pub fn run_local_script_in_terminal(
+        &mut self,
+        script: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let directory = script.parent().unwrap_or(Path::new(".")).to_path_buf();
+        #[cfg(windows)]
+        {
+            let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+            let args = vec!["/K".to_string(), format!("\"{}\"", script.display())];
+            self.create_local_terminal_with_command_and_working_directory(
+                &shell,
+                &args,
+                Some(directory),
+                window,
+                cx,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+            let quoted = crate::utils::shell::shell_quote_single(&script.to_string_lossy());
+            let command = format!("{quoted}; exec \"${{SHELL:-/bin/sh}}\" -l");
+            self.create_local_terminal_with_command_and_working_directory(
+                &shell,
+                &["-lc".to_string(), command],
+                Some(directory),
+                window,
+                cx,
+            );
+        }
+    }
+
     /// 使用指定命令创建本地终端Tab
     pub fn create_local_terminal_with_command(
         &mut self,
@@ -2402,6 +2460,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.create_ssh_terminal_with_config_and_cwd(config, None, window, cx);
+    }
+
+    pub fn create_ssh_terminal_with_config_and_cwd(
+        &mut self,
+        config: &SshConnectionConfig,
+        remote_cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let label = config.display_name();
         let initial_icon = config
             .os
@@ -2422,7 +2490,7 @@ impl Workspace {
                 Some(format!("tab-{}", self.next_tab_id).into()),
                 Some(label.clone().into()),
                 config,
-                None,
+                remote_cwd,
                 cx,
             )
         });
